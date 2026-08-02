@@ -35,7 +35,8 @@
 # agentic-review.yml — both read review/prompt.md, so local results and CI
 # results cannot drift. The flag names match the workflow's inputs one-for-one.
 #
-# Needs: OPENROUTER_API_KEY in the environment, and bun (omp is bun-only).
+# Needs: OPENROUTER_API_KEY in the environment (or OPENROUTER_API_KEY_FILE
+# pointing at a file holding it), and bun (omp is bun-only).
 # Read-only: no writes, no shell, no network beyond the model call.
 
 set -euo pipefail
@@ -129,7 +130,30 @@ support() { # support <relative-path> -> prints an existing path, or fails
 }
 
 step "Checking prerequisites"
-[ -n "${OPENROUTER_API_KEY:-}" ] || die "OPENROUTER_API_KEY is not set"
+
+# A key passed inline lands in shell history and in anything capturing the
+# terminal. OPENROUTER_API_KEY_FILE reads it from a file instead, the way Docker
+# handles secrets.
+if [ -z "${OPENROUTER_API_KEY:-}" ] && [ -n "${OPENROUTER_API_KEY_FILE:-}" ]; then
+  [ -r "$OPENROUTER_API_KEY_FILE" ] || die "OPENROUTER_API_KEY_FILE is not readable: $OPENROUTER_API_KEY_FILE"
+  OPENROUTER_API_KEY="$(tr -d '\r\n' < "$OPENROUTER_API_KEY_FILE")"
+  export OPENROUTER_API_KEY
+fi
+[ -n "${OPENROUTER_API_KEY:-}" ] || die "OPENROUTER_API_KEY is not set (or point OPENROUTER_API_KEY_FILE at a file containing it)"
+
+# Catch a pasted placeholder here rather than letting it become an invalid HTTP
+# header three minutes into a run. An explicit allowed set, because the obvious
+# alternatives do not work: [!\ -~] is ambiguous inside a bracket expression and
+# matches plain ASCII, and [![:print:]] treats a UTF-8 ellipsis as printable, so
+# both let "sk-or-…" straight through.
+case "$OPENROUTER_API_KEY" in
+  *[!A-Za-z0-9._-]*)
+    die "OPENROUTER_API_KEY contains a character that cannot appear in a key — a placeholder such as 'sk-or-…' was probably pasted literally" ;;
+esac
+case "$OPENROUTER_API_KEY" in
+  sk-or-*) ;;
+  *) say "warning: the key does not start with 'sk-or-' — OpenRouter keys normally do" ;;
+esac
 
 bad=""
 for t in ${TOOLS//,/ }; do

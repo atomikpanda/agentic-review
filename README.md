@@ -29,7 +29,7 @@ curl -fsSL .../install-review.sh | bash -s -- --repo owner/name --openrouter-key
 No GitHub involved — it reviews a local diff and writes the result to stdout.
 
 ```bash
-export OPENROUTER_API_KEY=sk-or-...
+export OPENROUTER_API_KEY=sk-or-v1-yourkeyhere   # or see OPENROUTER_API_KEY_FILE
 ./scripts/run-review.sh                        # vs the default branch
 ./scripts/run-review.sh --staged               # only what's staged
 ./scripts/run-review.sh --review-mode suggest  # with the fixes it would offer
@@ -44,6 +44,14 @@ and run it anywhere:
 ```bash
 ln -s "$PWD/scripts/run-review.sh" ~/.local/bin/review
 cd ~/some/other/project && review --base main
+```
+
+Keeping the key out of shell history: set `OPENROUTER_API_KEY_FILE` to a file
+containing it instead of passing the value inline.
+
+```bash
+printf '%s' 'sk-or-v1-...' > ~/.config/openrouter-key && chmod 600 ~/.config/openrouter-key
+OPENROUTER_API_KEY_FILE=~/.config/openrouter-key ./scripts/run-review.sh
 ```
 
 All progress goes to stderr and only the review goes to stdout, so it pipes
