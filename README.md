@@ -86,9 +86,17 @@ Three things that mechanism forces, all handled:
 
 ### Comments don't pile up
 
-Findings are re-derived from scratch on every push, so each run embeds a stable
-fingerprint (`file` + `title`, case- and whitespace-insensitive) in every
-comment. A later run uses it to:
+Findings are re-derived from scratch on every push, so each comment embeds a
+fingerprint. Matching is **fuzzy**, because an exact hash does not work: the
+same defect came back on this repo's own PR as "bun_version input is not passed
+to setup-bun", "Configured Bun version is ignored" and "Configured Bun version
+is not passed to setup-bun", each producing a new thread and leaving the last
+one un-retired. So a finding matches an existing thread when it is in the same
+file and the significant-word overlap clears `SIMILARITY` (0.30). Measured on
+that PR's real duplicates: same-issue pairs score 0.37–0.49, different-issue
+pairs 0.03–0.16, and the rule classifies 10/10 correctly.
+
+A later run uses that to:
 
 - **stay silent** about a finding whose thread is still open, instead of posting
   it again on every push — the thing that makes bot reviewers get muted

@@ -55,6 +55,41 @@ const fingerprint = (f) =>
     .digest("hex")
     .slice(0, 16);
 const stamp = (fp) => `\n\n<!-- ${MARKER}:${fp} -->`;
+
+// A hash over file+title only matches when the model phrases a finding exactly
+// as before, and it does not: the same defect came back on this pull request as
+// "bun_version input is not passed to setup-bun", "Configured Bun version is
+// ignored" and "Configured Bun version is not passed to setup-bun". Each new
+// wording produced a fresh thread AND left the old one un-retired.
+//
+// Identity here is inherently fuzzy, so it is compared fuzzily: Jaccard overlap
+// of significant words, within the same file. Measured on this PR's real
+// duplicates, pairs that are the same issue score 0.37-0.49 and pairs that are
+// different issues score 0.03-0.16, so the threshold sits between them.
+const SIMILARITY = Number(env("SIMILARITY", "0.30"));
+const STOPWORDS_FP = new Set(
+  ("this that with from have when then than been they them there which while would could" +
+    " should must into over under only also more most much some such very each other same" +
+    " about after before again where whether because during through does not"
+  ).split(" "),
+);
+function tokenSet(text) {
+  return new Set(
+    String(text ?? "")
+      .toLowerCase()
+      .replace(/```[\s\S]*?```/g, " ")   // suggestion blocks are not identity
+      .replace(/<!--[\s\S]*?-->/g, " ")  // our own marker
+      .replace(/<\/?details>|<\/?summary>/g, " ")
+      .replace(/[^a-z0-9_]+/g, " ")
+      .split(" ")
+      .filter((w) => w.length > 3 && !STOPWORDS_FP.has(w)),
+  );
+}
+function similarity(a, b) {
+  const inter = [...a].filter((x) => b.has(x)).length;
+  const union = a.size + b.size - inter;
+  return union ? inter / union : 0;
+}
 const readStamp = (body) => {
   const m = String(body ?? "").match(new RegExp(`<!-- ${MARKER}:([0-9a-f]{16}) -->`));
   return m ? m[1] : null;
@@ -300,6 +335,8 @@ async function ourThreads() {
         id: t.id, fp, isResolved: t.isResolved,
         commentId: c?.databaseId, body: c?.body ?? "",
         path: t.path, origOid: c?.originalCommit?.oid ?? null,
+        retired: RETIRED_RE.test(c?.body ?? ""),
+        tokens: tokenSet(c?.body ?? ""),
       });
   }
   return out;
@@ -513,12 +550,36 @@ async function main() {
       console.log(`::warning::could not read existing review threads (${e.message}); posting without dedupe`);
     }
   }
-  const liveFps = new Set(findings.map(fingerprint));
-  const openFps = new Set(prior.filter((t) => !t.isResolved).map((t) => t.fp));
+  // Threads still standing: not resolved, and not already retired. A retired
+  // thread is deliberately excluded so a finding that comes BACK is raised
+  // again rather than silently suppressed by its own tombstone.
+  const standing = prior.filter((t) => !t.isResolved && !t.retired);
+
+  const matchOf = (f) => {
+    const fp = fingerprint(f);
+    const exact = standing.find((t) => t.fp === fp);
+    if (exact) return exact;
+    const tk = tokenSet(`${f.title} ${f.body}`);
+    const file = String(f.file).replace(/^\.\//, "");
+    let best = null;
+    let bestScore = 0;
+    for (const t of standing) {
+      if (t.path !== file) continue;
+      const sc = similarity(tk, t.tokens);
+      if (sc > bestScore) { bestScore = sc; best = t; }
+    }
+    return bestScore >= SIMILARITY ? best : null;
+  };
 
   // A finding already sitting in an open thread is not repeated. Re-posting it
   // on every push is how a bot reviewer becomes noise people mute.
-  const fresh = findings.filter((f) => !openFps.has(fingerprint(f)));
+  const stillLive = new Set();
+  const fresh = [];
+  for (const f of findings) {
+    const m = matchOf(f);
+    if (m) stillLive.add(m.id);
+    else fresh.push(f);
+  }
   const repeats = findings.length - fresh.length;
 
   const { comments, unanchored } = build(fresh, ranges);
@@ -551,8 +612,8 @@ async function main() {
       console.log(`::warning::${findings.length} findings hit the max_findings cap, so nothing is being resolved — a missing finding may have been dropped rather than fixed`);
     } else {
       const tally = { resolved: 0, marked: 0, skipped: 0 };
-      for (const t of prior) {
-        if (t.isResolved || liveFps.has(t.fp)) continue;
+      for (const t of standing) {
+        if (stillLive.has(t.id)) continue;
         try {
           tally[await retireThread(t)]++;
         } catch (e) {

@@ -190,6 +190,13 @@ jobs:
         with:
           # Need the base commit to diff against.
           fetch-depth: 0
+          # actions/checkout otherwise writes a basic-auth header containing the
+          # workflow token into .git/config, and it stays there for the rest of
+          # the job. The agent has `read`, so a prompt injection in the diff can
+          # ask for .git/config and the token lands in a public PR comment.
+          # Everything after this point is local git — diff, show, cat-file — so
+          # nothing needs the credential to persist.
+          persist-credentials: false
 
       # The skill library lives in the central repo, so a repo enrolled by
       # install-review.sh gets the accumulated review knowledge without copying
@@ -206,6 +213,7 @@ jobs:
         with:
           repository: ${{ inputs.central_repo || 'atomikpanda/agentic-review' }}
           ref: main
+          persist-credentials: false
           path: .central-skills
           sparse-checkout: |
             skills
@@ -563,6 +571,16 @@ jobs:
       - name: strip agent configuration from the checkout
         run: |
           set -euo pipefail
+          # Assert rather than assume. If a future edit drops
+          # persist-credentials, the token is readable again and nothing else
+          # here would notice.
+          for cfg in .git/config .central-skills/.git/config; do
+            if [ -f "$cfg" ] && grep -qi 'extraheader' "$cfg"; then
+              echo "::error::$cfg contains a persisted credential; the read-only agent can read it"
+              exit 1
+            fi
+          done
+
           removed=0
           for d in .omp .claude .codex .gemini .opencode .cursor .windsurf .cline; do
             if [ -e "$d" ]; then rm -rf -- "$d"; echo "  removed $d/"; removed=1; fi
