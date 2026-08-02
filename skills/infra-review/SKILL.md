@@ -161,6 +161,10 @@ symptom be?* If the answer is "nothing visible", flag it.
   **Delete agent configuration from a checkout before pointing an agent at it**,
   and grep any new agent integration for "config discovered from the project
   directory" before trusting its sandbox.
+- **Enumerate every path the tool reads, not just the obvious one.** A first
+  attempt at this defence removed the agent *directories* and left `./mcp.json`
+  and `./.mcp.json` at the repository root, which load and spawn exactly the
+  same way. A partial strip reads as a fix in review and leaves the hole open.
 - **Ask which directory a tool treats as "the project".** The dangerous case is
   a tool whose config search starts at `--cwd`, because that is the attacker's
   directory in a CI review. A tool that only reads `$HOME` is fine.

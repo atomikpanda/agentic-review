@@ -364,11 +364,13 @@ jobs:
           # A pull request must not shape the index used to review it:
           # codegraph.json's `exclude` list could hide the very files it
           # changes. Take the base commit's copy, or none at all.
+          # Delete before writing. `> codegraph.json` FOLLOWS a symlink, so a
+          # pull request replacing that path with a link to somewhere on the
+          # runner would have the restore write through it to an arbitrary file.
+          rm -f codegraph.json
           if git cat-file -e "$BASE:codegraph.json" 2>/dev/null; then
             git show "$BASE:codegraph.json" > codegraph.json
             echo "  codegraph.json restored from the base commit"
-          else
-            rm -f codegraph.json
           fi
 
           export CODEGRAPH_INSTALL_DIR="$RUNNER_TEMP/cg"
@@ -378,13 +380,16 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh
           export PATH="$CODEGRAPH_BIN_DIR:$PATH"
 
-          # Prefer the central copy, same reasoning as the poster: prefer code
-          # we control over code the pull request supplies.
-          CODEGRAPH_SCRIPT="scripts/codegraph.sh"
-          if [ -f ".central-skills/scripts/codegraph.sh" ]; then
-            CODEGRAPH_SCRIPT=".central-skills/scripts/codegraph.sh"
+          # Central copy only — with the same self-review exception as the
+          # poster. This previously fell back to the pull request's own
+          # scripts/codegraph.sh unconditionally, which would execute
+          # attacker-committed code in a step whose environment carries the
+          # model key. The poster had the exception; this did not.
+          CODEGRAPH_SCRIPT=".central-skills/scripts/codegraph.sh"
+          if [ ! -f "$CODEGRAPH_SCRIPT" ] && [ "$GITHUB_REPOSITORY" = "$CENTRAL_REPO" ]; then
+            CODEGRAPH_SCRIPT="scripts/codegraph.sh"
           fi
-          [ -f "$CODEGRAPH_SCRIPT" ] || { echo "  no codegraph.sh — skipping"; exit 0; }
+          [ -f "$CODEGRAPH_SCRIPT" ] || { echo "  no codegraph.sh in $CENTRAL_REPO — skipping"; exit 0; }
 
           codegraph init . >/dev/null
           BASE_SHA="$BASE" HEAD_SHA="$HEAD" PROJECT="$PWD" \
@@ -562,7 +567,12 @@ jobs:
           for d in .omp .claude .codex .gemini .opencode .cursor .windsurf .cline; do
             if [ -e "$d" ]; then rm -rf -- "$d"; echo "  removed $d/"; removed=1; fi
           done
-          for f in .github/mcp.json .github/ssh.json .vscode/mcp.json .vscode/ssh.json; do
+          # Root-level config executes too. The first version of this step only
+          # removed the agent DIRECTORIES, which left ./mcp.json and ./.mcp.json
+          # loaded and spawnable — the fix was incomplete and the reviewer caught
+          # it. Verified: both execute under the production flags.
+          for f in mcp.json .mcp.json .github/mcp.json .github/ssh.json \
+                   .vscode/mcp.json .vscode/ssh.json; do
             if [ -e "$f" ]; then rm -f -- "$f"; echo "  removed $f"; removed=1; fi
           done
           if [ "$removed" = 0 ]; then echo "  no agent configuration present"; fi
