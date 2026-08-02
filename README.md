@@ -92,8 +92,16 @@ comment. A later run uses it to:
 
 - **stay silent** about a finding whose thread is still open, instead of posting
   it again on every push — the thing that makes bot reviewers get muted
-- **resolve** the threads it opened earlier and no longer reports, including the
+- **retire** the threads it opened earlier and no longer reports, including the
   everything-fixed case where the run returns no findings at all
+
+On retiring: `GITHUB_TOKEN` **cannot resolve review threads**. GitHub answers
+`resolveReviewThread` with `FORBIDDEN — Resource not accessible by integration`
+no matter which permissions the workflow declares; only a PAT or a suitably
+scoped GitHub App can. Editing our own comment is permitted, so a stale finding
+is instead prefixed `✅ No longer reported` with the original folded into a
+`<details>`. If you supply a token that can resolve, threads are resolved
+properly and the fallback never runs.
 
 Only threads carrying that marker are ever touched; a human's review thread has
 no fingerprint and cannot match. Resolution is skipped when a run hits

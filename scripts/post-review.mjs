@@ -286,7 +286,7 @@ async function ourThreads() {
          pullRequest(number:$pr){
            reviewThreads(first:100){
              nodes{ id isResolved isOutdated
-                    comments(first:1){ nodes{ body author{login} } } } } } } }`,
+                    comments(first:1){ nodes{ databaseId body author{login} } } } } } } }`,
     { owner, name, pr: Number(required("PR_NUMBER")) },
   );
   const nodes = data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
@@ -294,16 +294,66 @@ async function ourThreads() {
   for (const t of nodes) {
     const c = t.comments?.nodes?.[0];
     const fp = readStamp(c?.body);
-    if (fp) out.push({ id: t.id, fp, isResolved: t.isResolved });
+    if (fp) out.push({ id: t.id, fp, isResolved: t.isResolved, commentId: c?.databaseId, body: c?.body ?? "" });
   }
   return out;
 }
+
+const RESOLVED_MARK = "✅ **No longer reported**";
 
 async function resolveThread(id) {
   await graphql(
     `mutation($id:ID!){ resolveReviewThread(input:{threadId:$id}){ thread{ id } } }`,
     { id },
   );
+}
+
+// GITHUB_TOKEN cannot resolve review threads: resolveReviewThread answers
+// FORBIDDEN / "Resource not accessible by integration" no matter what
+// permissions the workflow declares. Only a PAT or a suitably-scoped App can.
+//
+// Editing our own review comment IS permitted, so a stale finding is marked and
+// folded away instead. Less tidy than a resolved thread, same practical effect:
+// the reader can see at a glance that the reviewer withdrew it.
+async function collapseComment(t) {
+  if (!t.commentId) return false;
+  if (t.body.startsWith(RESOLVED_MARK)) return false; // already done
+  const repo = required("GITHUB_REPO");
+  const body =
+    `${RESOLVED_MARK} — the reviewer no longer raises this.\n\n` +
+    `<details><summary>Original finding</summary>\n\n${t.body}\n\n</details>`;
+  const res = await fetch(
+    `https://api.github.com/repos/${repo}/pulls/comments/${t.commentId}`,
+    {
+      method: "PATCH",
+      headers: {
+        authorization: `Bearer ${required("GH_TOKEN")}`,
+        accept: "application/vnd.github+json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ body }),
+    },
+  );
+  if (!res.ok) throw new Error(`PATCH comment ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  return true;
+}
+
+// Resolve if the token allows it; otherwise mark the comment. Falls back once
+// and remembers, so a run with twenty stale threads makes one failed attempt
+// rather than twenty.
+let canResolveThreads = true;
+async function retireThread(t) {
+  if (canResolveThreads) {
+    try {
+      await resolveThread(t.id);
+      return "resolved";
+    } catch (e) {
+      if (!/FORBIDDEN|not accessible/i.test(e.message)) throw e;
+      canResolveThreads = false;
+      console.log("::notice::this token cannot resolve review threads (GITHUB_TOKEN never can); marking stale findings instead");
+    }
+  }
+  return (await collapseComment(t)) ? "marked" : "skipped";
 }
 
 async function postReview(payload) {
@@ -392,10 +442,9 @@ async function main() {
         let n = 0;
         for (const t of await ourThreads()) {
           if (t.isResolved) continue;
-          await resolveThread(t.id);
-          n++;
+          if ((await retireThread(t)) !== "skipped") n++;
         }
-        console.log(`  no findings — resolved ${n} open thread(s)`);
+        console.log(`  no findings — retired ${n} open thread(s)`);
       } catch (e) {
         console.log(`::warning::could not resolve threads (${e.message})`);
       }
@@ -454,17 +503,18 @@ async function main() {
     if (truncated) {
       console.log(`::warning::${findings.length} findings hit the max_findings cap, so nothing is being resolved — a missing finding may have been dropped rather than fixed`);
     } else {
-      let resolved = 0;
+      const tally = { resolved: 0, marked: 0, skipped: 0 };
       for (const t of prior) {
         if (t.isResolved || liveFps.has(t.fp)) continue;
         try {
-          await resolveThread(t.id);
-          resolved++;
+          tally[await retireThread(t)]++;
         } catch (e) {
-          console.log(`::warning::could not resolve a thread (${e.message})`);
+          console.log(`::warning::could not retire a thread (${e.message})`);
         }
       }
-      if (resolved) console.log(`  resolved ${resolved} thread(s) no longer reported`);
+      if (tally.resolved || tally.marked) {
+        console.log(`  retired ${tally.resolved + tally.marked} stale finding(s) (${tally.resolved} resolved, ${tally.marked} marked)`);
+      }
     }
   }
 
