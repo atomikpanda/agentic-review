@@ -14,24 +14,86 @@ name: agentic-review
 #     review:
 #       uses: <owner>/agentic-review/.github/workflows/agentic-review.yml@main
 #       secrets: { OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }} }
+#       with:
+#         model: openrouter/anthropic/claude-sonnet-5
+#         thinking: high
+#
+# Every knob below has a default, so `with:` is optional. See README.md for the
+# full table and the matching flags on scripts/run-review.sh.
 
 on:
   workflow_call:
     inputs:
+      # --- model ------------------------------------------------------------
       model:
-        description: Model slug, provider-prefixed.
+        description: Model slug, provider-prefixed (as it appears on openrouter.ai/models).
         type: string
         default: openrouter/openai/gpt-5.6-luna
+      thinking:
+        description: Reasoning effort — off|minimal|low|medium|high|xhigh|max|auto. Empty uses the model default.
+        type: string
+        default: ''
+      # --- what the agent may do -------------------------------------------
+      tools:
+        description: >-
+          Comma-separated omp tool allowlist. Validated against a read-only set;
+          anything outside it fails the job. See READ_ONLY_TOOLS below.
+        type: string
+        default: read,grep,glob,lsp,ast_grep
+      max_time:
+        description: Hard wall-clock cap passed to omp (e.g. 600, 10m, 1h). Empty means no cap.
+        type: string
+        default: ''
+      # --- prompt and injected knowledge ------------------------------------
+      prompt_path:
+        description: Review instructions. Looked up in the reviewed repo first, then in the central repo.
+        type: string
+        default: review/prompt.md
       skills_path:
-        description: File appended to the system prompt (a SKILL.md, or any guidance file).
+        description: File appended to the system prompt (a SKILL.md, or any guidance file). Same lookup order.
         type: string
         default: skills/infra-review/SKILL.md
       max_findings:
+        description: Upper bound on findings requested in the prompt. 0 disables the cap.
         type: number
         default: 20
+      # --- outputs ----------------------------------------------------------
+      post_comment:
+        description: Post the review as a PR comment. Off still uploads the artifact.
+        type: boolean
+        default: true
+      fail_on_findings:
+        description: Exit non-zero when the review reports anything (makes this a blocking check).
+        type: boolean
+        default: false
+      # --- runner and pinning ----------------------------------------------
+      runs_on:
+        description: Runner label.
+        type: string
+        default: ubuntu-latest
+      timeout_minutes:
+        description: Job timeout.
+        type: number
+        default: 20
+      bun_version:
+        description: Bun version. omp requires >= 1.3.14 and is bun-only — it does not run under node.
+        type: string
+        default: latest
+      omp_version:
+        description: npm dist-tag or exact version of @oh-my-pi/pi-coding-agent. Pin for reproducible reviews.
+        type: string
+        default: latest
+      extra_omp_args:
+        description: >-
+          Escape hatch for omp flags with no input above (e.g. "--add-dir docs --print-thoughts").
+          Split on whitespace, so values containing spaces are not supported — use the named
+          inputs for those. Flags that would defeat the read-only envelope are rejected.
+        type: string
+        default: ''
     secrets:
       OPENROUTER_API_KEY:
         required: true
+
   # Not `pull_request_target`. That would run with a writable token against
   # untrusted head code, which is the standard way this pattern becomes a
   # repo-compromise. `pull_request` gets a read-only token on forks.
@@ -65,8 +127,8 @@ jobs:
     # ready_for_review rather than while a PR is still being iterated on.
     # A draft PR pushed ten times would otherwise cost ten reviews.
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: ${{ inputs.timeout_minutes || 20 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -89,12 +151,96 @@ jobs:
             skills
             review
 
+      # Every input is resolved here, once, into the environment. Two reasons:
+      #
+      # 1. Inputs are NOT populated when this workflow runs from its own
+      #    `pull_request` trigger rather than via `workflow_call` — and
+      #    `default:` does not apply on that path either. Every value therefore
+      #    needs a shell-side fallback, and having them in one block is the only
+      #    way to keep the two paths honestly identical.
+      # 2. `${{ inputs.x }}` expanded directly inside a `run:` body is template
+      #    substitution into shell source. A value containing a backtick or
+      #    $(...) would execute. Passing through `env:` makes them data.
+      - name: resolve config
+        env:
+          IN_MODEL: ${{ inputs.model }}
+          IN_THINKING: ${{ inputs.thinking }}
+          IN_TOOLS: ${{ inputs.tools }}
+          IN_MAX_TIME: ${{ inputs.max_time }}
+          IN_PROMPT_PATH: ${{ inputs.prompt_path }}
+          IN_SKILLS_PATH: ${{ inputs.skills_path }}
+          IN_MAX_FINDINGS: ${{ inputs.max_findings }}
+          IN_POST_COMMENT: ${{ inputs.post_comment }}
+          IN_FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings }}
+          IN_BUN_VERSION: ${{ inputs.bun_version }}
+          IN_OMP_VERSION: ${{ inputs.omp_version }}
+          IN_EXTRA_ARGS: ${{ inputs.extra_omp_args }}
+        run: |
+          set -euo pipefail
+
+          # The full read-only subset of omp's builtin tools. Deliberately
+          # excluded and NOT overridable from a caller:
+          #   bash edit write ast_edit eval debug browser computer github task
+          #   hub web_search memory_edit retain learn manage_skill checkpoint
+          #   rewind ask security_scan
+          # A PR diff is attacker-controlled text and this agent reads it, so it
+          # must not be able to execute anything, modify the checkout, reach the
+          # network, or write back to GitHub. Prompt injection then has nothing
+          # to reach for. Note `security_scan` and `web_search` look harmless by
+          # name but both egress to the network; `ask` blocks forever under -p.
+          READ_ONLY_TOOLS="read grep glob lsp ast_grep inspect_image todo"
+
+          TOOLS="${IN_TOOLS:-read,grep,glob,lsp,ast_grep}"
+          bad=""
+          for t in ${TOOLS//,/ }; do
+            case " $READ_ONLY_TOOLS " in
+              *" $t "*) ;;
+              *) bad="$bad $t" ;;
+            esac
+          done
+          if [ -n "$bad" ]; then
+            echo "::error::tools not permitted:$bad"
+            echo "This workflow only runs read-only tools. Permitted: $READ_ONLY_TOOLS"
+            exit 1
+          fi
+
+          # extra_omp_args must not be able to undo the envelope the inputs
+          # above establish. Rejecting by name is the load-bearing check; the
+          # command below additionally emits --tools and --approval-mode last.
+          case " $IN_EXTRA_ARGS " in
+            *" --tools"*|*"--tools="*|*" --no-tools "*|*" --system-prompt"*|*"--system-prompt="*|\
+            *" --api-key"*|*"--api-key="*|*" --approval-mode"*|*"--approval-mode="*|\
+            *" --auto-approve "*|*" --yolo "*|*" --plan-yolo "*)
+              echo "::error::extra_omp_args may not contain --tools, --no-tools, --system-prompt, --api-key, --approval-mode, --auto-approve, --yolo or --plan-yolo"
+              exit 1 ;;
+          esac
+
+          {
+            echo "MODEL=${IN_MODEL:-openrouter/openai/gpt-5.6-luna}"
+            echo "THINKING=${IN_THINKING:-}"
+            echo "TOOLS=$TOOLS"
+            echo "MAX_TIME=${IN_MAX_TIME:-}"
+            echo "PROMPT_PATH=${IN_PROMPT_PATH:-review/prompt.md}"
+            echo "SKILLS_PATH=${IN_SKILLS_PATH:-skills/infra-review/SKILL.md}"
+            echo "MAX_FINDINGS=${IN_MAX_FINDINGS:-20}"
+            echo "POST_COMMENT=${IN_POST_COMMENT:-true}"
+            echo "FAIL_ON_FINDINGS=${IN_FAIL_ON_FINDINGS:-false}"
+            echo "BUN_VERSION=${IN_BUN_VERSION:-latest}"
+            echo "OMP_VERSION=${IN_OMP_VERSION:-latest}"
+            echo "EXTRA_ARGS=${IN_EXTRA_ARGS:-}"
+          } >> "$GITHUB_ENV"
+
+          echo "  model=${IN_MODEL:-openrouter/openai/gpt-5.6-luna} tools=$TOOLS thinking=${IN_THINKING:-<model default>}"
+
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # omp ships `#!/usr/bin/env bun` and imports `bun:` builtins, so bun
+          # is not an optional accelerator here — node cannot load it at all.
+          # package.json declares engines.bun >= 1.3.14.
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: install omp
-        run: bun install -g @oh-my-pi/pi-coding-agent
+        run: bun install -g "@oh-my-pi/pi-coding-agent@${OMP_VERSION}"
 
       - name: build review prompt
         id: prompt
@@ -104,13 +250,13 @@ jobs:
         run: |
           set -euo pipefail
           git diff --stat "$BASE" "$HEAD" > /tmp/diffstat.txt
-          # review/prompt.md is the single source of truth — scripts/run-review.sh
+          # prompt_path is the single source of truth — scripts/run-review.sh
           # reads the same file, so a local review and a CI review cannot drift.
-          PROMPT_FILE="review/prompt.md"
-          if [ ! -f "$PROMPT_FILE" ] && [ -f ".central-skills/review/prompt.md" ]; then
-            PROMPT_FILE=".central-skills/review/prompt.md"
+          PROMPT_FILE="$PROMPT_PATH"
+          if [ ! -f "$PROMPT_FILE" ] && [ -f ".central-skills/$PROMPT_PATH" ]; then
+            PROMPT_FILE=".central-skills/$PROMPT_PATH"
           fi
-          [ -f "$PROMPT_FILE" ] || { echo "no review/prompt.md found"; exit 1; }
+          [ -f "$PROMPT_FILE" ] || { echo "::error::no prompt file at $PROMPT_PATH (checked the repo and .central-skills/)"; exit 1; }
           {
             echo "Changed files:"
             cat /tmp/diffstat.txt
@@ -118,8 +264,12 @@ jobs:
             echo "The diff is: git diff $BASE $HEAD"
             echo
             cat "$PROMPT_FILE"
+            if [ "${MAX_FINDINGS:-0}" != "0" ]; then
+              echo
+              echo "Report at most $MAX_FINDINGS findings. If you have more, keep the most severe."
+            fi
           } > /tmp/prompt.txt
-          echo "  prompt built ($(wc -c < /tmp/prompt.txt) bytes)"
+          echo "  prompt built from $PROMPT_FILE ($(wc -c < /tmp/prompt.txt) bytes)"
 
       - name: run agentic review (read-only)
         env:
@@ -129,40 +279,44 @@ jobs:
           # Prefer a skill file in the repo under review, so a project can
           # override with its own conventions; otherwise fall back to the
           # shared library fetched above.
-          SKILL="${{ inputs.skills_path || 'skills/infra-review/SKILL.md' }}"
-          APPEND=""
-          if [ -f "$SKILL" ]; then
-            APPEND="--append-system-prompt=$SKILL"
-            echo "  injecting repo-local knowledge base: $SKILL"
-          elif [ -f ".central-skills/$SKILL" ]; then
-            APPEND="--append-system-prompt=.central-skills/$SKILL"
-            echo "  injecting shared knowledge base: .central-skills/$SKILL"
+          ARGS=()
+          if [ -n "$SKILLS_PATH" ] && [ -f "$SKILLS_PATH" ]; then
+            ARGS+=(--append-system-prompt="$SKILLS_PATH")
+            echo "  injecting repo-local knowledge base: $SKILLS_PATH"
+          elif [ -n "$SKILLS_PATH" ] && [ -f ".central-skills/$SKILLS_PATH" ]; then
+            ARGS+=(--append-system-prompt=".central-skills/$SKILLS_PATH")
+            echo "  injecting shared knowledge base: .central-skills/$SKILLS_PATH"
           else
             echo "  no skill file found — running without injected knowledge"
           fi
+          # `if` rather than `[ -n "$X" ] && ARGS+=(...)`: when the test fails
+          # it is the *last* command in that list, so `set -e` would kill the
+          # step. The && form is only safe when a later command follows.
+          if [ -n "$THINKING" ]; then ARGS+=(--thinking="$THINKING"); fi
+          if [ -n "$MAX_TIME" ]; then ARGS+=(--max-time="$MAX_TIME"); fi
+
+          # Word-split the escape hatch without glob expansion.
+          if [ -n "$EXTRA_ARGS" ]; then
+            set -f
+            # shellcheck disable=SC2206  # deliberate word splitting
+            EXTRA=($EXTRA_ARGS)
+            set +f
+            ARGS+=("${EXTRA[@]}")
+          fi
 
           # --tools is an allowlist and omp validates it — an unknown name is a
-          # hard error, so a typo here fails loudly rather than silently
-          # granting everything. Enabled, all read-only:
-          #   read, grep, glob  — file access
-          #   lsp               — cross-file symbol resolution (14 ops)
-          #   ast_grep          — structural queries over 50+ tree-sitter
-          #                       grammars. Read-only; ast_EDIT is not enabled.
-          #
-          # Deliberately excluded: bash, edit, write, ast_edit, eval, debug,
-          # python, browser, computer, github, task, web_search, memory_edit.
-          # A PR diff is attacker-controlled text and this agent reads it, so it
-          # must not be able to execute anything, modify the checkout, reach the
-          # network, or write back to GitHub. Prompt injection then has nothing
-          # to reach for.
+          # hard error, so a typo fails loudly rather than silently granting
+          # everything. It is emitted AFTER $EXTRA_ARGS so that even if the
+          # name-based rejection in `resolve config` were bypassed, the last
+          # --tools on the line is the validated one.
           #
           # --no-session keeps nothing on the runner.
           omp -p \
-            --model="${{ inputs.model || 'openrouter/openai/gpt-5.6-luna' }}" \
-            --tools=read,grep,glob,lsp,ast_grep \
-            --approval-mode=always-ask \
+            --model="$MODEL" \
             --no-session \
-            $APPEND \
+            "${ARGS[@]}" \
+            --tools="$TOOLS" \
+            --approval-mode=always-ask \
             --cwd="$PWD" \
             < /tmp/prompt.txt \
             > /tmp/review.md 2>/tmp/review.err || {
@@ -178,17 +332,27 @@ jobs:
         run: |
           set -euo pipefail
           if grep -qx "No findings." /tmp/review.md; then
-            echo "  no findings — not commenting"
+            echo "  no findings"
             exit 0
           fi
-          {
-            echo "### 🔎 Agentic review"
-            echo
-            echo "_Read-only agent (\`read\`,\`grep\`,\`glob\`,\`lsp\`,\`ast_grep\`) — checks things the diff alone cannot show._"
-            echo
-            cat /tmp/review.md
-          } > /tmp/comment.md
-          gh pr comment "$PR" --body-file /tmp/comment.md
+          if [ "$POST_COMMENT" = "true" ]; then
+            {
+              echo "### 🔎 Agentic review"
+              echo
+              # shellcheck disable=SC2016  # backticks here are markdown, not substitution
+              printf '_Read-only agent (`%s`) on `%s` — checks things the diff alone cannot show._\n' \
+                "$TOOLS" "$MODEL"
+              echo
+              cat /tmp/review.md
+            } > /tmp/comment.md
+            gh pr comment "$PR" --body-file /tmp/comment.md
+          else
+            echo "  post_comment=false — see the uploaded artifact"
+          fi
+          if [ "$FAIL_ON_FINDINGS" = "true" ]; then
+            echo "::error::agentic review reported findings and fail_on_findings is set"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always()

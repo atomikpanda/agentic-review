@@ -1,36 +1,86 @@
 #!/usr/bin/env bash
 # Run the same agentic review CI runs, locally, before opening a PR.
 #
-#   ./scripts/run-review.sh                 # vs the default branch
+#   ./scripts/run-review.sh                          # vs the default branch
 #   ./scripts/run-review.sh --base main
-#   ./scripts/run-review.sh --staged        # only what's staged
+#   ./scripts/run-review.sh --staged                 # only what's staged
 #   ./scripts/run-review.sh --model openrouter/anthropic/claude-sonnet-5
+#   ./scripts/run-review.sh --thinking high --max-time 10m
+#   ./scripts/run-review.sh -- --add-dir ../shared   # extra omp flags
+#
+# Options (every one has an AGENTIC_REVIEW_* env default, so you can set them
+# once in your shell profile instead of typing them):
+#
+#   --base REF          base to diff against          $AGENTIC_REVIEW_BASE
+#   --staged            review staged changes instead
+#   --model SLUG        provider-prefixed model       $AGENTIC_REVIEW_MODEL
+#   --thinking LEVEL    off|minimal|low|medium|high|xhigh|max|auto
+#                                                     $AGENTIC_REVIEW_THINKING
+#   --tools LIST        comma-separated omp tools     $AGENTIC_REVIEW_TOOLS
+#   --max-time DUR      hard cap, e.g. 600, 10m, 1h   $AGENTIC_REVIEW_MAX_TIME
+#   --prompt FILE       review instructions           $AGENTIC_REVIEW_PROMPT
+#   --skill FILE        appended to the system prompt $AGENTIC_REVIEW_SKILL
+#   --max-findings N    0 disables the cap            $AGENTIC_REVIEW_MAX_FINDINGS
+#   --omp-version V     npm version or dist-tag       $AGENTIC_REVIEW_OMP_VERSION
+#   --out FILE          write the review here
+#   --no-fail           exit 0 even when findings are reported
+#   -- ARGS...          everything after -- is passed to omp verbatim
 #
 # Identical prompt, tools and skill injection to .github/workflows/
 # agentic-review.yml — both read review/prompt.md, so local results and CI
-# results cannot drift.
+# results cannot drift. The flag names match the workflow's inputs one-for-one.
 #
-# Needs: OPENROUTER_API_KEY in the environment. Read-only: no writes, no shell,
-# no network beyond the model call.
+# Needs: OPENROUTER_API_KEY in the environment, and bun (omp is bun-only).
+# Read-only: no writes, no shell, no network beyond the model call.
 
 set -euo pipefail
 
-BASE=""; MODEL="openrouter/openai/gpt-5.6-luna"; STAGED=0; OUT=""
-SKILL_DEFAULT="skills/infra-review/SKILL.md"; SKILL=""
+# omp's full read-only tool set. --tools is checked against this before we
+# invoke anything, so a slip here fails with a readable message rather than
+# handing an agent that reads attacker-authored diffs a shell.
+READ_ONLY_TOOLS="read grep glob lsp ast_grep inspect_image todo"
+
+# omp ships `#!/usr/bin/env bun`, imports `bun:` builtins, and declares
+# engines.bun >= 1.3.14. It cannot run under node at all, and an older bun
+# fails with a minified SyntaxError, so both are checked explicitly below.
+BUN_MIN="1.3.14"
+
+BASE="${AGENTIC_REVIEW_BASE:-}"
+MODEL="${AGENTIC_REVIEW_MODEL:-openrouter/openai/gpt-5.6-luna}"
+THINKING="${AGENTIC_REVIEW_THINKING:-}"
+TOOLS="${AGENTIC_REVIEW_TOOLS:-read,grep,glob,lsp,ast_grep}"
+MAX_TIME="${AGENTIC_REVIEW_MAX_TIME:-}"
+PROMPT_FILE="${AGENTIC_REVIEW_PROMPT:-review/prompt.md}"
+SKILL="${AGENTIC_REVIEW_SKILL:-}"
+SKILL_DEFAULT="skills/infra-review/SKILL.md"
+MAX_FINDINGS="${AGENTIC_REVIEW_MAX_FINDINGS:-20}"
+OMP_VERSION="${AGENTIC_REVIEW_OMP_VERSION:-latest}"
+STAGED=0; OUT=""; FAIL_ON_FINDINGS=1
+PASSTHRU=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --base)   BASE="${2:-}"; shift 2 ;;
-    --model)  MODEL="${2:-}"; shift 2 ;;
-    --skill)  SKILL="${2:-}"; shift 2 ;;
-    --out)    OUT="${2:-}"; shift 2 ;;
-    --staged) STAGED=1; shift ;;
-    -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --base)         BASE="${2:-}"; shift 2 ;;
+    --model)        MODEL="${2:-}"; shift 2 ;;
+    --thinking)     THINKING="${2:-}"; shift 2 ;;
+    --tools)        TOOLS="${2:-}"; shift 2 ;;
+    --max-time)     MAX_TIME="${2:-}"; shift 2 ;;
+    --prompt)       PROMPT_FILE="${2:-}"; shift 2 ;;
+    --skill)        SKILL="${2:-}"; shift 2 ;;
+    --max-findings) MAX_FINDINGS="${2:-}"; shift 2 ;;
+    --omp-version)  OMP_VERSION="${2:-}"; shift 2 ;;
+    --out)          OUT="${2:-}"; shift 2 ;;
+    --staged)       STAGED=1; shift ;;
+    --no-fail)      FAIL_ON_FINDINGS=0; shift ;;
+    --)             shift; PASSTHRU=("$@"); break ;;
+    # Print the header comment, stopping at the first line that isn't one.
+    # A line range would silently start leaking code every time the header grows.
+    -h|--help)      awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; exit 0 ;;
     *) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
 
-_c() { [ -t 1 ] && printf '\033[%sm' "$1" || true; }
+_c() { if [ -t 1 ]; then printf '\033[%sm' "$1"; fi; }
 say()  { _c "0;36"; printf '  %s\n' "$*"; _c "0"; }
 ok()   { _c "0;32"; printf '  ✓ %s\n' "$*"; _c "0"; }
 die()  { _c "0;31"; printf '  ✗ %s\n' "$*" >&2; _c "0"; exit 1; }
@@ -41,14 +91,54 @@ cd "$REPO_ROOT"
 
 step "Checking prerequisites"
 [ -n "${OPENROUTER_API_KEY:-}" ] || die "OPENROUTER_API_KEY is not set"
+
+bad=""
+for t in ${TOOLS//,/ }; do
+  case " $READ_ONLY_TOOLS " in
+    *" $t "*) ;;
+    *) bad="$bad $t" ;;
+  esac
+done
+[ -z "$bad" ] || die "tools not permitted:$bad — this reviewer only runs read-only tools ($READ_ONLY_TOOLS)"
+
+# The escape hatch must not be able to undo the envelope the flags above set.
+for a in "${PASSTHRU[@]+"${PASSTHRU[@]}"}"; do
+  case "$a" in
+    --tools|--tools=*|--no-tools)
+      die "$a cannot be passed after -- (it would undo the read-only allowlist); use --tools" ;;
+    --system-prompt|--system-prompt=*)
+      die "$a cannot be passed after -- (it would replace the review prompt); use --prompt or --skill" ;;
+    --api-key|--api-key=*)
+      die "$a cannot be passed after -- ; set OPENROUTER_API_KEY in the environment instead" ;;
+  esac
+done
+
+# Version-compare without sort -V, which is absent on some BSD/macOS setups.
+ver_ge() { # ver_ge A B  -> 0 when A >= B
+  local a b i
+  IFS=. read -ra a <<< "${1%%-*}"
+  IFS=. read -ra b <<< "${2%%-*}"
+  for i in 0 1 2; do
+    local x="${a[i]:-0}" y="${b[i]:-0}"
+    if [ "$x" -gt "$y" ] 2>/dev/null; then return 0; fi
+    if [ "$x" -lt "$y" ] 2>/dev/null; then return 1; fi
+  done
+  return 0
+}
+
 if command -v omp >/dev/null 2>&1; then
   OMP=(omp); ok "omp $(omp --version 2>/dev/null | head -1)"
 elif command -v bunx >/dev/null 2>&1; then
-  OMP=(bunx --bun @oh-my-pi/pi-coding-agent@latest); ok "using bunx (omp not installed)"
-elif command -v npx >/dev/null 2>&1; then
-  OMP=(npx -y @oh-my-pi/pi-coding-agent@latest); ok "using npx (omp not installed)"
+  bunv="$(bun --version 2>/dev/null || echo 0)"
+  ver_ge "$bunv" "$BUN_MIN" \
+    || die "bun $bunv is too old — omp needs >= $BUN_MIN (it crashes with a minified SyntaxError otherwise). Upgrade with: bun upgrade"
+  OMP=(bunx --bun "@oh-my-pi/pi-coding-agent@${OMP_VERSION}"); ok "using bunx (bun $bunv)"
 else
-  die "need omp, bun or npm — https://omp.sh/install"
+  # There is deliberately no npx fallback. omp's entrypoint is
+  # `#!/usr/bin/env bun` and it imports `bun:` builtins, so node exits with
+  # ERR_UNSUPPORTED_ESM_URL_SCHEME. Offering npx here would print a reassuring
+  # "using npx" and then fail with an error that points nowhere near the cause.
+  die "need bun >= $BUN_MIN — omp does not run under node. Install: curl -fsSL https://bun.sh/install | bash"
 fi
 
 step "Working out what changed"
@@ -79,8 +169,7 @@ ok "reviewing against $RANGE"
 printf '%s\n' "$DIFFSTAT" | sed 's/^/    /'
 
 step "Building prompt"
-PROMPT_FILE="review/prompt.md"
-[ -f "$PROMPT_FILE" ] || die "missing $PROMPT_FILE — run from a repo that has it, or copy it in"
+[ -f "$PROMPT_FILE" ] || die "missing $PROMPT_FILE — run from a repo that has it, or pass --prompt"
 TMP_PROMPT="$(mktemp)"
 {
   echo "Changed files:"
@@ -89,26 +178,35 @@ TMP_PROMPT="$(mktemp)"
   echo "The diff is: $DIFFCMD"
   echo
   cat "$PROMPT_FILE"
+  if [ "${MAX_FINDINGS:-0}" != "0" ]; then
+    echo
+    echo "Report at most $MAX_FINDINGS findings. If you have more, keep the most severe."
+  fi
 } > "$TMP_PROMPT"
-ok "$(wc -c < "$TMP_PROMPT" | tr -d ' ') bytes"
+ok "$(wc -c < "$TMP_PROMPT" | tr -d ' ') bytes from $PROMPT_FILE"
 
-APPEND=()
+ARGS=()
 [ -n "$SKILL" ] || { [ -f "$SKILL_DEFAULT" ] && SKILL="$SKILL_DEFAULT"; }
 if [ -n "$SKILL" ] && [ -f "$SKILL" ]; then
-  APPEND=(--append-system-prompt="$SKILL"); ok "knowledge base: $SKILL"
+  ARGS+=(--append-system-prompt="$SKILL"); ok "knowledge base: $SKILL"
 else
   say "no skill file — running without injected knowledge"
 fi
+if [ -n "$THINKING" ]; then ARGS+=(--thinking="$THINKING"); fi
+if [ -n "$MAX_TIME" ]; then ARGS+=(--max-time="$MAX_TIME"); fi
+if [ ${#PASSTHRU[@]} -gt 0 ]; then ARGS+=("${PASSTHRU[@]}"); fi
 
 step "Reviewing with $MODEL"
-say "read-only tools: read, grep, glob, lsp, ast_grep"
+say "read-only tools: $TOOLS${THINKING:+ | thinking: $THINKING}"
 TMP_OUT="$(mktemp)"
-# Same allowlist as CI. omp validates these names, so a typo fails loudly.
+# Same allowlist as CI, and emitted last for the same reason: whatever came
+# through -- cannot be the winning --tools. omp validates these names, so a
+# typo fails loudly.
 if ! "${OMP[@]}" -p \
       --model="$MODEL" \
-      --tools=read,grep,glob,lsp,ast_grep \
       --no-session \
-      "${APPEND[@]}" \
+      "${ARGS[@]+"${ARGS[@]}"}" \
+      --tools="$TOOLS" \
       --cwd="$REPO_ROOT" \
       < "$TMP_PROMPT" > "$TMP_OUT" 2>"$TMP_OUT.err"; then
   printf '\n'; sed 's/^/    /' "$TMP_OUT.err" | tail -20
@@ -134,8 +232,10 @@ rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err"
 printf '\n'
 if [ "$CLEAN" = 1 ]; then
   ok "no findings"
-else
+elif [ "$FAIL_ON_FINDINGS" = 1 ]; then
   # Non-zero exit so this is usable as a pre-push hook or in a pipeline.
   _c "0;33"; printf '  ! findings above — review before pushing\n'; _c "0"
   exit 1
+else
+  _c "0;33"; printf '  ! findings above (--no-fail set)\n'; _c "0"
 fi

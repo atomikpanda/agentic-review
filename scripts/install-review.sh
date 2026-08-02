@@ -9,6 +9,31 @@
 # Adds a reusable-workflow caller for the read-only agentic reviewer, sets the
 # model key as a repo secret, and optionally writes a .pr_agent.toml for the
 # self-hosted PR-Agent App. Idempotent: re-running only fills in what's missing.
+#
+# Setup options:
+#   --repo OWNER/NAME        target repository
+#   --openrouter-key KEY     stored as the OPENROUTER_API_KEY repo secret
+#   --ref REF                central-repo ref to pin the workflow to (default main)
+#   --with-pr-agent          also write .pr_agent.toml
+#   --no-pr-agent            skip it
+#   -y, --yes                assume yes
+#
+# Reviewer options — each writes one line into the generated workflow's `with:`
+# block. Anything you leave unset is omitted, so it keeps tracking the central
+# repo's default rather than being pinned at install time:
+#   --model SLUG             provider-prefixed model slug
+#   --thinking LEVEL         off|minimal|low|medium|high|xhigh|max|auto
+#   --tools LIST             comma-separated read-only omp tools
+#   --max-time DUR           hard cap per review, e.g. 600, 10m, 1h
+#   --prompt FILE            review instructions path
+#   --skill FILE             file appended to the system prompt
+#   --max-findings N         0 disables the cap
+#   --fail-on-findings       make the review a blocking check
+#   --no-comment             don't post a PR comment (artifact only)
+#   --omp-version V          pin @oh-my-pi/pi-coding-agent
+#   --bun-version V          pin bun
+#   --extra-omp-args ARGS    passed through to omp verbatim
+#   --pr-agent-model SLUG    model for PR-Agent on this repo
 
 set -euo pipefail
 
@@ -26,21 +51,42 @@ if [ -t 0 ]; then TTY="/dev/stdin"
 elif [ -e /dev/tty ] && (exec 3<>/dev/tty) 2>/dev/null; then TTY="/dev/tty"
 fi
 
-REPO=""; OR_KEY=""; ASSUME_YES=0; WITH_PR_AGENT=""
+REPO=""; OR_KEY=""; ASSUME_YES=0; WITH_PR_AGENT=""; PR_AGENT_MODEL=""
+# Reviewer knobs. Empty means "not specified" — omitted from `with:` entirely.
+I_MODEL=""; I_THINKING=""; I_TOOLS=""; I_MAX_TIME=""; I_PROMPT=""; I_SKILL=""
+I_MAX_FINDINGS=""; I_FAIL=""; I_COMMENT=""; I_OMP_VERSION=""; I_BUN_VERSION=""
+I_EXTRA_ARGS=""
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --repo)            REPO="${2:-}"; shift 2 ;;
-    --openrouter-key)  OR_KEY="${2:-}"; shift 2 ;;
-    --with-pr-agent)   WITH_PR_AGENT=1; shift ;;
-    --no-pr-agent)     WITH_PR_AGENT=0; shift ;;
-    -y|--yes)          ASSUME_YES=1; shift ;;
+    --repo)             REPO="${2:-}"; shift 2 ;;
+    --openrouter-key)   OR_KEY="${2:-}"; shift 2 ;;
+    --ref)              CENTRAL_REF="${2:-}"; shift 2 ;;
+    --with-pr-agent)    WITH_PR_AGENT=1; shift ;;
+    --no-pr-agent)      WITH_PR_AGENT=0; shift ;;
+    --pr-agent-model)   PR_AGENT_MODEL="${2:-}"; WITH_PR_AGENT=1; shift 2 ;;
+    --model)            I_MODEL="${2:-}"; shift 2 ;;
+    --thinking)         I_THINKING="${2:-}"; shift 2 ;;
+    --tools)            I_TOOLS="${2:-}"; shift 2 ;;
+    --max-time)         I_MAX_TIME="${2:-}"; shift 2 ;;
+    --prompt)           I_PROMPT="${2:-}"; shift 2 ;;
+    --skill)            I_SKILL="${2:-}"; shift 2 ;;
+    --max-findings)     I_MAX_FINDINGS="${2:-}"; shift 2 ;;
+    --fail-on-findings) I_FAIL="true"; shift ;;
+    --no-comment)       I_COMMENT="false"; shift ;;
+    --omp-version)      I_OMP_VERSION="${2:-}"; shift 2 ;;
+    --bun-version)      I_BUN_VERSION="${2:-}"; shift 2 ;;
+    --extra-omp-args)   I_EXTRA_ARGS="${2:-}"; shift 2 ;;
+    -y|--yes)           ASSUME_YES=1; shift ;;
+    # Print the header comment, stopping at the first line that isn't one.
+    # A line range would silently start leaking code every time the header grows.
     -h|--help)
-      sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+      awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; exit 0 ;;
     *) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
 
-_c() { [ -t 1 ] && printf '\033[%sm' "$1" || true; }
+_c() { if [ -t 1 ]; then printf '\033[%sm' "$1"; fi; }
 say()  { _c "0;36"; printf '  %s\n' "$*"; _c "0"; }
 ok()   { _c "0;32"; printf '  ✓ %s\n' "$*"; _c "0"; }
 warn() { _c "0;33"; printf '  ! %s\n' "$*"; _c "0"; }
@@ -76,6 +122,14 @@ command -v gh  >/dev/null 2>&1 || die "gh not found — https://cli.github.com"
 command -v git >/dev/null 2>&1 || die "git not found"
 gh auth status >/dev/null 2>&1 || die "not logged in — run: gh auth login"
 ok "gh authenticated"
+
+# Writing under .github/workflows/ needs the `workflow` scope. Without it the
+# API call fails late, after the secret has already been set, with a message
+# that does not name the missing scope.
+if ! gh auth status 2>&1 | grep -q "'workflow'"; then
+  warn "your gh token may lack the 'workflow' scope — if the commit below is"
+  warn "rejected, run: gh auth refresh -h github.com -s workflow"
+fi
 
 # --- target repo -----------------------------------------------------------
 step "Target repository"
@@ -133,6 +187,51 @@ jobs:
     secrets:
       OPENROUTER_API_KEY: \${{ secrets.OPENROUTER_API_KEY }}
 YAML
+
+  # Only the knobs that were explicitly asked for. Everything else is left out
+  # so it keeps following the central repo's default instead of being frozen at
+  # whatever it happened to be on install day.
+  emit() { if [ -n "$2" ]; then printf '      %s: %s\n' "$1" "$2" >> "$tmp"; fi; }
+  if [ -n "$I_MODEL$I_THINKING$I_TOOLS$I_MAX_TIME$I_PROMPT$I_SKILL$I_MAX_FINDINGS$I_FAIL$I_COMMENT$I_OMP_VERSION$I_BUN_VERSION$I_EXTRA_ARGS" ]; then
+    printf '    with:\n' >> "$tmp"
+  fi
+  emit model            "$I_MODEL"
+  emit thinking         "$I_THINKING"
+  emit tools            "$I_TOOLS"
+  emit max_time         "$I_MAX_TIME"
+  emit prompt_path      "$I_PROMPT"
+  emit skills_path      "$I_SKILL"
+  emit max_findings     "$I_MAX_FINDINGS"
+  emit fail_on_findings "$I_FAIL"
+  emit post_comment     "$I_COMMENT"
+  emit omp_version      "$I_OMP_VERSION"
+  emit bun_version      "$I_BUN_VERSION"
+  emit extra_omp_args   "$I_EXTRA_ARGS"
+
+  cat >> "$tmp" <<'YAML'
+
+# Everything the reviewer accepts, with its default. To override one, add it
+# under a `with:` block indented beneath `review:` above (create the block if
+# it isn't there). Keys you leave out keep tracking the central repo, so they
+# improve as it does rather than being frozen at install time.
+#
+#   model:            openrouter/openai/gpt-5.6-luna
+#   thinking:         ''            # off|minimal|low|medium|high|xhigh|max|auto
+#   tools:            read,grep,glob,lsp,ast_grep
+#                                   # also allowed: inspect_image, todo
+#   max_time:         ''            # e.g. 600, 10m, 1h
+#   prompt_path:      review/prompt.md
+#   skills_path:      skills/infra-review/SKILL.md
+#   max_findings:     20            # 0 disables the cap
+#   post_comment:     true
+#   fail_on_findings: false         # true makes this a blocking check
+#   runs_on:          ubuntu-latest
+#   timeout_minutes:  20
+#   bun_version:      latest        # omp needs >= 1.3.14 and is bun-only
+#   omp_version:      latest        # pin for reproducible reviews
+#   extra_omp_args:   ''            # any other omp flag
+YAML
+
   args=(-f "message=chore: enable agentic code review"
         -f "content=$(base64 < "$tmp" | tr -d '\n')")
   [ -n "$existing_sha" ] && args+=(-f "sha=$existing_sha")
@@ -163,6 +262,22 @@ if [ "$WITH_PR_AGENT" = 1 ]; then
 # calls to read a version bump.
 ignore_pr_authors = ["renovate[bot]", "dependabot[bot]"]
 ignore_pr_labels = ["dependencies"]
+TOML
+    if [ -n "$PR_AGENT_MODEL" ]; then
+      # The App's own .secrets.toml sets the default; this overrides it for
+      # this repo only. custom_model_max_tokens has to travel with it —
+      # PR-Agent's token table has no "openrouter/..." entries, so a model set
+      # without a declared window fails every run.
+      cat >> "$tmp" <<TOML
+model = "${PR_AGENT_MODEL}"
+# Required whenever model is set here: PR-Agent's built-in token table is keyed
+# on exact model names and has no openrouter/* entries. Adjust to the window
+# the model above actually advertises.
+custom_model_max_tokens = 1050000
+max_model_tokens = 200000
+TOML
+    fi
+    cat >> "$tmp" <<'TOML'
 
 [github_app]
 pr_commands = [
@@ -177,7 +292,7 @@ TOML
       -f "message=chore: add pr-agent config" \
       -f "content=$(base64 < "$tmp" | tr -d '\n')" >/dev/null
     rm -f "$tmp"
-    ok ".pr_agent.toml committed"
+    ok ".pr_agent.toml committed${PR_AGENT_MODEL:+ (model: $PR_AGENT_MODEL)}"
   fi
 fi
 
@@ -187,6 +302,7 @@ ok "review enabled on $REPO"
 printf '\n'
 say "Open a PR — the agentic reviewer runs on open and on every push."
 say "Drafts are skipped; superseded runs are cancelled."
+say "Every knob is listed at the bottom of $WORKFLOW."
 printf '\n'
 say "Cost is roughly \$0.10–0.30 per review on gpt-5.6-luna."
 if [ "$WITH_PR_AGENT" = 1 ]; then
