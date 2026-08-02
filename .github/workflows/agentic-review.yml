@@ -349,6 +349,16 @@ jobs:
               echo "    $1 (from $CENTRAL_REPO)" >&2
               return 0
             fi
+            # Last resort, and only when this project is reviewing itself: a
+            # branch that ADDS a support file has it in neither the base commit
+            # nor the central repo until it merges. For any other repository
+            # this stays off, because the whole point is that a pull request
+            # must not supply its own review instructions.
+            if [ "$GITHUB_REPOSITORY" = "$CENTRAL_REPO" ] && [ -f "$1" ]; then
+              cp "$1" "$2"
+              echo "    $1 (from this branch — self-review)" >&2
+              return 0
+            fi
             return 1
           }
 
