@@ -99,8 +99,15 @@ On retiring: `GITHUB_TOKEN` **cannot resolve review threads**. GitHub answers
 `resolveReviewThread` with `FORBIDDEN — Resource not accessible by integration`
 no matter which permissions the workflow declares; only a PAT or a suitably
 scoped GitHub App can. Editing our own comment is permitted, so a stale finding
-is instead prefixed `✅ No longer reported` with the original folded into a
-`<details>`. If you supply a token that can resolve, threads are resolved
+is instead prefixed `✅ No longer reported as of <commit>` — linking the commit
+reviewed — with the original folded into a `<details>`.
+
+It deliberately does **not** say "fixed in <commit>". All that is known is that
+this run did not raise the finding, not that anything fixed it; models give
+inconsistent verdicts across runs of identical code. So the note reports one
+cheap check instead: whether the file changed since the finding was raised. If
+it did not, the marker becomes `⚠️ … but <file> has not changed since`, which
+says plainly that the disappearance is unexplained rather than implying a fix. If you supply a token that can resolve, threads are resolved
 properly and the fallback never runs.
 
 Only threads carrying that marker are ever touched; a human's review thread has

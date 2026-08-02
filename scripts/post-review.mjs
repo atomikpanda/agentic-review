@@ -285,8 +285,9 @@ async function ourThreads() {
        repository(owner:$owner,name:$name){
          pullRequest(number:$pr){
            reviewThreads(first:100){
-             nodes{ id isResolved isOutdated
-                    comments(first:1){ nodes{ databaseId body author{login} } } } } } } }`,
+             nodes{ id isResolved isOutdated path
+                    comments(first:1){ nodes{ databaseId body author{login}
+                                              originalCommit{ oid } } } } } } } }`,
     { owner, name, pr: Number(required("PR_NUMBER")) },
   );
   const nodes = data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
@@ -294,12 +295,58 @@ async function ourThreads() {
   for (const t of nodes) {
     const c = t.comments?.nodes?.[0];
     const fp = readStamp(c?.body);
-    if (fp) out.push({ id: t.id, fp, isResolved: t.isResolved, commentId: c?.databaseId, body: c?.body ?? "" });
+    if (fp)
+      out.push({
+        id: t.id, fp, isResolved: t.isResolved,
+        commentId: c?.databaseId, body: c?.body ?? "",
+        path: t.path, origOid: c?.originalCommit?.oid ?? null,
+      });
   }
   return out;
 }
 
-const RESOLVED_MARK = "✅ **No longer reported**";
+const RETIRED_RE = /^(?:✅|⚠️) \*\*No longer reported\*\*/;
+
+// "Fixed in <sha>" would be a nicer sentence and a false one. All that is known
+// at this point is that THIS run did not raise the finding — not that anything
+// fixed it, and not which commit would have. Models are documented to give
+// inconsistent verdicts across runs of identical code, and this project has
+// already seen the same defect come back under a reworded title.
+//
+// So the commit is reported as context, and the one cheap check that
+// distinguishes the two cases is run: did the file actually change since the
+// finding was raised? If it did not, the disappearance is unexplained and the
+// note says so rather than implying a fix.
+function retirementNote(t) {
+  const head = required("HEAD_SHA");
+  const short = head.slice(0, 7);
+  const repo = required("GITHUB_REPO");
+  const link = `[\`${short}\`](https://github.com/${repo}/commit/${head})`;
+
+  if (!t.path || !t.origOid) {
+    return `✅ **No longer reported** as of ${link}.`;
+  }
+  let changed = null;
+  try {
+    execFileSync("git", ["diff", "--quiet", t.origOid, head, "--", t.path], { stdio: "ignore" });
+    changed = false;
+  } catch (e) {
+    // `git diff --quiet` exits 1 for "differs"; anything else is a real error
+    // (most often the original commit is gone after a force-push).
+    changed = e.status === 1 ? true : null;
+  }
+  if (changed === true) {
+    return `✅ **No longer reported** as of ${link} — \`${t.path}\` has changed since this was raised.`;
+  }
+  if (changed === false) {
+    return (
+      `⚠️ **No longer reported** as of ${link} — but \`${t.path}\` has **not changed** ` +
+      `since this was raised, so nothing here was fixed. Treat it as unconfirmed: ` +
+      `the reviewer may simply not have raised it on this run.`
+    );
+  }
+  return `✅ **No longer reported** as of ${link}.`;
+}
 
 async function resolveThread(id) {
   await graphql(
@@ -317,10 +364,10 @@ async function resolveThread(id) {
 // the reader can see at a glance that the reviewer withdrew it.
 async function collapseComment(t) {
   if (!t.commentId) return false;
-  if (t.body.startsWith(RESOLVED_MARK)) return false; // already done
+  if (RETIRED_RE.test(t.body)) return false; // already done
   const repo = required("GITHUB_REPO");
   const body =
-    `${RESOLVED_MARK} — the reviewer no longer raises this.\n\n` +
+    `${retirementNote(t)}\n\n` +
     `<details><summary>Original finding</summary>\n\n${t.body}\n\n</details>`;
   const res = await fetch(
     `https://api.github.com/repos/${repo}/pulls/comments/${t.commentId}`,
