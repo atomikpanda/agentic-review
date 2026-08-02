@@ -93,12 +93,24 @@ function commentableRanges(baseSha, headSha) {
 
   const byFile = new Map();
   let file = null;
+  let inHeader = false;
   for (const line of diff.split("\n")) {
-    if (line.startsWith("+++ ")) {
+    // `diff --git` is the authoritative file delimiter. Keying on a bare
+    // "+++ " prefix misreads CONTENT: an added line that itself begins with
+    // "+++ " — reviewing a patch file, or documentation containing a diff
+    // snippet, both of which this repository has — would be taken as a new
+    // file header, and every later hunk would be attributed to the wrong path.
+    if (line.startsWith("diff --git ")) {
+      file = null;
+      inHeader = true;
+      continue;
+    }
+    if (inHeader && line.startsWith("+++ ")) {
       const p = line.slice(4).trim();
       // /dev/null means the file was deleted — nothing to comment on.
       file = p === "/dev/null" ? null : p.replace(/^b\//, "");
       if (file && !byFile.has(file)) byFile.set(file, []);
+      inHeader = false;
       continue;
     }
     if (file && line.startsWith("@@")) {
@@ -254,11 +266,27 @@ async function main() {
   const parsed = extractJson(raw);
 
   if (!parsed) {
-    // Do not silently succeed on unparseable output — that is the same failure
-    // class as an empty review passing for a clean one.
-    console.error("::error::could not parse JSON findings from the agent output");
-    console.error(raw.slice(0, 2000));
-    process.exit(1);
+    // The model answered, just not in the requested shape — most likely prose.
+    // Discarding it loses a review that has already been paid for, so post it
+    // verbatim as a summary and warn. Still not silent: the annotation says the
+    // contract was broken, and there are no inline comments to imply otherwise.
+    console.log("::warning::agent output was not the requested JSON; posting it as a summary comment");
+    if (env("DRY_RUN", "") === "1" || env("RENDER", "") === "1") {
+      process.stdout.write(raw);
+      return;
+    }
+    const res = await postReview({
+      commit_id: required("HEAD_SHA"),
+      event: "COMMENT",
+      body: `### 🔎 Agentic review\n\n_Returned prose rather than structured findings, so there are no inline suggestions on this run._\n\n${raw}`,
+    });
+    if (!res.ok) {
+      console.error(`::error::could not post the review (${res.status})`);
+      console.error(res.text.slice(0, 1000));
+      process.exit(1);
+    }
+    console.log("  posted as a summary comment");
+    return;
   }
 
   const findings = parsed.findings;

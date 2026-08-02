@@ -266,6 +266,9 @@ fi
 {
   cat "$PROMPT_FILE"
   echo
+  # Output contract before the diff — see the workflow for why.
+  cat "$FORMAT_FILE"
+  echo
   echo "## Changed files"
   echo
   echo '```'
@@ -301,7 +304,11 @@ fi
     fi
   fi
   echo
-  cat "$FORMAT_FILE"
+  if [ "$REVIEW_MODE" = "summary" ]; then
+    echo "Reply with the markdown described above, or exactly \"No findings.\""
+  else
+    echo "Reply with the single JSON object described above and nothing else — no prose, no code fence."
+  fi
 } > "$TMP_PROMPT"
 ok "$(wc -c < "$TMP_PROMPT" | tr -d ' ') bytes (diff ${DIFF_BYTES}B, truncated=$TRUNCATED)"
 

@@ -459,6 +459,13 @@ jobs:
           {
             cat /tmp/prompt-body.md
             echo
+            # The output contract goes BEFORE the diff. It used to be last, and
+            # once the diff grew to ~100 KB the model stopped honouring it and
+            # answered in markdown — the JSON parser then rejected a review that
+            # had cost a full run. Instructions must not sit behind 100 KB of
+            # data with nothing after them.
+            cat /tmp/format.md
+            echo
             echo "## Changed files"
             echo
             echo '```'
@@ -488,7 +495,12 @@ jobs:
               echo "Report at most $MAX_FINDINGS findings. If you have more, keep the most severe."
             fi
             echo
-            cat /tmp/format.md
+            # Restated after the diff so the last thing read is the contract.
+            if [ "$REVIEW_MODE" = "summary" ]; then
+              echo "Reply with the markdown described above, or exactly \"No findings.\""
+            else
+              echo "Reply with the single JSON object described above and nothing else — no prose, no code fence."
+            fi
           } > /tmp/prompt.txt
           echo "  prompt: $(wc -c < /tmp/prompt.txt) bytes (diff $DIFF_BYTES bytes, truncated=$TRUNCATED, mode=$REVIEW_MODE)"
 
