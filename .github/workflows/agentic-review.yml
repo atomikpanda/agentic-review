@@ -53,10 +53,10 @@ on:
         default: review/prompt.md
       skills_path:
         description: >-
-          File appended to the system prompt (a SKILL.md, or any guidance file).
-          Same base-then-central resolution as prompt_path.
+          Comma-separated list of files appended to the system prompt. Each is
+          resolved base-then-central like prompt_path, and all are concatenated.
         type: string
-        default: skills/infra-review/SKILL.md
+        default: skills/infra-review/SKILL.md,skills/security-review/SKILL.md
       max_findings:
         description: Upper bound on findings requested in the prompt. 0 disables the cap.
         type: number
@@ -444,7 +444,24 @@ jobs:
           resolve "$FORMAT_NAME" /tmp/format.md \
             || { echo "::error::no output format at $FORMAT_NAME in the base commit or $CENTRAL_REPO"; exit 1; }
 
-          if [ -n "$SKILLS_PATH" ] && resolve "$SKILLS_PATH" /tmp/skill.md; then
+          # skills_path is a LIST. One file meant choosing between domain
+          # knowledge and security classes; a repo usually wants both, and the
+          # infra catalogue contributes nothing to a Swift or TypeScript repo.
+          : > /tmp/skill.md
+          any_skill=0
+          IFS=',' read -ra _skills <<< "$SKILLS_PATH"
+          for sk in "${_skills[@]}"; do
+            sk="$(printf '%s' "$sk" | tr -d '[:space:]')"
+            [ -n "$sk" ] || continue
+            if resolve "$sk" /tmp/one-skill.md; then
+              cat /tmp/one-skill.md >> /tmp/skill.md
+              printf '\n\n' >> /tmp/skill.md
+              any_skill=1
+            else
+              echo "::warning::skill file not found: $sk"
+            fi
+          done
+          if [ "$any_skill" = 1 ]; then
             echo "SKILL_FILE=/tmp/skill.md" >> "$GITHUB_ENV"
           else
             echo "SKILL_FILE=" >> "$GITHUB_ENV"

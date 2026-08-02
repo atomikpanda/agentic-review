@@ -155,7 +155,7 @@ keeps tracking them.
 | Tool allowlist | `read,grep,glob,ast_grep` | `tools` | `--tools` | `--tools` |
 | Wall-clock cap | none | `max_time` | `--max-time` | `--max-time` |
 | Review prompt | `review/prompt.md` | `prompt_path` | `--prompt` | `--prompt` |
-| Injected knowledge | `skills/infra-review/SKILL.md` | `skills_path` | `--skill` | `--skill` |
+| Injected knowledge | both skills (comma-separated list) | `skills_path` | `--skill` | `--skill` |
 | Review style | `suggest` | `review_mode` | `--review-mode` | `--review-mode` |
 | Findings cap | `20` (`0` = none) | `max_findings` | `--max-findings` | `--max-findings` |
 | Post a PR comment | `true` | `post_comment` | `--no-comment` | n/a |
@@ -277,6 +277,10 @@ The workflow uses `pull_request`, never `pull_request_target` — the latter run
 a writable token against untrusted head code.
 
 ## Knowledge injection
+
+Two skills ship, and `skills_path` takes a comma-separated list so a repo gets
+both — the infra catalogue contributes almost nothing to a Swift or TypeScript
+project, and the security classes contribute little to a Caddyfile.
 
 [`skills/infra-review/SKILL.md`](skills/infra-review/SKILL.md) is a catalogue of
 tool-default behaviours that look correct in a diff and fail silently in

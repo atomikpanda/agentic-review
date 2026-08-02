@@ -63,7 +63,7 @@ TOOLS="${AGENTIC_REVIEW_TOOLS:-read,grep,glob,ast_grep}"
 MAX_TIME="${AGENTIC_REVIEW_MAX_TIME:-}"
 PROMPT_FILE="${AGENTIC_REVIEW_PROMPT:-review/prompt.md}"
 SKILL="${AGENTIC_REVIEW_SKILL:-}"
-SKILL_DEFAULT="skills/infra-review/SKILL.md"
+SKILL_DEFAULT="skills/infra-review/SKILL.md,skills/security-review/SKILL.md"
 MAX_FINDINGS="${AGENTIC_REVIEW_MAX_FINDINGS:-20}"
 # summary by default locally: there is no pull request to anchor comments to,
 # so suggest/inline render the proposed fixes to the terminal instead.
@@ -314,8 +314,19 @@ ok "$(wc -c < "$TMP_PROMPT" | tr -d ' ') bytes (diff ${DIFF_BYTES}B, truncated=$
 
 ARGS=()
 [ -n "$SKILL" ] || SKILL="$SKILL_DEFAULT"
-if SKILL="$(support "$SKILL")"; then
-  ARGS+=(--append-system-prompt="$SKILL"); ok "knowledge base: $SKILL"
+# --skill takes a comma-separated list; they are concatenated.
+TMP_SKILL="$(mktemp)"; : > "$TMP_SKILL"; skill_names=""
+IFS=',' read -ra _skills <<< "$SKILL"
+for sk in "${_skills[@]}"; do
+  sk="$(printf '%s' "$sk" | tr -d '[:space:]')"
+  [ -n "$sk" ] || continue
+  if resolved="$(support "$sk")"; then
+    cat "$resolved" >> "$TMP_SKILL"; printf '\n\n' >> "$TMP_SKILL"
+    skill_names="$skill_names $sk"
+  fi
+done
+if [ -s "$TMP_SKILL" ]; then
+  ARGS+=(--append-system-prompt="$TMP_SKILL"); ok "knowledge base:$skill_names"
 else
   say "no skill file — running without injected knowledge"
 fi
@@ -349,7 +360,7 @@ if ! "${OMP[@]}" -p \
       "@$TMP_PROMPT" \
       < /dev/null > "$TMP_OUT" 2>"$TMP_OUT.err"; then
   printf '\n' >&2; sed 's/^/    /' "$TMP_OUT.err" | tail -20 >&2
-  rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err"
+  rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err" "$TMP_SKILL"
   die "review failed"
 fi
 
@@ -358,7 +369,7 @@ fi
 # either stream. Without this check that silently reads as "no findings".
 if [ ! -s "$TMP_OUT" ]; then
   printf '\n' >&2; sed 's/^/    /' "$TMP_OUT.err" | tail -20 >&2
-  rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err"
+  rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err" "$TMP_SKILL"
   die "omp exited 0 but produced no output — the review did not run (check OPENROUTER_API_KEY)"
 fi
 
