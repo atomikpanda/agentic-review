@@ -84,6 +84,23 @@ Three things that mechanism forces, all handled:
 - **The review is never lost.** If the inline post is rejected anyway, it falls
   back to posting everything as a summary rather than failing silently.
 
+### Comments don't pile up
+
+Findings are re-derived from scratch on every push, so each run embeds a stable
+fingerprint (`file` + `title`, case- and whitespace-insensitive) in every
+comment. A later run uses it to:
+
+- **stay silent** about a finding whose thread is still open, instead of posting
+  it again on every push — the thing that makes bot reviewers get muted
+- **resolve** the threads it opened earlier and no longer reports, including the
+  everything-fixed case where the run returns no findings at all
+
+Only threads carrying that marker are ever touched; a human's review thread has
+no fingerprint and cannot match. Resolution is skipped when a run hits
+`max_findings`, because there a missing finding may have been squeezed out
+rather than fixed, and resolving it would quietly retract a live defect. Turn
+the whole thing off with `resolve_stale: false`.
+
 The event is always `COMMENT`, never `REQUEST_CHANGES` — use
 `fail_on_findings` if you want the check itself to block.
 
@@ -142,6 +159,7 @@ keeps tracking them.
 | Review style | `suggest` | `review_mode` | `--review-mode` | `--review-mode` |
 | Findings cap | `20` (`0` = none) | `max_findings` | `--max-findings` | `--max-findings` |
 | Post a PR comment | `true` | `post_comment` | `--no-comment` | n/a |
+| Resolve stale threads | `true` | `resolve_stale` | n/a | n/a |
 | Block the PR on findings | `false` | `fail_on_findings` | `--fail-on-findings` | `--no-fail` inverts |
 | Job timeout | `20` | `timeout_minutes` | n/a | n/a |
 | Diff size cap | `400000` bytes | `max_diff_bytes` | n/a | `$AGENTIC_REVIEW_MAX_DIFF_BYTES` |

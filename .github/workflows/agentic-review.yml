@@ -88,6 +88,13 @@ on:
           summary — one issue comment with everything in it, no line anchoring.
         type: string
         default: suggest
+      resolve_stale:
+        description: >-
+          On each run, resolve the review threads this reviewer opened earlier
+          and no longer reports, and stay silent about findings whose thread is
+          still open instead of posting them again.
+        type: boolean
+        default: true
       post_comment:
         description: Post the review as a PR comment. Off still uploads the artifact.
         type: boolean
@@ -230,6 +237,7 @@ jobs:
           IN_CODEGRAPH_VERSION: ${{ inputs.codegraph_version }}
           IN_REVIEW_MODE: ${{ inputs.review_mode }}
           IN_POST_COMMENT: ${{ inputs.post_comment }}
+          IN_RESOLVE_STALE: ${{ inputs.resolve_stale }}
           IN_FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings }}
           IN_BUN_VERSION: ${{ inputs.bun_version }}
           IN_OMP_VERSION: ${{ inputs.omp_version }}
@@ -319,6 +327,7 @@ jobs:
             echo "CODEGRAPH=${IN_CODEGRAPH:-true}"
             echo "CODEGRAPH_VERSION=${IN_CODEGRAPH_VERSION:-}"
             echo "POST_COMMENT=${IN_POST_COMMENT:-true}"
+            echo "RESOLVE_STALE=${IN_RESOLVE_STALE:-true}"
             echo "FAIL_ON_FINDINGS=${IN_FAIL_ON_FINDINGS:-false}"
             echo "BUN_VERSION=${IN_BUN_VERSION:-latest}"
             echo "OMP_VERSION=${IN_OMP_VERSION:-latest}"
@@ -682,6 +691,8 @@ jobs:
               HEAD_SHA="$HEAD" \
               BASE_SHA="$BASE" \
               REVIEW_MODE="$REVIEW_MODE" \
+              RESOLVE_STALE="$RESOLVE_STALE" \
+              MAX_FINDINGS="$MAX_FINDINGS" \
                 node "$POSTER"
             fi
             if [ "$FAIL_ON_FINDINGS" = "true" ] && ! grep -q '"findings"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]' /tmp/review.md; then
