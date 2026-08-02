@@ -6,6 +6,7 @@
 #   ./scripts/run-review.sh --staged                 # only what's staged
 #   ./scripts/run-review.sh --model openrouter/anthropic/claude-sonnet-5
 #   ./scripts/run-review.sh --thinking high --max-time 10m
+#   ./scripts/run-review.sh --review-mode suggest   # show proposed fixes
 #   ./scripts/run-review.sh -- --add-dir ../shared   # extra omp flags
 #
 # Options (every one has an AGENTIC_REVIEW_* env default, so you can set them
@@ -21,6 +22,8 @@
 #   --prompt FILE       review instructions           $AGENTIC_REVIEW_PROMPT
 #   --skill FILE        appended to the system prompt $AGENTIC_REVIEW_SKILL
 #   --max-findings N    0 disables the cap            $AGENTIC_REVIEW_MAX_FINDINGS
+#   --review-mode M     summary|inline|suggest        $AGENTIC_REVIEW_MODE
+#                       suggest prints the fixes it would offer on a PR
 #   --omp-version V     npm version or dist-tag       $AGENTIC_REVIEW_OMP_VERSION
 #   --out FILE          write the review here
 #   --no-fail           exit 0 even when findings are reported
@@ -54,6 +57,9 @@ PROMPT_FILE="${AGENTIC_REVIEW_PROMPT:-review/prompt.md}"
 SKILL="${AGENTIC_REVIEW_SKILL:-}"
 SKILL_DEFAULT="skills/infra-review/SKILL.md"
 MAX_FINDINGS="${AGENTIC_REVIEW_MAX_FINDINGS:-20}"
+# summary by default locally: there is no pull request to anchor comments to,
+# so suggest/inline render the proposed fixes to the terminal instead.
+REVIEW_MODE="${AGENTIC_REVIEW_MODE:-summary}"
 OMP_VERSION="${AGENTIC_REVIEW_OMP_VERSION:-latest}"
 STAGED=0; OUT=""; FAIL_ON_FINDINGS=1
 PASSTHRU=()
@@ -68,6 +74,7 @@ while [ $# -gt 0 ]; do
     --prompt)       PROMPT_FILE="${2:-}"; shift 2 ;;
     --skill)        SKILL="${2:-}"; shift 2 ;;
     --max-findings) MAX_FINDINGS="${2:-}"; shift 2 ;;
+    --review-mode)  REVIEW_MODE="${2:-}"; shift 2 ;;
     --omp-version)  OMP_VERSION="${2:-}"; shift 2 ;;
     --out)          OUT="${2:-}"; shift 2 ;;
     --staged)       STAGED=1; shift ;;
@@ -170,6 +177,16 @@ printf '%s\n' "$DIFFSTAT" | sed 's/^/    /'
 
 step "Building prompt"
 [ -f "$PROMPT_FILE" ] || die "missing $PROMPT_FILE — run from a repo that has it, or pass --prompt"
+
+# Same split as CI: review instructions and output format are separate files,
+# so asking for suggested fixes does not fork the "what to look for" half.
+case "$REVIEW_MODE" in
+  summary) FORMAT_FILE="review/format-markdown.md" ;;
+  suggest|inline) FORMAT_FILE="review/format-json.md" ;;
+  *) die "--review-mode must be summary, inline or suggest (got '$REVIEW_MODE')" ;;
+esac
+[ -f "$FORMAT_FILE" ] || die "missing $FORMAT_FILE"
+
 TMP_PROMPT="$(mktemp)"
 {
   echo "Changed files:"
@@ -182,8 +199,10 @@ TMP_PROMPT="$(mktemp)"
     echo
     echo "Report at most $MAX_FINDINGS findings. If you have more, keep the most severe."
   fi
+  echo
+  cat "$FORMAT_FILE"
 } > "$TMP_PROMPT"
-ok "$(wc -c < "$TMP_PROMPT" | tr -d ' ') bytes from $PROMPT_FILE"
+ok "$(wc -c < "$TMP_PROMPT" | tr -d ' ') bytes from $PROMPT_FILE + $FORMAT_FILE"
 
 ARGS=()
 [ -n "$SKILL" ] || { [ -f "$SKILL_DEFAULT" ] && SKILL="$SKILL_DEFAULT"; }
@@ -238,13 +257,27 @@ fi
 # (`if` rather than `grep … && CLEAN=1` purely for clarity — a failing
 # non-final command in a && list is exempt from set -e, so both are correct.)
 CLEAN=0
-if grep -qx "No findings." "$TMP_OUT"; then CLEAN=1; fi
+if [ "$REVIEW_MODE" = "summary" ]; then
+  if grep -qx "No findings." "$TMP_OUT"; then CLEAN=1; fi
+elif grep -q '"findings"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]' "$TMP_OUT"; then
+  CLEAN=1
+fi
 
 printf '\n'
 if [ -n "$OUT" ]; then
+  # --out gets the raw agent output, so a JSON review stays machine-readable.
   cp "$TMP_OUT" "$OUT"; ok "written to $OUT"
-else
+elif [ "$REVIEW_MODE" = "summary" ]; then
   cat "$TMP_OUT"
+else
+  # Render the structured findings, including the fixes that would appear as
+  # committable suggestions on a pull request. Shares post-review.mjs's parser
+  # so the terminal and the PR cannot disagree about what the agent said.
+  if command -v node >/dev/null 2>&1 && [ -f "scripts/post-review.mjs" ]; then
+    FINDINGS_FILE="$TMP_OUT" RENDER=1 node scripts/post-review.mjs || cat "$TMP_OUT"
+  else
+    cat "$TMP_OUT"
+  fi
 fi
 rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err"
 

@@ -27,6 +27,7 @@
 #   --max-time DUR           hard cap per review, e.g. 600, 10m, 1h
 #   --prompt FILE            review instructions path
 #   --skill FILE             file appended to the system prompt
+#   --review-mode M          suggest|inline|summary (default suggest)
 #   --max-findings N         0 disables the cap
 #   --fail-on-findings       make the review a blocking check
 #   --no-comment             don't post a PR comment (artifact only)
@@ -55,6 +56,7 @@ REPO=""; OR_KEY=""; ASSUME_YES=0; WITH_PR_AGENT=""; PR_AGENT_MODEL=""
 # Reviewer knobs. Empty means "not specified" — omitted from `with:` entirely.
 I_MODEL=""; I_THINKING=""; I_TOOLS=""; I_MAX_TIME=""; I_PROMPT=""; I_SKILL=""
 I_MAX_FINDINGS=""; I_FAIL=""; I_COMMENT=""; I_OMP_VERSION=""; I_BUN_VERSION=""
+I_REVIEW_MODE=""
 I_EXTRA_ARGS=""
 
 while [ $# -gt 0 ]; do
@@ -72,6 +74,7 @@ while [ $# -gt 0 ]; do
     --prompt)           I_PROMPT="${2:-}"; shift 2 ;;
     --skill)            I_SKILL="${2:-}"; shift 2 ;;
     --max-findings)     I_MAX_FINDINGS="${2:-}"; shift 2 ;;
+    --review-mode)      I_REVIEW_MODE="${2:-}"; shift 2 ;;
     --fail-on-findings) I_FAIL="true"; shift ;;
     --no-comment)       I_COMMENT="false"; shift ;;
     --omp-version)      I_OMP_VERSION="${2:-}"; shift 2 ;;
@@ -181,6 +184,13 @@ on:
   pull_request:
     types: [opened, reopened, ready_for_review, synchronize]
 
+# A called workflow cannot grant itself more than the caller has. Without this
+# block a repository whose default GITHUB_TOKEN is read-only would run the
+# review and then fail at the moment it tried to post the result.
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   review:
     uses: ${CENTRAL_REPO}/.github/workflows/agentic-review.yml@${CENTRAL_REF}
@@ -192,7 +202,7 @@ YAML
   # so it keeps following the central repo's default instead of being frozen at
   # whatever it happened to be on install day.
   emit() { if [ -n "$2" ]; then printf '      %s: %s\n' "$1" "$2" >> "$tmp"; fi; }
-  if [ -n "$I_MODEL$I_THINKING$I_TOOLS$I_MAX_TIME$I_PROMPT$I_SKILL$I_MAX_FINDINGS$I_FAIL$I_COMMENT$I_OMP_VERSION$I_BUN_VERSION$I_EXTRA_ARGS" ]; then
+  if [ -n "$I_MODEL$I_THINKING$I_TOOLS$I_MAX_TIME$I_PROMPT$I_SKILL$I_MAX_FINDINGS$I_REVIEW_MODE$I_FAIL$I_COMMENT$I_OMP_VERSION$I_BUN_VERSION$I_EXTRA_ARGS" ]; then
     printf '    with:\n' >> "$tmp"
   fi
   emit model            "$I_MODEL"
@@ -201,6 +211,7 @@ YAML
   emit max_time         "$I_MAX_TIME"
   emit prompt_path      "$I_PROMPT"
   emit skills_path      "$I_SKILL"
+  emit review_mode      "$I_REVIEW_MODE"
   emit max_findings     "$I_MAX_FINDINGS"
   emit fail_on_findings "$I_FAIL"
   emit post_comment     "$I_COMMENT"
@@ -222,6 +233,7 @@ YAML
 #   max_time:         ''            # e.g. 600, 10m, 1h
 #   prompt_path:      review/prompt.md
 #   skills_path:      skills/infra-review/SKILL.md
+#   review_mode:      suggest       # suggest | inline | summary
 #   max_findings:     20            # 0 disables the cap
 #   post_comment:     true
 #   fail_on_findings: false         # true makes this a blocking check

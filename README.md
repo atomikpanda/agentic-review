@@ -33,6 +33,55 @@ export OPENROUTER_API_KEY=sk-or-...
 
 Exits non-zero when there are findings, so it works as a pre-push hook.
 
+## Suggested fixes
+
+By default the reviewer posts **inline review comments with committable
+`suggestion` blocks** — the same "Commit suggestion" button you get from a
+human reviewer, not a wall of prose at the bottom of the PR.
+
+| `review_mode` | What you get |
+|---|---|
+| `suggest` (default) | Inline comments anchored to the offending lines, each with a ready-to-commit fix where the agent could produce a complete one |
+| `inline` | The same inline comments, explanation only, no fixes |
+| `summary` | One issue comment containing everything — no line anchoring |
+
+This is a different mechanism, not a different format. A suggestion has to be
+an inline review comment attached to a line range **inside the pull request's
+diff**, so the agent emits structured findings (`file`, `start_line`,
+`end_line`, `suggestion`) rather than markdown, and
+[`scripts/post-review.mjs`](scripts/post-review.mjs) turns them into one
+`POST /pulls/{n}/reviews` call.
+
+Three things that mechanism forces, all handled:
+
+- **Anchoring is validated against the real diff.** GitHub rejects the *entire*
+  review if any single comment names a line outside the diff, so every finding
+  is checked against the actual hunk ranges first. Findings that cannot anchor
+  are moved into the summary instead of being dropped — a real defect in
+  untouched code is still worth saying.
+- **A wrong suggestion is worse than none.** The fix has to be the complete
+  replacement for the lines it spans, with original indentation, because
+  someone will click the button. The prompt tells the agent to emit `null`
+  whenever it cannot produce that, and a comment with no suggestion is a
+  perfectly good outcome.
+- **The review is never lost.** If the inline post is rejected anyway, it falls
+  back to posting everything as a summary rather than failing silently.
+
+The event is always `COMMENT`, never `REQUEST_CHANGES` — use
+`fail_on_findings` if you want the check itself to block.
+
+Locally, `--review-mode suggest` prints each finding with the fix it would
+offer, using the same parser as CI:
+
+```
+High — Two lines are wrong
+  edge/Caddyfile:2-3
+  They break the thing.
+  suggested fix:
+    | FIXED2
+    | FIXED3
+```
+
 ## Configuration
 
 Every knob is settable on all three surfaces, under the same name. Defaults are
@@ -47,6 +96,7 @@ keeps tracking them.
 | Wall-clock cap | none | `max_time` | `--max-time` | `--max-time` |
 | Review prompt | `review/prompt.md` | `prompt_path` | `--prompt` | `--prompt` |
 | Injected knowledge | `skills/infra-review/SKILL.md` | `skills_path` | `--skill` | `--skill` |
+| Review style | `suggest` | `review_mode` | `--review-mode` | `--review-mode` |
 | Findings cap | `20` (`0` = none) | `max_findings` | `--max-findings` | `--max-findings` |
 | Post a PR comment | `true` | `post_comment` | `--no-comment` | n/a |
 | Block the PR on findings | `false` | `fail_on_findings` | `--fail-on-findings` | `--no-fail` inverts |

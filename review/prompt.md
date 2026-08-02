@@ -26,6 +26,4 @@ Report ONLY defects you have verified by reading the relevant files. For each,
 state the concrete failure: the input or condition, and the wrong behaviour
 that results. If you cannot describe how it breaks, do not report it.
 
-Output GitHub-flavoured markdown: a `##` heading per finding with a severity
-(Critical/High/Medium), the `file:line`, what breaks, and why. If you find
-nothing, say exactly: "No findings."
+The output format you must use is described at the end of this prompt.

@@ -58,6 +58,14 @@ on:
         type: number
         default: 20
       # --- outputs ----------------------------------------------------------
+      review_mode:
+        description: >-
+          suggest — inline review comments with committable ```suggestion blocks
+          where the agent can produce a complete fix (default).
+          inline — the same inline comments, explanations only, no fixes.
+          summary — one issue comment with everything in it, no line anchoring.
+        type: string
+        default: suggest
       post_comment:
         description: Post the review as a PR comment. Off still uploads the artifact.
         type: boolean
@@ -150,6 +158,7 @@ jobs:
           sparse-checkout: |
             skills
             review
+            scripts
 
       # Every input is resolved here, once, into the environment. Two reasons:
       #
@@ -170,6 +179,7 @@ jobs:
           IN_PROMPT_PATH: ${{ inputs.prompt_path }}
           IN_SKILLS_PATH: ${{ inputs.skills_path }}
           IN_MAX_FINDINGS: ${{ inputs.max_findings }}
+          IN_REVIEW_MODE: ${{ inputs.review_mode }}
           IN_POST_COMMENT: ${{ inputs.post_comment }}
           IN_FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings }}
           IN_BUN_VERSION: ${{ inputs.bun_version }}
@@ -215,7 +225,14 @@ jobs:
               exit 1 ;;
           esac
 
+          REVIEW_MODE="${IN_REVIEW_MODE:-suggest}"
+          case "$REVIEW_MODE" in
+            suggest|inline|summary) ;;
+            *) echo "::error::review_mode must be suggest, inline or summary (got '$REVIEW_MODE')"; exit 1 ;;
+          esac
+
           {
+            echo "REVIEW_MODE=$REVIEW_MODE"
             echo "MODEL=${IN_MODEL:-openrouter/openai/gpt-5.6-luna}"
             echo "THINKING=${IN_THINKING:-}"
             echo "TOOLS=$TOOLS"
@@ -257,6 +274,20 @@ jobs:
             PROMPT_FILE=".central-skills/$PROMPT_PATH"
           fi
           [ -f "$PROMPT_FILE" ] || { echo "::error::no prompt file at $PROMPT_PATH (checked the repo and .central-skills/)"; exit 1; }
+
+          # The output format is a separate file from the review instructions,
+          # because the two vary independently: what to look for is the same
+          # whether the result is prose or line-anchored JSON.
+          case "$REVIEW_MODE" in
+            summary) FORMAT_NAME="review/format-markdown.md" ;;
+            *)       FORMAT_NAME="review/format-json.md" ;;
+          esac
+          FORMAT_FILE="$FORMAT_NAME"
+          if [ ! -f "$FORMAT_FILE" ] && [ -f ".central-skills/$FORMAT_NAME" ]; then
+            FORMAT_FILE=".central-skills/$FORMAT_NAME"
+          fi
+          [ -f "$FORMAT_FILE" ] || { echo "::error::no format file at $FORMAT_NAME (checked the repo and .central-skills/)"; exit 1; }
+
           {
             echo "Changed files:"
             cat /tmp/diffstat.txt
@@ -268,8 +299,10 @@ jobs:
               echo
               echo "Report at most $MAX_FINDINGS findings. If you have more, keep the most severe."
             fi
+            echo
+            cat "$FORMAT_FILE"
           } > /tmp/prompt.txt
-          echo "  prompt built from $PROMPT_FILE ($(wc -c < /tmp/prompt.txt) bytes)"
+          echo "  prompt built from $PROMPT_FILE + $FORMAT_FILE ($(wc -c < /tmp/prompt.txt) bytes, mode=$REVIEW_MODE)"
 
       - name: run agentic review (read-only)
         env:
@@ -369,8 +402,45 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+
+          # suggest/inline: hand the structured findings to the poster, which
+          # anchors each one to a diff line and attaches a committable
+          # ```suggestion block where the agent produced a complete fix.
+          if [ "$REVIEW_MODE" != "summary" ]; then
+            # Prefer the poster from the central checkout over the one in the
+            # repo under review: it runs with a token that can write to the
+            # pull request, so the trusted copy wins where there is one. The
+            # local fallback exists so this repo can test its own changes and
+            # so a fork of the whole project still works.
+            POSTER="scripts/post-review.mjs"
+            if [ -f ".central-skills/scripts/post-review.mjs" ]; then
+              POSTER=".central-skills/scripts/post-review.mjs"
+            fi
+            [ -f "$POSTER" ] || { echo "::error::post-review.mjs not found in either checkout"; exit 1; }
+            echo "  poster: $POSTER"
+
+            if [ "$POST_COMMENT" != "true" ]; then
+              echo "  post_comment=false — see the uploaded artifact"
+            else
+              FINDINGS_FILE=/tmp/review.md \
+              GITHUB_REPO="$GITHUB_REPOSITORY" \
+              PR_NUMBER="$PR" \
+              HEAD_SHA="$HEAD" \
+              BASE_SHA="$BASE" \
+              REVIEW_MODE="$REVIEW_MODE" \
+                node "$POSTER"
+            fi
+            if [ "$FAIL_ON_FINDINGS" = "true" ] && ! grep -q '"findings"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]' /tmp/review.md; then
+              echo "::error::agentic review reported findings and fail_on_findings is set"
+              exit 1
+            fi
+            exit 0
+          fi
+
           if grep -qx "No findings." /tmp/review.md; then
             echo "  no findings"
             exit 0
