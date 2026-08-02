@@ -61,6 +61,17 @@ on:
         description: Upper bound on findings requested in the prompt. 0 disables the cap.
         type: number
         default: 20
+      codegraph:
+        description: >-
+          Build a symbol/dependency index of the changed files with codegraph
+          (tree-sitter, never runs the project's build) and put it in the prompt.
+          Adds roughly a second of indexing on a small repo.
+        type: boolean
+        default: true
+      codegraph_version:
+        description: codegraph release to pin, e.g. v1.5.0. Empty tracks the latest release.
+        type: string
+        default: ''
       max_diff_bytes:
         description: >-
           Cap on how much of the diff is put in the prompt. The diff dominates
@@ -215,6 +226,8 @@ jobs:
           IN_SKILLS_PATH: ${{ inputs.skills_path }}
           IN_MAX_FINDINGS: ${{ inputs.max_findings }}
           IN_MAX_DIFF_BYTES: ${{ inputs.max_diff_bytes }}
+          IN_CODEGRAPH: ${{ inputs.codegraph }}
+          IN_CODEGRAPH_VERSION: ${{ inputs.codegraph_version }}
           IN_REVIEW_MODE: ${{ inputs.review_mode }}
           IN_POST_COMMENT: ${{ inputs.post_comment }}
           IN_FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings }}
@@ -232,7 +245,7 @@ jobs:
           for v in IN_MODEL IN_THINKING IN_TOOLS IN_MAX_TIME IN_PROMPT_PATH \
                    IN_SKILLS_PATH IN_MAX_FINDINGS IN_REVIEW_MODE IN_POST_COMMENT \
                    IN_FAIL_ON_FINDINGS IN_BUN_VERSION IN_OMP_VERSION IN_EXTRA_ARGS \
-                   IN_CENTRAL_REPO IN_MAX_DIFF_BYTES; do
+                   IN_CENTRAL_REPO IN_MAX_DIFF_BYTES IN_CODEGRAPH_VERSION; do
             if [ "${!v}" != "${!v//[$'\n\r']/}" ]; then
               echo "::error::$v must not contain a newline"
               exit 1
@@ -303,6 +316,8 @@ jobs:
             echo "SKILLS_PATH=${IN_SKILLS_PATH:-skills/infra-review/SKILL.md}"
             echo "MAX_FINDINGS=${IN_MAX_FINDINGS:-20}"
             echo "MAX_DIFF_BYTES=${IN_MAX_DIFF_BYTES:-400000}"
+            echo "CODEGRAPH=${IN_CODEGRAPH:-true}"
+            echo "CODEGRAPH_VERSION=${IN_CODEGRAPH_VERSION:-}"
             echo "POST_COMMENT=${IN_POST_COMMENT:-true}"
             echo "FAIL_ON_FINDINGS=${IN_FAIL_ON_FINDINGS:-false}"
             echo "BUN_VERSION=${IN_BUN_VERSION:-latest}"
@@ -321,6 +336,51 @@ jobs:
 
       - name: install omp
         run: bun install -g "@oh-my-pi/pi-coding-agent@${OMP_VERSION}"
+
+      # A symbol and dependency index of the changed files, from codegraph.
+      #
+      # tree-sitter extraction, so it never runs the project's build system —
+      # the property that rules out every SCIP-class indexer here, since this
+      # parses attacker-authored pull requests. Soft-fails: a missing index
+      # makes the review worse, not wrong, so it must never fail the job.
+      - name: build code graph
+        continue-on-error: true
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${CODEGRAPH:-true}" != "true" ]; then echo "  disabled"; exit 0; fi
+
+          # A pull request must not shape the index used to review it:
+          # codegraph.json's `exclude` list could hide the very files it
+          # changes. Take the base commit's copy, or none at all.
+          if git cat-file -e "$BASE:codegraph.json" 2>/dev/null; then
+            git show "$BASE:codegraph.json" > codegraph.json
+            echo "  codegraph.json restored from the base commit"
+          else
+            rm -f codegraph.json
+          fi
+
+          export CODEGRAPH_INSTALL_DIR="$RUNNER_TEMP/cg"
+          export CODEGRAPH_BIN_DIR="$RUNNER_TEMP/cg/bin"
+          export CODEGRAPH_TELEMETRY=0   # it is on by default; this is CI
+          if [ -n "${CODEGRAPH_VERSION:-}" ]; then export CODEGRAPH_VERSION; fi
+          curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh
+          export PATH="$CODEGRAPH_BIN_DIR:$PATH"
+
+          # Prefer the central copy, same reasoning as the poster: prefer code
+          # we control over code the pull request supplies.
+          CODEGRAPH_SCRIPT="scripts/codegraph.sh"
+          if [ -f ".central-skills/scripts/codegraph.sh" ]; then
+            CODEGRAPH_SCRIPT=".central-skills/scripts/codegraph.sh"
+          fi
+          [ -f "$CODEGRAPH_SCRIPT" ] || { echo "  no codegraph.sh — skipping"; exit 0; }
+
+          codegraph init . >/dev/null
+          BASE_SHA="$BASE" HEAD_SHA="$HEAD" PROJECT="$PWD" \
+            bash "$CODEGRAPH_SCRIPT" > /tmp/codegraph.md || true
+          echo "  index: $(wc -c < /tmp/codegraph.md 2>/dev/null || echo 0) bytes"
 
       - name: build review prompt
         id: prompt
@@ -415,6 +475,11 @@ jobs:
             echo '```diff'
             cat /tmp/diff.patch
             echo '```'
+            echo
+            if [ -s /tmp/codegraph.md ]; then
+              echo
+              cat /tmp/codegraph.md
+            fi
             echo
             echo "The working tree is checked out at the merge result, so you can read any"
             echo "file at its post-change state. Use that to check what the diff depends on."

@@ -289,6 +289,17 @@ fi
     echo
     echo "Report at most $MAX_FINDINGS findings. If you have more, keep the most severe."
   fi
+  # Symbol/dependency index, when the project is already indexed. Deliberately
+  # NOT auto-initialised: `codegraph init` writes a .codegraph/ directory into
+  # the repository, and a review tool should not leave artefacts in someone's
+  # working tree without being asked. Run `codegraph init` yourself to enable it.
+  if CG="$(support scripts/codegraph.sh)" && [ -d "$REPO_ROOT/.codegraph" ]; then
+    if [ "$STAGED" = 1 ]; then
+      STAGED=1 PROJECT="$REPO_ROOT" bash "$CG" 2>/dev/null || true
+    else
+      BASE_SHA="$MERGE_BASE" HEAD_SHA="HEAD" PROJECT="$REPO_ROOT" bash "$CG" 2>/dev/null || true
+    fi
+  fi
   echo
   cat "$FORMAT_FILE"
 } > "$TMP_PROMPT"

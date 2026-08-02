@@ -99,6 +99,32 @@ High — Two lines are wrong
     | FIXED3
 ```
 
+## Symbol index
+
+The prompt carries a symbol and dependency index of the changed files, built
+with [codegraph](https://github.com/colbymchenry/codegraph): per file, every
+symbol it defines with a line number, and which other files depend on it. That
+is the blast radius a diff cannot show.
+
+It uses tree-sitter and **never runs the project's build system**, which is the
+property that rules out every SCIP-class indexer here — this parses
+attacker-authored pull requests. Indexing 35 Swift files takes under a second.
+It soft-fails: a missing index makes a review worse, never wrong.
+
+Two things the pull request is not allowed to influence: `codegraph.json` is
+restored from the base commit before indexing, so a PR cannot `exclude` the
+files it changes and hide them from its own review, and telemetry is disabled
+in CI (it is on by default).
+
+Locally it is used only if the repo is **already indexed** — `run-review.sh`
+will not run `codegraph init` for you, because a review tool should not leave a
+`.codegraph/` directory in your working tree uninvited:
+
+```bash
+codegraph init .        # once per project
+./scripts/run-review.sh
+```
+
 ## Configuration
 
 Every knob is settable on all three surfaces, under the same name. Defaults are
@@ -119,6 +145,8 @@ keeps tracking them.
 | Block the PR on findings | `false` | `fail_on_findings` | `--fail-on-findings` | `--no-fail` inverts |
 | Job timeout | `20` | `timeout_minutes` | n/a | n/a |
 | Diff size cap | `400000` bytes | `max_diff_bytes` | n/a | `$AGENTIC_REVIEW_MAX_DIFF_BYTES` |
+| Symbol index | on | `codegraph` | n/a | auto when indexed |
+| Pin codegraph | latest | `codegraph_version` | n/a | n/a |
 | Central repo | this repo | `central_repo` | `CENTRAL_REPO=` env | n/a |
 | Pin bun | `latest` | `bun_version` | `--bun-version` | n/a |
 | Pin omp | `latest` | `omp_version` | `--omp-version` | `--omp-version` |
