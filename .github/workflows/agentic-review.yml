@@ -321,7 +321,7 @@ jobs:
             echo "CENTRAL_REPO=${IN_CENTRAL_REPO:-atomikpanda/agentic-review}"
             echo "MAX_TIME=${IN_MAX_TIME:-}"
             echo "PROMPT_PATH=${IN_PROMPT_PATH:-review/prompt.md}"
-            echo "SKILLS_PATH=${IN_SKILLS_PATH:-skills/infra-review/SKILL.md}"
+            echo "SKILLS_PATH=${IN_SKILLS_PATH:-skills/infra-review/SKILL.md,skills/security-review/SKILL.md}"
             echo "MAX_FINDINGS=${IN_MAX_FINDINGS:-20}"
             echo "MAX_DIFF_BYTES=${IN_MAX_DIFF_BYTES:-400000}"
             echo "CODEGRAPH=${IN_CODEGRAPH:-true}"
