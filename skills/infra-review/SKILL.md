@@ -120,6 +120,32 @@ symptom be?* If the answer is "nothing visible", flag it.
 - **Path-based secret scanning that excludes `*.example` or `.github/**`** will
   miss a real key pasted there. Detect placeholder *content* instead.
 
+## CLI tools invoked from scripts and CI
+
+- **"It reads stdin" is an assumption, not a fact — verify it.** A CLI that
+  takes a prompt or payload may only read piped stdin behind a guard like
+  `if (process.stdin.isTTY !== false) return`. On both node and bun that
+  property is `undefined` for a redirect *or* a pipe — it is never `false` —
+  so the guard always returns early and the input is silently discarded. The
+  program then has no work, does it successfully, and **exits 0 having produced
+  nothing**. `cmd < input.txt` in a workflow is worth checking against the
+  tool's actual argument handling; the alternative is usually a positional
+  argument or an `@file` form.
+- **Exit 0 with empty output is not success.** Any step that captures a
+  command's stdout to a file must assert the file is non-empty before treating
+  it as a result. Without that assertion, "produced a correct empty answer" and
+  "never ran" are the same green check — and the second is far more likely.
+- **Check what an approval or confirmation flag actually maps to.** A name like
+  `always-ask` can be the *tightest* setting rather than an interactive one
+  (auto-approving a read tier while blocking write and exec), and the default
+  when the flag is omitted can be the most permissive one. Read the mapping
+  before assuming the safe-sounding name is the safe behaviour.
+- **A runtime is a hard dependency when the entrypoint names it.** A `#!/usr/bin/env bun`
+  shebang plus `bun:` imports means node cannot run the tool at all — a
+  `node`/`npx` fallback in a script is dead code that fails with an error
+  pointing nowhere near the cause. Honour `engines` too: a too-old runtime can
+  surface as a minified `SyntaxError`.
+
 ## Documentation is reviewable
 
 Two real defects were found in prose, not code: an API token scope that was

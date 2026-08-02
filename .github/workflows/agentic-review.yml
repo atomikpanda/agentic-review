@@ -322,7 +322,20 @@ jobs:
           # name-based rejection in `resolve config` were bypassed, the last
           # --tools on the line is the validated one.
           #
+          # --approval-mode=always-ask is the TIGHTEST of omp's three modes,
+          # not a prompt-on-everything: it maps to the `read` tier, which
+          # auto-approves read-only tools and blocks write and exec. omp's
+          # default is `yolo`, so this must stay explicit.
+          #
           # --no-session keeps nothing on the runner.
+          #
+          # The prompt goes in as a POSITIONAL argument, not on stdin. omp only
+          # reads piped stdin when `process.stdin.isTTY === false`, and on both
+          # bun and node that property is `undefined` for a redirect or a pipe
+          # — never false. So `omp -p < prompt.txt` reads nothing, has nothing
+          # to do, and exits 0 having produced no output. That is not a
+          # hypothetical: it is what this workflow did on its first live run.
+          # stdin is pointed at /dev/null so nothing can block on a terminal.
           omp -p \
             --model="$MODEL" \
             --no-session \
@@ -330,7 +343,8 @@ jobs:
             --tools="$TOOLS" \
             --approval-mode=always-ask \
             --cwd="$PWD" \
-            < /tmp/prompt.txt \
+            "$(cat /tmp/prompt.txt)" \
+            < /dev/null \
             > /tmp/review.md 2>/tmp/review.err || {
               echo "omp failed:"; tail -30 /tmp/review.err; exit 1;
             }

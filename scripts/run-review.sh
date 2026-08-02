@@ -202,13 +202,23 @@ TMP_OUT="$(mktemp)"
 # Same allowlist as CI, and emitted last for the same reason: whatever came
 # through -- cannot be the winning --tools. omp validates these names, so a
 # typo fails loudly.
+#
+# The prompt is a POSITIONAL argument, not stdin. omp only reads piped stdin
+# when `process.stdin.isTTY === false`, and that property is `undefined` for a
+# redirect or a pipe on both bun and node — never false. `omp -p < prompt`
+# therefore reads nothing and exits 0 with no output at all.
+#
+# --approval-mode=always-ask matches CI. It is omp's tightest mode (the `read`
+# tier: auto-approve read-only, block write and exec); the default is `yolo`.
 if ! "${OMP[@]}" -p \
       --model="$MODEL" \
       --no-session \
       "${ARGS[@]+"${ARGS[@]}"}" \
       --tools="$TOOLS" \
+      --approval-mode=always-ask \
       --cwd="$REPO_ROOT" \
-      < "$TMP_PROMPT" > "$TMP_OUT" 2>"$TMP_OUT.err"; then
+      "$(cat "$TMP_PROMPT")" \
+      < /dev/null > "$TMP_OUT" 2>"$TMP_OUT.err"; then
   printf '\n'; sed 's/^/    /' "$TMP_OUT.err" | tail -20
   rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err"
   die "review failed"
