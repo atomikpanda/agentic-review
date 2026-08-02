@@ -1,0 +1,200 @@
+name: agentic-review
+
+# Agentic PR review using oh-my-pi (omp) in headless read-only mode.
+#
+# This is the tier PR-Agent structurally cannot cover: PR-Agent makes
+# single-shot model calls with no tool-use loop, so it can only ever see the
+# diff. Roughly a fifth of the real findings on this repo's first PR required
+# reading files *outside* the diff — noticing a variable file was gitignored
+# and therefore absent in CI, or connecting a documented token scope to a call
+# three directories away. That needs an agent with tools.
+#
+# Reusable: call it from any repo with
+#   jobs:
+#     review:
+#       uses: <owner>/agentic-review/.github/workflows/agentic-review.yml@main
+#       secrets: { OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }} }
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: Model slug, provider-prefixed.
+        type: string
+        default: openrouter/openai/gpt-5.6-luna
+      skills_path:
+        description: File appended to the system prompt (a SKILL.md, or any guidance file).
+        type: string
+        default: skills/infra-review/SKILL.md
+      max_findings:
+        type: number
+        default: 20
+    secrets:
+      OPENROUTER_API_KEY:
+        required: true
+  # Not `pull_request_target`. That would run with a writable token against
+  # untrusted head code, which is the standard way this pattern becomes a
+  # repo-compromise. `pull_request` gets a read-only token on forks.
+  #
+  # Types are listed explicitly because the DEFAULT for `pull_request` is
+  # [opened, synchronize, reopened] — and `synchronize` fires on every push to
+  # an open PR. Left implicit, this agent would review on every push while
+  # pr-agent (handle_push_trigger = false) reviews only on open, which is the
+  # opposite of what the cost profile wants.
+  #
+  # `synchronize` is included deliberately: re-reviewing after a fix is how the
+  # four review rounds on PR #1 each found something new. The concurrency block
+  # below cancels superseded runs, so a burst of pushes costs one review, not
+  # one per commit.
+  #
+  # To mirror pr-agent exactly (review on open only), delete `synchronize`.
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: agentic-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Skip drafts — matches pr-agent's handle_pr_actions, which fires on
+    # ready_for_review rather than while a PR is still being iterated on.
+    # A draft PR pushed ten times would otherwise cost ten reviews.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need the base commit to diff against.
+          fetch-depth: 0
+
+      # The skill library lives in the central repo, so a repo enrolled by
+      # install-review.sh gets the accumulated review knowledge without copying
+      # files into it. Soft-fails: if the central repo is private or moved, the
+      # review still runs, just without injected knowledge.
+      - name: fetch shared skills
+        id: central
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/agentic-review
+          ref: main
+          path: .central-skills
+          sparse-checkout: |
+            skills
+            review
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: install omp
+        run: bun install -g @oh-my-pi/pi-coding-agent
+
+      - name: build review prompt
+        id: prompt
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git diff --stat "$BASE" "$HEAD" > /tmp/diffstat.txt
+          # review/prompt.md is the single source of truth — scripts/run-review.sh
+          # reads the same file, so a local review and a CI review cannot drift.
+          PROMPT_FILE="review/prompt.md"
+          if [ ! -f "$PROMPT_FILE" ] && [ -f ".central-skills/review/prompt.md" ]; then
+            PROMPT_FILE=".central-skills/review/prompt.md"
+          fi
+          [ -f "$PROMPT_FILE" ] || { echo "no review/prompt.md found"; exit 1; }
+          {
+            echo "Changed files:"
+            cat /tmp/diffstat.txt
+            echo
+            echo "The diff is: git diff $BASE $HEAD"
+            echo
+            cat "$PROMPT_FILE"
+          } > /tmp/prompt.txt
+          echo "  prompt built ($(wc -c < /tmp/prompt.txt) bytes)"
+
+      - name: run agentic review (read-only)
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          # Prefer a skill file in the repo under review, so a project can
+          # override with its own conventions; otherwise fall back to the
+          # shared library fetched above.
+          SKILL="${{ inputs.skills_path || 'skills/infra-review/SKILL.md' }}"
+          APPEND=""
+          if [ -f "$SKILL" ]; then
+            APPEND="--append-system-prompt=$SKILL"
+            echo "  injecting repo-local knowledge base: $SKILL"
+          elif [ -f ".central-skills/$SKILL" ]; then
+            APPEND="--append-system-prompt=.central-skills/$SKILL"
+            echo "  injecting shared knowledge base: .central-skills/$SKILL"
+          else
+            echo "  no skill file found — running without injected knowledge"
+          fi
+
+          # --tools is an allowlist and omp validates it — an unknown name is a
+          # hard error, so a typo here fails loudly rather than silently
+          # granting everything. Enabled, all read-only:
+          #   read, grep, glob  — file access
+          #   lsp               — cross-file symbol resolution (14 ops)
+          #   ast_grep          — structural queries over 50+ tree-sitter
+          #                       grammars. Read-only; ast_EDIT is not enabled.
+          #
+          # Deliberately excluded: bash, edit, write, ast_edit, eval, debug,
+          # python, browser, computer, github, task, web_search, memory_edit.
+          # A PR diff is attacker-controlled text and this agent reads it, so it
+          # must not be able to execute anything, modify the checkout, reach the
+          # network, or write back to GitHub. Prompt injection then has nothing
+          # to reach for.
+          #
+          # --no-session keeps nothing on the runner.
+          omp -p \
+            --model="${{ inputs.model || 'openrouter/openai/gpt-5.6-luna' }}" \
+            --tools=read,grep,glob,lsp,ast_grep \
+            --approval-mode=always-ask \
+            --no-session \
+            $APPEND \
+            --cwd="$PWD" \
+            < /tmp/prompt.txt \
+            > /tmp/review.md 2>/tmp/review.err || {
+              echo "omp failed:"; tail -30 /tmp/review.err; exit 1;
+            }
+          echo "  review produced $(wc -c < /tmp/review.md) bytes"
+
+      - name: post review
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if grep -qx "No findings." /tmp/review.md; then
+            echo "  no findings — not commenting"
+            exit 0
+          fi
+          {
+            echo "### 🔎 Agentic review"
+            echo
+            echo "_Read-only agent (\`read\`,\`grep\`,\`glob\`,\`lsp\`,\`ast_grep\`) — checks things the diff alone cannot show._"
+            echo
+            cat /tmp/review.md
+          } > /tmp/comment.md
+          gh pr comment "$PR" --body-file /tmp/comment.md
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agentic-review
+          path: |
+            /tmp/review.md
+            /tmp/review.err
+          retention-days: 7
