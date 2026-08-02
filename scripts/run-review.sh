@@ -214,6 +214,15 @@ if ! "${OMP[@]}" -p \
   die "review failed"
 fi
 
+# A zero-byte review is a broken run, not a clean one, and omp's exit code does
+# not distinguish them — with no credential it exits 0 and writes nothing to
+# either stream. Without this check that silently reads as "no findings".
+if [ ! -s "$TMP_OUT" ]; then
+  printf '\n'; sed 's/^/    /' "$TMP_OUT.err" | tail -20
+  rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err"
+  die "omp exited 0 but produced no output — the review did not run (check OPENROUTER_API_KEY)"
+fi
+
 # Read the verdict BEFORE cleanup: $OUT is empty when printing to stdout and
 # the temp file is gone by then, so a check placed afterwards can never fire.
 # (`if` rather than `grep … && CLEAN=1` purely for clarity — a failing

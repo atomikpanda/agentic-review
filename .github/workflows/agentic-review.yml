@@ -276,6 +276,18 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           set -euo pipefail
+          # Checked explicitly because omp does NOT fail without it: with no
+          # credential it exits 0, writes nothing to stdout and nothing to
+          # stderr. Left to itself the job goes green having reviewed nothing,
+          # which is the one outcome worse than a red check.
+          case "$MODEL" in
+            openrouter/*)
+              [ -n "${OPENROUTER_API_KEY:-}" ] || {
+                echo "::error::OPENROUTER_API_KEY is empty. Add it to this repository's secrets (Settings > Secrets and variables > Actions), and pass it through in the caller workflow's secrets: block."
+                exit 1
+              } ;;
+          esac
+
           # Prefer a skill file in the repo under review, so a project can
           # override with its own conventions; otherwise fall back to the
           # shared library fetched above.
@@ -322,10 +334,24 @@ jobs:
             > /tmp/review.md 2>/tmp/review.err || {
               echo "omp failed:"; tail -30 /tmp/review.err; exit 1;
             }
+
+          # A zero-byte review is a broken run, not a clean one, and the exit
+          # code does not distinguish them. Without this the two collapse into
+          # the same green check. Anything that makes omp produce nothing —
+          # missing credential, model refusing the request, a flag it rejected
+          # silently — lands here.
+          if [ ! -s /tmp/review.md ]; then
+            echo "::error::omp exited 0 but produced no output. This is not 'no findings' — the review did not run. stderr follows."
+            tail -30 /tmp/review.err
+            exit 1
+          fi
           echo "  review produced $(wc -c < /tmp/review.md) bytes"
 
       - name: post review
-        if: github.event_name == 'pull_request'
+        # success() is implied for a step whose `if` has no status function,
+        # but spelling it out removes the doubt: a failed review must never
+        # reach the commenting step.
+        if: success() && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
