@@ -26,13 +26,29 @@ curl -fsSL .../install-review.sh | bash -s -- --repo owner/name --openrouter-key
 
 ## Run it locally
 
+No GitHub involved — it reviews a local diff and writes the result to stdout.
+
 ```bash
 export OPENROUTER_API_KEY=sk-or-...
-./scripts/run-review.sh            # vs the default branch
-./scripts/run-review.sh --staged   # only what's staged
+./scripts/run-review.sh                        # vs the default branch
+./scripts/run-review.sh --staged               # only what's staged
+./scripts/run-review.sh --review-mode suggest  # with the fixes it would offer
+./scripts/run-review.sh --json | jq '.findings[].file'
 ```
 
-Exits non-zero when there are findings, so it works as a pre-push hook.
+**Works from any repository.** The prompt, output format and skill file are
+resolved relative to the script itself (symlinks followed), then overridden by
+the repo under review if it ships its own. So you can symlink it onto `PATH`
+and run it anywhere:
+
+```bash
+ln -s "$PWD/scripts/run-review.sh" ~/.local/bin/review
+cd ~/some/other/project && review --base main
+```
+
+All progress goes to stderr and only the review goes to stdout, so it pipes
+cleanly. Exits non-zero when there are findings, so it also works as a pre-push
+hook.
 
 ## Suggested fixes
 

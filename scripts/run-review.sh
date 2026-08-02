@@ -7,6 +7,7 @@
 #   ./scripts/run-review.sh --model openrouter/anthropic/claude-sonnet-5
 #   ./scripts/run-review.sh --thinking high --max-time 10m
 #   ./scripts/run-review.sh --review-mode suggest   # show proposed fixes
+#   ./scripts/run-review.sh --json | jq '.findings[] | .file'
 #   ./scripts/run-review.sh -- --add-dir ../shared   # extra omp flags
 #
 # Options (every one has an AGENTIC_REVIEW_* env default, so you can set them
@@ -26,6 +27,7 @@
 #                       suggest prints the fixes it would offer on a PR
 #   --omp-version V     npm version or dist-tag       $AGENTIC_REVIEW_OMP_VERSION
 #   --out FILE          write the review here
+#   --json              raw findings JSON on stdout, for piping
 #   --no-fail           exit 0 even when findings are reported
 #   -- ARGS...          everything after -- is passed to omp verbatim
 #
@@ -68,7 +70,7 @@ MAX_FINDINGS="${AGENTIC_REVIEW_MAX_FINDINGS:-20}"
 REVIEW_MODE="${AGENTIC_REVIEW_MODE:-summary}"
 OMP_VERSION="${AGENTIC_REVIEW_OMP_VERSION:-latest}"
 MAX_DIFF_BYTES="${AGENTIC_REVIEW_MAX_DIFF_BYTES:-400000}"
-STAGED=0; OUT=""; FAIL_ON_FINDINGS=1
+STAGED=0; OUT=""; FAIL_ON_FINDINGS=1; AS_JSON=0
 PASSTHRU=()
 
 while [ $# -gt 0 ]; do
@@ -86,6 +88,7 @@ while [ $# -gt 0 ]; do
     --out)          OUT="${2:-}"; shift 2 ;;
     --staged)       STAGED=1; shift ;;
     --no-fail)      FAIL_ON_FINDINGS=0; shift ;;
+    --json)         AS_JSON=1; REVIEW_MODE="${REVIEW_MODE/#summary/suggest}"; shift ;;
     --)             shift; PASSTHRU=("$@"); break ;;
     # Print the header comment, stopping at the first line that isn't one.
     # A line range would silently start leaking code every time the header grows.
@@ -94,14 +97,36 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-_c() { if [ -t 1 ]; then printf '\033[%sm' "$1"; fi; }
-say()  { _c "0;36"; printf '  %s\n' "$*"; _c "0"; }
-ok()   { _c "0;32"; printf '  ✓ %s\n' "$*"; _c "0"; }
+# All progress goes to stderr, so stdout carries nothing but the review. That
+# is what makes `--json | jq` and `--review-mode suggest > out.md` work.
+_c() { if [ -t 2 ]; then printf '\033[%sm' "$1" >&2; fi; }
+say()  { _c "0;36"; printf '  %s\n' "$*" >&2; _c "0"; }
+ok()   { _c "0;32"; printf '  ✓ %s\n' "$*" >&2; _c "0"; }
 die()  { _c "0;31"; printf '  ✗ %s\n' "$*" >&2; _c "0"; exit 1; }
-step() { printf '\n'; _c "1;37"; printf '▸ %s\n' "$*"; _c "0"; }
+step() { printf '\n' >&2; _c "1;37"; printf '▸ %s\n' "$*" >&2; _c "0"; }
+
+# Where this script lives, with symlinks resolved — so `ln -s .../run-review.sh
+# ~/bin/review` still finds review/prompt.md. Support files were previously
+# looked up relative to the CURRENT directory, which meant the local runner only
+# worked inside this repository: the one place you least need it.
+_self="${BASH_SOURCE[0]}"
+while [ -L "$_self" ]; do
+  _dir="$(cd -P "$(dirname "$_self")" && pwd)"
+  _self="$(readlink "$_self")"
+  case "$_self" in /*) ;; *) _self="$_dir/$_self" ;; esac
+done
+SELF_ROOT="$(cd -P "$(dirname "$_self")/.." && pwd)"
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not in a git repository"
 cd "$REPO_ROOT"
+
+# Repository under review first (a project may ship its own conventions), then
+# the copy that came with this script.
+support() { # support <relative-path> -> prints an existing path, or fails
+  if [ -f "$1" ]; then printf '%s' "$1"; return 0; fi
+  if [ -f "$SELF_ROOT/$1" ]; then printf '%s' "$SELF_ROOT/$1"; return 0; fi
+  return 1
+}
 
 step "Checking prerequisites"
 [ -n "${OPENROUTER_API_KEY:-}" ] || die "OPENROUTER_API_KEY is not set"
@@ -128,12 +153,23 @@ for a in "${PASSTHRU[@]+"${PASSTHRU[@]}"}"; do
 done
 
 # Version-compare without sort -V, which is absent on some BSD/macOS setups.
+#
+# Splitting with IFS rather than a here-string on purpose: `read <<<` needs a
+# temp file, and when that fails the arrays come back EMPTY, every component
+# defaults to 0, the versions compare equal and the check passes. A version
+# gate that fails open is worse than none — it reports success while letting a
+# known-broken runtime through.
 ver_ge() { # ver_ge A B  -> 0 when A >= B
-  local a b i
-  IFS=. read -ra a <<< "${1%%-*}"
-  IFS=. read -ra b <<< "${2%%-*}"
+  local i x y
+  local -a a b
+  local IFS=.
+  # shellcheck disable=SC2206  # deliberate IFS split
+  a=(${1%%-*})
+  # shellcheck disable=SC2206
+  b=(${2%%-*})
+  unset IFS
   for i in 0 1 2; do
-    local x="${a[i]:-0}" y="${b[i]:-0}"
+    x="${a[i]:-0}"; y="${b[i]:-0}"
     if [ "$x" -gt "$y" ] 2>/dev/null; then return 0; fi
     if [ "$x" -lt "$y" ] 2>/dev/null; then return 1; fi
   done
@@ -168,9 +204,9 @@ fi
 for _d in .omp .claude .cursor .codex .gemini .opencode .windsurf; do
   if [ -f "$_d/mcp.json" ]; then
     _c "0;33"
-    printf '  ! %s/mcp.json will be loaded by omp, and any command it names will run.\n' "$_d"
-    printf '    That is fine for your own config. If this branch came from someone\n'
-    printf '    else, read that file before continuing. CI deletes it; this does not.\n'
+    printf '  ! %s/mcp.json will be loaded by omp, and any command it names will run.\n' "$_d" >&2
+    printf '    That is fine for your own config. If this branch came from someone\n' >&2
+    printf '    else, read that file before continuing. CI deletes it; this does not.\n' >&2
     _c "0"
   fi
 done
@@ -200,10 +236,11 @@ else
   RANGE="$BASE"
 fi
 ok "reviewing against $RANGE"
-printf '%s\n' "$DIFFSTAT" | sed 's/^/    /'
+printf '%s\n' "$DIFFSTAT" | sed 's/^/    /' >&2
 
 step "Building prompt"
-[ -f "$PROMPT_FILE" ] || die "missing $PROMPT_FILE — run from a repo that has it, or pass --prompt"
+PROMPT_FILE="$(support "$PROMPT_FILE")" \
+  || die "no review instructions at $PROMPT_FILE (looked in this repo and in $SELF_ROOT)"
 
 # Same split as CI: review instructions and output format are separate files,
 # so asking for suggested fixes does not fork the "what to look for" half.
@@ -212,7 +249,8 @@ case "$REVIEW_MODE" in
   suggest|inline) FORMAT_FILE="review/format-json.md" ;;
   *) die "--review-mode must be summary, inline or suggest (got '$REVIEW_MODE')" ;;
 esac
-[ -f "$FORMAT_FILE" ] || die "missing $FORMAT_FILE"
+FORMAT_FILE="$(support "$FORMAT_FILE")" \
+  || die "no output format at $FORMAT_FILE (looked in this repo and in $SELF_ROOT)"
 
 TMP_PROMPT="$(mktemp)"
 # The diff goes in verbatim. It used to say only "The diff is: git diff A B",
@@ -257,8 +295,8 @@ fi
 ok "$(wc -c < "$TMP_PROMPT" | tr -d ' ') bytes (diff ${DIFF_BYTES}B, truncated=$TRUNCATED)"
 
 ARGS=()
-[ -n "$SKILL" ] || { [ -f "$SKILL_DEFAULT" ] && SKILL="$SKILL_DEFAULT"; }
-if [ -n "$SKILL" ] && [ -f "$SKILL" ]; then
+[ -n "$SKILL" ] || SKILL="$SKILL_DEFAULT"
+if SKILL="$(support "$SKILL")"; then
   ARGS+=(--append-system-prompt="$SKILL"); ok "knowledge base: $SKILL"
 else
   say "no skill file — running without injected knowledge"
@@ -292,7 +330,7 @@ if ! "${OMP[@]}" -p \
       --cwd="$REPO_ROOT" \
       "@$TMP_PROMPT" \
       < /dev/null > "$TMP_OUT" 2>"$TMP_OUT.err"; then
-  printf '\n'; sed 's/^/    /' "$TMP_OUT.err" | tail -20
+  printf '\n' >&2; sed 's/^/    /' "$TMP_OUT.err" | tail -20 >&2
   rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err"
   die "review failed"
 fi
@@ -301,7 +339,7 @@ fi
 # not distinguish them — with no credential it exits 0 and writes nothing to
 # either stream. Without this check that silently reads as "no findings".
 if [ ! -s "$TMP_OUT" ]; then
-  printf '\n'; sed 's/^/    /' "$TMP_OUT.err" | tail -20
+  printf '\n' >&2; sed 's/^/    /' "$TMP_OUT.err" | tail -20 >&2
   rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err"
   die "omp exited 0 but produced no output — the review did not run (check OPENROUTER_API_KEY)"
 fi
@@ -321,27 +359,31 @@ printf '\n'
 if [ -n "$OUT" ]; then
   # --out gets the raw agent output, so a JSON review stays machine-readable.
   cp "$TMP_OUT" "$OUT"; ok "written to $OUT"
+elif [ "$AS_JSON" = 1 ]; then
+  # Raw model output, so the findings stay machine-readable for a pipeline.
+  # Progress goes to stderr throughout, so stdout is only ever the result.
+  cat "$TMP_OUT"
 elif [ "$REVIEW_MODE" = "summary" ]; then
   cat "$TMP_OUT"
 else
   # Render the structured findings, including the fixes that would appear as
   # committable suggestions on a pull request. Shares post-review.mjs's parser
   # so the terminal and the PR cannot disagree about what the agent said.
-  if command -v node >/dev/null 2>&1 && [ -f "scripts/post-review.mjs" ]; then
-    FINDINGS_FILE="$TMP_OUT" RENDER=1 node scripts/post-review.mjs || cat "$TMP_OUT"
+  if command -v node >/dev/null 2>&1 && RENDERER="$(support scripts/post-review.mjs)"; then
+    FINDINGS_FILE="$TMP_OUT" RENDER=1 node "$RENDERER" || cat "$TMP_OUT"
   else
     cat "$TMP_OUT"
   fi
 fi
 rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err"
 
-printf '\n'
+printf '\n' >&2
 if [ "$CLEAN" = 1 ]; then
   ok "no findings"
 elif [ "$FAIL_ON_FINDINGS" = 1 ]; then
   # Non-zero exit so this is usable as a pre-push hook or in a pipeline.
-  _c "0;33"; printf '  ! findings above — review before pushing\n'; _c "0"
+  _c "0;33"; printf '  ! findings above — review before pushing\n' >&2; _c "0"
   exit 1
 else
-  _c "0;33"; printf '  ! findings above (--no-fail set)\n'; _c "0"
+  _c "0;33"; printf '  ! findings above (--no-fail set)\n' >&2; _c "0"
 fi
