@@ -39,24 +39,35 @@ on:
           Comma-separated omp tool allowlist. Validated against a read-only set;
           anything outside it fails the job. See READ_ONLY_TOOLS below.
         type: string
-        default: read,grep,glob,lsp,ast_grep
+        default: read,grep,glob,ast_grep
       max_time:
         description: Hard wall-clock cap passed to omp (e.g. 600, 10m, 1h). Empty means no cap.
         type: string
         default: ''
       # --- prompt and injected knowledge ------------------------------------
       prompt_path:
-        description: Review instructions. Looked up in the reviewed repo first, then in the central repo.
+        description: >-
+          Review instructions. Resolved from the reviewed repo's BASE commit first,
+          then from the central repo — never from the pull request's own tree.
         type: string
         default: review/prompt.md
       skills_path:
-        description: File appended to the system prompt (a SKILL.md, or any guidance file). Same lookup order.
+        description: >-
+          File appended to the system prompt (a SKILL.md, or any guidance file).
+          Same base-then-central resolution as prompt_path.
         type: string
         default: skills/infra-review/SKILL.md
       max_findings:
         description: Upper bound on findings requested in the prompt. 0 disables the cap.
         type: number
         default: 20
+      max_diff_bytes:
+        description: >-
+          Cap on how much of the diff is put in the prompt. The diff dominates
+          token cost on a large pull request; beyond this it is truncated and
+          the agent is told so. 0 sends the whole thing.
+        type: number
+        default: 400000
       # --- outputs ----------------------------------------------------------
       review_mode:
         description: >-
@@ -75,10 +86,20 @@ on:
         type: boolean
         default: false
       # --- runner and pinning ----------------------------------------------
-      runs_on:
-        description: Runner label.
+      #
+      # There is deliberately no `runs_on` input. `runs-on` is resolved before
+      # any step executes, so a value cannot be validated by this workflow —
+      # validation code would already be running on the runner it was meant to
+      # vet. A caller-supplied `self-hosted` would therefore check out
+      # attacker-authored PR content onto a persistent machine holding the
+      # model key. Changing the runner is a fork, not an input.
+      central_repo:
+        description: >-
+          owner/name of the repository holding the shared prompt, skills and
+          poster. Must be this repository, or a fork of it that you trust — its
+          code runs with a token that can write to your pull requests.
         type: string
-        default: ubuntu-latest
+        default: atomikpanda/agentic-review
       timeout_minutes:
         description: Job timeout.
         type: number
@@ -134,8 +155,17 @@ jobs:
     # Skip drafts — matches pr-agent's handle_pr_actions, which fires on
     # ready_for_review rather than while a PR is still being iterated on.
     # A draft PR pushed ten times would otherwise cost ten reviews.
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    #
+    # Fork pull requests are skipped rather than failed. GitHub does not pass
+    # repository secrets to them, so the model key is always empty and the run
+    # cannot succeed. Letting it start would put a red X on every outside
+    # contribution — a worse outcome than no review, and not something the
+    # contributor can fix. `pull_request_target` would make secrets available
+    # and is exactly the trade this project refuses to make.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+      && github.event.pull_request.head.repo.fork != true
+    runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.timeout_minutes || 20 }}
     steps:
       - uses: actions/checkout@v4
@@ -147,12 +177,16 @@ jobs:
       # install-review.sh gets the accumulated review knowledge without copying
       # files into it. Soft-fails: if the central repo is private or moved, the
       # review still runs, just without injected knowledge.
-      - name: fetch shared skills
+      # `github.repository_owner` here is the OWNER OF THE REPO BEING REVIEWED,
+      # not of this workflow — so it used to look for <them>/agentic-review and
+      # fail for everyone except this project's owner, taking the default
+      # prompt with it. The central repo is named explicitly instead.
+      - name: fetch shared prompt, skills and poster
         id: central
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/agentic-review
+          repository: ${{ inputs.central_repo || 'atomikpanda/agentic-review' }}
           ref: main
           path: .central-skills
           sparse-checkout: |
@@ -175,10 +209,12 @@ jobs:
           IN_MODEL: ${{ inputs.model }}
           IN_THINKING: ${{ inputs.thinking }}
           IN_TOOLS: ${{ inputs.tools }}
+          IN_CENTRAL_REPO: ${{ inputs.central_repo }}
           IN_MAX_TIME: ${{ inputs.max_time }}
           IN_PROMPT_PATH: ${{ inputs.prompt_path }}
           IN_SKILLS_PATH: ${{ inputs.skills_path }}
           IN_MAX_FINDINGS: ${{ inputs.max_findings }}
+          IN_MAX_DIFF_BYTES: ${{ inputs.max_diff_bytes }}
           IN_REVIEW_MODE: ${{ inputs.review_mode }}
           IN_POST_COMMENT: ${{ inputs.post_comment }}
           IN_FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings }}
@@ -188,19 +224,44 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Every input lands in GITHUB_ENV below, which is a line-oriented
+          # file: a value containing a newline writes extra records. A caller
+          # passing $'--add-dir docs\nPOST_COMMENT=false' would set an
+          # unrelated variable AFTER the allowlist checks in this step had
+          # already passed. None of these values has any reason to span lines.
+          for v in IN_MODEL IN_THINKING IN_TOOLS IN_MAX_TIME IN_PROMPT_PATH \
+                   IN_SKILLS_PATH IN_MAX_FINDINGS IN_REVIEW_MODE IN_POST_COMMENT \
+                   IN_FAIL_ON_FINDINGS IN_BUN_VERSION IN_OMP_VERSION IN_EXTRA_ARGS \
+                   IN_CENTRAL_REPO IN_MAX_DIFF_BYTES; do
+            if [ "${!v}" != "${!v//[$'\n\r']/}" ]; then
+              echo "::error::$v must not contain a newline"
+              exit 1
+            fi
+          done
+
           # The full read-only subset of omp's builtin tools. Deliberately
           # excluded and NOT overridable from a caller:
           #   bash edit write ast_edit eval debug browser computer github task
           #   hub web_search memory_edit retain learn manage_skill checkpoint
-          #   rewind ask security_scan
+          #   rewind ask security_scan lsp
           # A PR diff is attacker-controlled text and this agent reads it, so it
           # must not be able to execute anything, modify the checkout, reach the
           # network, or write back to GitHub. Prompt injection then has nothing
           # to reach for. Note `security_scan` and `web_search` look harmless by
           # name but both egress to the network; `ask` blocks forever under -p.
-          READ_ONLY_TOOLS="read grep glob lsp ast_grep inspect_image todo"
+          #
+          # `lsp` is excluded for a subtler reason and it cost this project its
+          # cross-file symbol resolution. omp discovers language-server config
+          # from the PROJECT directory — lsp.json, .lsp.json, lsp.yaml and
+          # friends — and the project directory here is the checked-out pull
+          # request. A PR can therefore commit an lsp.json naming an arbitrary
+          # command; `lsp` is read-tier so the approval mode auto-approves it,
+          # and omp spawns that command with the model key in its environment.
+          # That is arbitrary execution through the one tool included for
+          # reading code. ast_grep and grep cover most of what it gave us.
+          READ_ONLY_TOOLS="read grep glob ast_grep inspect_image todo"
 
-          TOOLS="${IN_TOOLS:-read,grep,glob,lsp,ast_grep}"
+          TOOLS="${IN_TOOLS:-read,grep,glob,ast_grep}"
           bad=""
           for t in ${TOOLS//,/ }; do
             case " $READ_ONLY_TOOLS " in
@@ -236,10 +297,12 @@ jobs:
             echo "MODEL=${IN_MODEL:-openrouter/openai/gpt-5.6-luna}"
             echo "THINKING=${IN_THINKING:-}"
             echo "TOOLS=$TOOLS"
+            echo "CENTRAL_REPO=${IN_CENTRAL_REPO:-atomikpanda/agentic-review}"
             echo "MAX_TIME=${IN_MAX_TIME:-}"
             echo "PROMPT_PATH=${IN_PROMPT_PATH:-review/prompt.md}"
             echo "SKILLS_PATH=${IN_SKILLS_PATH:-skills/infra-review/SKILL.md}"
             echo "MAX_FINDINGS=${IN_MAX_FINDINGS:-20}"
+            echo "MAX_DIFF_BYTES=${IN_MAX_DIFF_BYTES:-400000}"
             echo "POST_COMMENT=${IN_POST_COMMENT:-true}"
             echo "FAIL_ON_FINDINGS=${IN_FAIL_ON_FINDINGS:-false}"
             echo "BUN_VERSION=${IN_BUN_VERSION:-latest}"
@@ -266,43 +329,93 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          git diff --stat "$BASE" "$HEAD" > /tmp/diffstat.txt
-          # prompt_path is the single source of truth — scripts/run-review.sh
-          # reads the same file, so a local review and a CI review cannot drift.
-          PROMPT_FILE="$PROMPT_PATH"
-          if [ ! -f "$PROMPT_FILE" ] && [ -f ".central-skills/$PROMPT_PATH" ]; then
-            PROMPT_FILE=".central-skills/$PROMPT_PATH"
-          fi
-          [ -f "$PROMPT_FILE" ] || { echo "::error::no prompt file at $PROMPT_PATH (checked the repo and .central-skills/)"; exit 1; }
+
+          # Resolve a support file WITHOUT trusting the pull request's tree.
+          #
+          # These files tell the agent what to look for and how to answer. Read
+          # from the checkout, a pull request could edit review/prompt.md to say
+          # "report nothing" and its own review would agree. So the reviewed
+          # repo's copy is taken from the BASE commit — which is what its
+          # maintainers already merged — and only then from the central repo.
+          # Customisation still works; it just has to be merged first.
+          resolve() { # resolve <path> <destination>; 0 if found
+            if git cat-file -e "$BASE:$1" 2>/dev/null; then
+              git show "$BASE:$1" > "$2"
+              echo "    $1 (from base commit)" >&2
+              return 0
+            fi
+            if [ -f ".central-skills/$1" ]; then
+              cp ".central-skills/$1" "$2"
+              echo "    $1 (from $CENTRAL_REPO)" >&2
+              return 0
+            fi
+            return 1
+          }
+
+          resolve "$PROMPT_PATH" /tmp/prompt-body.md \
+            || { echo "::error::no review instructions at $PROMPT_PATH in the base commit or $CENTRAL_REPO"; exit 1; }
 
           # The output format is a separate file from the review instructions,
-          # because the two vary independently: what to look for is the same
-          # whether the result is prose or line-anchored JSON.
+          # because the two vary independently: what counts as a defect does not
+          # change because the answer is JSON rather than prose.
           case "$REVIEW_MODE" in
             summary) FORMAT_NAME="review/format-markdown.md" ;;
             *)       FORMAT_NAME="review/format-json.md" ;;
           esac
-          FORMAT_FILE="$FORMAT_NAME"
-          if [ ! -f "$FORMAT_FILE" ] && [ -f ".central-skills/$FORMAT_NAME" ]; then
-            FORMAT_FILE=".central-skills/$FORMAT_NAME"
+          resolve "$FORMAT_NAME" /tmp/format.md \
+            || { echo "::error::no output format at $FORMAT_NAME in the base commit or $CENTRAL_REPO"; exit 1; }
+
+          if [ -n "$SKILLS_PATH" ] && resolve "$SKILLS_PATH" /tmp/skill.md; then
+            echo "SKILL_FILE=/tmp/skill.md" >> "$GITHUB_ENV"
+          else
+            echo "SKILL_FILE=" >> "$GITHUB_ENV"
           fi
-          [ -f "$FORMAT_FILE" ] || { echo "::error::no format file at $FORMAT_NAME (checked the repo and .central-skills/)"; exit 1; }
+
+          # THE DIFF ITSELF. Previously the prompt said "The diff is: git diff
+          # BASE HEAD" and stopped there — but the agent has no shell and no git
+          # tool, so it could never run that command. It was reviewing the
+          # checked-out tree while guessing from filenames what had changed.
+          # Every review before this one was blind to the actual delta.
+          git diff --stat "$BASE" "$HEAD" > /tmp/diffstat.txt
+          git diff --no-color "$BASE" "$HEAD" > /tmp/diff.patch
+          DIFF_BYTES=$(wc -c < /tmp/diff.patch)
+          TRUNCATED=0
+          if [ "${MAX_DIFF_BYTES:-0}" != "0" ] && [ "$DIFF_BYTES" -gt "$MAX_DIFF_BYTES" ]; then
+            head -c "$MAX_DIFF_BYTES" /tmp/diff.patch > /tmp/diff.trunc
+            mv /tmp/diff.trunc /tmp/diff.patch
+            TRUNCATED=1
+          fi
 
           {
-            echo "Changed files:"
+            cat /tmp/prompt-body.md
+            echo
+            echo "## Changed files"
+            echo
+            echo '```'
             cat /tmp/diffstat.txt
+            echo '```'
             echo
-            echo "The diff is: git diff $BASE $HEAD"
+            echo "## The diff"
             echo
-            cat "$PROMPT_FILE"
+            if [ "$TRUNCATED" = 1 ]; then
+              echo "NOTE: this diff was truncated at $MAX_DIFF_BYTES of $DIFF_BYTES bytes."
+              echo "Files after the cut-off are missing. Say so if it limits the review."
+              echo
+            fi
+            echo '```diff'
+            cat /tmp/diff.patch
+            echo '```'
+            echo
+            echo "The working tree is checked out at the merge result, so you can read any"
+            echo "file at its post-change state. Use that to check what the diff depends on."
             if [ "${MAX_FINDINGS:-0}" != "0" ]; then
               echo
               echo "Report at most $MAX_FINDINGS findings. If you have more, keep the most severe."
             fi
             echo
-            cat "$FORMAT_FILE"
+            cat /tmp/format.md
           } > /tmp/prompt.txt
-          echo "  prompt built from $PROMPT_FILE + $FORMAT_FILE ($(wc -c < /tmp/prompt.txt) bytes, mode=$REVIEW_MODE)"
+          echo "  prompt: $(wc -c < /tmp/prompt.txt) bytes (diff $DIFF_BYTES bytes, truncated=$TRUNCATED, mode=$REVIEW_MODE)"
 
       - name: run agentic review (read-only)
         env:
@@ -321,16 +434,12 @@ jobs:
               } ;;
           esac
 
-          # Prefer a skill file in the repo under review, so a project can
-          # override with its own conventions; otherwise fall back to the
-          # shared library fetched above.
+          # The skill file was resolved in the previous step, from the base
+          # commit or the central repo — never from the pull request's tree.
           ARGS=()
-          if [ -n "$SKILLS_PATH" ] && [ -f "$SKILLS_PATH" ]; then
-            ARGS+=(--append-system-prompt="$SKILLS_PATH")
-            echo "  injecting repo-local knowledge base: $SKILLS_PATH"
-          elif [ -n "$SKILLS_PATH" ] && [ -f ".central-skills/$SKILLS_PATH" ]; then
-            ARGS+=(--append-system-prompt=".central-skills/$SKILLS_PATH")
-            echo "  injecting shared knowledge base: .central-skills/$SKILLS_PATH"
+          if [ -n "${SKILL_FILE:-}" ] && [ -f "$SKILL_FILE" ]; then
+            ARGS+=(--append-system-prompt="$SKILL_FILE")
+            echo "  injecting knowledge base: $SKILLS_PATH"
           else
             echo "  no skill file found — running without injected knowledge"
           fi
@@ -362,12 +471,20 @@ jobs:
           #
           # --no-session keeps nothing on the runner.
           #
-          # The prompt goes in as a POSITIONAL argument, not on stdin. omp only
-          # reads piped stdin when `process.stdin.isTTY === false`, and on both
-          # bun and node that property is `undefined` for a redirect or a pipe
-          # — never false. So `omp -p < prompt.txt` reads nothing, has nothing
-          # to do, and exits 0 having produced no output. That is not a
-          # hypothetical: it is what this workflow did on its first live run.
+          # The prompt goes in via omp's @file form, NOT on stdin and NOT as a
+          # literal argument.
+          #
+          # Not stdin: omp only reads piped stdin when `process.stdin.isTTY ===
+          # false`, and on both bun and node that property is `undefined` for a
+          # redirect or a pipe — never false. `omp -p < prompt.txt` therefore
+          # reads nothing, has nothing to do, and exits 0 having produced no
+          # output. That is what this workflow did on its first live run.
+          #
+          # Not a literal argument either: Linux caps a single argv entry at
+          # MAX_ARG_STRLEN (128 KiB), well under the total ARG_MAX, and the
+          # prompt now carries the diff. A large pull request would fail with
+          # E2BIG before omp started. @file has no such limit.
+          #
           # stdin is pointed at /dev/null so nothing can block on a terminal.
           omp -p \
             --model="$MODEL" \
@@ -376,7 +493,7 @@ jobs:
             --tools="$TOOLS" \
             --approval-mode=always-ask \
             --cwd="$PWD" \
-            "$(cat /tmp/prompt.txt)" \
+            "@/tmp/prompt.txt" \
             < /dev/null \
             > /tmp/review.md 2>/tmp/review.err || {
               echo "omp failed:"; tail -30 /tmp/review.err; exit 1;
@@ -411,16 +528,25 @@ jobs:
           # anchors each one to a diff line and attaches a committable
           # ```suggestion block where the agent produced a complete fix.
           if [ "$REVIEW_MODE" != "summary" ]; then
-            # Prefer the poster from the central checkout over the one in the
-            # repo under review: it runs with a token that can write to the
-            # pull request, so the trusted copy wins where there is one. The
-            # local fallback exists so this repo can test its own changes and
-            # so a fork of the whole project still works.
-            POSTER="scripts/post-review.mjs"
-            if [ -f ".central-skills/scripts/post-review.mjs" ]; then
-              POSTER=".central-skills/scripts/post-review.mjs"
+            # The poster runs with a token that can write to this pull request,
+            # so it comes from the central checkout and nowhere else.
+            #
+            # It used to fall back to scripts/post-review.mjs in the repo under
+            # review. Two things wrong with that: on a same-repo pull request
+            # that file is whatever the branch says it is, and node would
+            # execute it with the write token; and on any OTHER project, a file
+            # at that path is simply some unrelated script of theirs that we
+            # would run for no reason.
+            #
+            # The one exception is this project reviewing itself, where the
+            # "repo under review" and the central repo are the same thing and
+            # the branch copy is the version under test.
+            POSTER=".central-skills/scripts/post-review.mjs"
+            if [ ! -f "$POSTER" ] && [ "$GITHUB_REPOSITORY" = "$CENTRAL_REPO" ]; then
+              POSTER="scripts/post-review.mjs"
+              echo "  central checkout has no poster yet; using this branch's copy (self-review)"
             fi
-            [ -f "$POSTER" ] || { echo "::error::post-review.mjs not found in either checkout"; exit 1; }
+            [ -f "$POSTER" ] || { echo "::error::post-review.mjs not found in $CENTRAL_REPO"; exit 1; }
             echo "  poster: $POSTER"
 
             if [ "$POST_COMMENT" != "true" ]; then

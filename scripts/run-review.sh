@@ -41,7 +41,13 @@ set -euo pipefail
 # omp's full read-only tool set. --tools is checked against this before we
 # invoke anything, so a slip here fails with a readable message rather than
 # handing an agent that reads attacker-authored diffs a shell.
-READ_ONLY_TOOLS="read grep glob lsp ast_grep inspect_image todo"
+#
+# `lsp` is absent deliberately. omp discovers language-server config from the
+# PROJECT directory (lsp.json, .lsp.json, lsp.yaml...), so a repository can
+# name an arbitrary command there; lsp is read-tier, so the approval mode
+# auto-approves it and omp spawns that command. That is arbitrary execution
+# via the one tool included for reading code.
+READ_ONLY_TOOLS="read grep glob ast_grep inspect_image todo"
 
 # omp ships `#!/usr/bin/env bun`, imports `bun:` builtins, and declares
 # engines.bun >= 1.3.14. It cannot run under node at all, and an older bun
@@ -51,7 +57,7 @@ BUN_MIN="1.3.14"
 BASE="${AGENTIC_REVIEW_BASE:-}"
 MODEL="${AGENTIC_REVIEW_MODEL:-openrouter/openai/gpt-5.6-luna}"
 THINKING="${AGENTIC_REVIEW_THINKING:-}"
-TOOLS="${AGENTIC_REVIEW_TOOLS:-read,grep,glob,lsp,ast_grep}"
+TOOLS="${AGENTIC_REVIEW_TOOLS:-read,grep,glob,ast_grep}"
 MAX_TIME="${AGENTIC_REVIEW_MAX_TIME:-}"
 PROMPT_FILE="${AGENTIC_REVIEW_PROMPT:-review/prompt.md}"
 SKILL="${AGENTIC_REVIEW_SKILL:-}"
@@ -61,6 +67,7 @@ MAX_FINDINGS="${AGENTIC_REVIEW_MAX_FINDINGS:-20}"
 # so suggest/inline render the proposed fixes to the terminal instead.
 REVIEW_MODE="${AGENTIC_REVIEW_MODE:-summary}"
 OMP_VERSION="${AGENTIC_REVIEW_OMP_VERSION:-latest}"
+MAX_DIFF_BYTES="${AGENTIC_REVIEW_MAX_DIFF_BYTES:-400000}"
 STAGED=0; OUT=""; FAIL_ON_FINDINGS=1
 PASSTHRU=()
 
@@ -133,7 +140,11 @@ ver_ge() { # ver_ge A B  -> 0 when A >= B
   return 0
 }
 
-if command -v omp >/dev/null 2>&1; then
+# An installed omp is used only when no specific version was asked for —
+# otherwise --omp-version / AGENTIC_REVIEW_OMP_VERSION would be silently
+# ignored on every machine that happens to have omp on PATH, which is most of
+# them, and a "pinned" review would not be pinned at all.
+if [ "$OMP_VERSION" = "latest" ] && command -v omp >/dev/null 2>&1; then
   OMP=(omp); ok "omp $(omp --version 2>/dev/null | head -1)"
 elif command -v bunx >/dev/null 2>&1; then
   bunv="$(bun --version 2>/dev/null || echo 0)"
@@ -153,7 +164,7 @@ if [ "$STAGED" = 1 ]; then
   RANGE="--staged"
   git diff --cached --quiet && die "nothing staged"
   DIFFSTAT="$(git diff --cached --stat)"
-  DIFFCMD="git diff --cached"
+  DIFFTEXT="$(git diff --cached --no-color)"
 else
   if [ -z "$BASE" ]; then
     # origin/HEAD is the reliable default-branch pointer; fall back sensibly.
@@ -169,7 +180,7 @@ else
   # that landed on the base since. Same range CI reviews.
   git diff --quiet "$MERGE_BASE" HEAD && die "no changes vs $BASE"
   DIFFSTAT="$(git diff --stat "$MERGE_BASE" HEAD)"
-  DIFFCMD="git diff $MERGE_BASE HEAD"
+  DIFFTEXT="$(git diff --no-color "$MERGE_BASE" HEAD)"
   RANGE="$BASE"
 fi
 ok "reviewing against $RANGE"
@@ -188,13 +199,38 @@ esac
 [ -f "$FORMAT_FILE" ] || die "missing $FORMAT_FILE"
 
 TMP_PROMPT="$(mktemp)"
+# The diff goes in verbatim. It used to say only "The diff is: git diff A B",
+# but the tool allowlist has no shell and no git, so the agent could never run
+# that — it was reviewing the working tree while guessing from filenames what
+# had changed.
+DIFF_BYTES=${#DIFFTEXT}
+TRUNCATED=0
+if [ "$MAX_DIFF_BYTES" != "0" ] && [ "$DIFF_BYTES" -gt "$MAX_DIFF_BYTES" ]; then
+  DIFFTEXT="${DIFFTEXT:0:$MAX_DIFF_BYTES}"
+  TRUNCATED=1
+fi
 {
-  echo "Changed files:"
-  printf '%s\n' "$DIFFSTAT"
-  echo
-  echo "The diff is: $DIFFCMD"
-  echo
   cat "$PROMPT_FILE"
+  echo
+  echo "## Changed files"
+  echo
+  echo '```'
+  printf '%s\n' "$DIFFSTAT"
+  echo '```'
+  echo
+  echo "## The diff"
+  echo
+  if [ "$TRUNCATED" = 1 ]; then
+    echo "NOTE: this diff was truncated at $MAX_DIFF_BYTES of $DIFF_BYTES bytes."
+    echo "Files after the cut-off are missing. Say so if it limits the review."
+    echo
+  fi
+  echo '```diff'
+  printf '%s\n' "$DIFFTEXT"
+  echo '```'
+  echo
+  echo "The working tree is checked out at the post-change state, so you can read any"
+  echo "file as it will be after this branch lands. Use that to check what the diff depends on."
   if [ "${MAX_FINDINGS:-0}" != "0" ]; then
     echo
     echo "Report at most $MAX_FINDINGS findings. If you have more, keep the most severe."
@@ -202,7 +238,7 @@ TMP_PROMPT="$(mktemp)"
   echo
   cat "$FORMAT_FILE"
 } > "$TMP_PROMPT"
-ok "$(wc -c < "$TMP_PROMPT" | tr -d ' ') bytes from $PROMPT_FILE + $FORMAT_FILE"
+ok "$(wc -c < "$TMP_PROMPT" | tr -d ' ') bytes (diff ${DIFF_BYTES}B, truncated=$TRUNCATED)"
 
 ARGS=()
 [ -n "$SKILL" ] || { [ -f "$SKILL_DEFAULT" ] && SKILL="$SKILL_DEFAULT"; }
@@ -222,10 +258,12 @@ TMP_OUT="$(mktemp)"
 # through -- cannot be the winning --tools. omp validates these names, so a
 # typo fails loudly.
 #
-# The prompt is a POSITIONAL argument, not stdin. omp only reads piped stdin
-# when `process.stdin.isTTY === false`, and that property is `undefined` for a
-# redirect or a pipe on both bun and node — never false. `omp -p < prompt`
-# therefore reads nothing and exits 0 with no output at all.
+# The prompt goes in via omp's @file form. Not stdin: omp only reads piped
+# stdin when `process.stdin.isTTY === false`, and that property is `undefined`
+# for a redirect or a pipe on both bun and node — never false, so `omp -p <
+# prompt` reads nothing and exits 0 with no output at all. Not a literal
+# argument either: Linux caps one argv entry at 128 KiB and the prompt now
+# carries the diff.
 #
 # --approval-mode=always-ask matches CI. It is omp's tightest mode (the `read`
 # tier: auto-approve read-only, block write and exec); the default is `yolo`.
@@ -236,7 +274,7 @@ if ! "${OMP[@]}" -p \
       --tools="$TOOLS" \
       --approval-mode=always-ask \
       --cwd="$REPO_ROOT" \
-      "$(cat "$TMP_PROMPT")" \
+      "@$TMP_PROMPT" \
       < /dev/null > "$TMP_OUT" 2>"$TMP_OUT.err"; then
   printf '\n'; sed 's/^/    /' "$TMP_OUT.err" | tail -20
   rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err"

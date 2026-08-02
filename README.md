@@ -3,9 +3,10 @@
 Read-only agentic code review for GitHub pull requests, assembled from existing
 tools rather than built from scratch. One command to enable on a repo.
 
-It reviews what a diff cannot show — whether a referenced config value actually
-exists, whether a dependency is gitignored and therefore absent in CI, whether
-something is installed but never configured.
+The agent gets the diff **and** the checked-out tree, so it reviews what a diff
+alone cannot show — whether a referenced config value actually exists, whether a
+dependency is gitignored and therefore absent in CI, whether something is
+installed but never configured.
 
 ## Enable on a repo
 
@@ -92,7 +93,7 @@ keeps tracking them.
 |---|---|---|---|---|
 | Model slug | `openrouter/openai/gpt-5.6-luna` | `model` | `--model` | `--model` |
 | Reasoning effort | model default | `thinking` | `--thinking` | `--thinking` |
-| Tool allowlist | `read,grep,glob,lsp,ast_grep` | `tools` | `--tools` | `--tools` |
+| Tool allowlist | `read,grep,glob,ast_grep` | `tools` | `--tools` | `--tools` |
 | Wall-clock cap | none | `max_time` | `--max-time` | `--max-time` |
 | Review prompt | `review/prompt.md` | `prompt_path` | `--prompt` | `--prompt` |
 | Injected knowledge | `skills/infra-review/SKILL.md` | `skills_path` | `--skill` | `--skill` |
@@ -100,8 +101,9 @@ keeps tracking them.
 | Findings cap | `20` (`0` = none) | `max_findings` | `--max-findings` | `--max-findings` |
 | Post a PR comment | `true` | `post_comment` | `--no-comment` | n/a |
 | Block the PR on findings | `false` | `fail_on_findings` | `--fail-on-findings` | `--no-fail` inverts |
-| Runner label | `ubuntu-latest` | `runs_on` | n/a | n/a |
 | Job timeout | `20` | `timeout_minutes` | n/a | n/a |
+| Diff size cap | `400000` bytes | `max_diff_bytes` | n/a | `$AGENTIC_REVIEW_MAX_DIFF_BYTES` |
+| Central repo | this repo | `central_repo` | `CENTRAL_REPO=` env | n/a |
 | Pin bun | `latest` | `bun_version` | `--bun-version` | n/a |
 | Pin omp | `latest` | `omp_version` | `--omp-version` | `--omp-version` |
 | Any other omp flag | none | `extra_omp_args` | `--extra-omp-args` | after `--` |
@@ -141,6 +143,16 @@ export AGENTIC_REVIEW_THINKING=high
 ./scripts/run-review.sh -- --add-dir ../shared-config
 ```
 
+The runner is **not** an input. `runs-on` is resolved before any step executes,
+so a caller-supplied value cannot be validated — the validation would already be
+running on the runner it was meant to vet, and `self-hosted` would put
+attacker-authored PR content on a persistent machine holding your model key.
+
+Fork pull requests are **skipped**, not failed. GitHub never passes secrets to
+them, so the run cannot succeed; failing would put a red X on every outside
+contribution that the contributor has no way to fix. Reviewing forks would
+require `pull_request_target`, which is the trade this project refuses.
+
 ### What is not configurable
 
 `tools` is validated against the read-only set below and the job fails on
@@ -167,19 +179,27 @@ read-only tool allowlist:
 | Enabled | Why |
 |---|---|
 | `read`, `grep`, `glob` | Read files the diff depends on but doesn't touch |
-| `lsp` | Cross-file symbol resolution |
 | `ast_grep` | Structural queries over 50+ tree-sitter grammars |
 
-`inspect_image` and `todo` are also permitted but off by default — those seven
+`inspect_image` and `todo` are also permitted but off by default — those six
 are the entire set `tools` will accept.
 
 Excluded: `bash`, `edit`, `write`, `ast_edit`, `eval`, `debug`, `browser`,
 `computer`, `github`, `task`, `hub`, `web_search`, `memory_edit`, `retain`,
-`learn`, `manage_skill`, `checkpoint`, `rewind`, `ask`, `security_scan`.
+`learn`, `manage_skill`, `checkpoint`, `rewind`, `ask`, `security_scan`, `lsp`.
 
-Two of those read as harmless and are not: `security_scan` is classified
-`exec` by omp and reaches an external cloud service, and `web_search` egresses
-to the network. `ask` blocks forever under `-p`.
+Three of those read as harmless and are not:
+
+- **`lsp`** — omp discovers language-server configuration from the *project*
+  directory (`lsp.json`, `.lsp.json`, `.lsp.yaml`…), and the project directory
+  here is the checked-out pull request. A PR can commit an `lsp.json` naming
+  any command; `lsp` is read-tier, so the approval mode auto-approves it and
+  omp spawns that command with the model key in its environment. Excluding it
+  cost this project cross-file symbol resolution — `ast_grep` and `grep` carry
+  that load instead.
+- **`security_scan`** — classified `exec` by omp, and reaches an external cloud
+  service.
+- **`web_search`** — network egress. `ask` also blocks forever under `-p`.
 
 A PR diff is attacker-controlled text and this agent reads it, so it must not
 be able to execute anything, modify the checkout, reach the network, or write
