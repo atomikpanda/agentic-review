@@ -388,3 +388,7 @@ jobs:
             /tmp/review.md
             /tmp/review.err
           retention-days: 7
+          # This step is `always()`, so it also runs when the review failed
+          # before either file existed. Without this the real error is followed
+          # by a "No files were found" warning that reads like a second fault.
+          if-no-files-found: ignore
