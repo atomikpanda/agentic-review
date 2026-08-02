@@ -427,6 +427,43 @@ jobs:
           } > /tmp/prompt.txt
           echo "  prompt: $(wc -c < /tmp/prompt.txt) bytes (diff $DIFF_BYTES bytes, truncated=$TRUNCATED, mode=$REVIEW_MODE)"
 
+      # SECURITY-CRITICAL. omp loads MCP server definitions from agent config
+      # directories in the WORKING DIRECTORY and spawns the commands they name.
+      # That happens at startup, before any tool is invoked, and none of
+      # --tools, --approval-mode, --no-extensions, --no-skills or --no-rules
+      # affects it. A pull request that commits .omp/mcp.json therefore gets
+      # arbitrary command execution on this runner, with OPENROUTER_API_KEY in
+      # the environment — completely bypassing the read-only tool allowlist
+      # that the rest of this workflow rests on.
+      #
+      # Verified against omp 17.2.4 with a config naming `/bin/sh -c "touch
+      # PROOF"`, under the exact flags used below. Executed from .omp/,
+      # .claude/ and .cursor/. Did NOT execute from .github/, .vscode/ or
+      # .windsurf/ — so the honoured set is narrower than omp's flavour table
+      # lists. Adding --no-extensions --no-skills --no-rules made no
+      # difference; this is loaded independently of the tool system.
+      #
+      # The whole flavour directories are removed rather than just mcp.json,
+      # because their other settings can also change approval behaviour, and
+      # because which flavours are honoured is an omp implementation detail
+      # that can widen in any release. .github and .vscode are ordinary project
+      # directories — this reviewer exists partly to review .github/workflows —
+      # so only the two files omp reads are taken from those.
+      #
+      # The diff still contains every one of these files, so the agent can
+      # still see and report on them. It simply cannot be configured by them.
+      - name: strip agent configuration from the checkout
+        run: |
+          set -euo pipefail
+          removed=0
+          for d in .omp .claude .codex .gemini .opencode .cursor .windsurf .cline; do
+            if [ -e "$d" ]; then rm -rf -- "$d"; echo "  removed $d/"; removed=1; fi
+          done
+          for f in .github/mcp.json .github/ssh.json .vscode/mcp.json .vscode/ssh.json; do
+            if [ -e "$f" ]; then rm -f -- "$f"; echo "  removed $f"; removed=1; fi
+          done
+          if [ "$removed" = 0 ]; then echo "  no agent configuration present"; fi
+
       - name: run agentic review (read-only)
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}

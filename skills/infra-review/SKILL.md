@@ -146,6 +146,28 @@ symptom be?* If the answer is "nothing visible", flag it.
   pointing nowhere near the cause. Honour `engines` too: a too-old runtime can
   surface as a minified `SyntaxError`.
 
+## Agent tooling run against untrusted code
+
+- **A tool allowlist does not bound what an agent can do if the tool loads
+  configuration from the working directory.** Coding agents discover MCP
+  servers, language servers, hooks and plugins from project-level config —
+  `.omp/mcp.json`, `.claude/mcp.json`, `.cursor/mcp.json`, `lsp.json` — and
+  those files name a *command* the agent then spawns. When the working
+  directory is a checked-out pull request, that config is written by the
+  contributor. Execution happens at startup, before any tool call, so a
+  read-only tool list, an approval mode and flags like `--no-extensions` all
+  miss it entirely. Verified live: `.omp/mcp.json` naming `/bin/sh -c "touch
+  PROOF"` executed under a strict read-only allowlist.
+  **Delete agent configuration from a checkout before pointing an agent at it**,
+  and grep any new agent integration for "config discovered from the project
+  directory" before trusting its sandbox.
+- **Ask which directory a tool treats as "the project".** The dangerous case is
+  a tool whose config search starts at `--cwd`, because that is the attacker's
+  directory in a CI review. A tool that only reads `$HOME` is fine.
+- **A CI step that removes files does not blind the review**, as long as the
+  diff is supplied separately: the content is still visible as text, it just
+  cannot act as configuration.
+
 ## Documentation is reviewable
 
 Two real defects were found in prose, not code: an API token scope that was

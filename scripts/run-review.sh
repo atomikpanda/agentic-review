@@ -159,6 +159,22 @@ else
   die "need bun >= $BUN_MIN — omp does not run under node. Install: curl -fsSL https://bun.sh/install | bash"
 fi
 
+# Local runs are NOT stripped: this is your own working tree and deleting a
+# developer's .claude/ or .omp/ would be indefensible. But the exposure is real
+# whenever the branch under review came from someone else, so it is named.
+#
+# omp loads MCP server definitions from these directories and spawns the
+# commands they name, at startup, regardless of --tools or --approval-mode.
+for _d in .omp .claude .cursor .codex .gemini .opencode .windsurf; do
+  if [ -f "$_d/mcp.json" ]; then
+    _c "0;33"
+    printf '  ! %s/mcp.json will be loaded by omp, and any command it names will run.\n' "$_d"
+    printf '    That is fine for your own config. If this branch came from someone\n'
+    printf '    else, read that file before continuing. CI deletes it; this does not.\n'
+    _c "0"
+  fi
+done
+
 step "Working out what changed"
 if [ "$STAGED" = 1 ]; then
   RANGE="--staged"
