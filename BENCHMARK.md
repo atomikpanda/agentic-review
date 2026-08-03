@@ -59,7 +59,16 @@ runs of identical code. Repeated sampling is why the union beats any single run.
 | 3 passes, default thinking | 2 | 6/11, 8/11 | 16–20 | ~$0.02 |
 | 3 lens passes, default thinking | 1 | 5/11 | 9 | mapping was wrong, see below |
 | **1 pass, `thinking: high`** | **4** | **8, 9, 8, 8** | **14–17** | ~$0.03, ~4 min |
+| 1 pass, `thinking: high`, **codegraph off** | 7 | 7,7,8,8,8,8,9 | 13–18 | mean 7.9 |
+| 1 pass, `thinking: high`, **codegraph on** | 3 | 7, 0, 7 | 0–16 | one run returned nothing |
 | Union across everything | | 10/11 | | |
+
+**Codegraph shows no measurable benefit here, and the test is weak.** Two valid
+samples at 7/11 against a 7-sample control averaging 7.9 is inside the noise. It
+is also the wrong benchmark for the question: this repository is YAML, shell and
+HCL, and codegraph indexes almost none of it — the workflow files return zero
+symbols. Answering the codegraph question properly needs a Swift or TypeScript
+benchmark, where it has something to parse.
 
 **Reasoning effort is the largest lever measured, by a distance.** At the model's
 default the agent made 3 turns and 2 tool calls on a 43-file diff — it read the

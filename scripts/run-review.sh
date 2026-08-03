@@ -481,10 +481,11 @@ run_pass() { # run_pass <prompt-file> <out-file>
     < /dev/null > "$2" 2>"$2.err"
 }
 
+CHECKER="$(support scripts/merge-findings.mjs 2>/dev/null || true)"
+
 if [ -n "$LENSES" ]; then
   # One pass per concern. Each gets only its own knowledge, so the prompt stays
   # small and the lenses cannot dilute one another.
-  CHECKER="$(support scripts/merge-findings.mjs 2>/dev/null || true)"
   PASS_OUTS=""; ok_passes=0; li=0
   IFS=',' read -ra _lenses <<< "$LENSES"
   for lens in "${_lenses[@]}"; do
@@ -524,7 +525,10 @@ if [ -n "$LENSES" ]; then
   # shellcheck disable=SC2086
   rm -f $PASS_OUTS
 elif [ "${PASSES:-1}" -le 1 ]; then
-  if ! run_pass "$TMP_PROMPT" "$TMP_OUT"; then
+  # Checked here too. The retry originally covered only the multi-pass paths,
+  # so a single pass could still return output the poster could not use — and
+  # did: one benchmark run came back with zero findings and no error.
+  if ! run_pass_checked "$TMP_PROMPT" "$TMP_OUT"; then
     printf '\n' >&2; sed 's/^/    /' "$TMP_OUT.err" | tail -20 >&2
     rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err" "$TMP_SKILL"
     die "review failed"
@@ -533,7 +537,6 @@ else
   # Repeated sampling. The same model over identical input agreed with itself
   # on only 5 of 9 findings across two runs, so a single pass systematically
   # under-reports; three passes took measured recall from 5/11 to 7/11.
-  CHECKER="$(support scripts/merge-findings.mjs 2>/dev/null || true)"
   PASS_OUTS=""
   ok_passes=0
   for i in $(seq 1 "$PASSES"); do
