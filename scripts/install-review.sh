@@ -13,7 +13,8 @@
 # Setup options:
 #   --repo OWNER/NAME        target repository
 #   --openrouter-key KEY     stored as the OPENROUTER_API_KEY repo secret
-#   --ref REF                central-repo ref to pin the workflow to (default main)
+#   --ref REF                central-repo ref to pin the workflow to (default v1;
+#                            pass main to track development, or a tag/SHA to pin harder)
 #   --with-pr-agent          also write .pr_agent.toml
 #   --no-pr-agent            skip it
 #   -y, --yes                assume yes
@@ -39,7 +40,12 @@
 set -euo pipefail
 
 CENTRAL_REPO="${CENTRAL_REPO:-atomikpanda/agentic-review}"
-CENTRAL_REF="${CENTRAL_REF:-main}"
+# A release tag, not a branch. `@main` meant every consumer executed whatever
+# was on main at the moment their pull request opened — with a token that can
+# write to that pull request — so an untested commit here reached every repo
+# immediately. `v1` moves only when a release is cut. Pass --ref main to track
+# development, or --ref <sha> to pin harder than a moving major tag.
+CENTRAL_REF="${CENTRAL_REF:-v1}"
 WORKFLOW=".github/workflows/agentic-review.yml"
 
 # --- input plumbing --------------------------------------------------------
@@ -214,7 +220,10 @@ YAML
   emit skills_path      "$I_SKILL"
   emit review_mode      "$I_REVIEW_MODE"
   # A pinned install must pin the support files too, or pinned workflow logic
-  # runs against whatever main happens to hold.
+  # runs against whatever main happens to hold. The comparison is against
+  # `main` because that is the central workflow's own default for this input —
+  # anything else has to be stated. Since CENTRAL_REF now defaults to v1, the
+  # normal install emits `central_ref: v1` and both halves stay in step.
   if [ "$CENTRAL_REF" != "main" ]; then emit central_ref "$CENTRAL_REF"; fi
   # The reusable workflow needs to know where to fetch the shared prompt and
   # poster from. It cannot infer it: github.repository_owner there is the owner

@@ -12,11 +12,17 @@ name: agentic-review
 # Reusable: call it from any repo with
 #   jobs:
 #     review:
-#       uses: <owner>/agentic-review/.github/workflows/agentic-review.yml@main
+#       uses: <owner>/agentic-review/.github/workflows/agentic-review.yml@v1
 #       secrets: { OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }} }
 #       with:
+#         central_ref: v1
 #         model: openrouter/anthropic/claude-sonnet-5
 #         thinking: high
+#
+# Point `uses:` at a release tag rather than @main, and set central_ref to
+# match. This workflow runs with a token that can write to the caller's pull
+# request, so @main means every commit here executes in every consuming repo
+# the moment a PR opens. See README.md, "Which ref to point at".
 #
 # Every knob below has a default, so `with:` is optional. See README.md for the
 # full table and the matching flags on scripts/run-review.sh.

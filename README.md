@@ -338,15 +338,33 @@ In a workflow:
 ```yaml
 jobs:
   review:
-    uses: atomikpanda/agentic-review/.github/workflows/agentic-review.yml@main
+    uses: atomikpanda/agentic-review/.github/workflows/agentic-review.yml@v1
     secrets:
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
     with:
+      central_ref: v1
       model: openrouter/anthropic/claude-sonnet-5
       thinking: high
       max_time: 12m
       fail_on_findings: true
 ```
+
+### Which ref to point at
+
+`uses:` selects the workflow; `central_ref` selects the prompt, skills and
+poster it fetches. **Set both to the same thing** — a pinned workflow reading a
+moving prompt is the worst of both.
+
+| Ref | Moves when | Use for |
+|---|---|---|
+| `@v1` | a release is cut | the default; fixes arrive, the interface does not break |
+| `@v1.0.0` | never | reproducible runs, or when you want to approve every change |
+| `@main` | every commit | this repo's own PRs, and anyone actively developing the reviewer |
+
+`@main` was the original default and is a poor one for consumers: the review
+runs with a token that can write to the pull request, so every commit here
+reached every repo the moment a PR opened, untested. Cutting `v1` is what makes
+"track the central repo" and "do not execute unreviewed code" compatible.
 
 At install time — the same values, written into the caller for you:
 
