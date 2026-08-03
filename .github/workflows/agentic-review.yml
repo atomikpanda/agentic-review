@@ -575,7 +575,9 @@ jobs:
               {
                 printf '%s\n' '# Output format'
                 printf '%s\n' ''
+                # shellcheck disable=SC2016  # backticks are markdown, not substitution
                 printf '%s\n' 'Markdown: a `##` heading per finding with a severity (Critical/High/Medium),'
+                # shellcheck disable=SC2016
                 printf '%s\n' 'the `file:line`, what breaks and why. If you find nothing, say exactly:'
                 printf '%s\n' '"No findings."'
               } > /tmp/format.md

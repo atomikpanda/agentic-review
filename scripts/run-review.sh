@@ -411,7 +411,10 @@ if [ "$MAX_DIFF_BYTES" != "0" ] && [ "$DIFF_BYTES" -gt "$MAX_DIFF_BYTES" ]; then
   DIFFTEXT="${DIFFTEXT:0:$MAX_DIFF_BYTES}"
   TRUNCATED=1
 fi
-readonly TRUNCATED DIFF_BYTES
+# Deliberately NOT readonly. Marking it so turns any later assignment into a
+# fatal shell error mid-run, which trades a wrong number for a dead review — and
+# the recomputation this guarded against is now structurally impossible anyway,
+# since the value is computed once before the first prompt is built.
 {
   cat "$PROMPT_FILE"
   echo
