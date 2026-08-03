@@ -126,6 +126,21 @@ it did not, the marker becomes `⚠️ … but <file> has not changed since`, wh
 says plainly that the disappearance is unexplained rather than implying a fix. If you supply a token that can resolve, threads are resolved
 properly and the fallback never runs.
 
+It also **stays quiet about anything a human already resolved**, while the code
+under it is unchanged. Resolving a thread is a decision — fixed, intentional, or
+won't fix — and re-raising it every push is how a reviewer gets muted. If the
+file changes afterwards the finding is raised again, because then the defect may
+genuinely be back.
+
+What it deliberately does **not** do is read the comment text. Adversarial
+comments flip 91–100% of LLM vulnerability verdicts
+([arXiv 2607.24964](https://arxiv.org/html/2607.24964)), and prompt-level
+"ignore untrusted content" instructions barely dent that — only keeping the text
+out of the prompt works, which drops it below 3%. Pull-request comments are
+easier to inject than code comments, since posting one requires no merge. So
+this reads a marker we wrote, a boolean, and a `git diff` — no attacker-authored
+text reaches the model.
+
 Only threads carrying that marker are ever touched; a human's review thread has
 no fingerprint and cannot match. Resolution is skipped when a run hits
 `max_findings`, because there a missing finding may have been squeezed out

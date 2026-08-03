@@ -322,6 +322,19 @@ async function ourThreads() {
 
 const RETIRED_RE = /^(?:✅|⚠️) \*\*No longer reported\*\*/;
 
+// Did the file change between the commit a thread was raised on and now?
+// null when it cannot be determined — usually the original commit is gone
+// after a force-push.
+function fileChangedSince(t) {
+  if (!t.path || !t.origOid) return null;
+  try {
+    execFileSync("git", ["diff", "--quiet", t.origOid, required("HEAD_SHA"), "--", t.path], { stdio: "ignore" });
+    return false;
+  } catch (e) {
+    return e.status === 1 ? true : null;
+  }
+}
+
 // "Fixed in <sha>" would be a nicer sentence and a false one. All that is known
 // at this point is that THIS run did not raise the finding — not that anything
 // fixed it, and not which commit would have. Models are documented to give
@@ -341,15 +354,7 @@ function retirementNote(t) {
   if (!t.path || !t.origOid) {
     return `✅ **No longer reported** as of ${link}.`;
   }
-  let changed = null;
-  try {
-    execFileSync("git", ["diff", "--quiet", t.origOid, head, "--", t.path], { stdio: "ignore" });
-    changed = false;
-  } catch (e) {
-    // `git diff --quiet` exits 1 for "differs"; anything else is a real error
-    // (most often the original commit is gone after a force-push).
-    changed = e.status === 1 ? true : null;
-  }
+  const changed = fileChangedSince(t);
   if (changed === true) {
     return `✅ **No longer reported** as of ${link} — \`${t.path}\` has changed since this was raised.`;
   }
@@ -551,14 +556,42 @@ async function main() {
 
   // A finding already sitting in an open thread is not repeated. Re-posting it
   // on every push is how a bot reviewer becomes noise people mute.
+  // A thread someone RESOLVED is a decision: fixed, or intentional, or won't
+  // fix. Re-raising it every push is how a reviewer gets muted. So a finding
+  // that matches a resolved thread is dropped — but only while the code under
+  // it is untouched. If the file changed since, the defect may genuinely be
+  // back, and silence would be the worse error.
+  //
+  // Note what this deliberately does NOT do: read the comment text. Adversarial
+  // comments flip 91-100% of LLM vulnerability verdicts (arXiv 2607.24964), and
+  // prompt-level "ignore untrusted content" defences barely dent it — only
+  // keeping the text out works. Pull-request comments are easier to inject than
+  // code comments, since posting one needs no merge. So this reads our own
+  // marker, a boolean, and a git diff. No attacker-authored text reaches the
+  // model.
+  const dismissed = prior.filter((t) => t.isResolved);
+  const dismissedMatch = (f) => {
+    const tk = tokenSet(`${f.title} ${f.body}`);
+    const file = String(f.file).replace(/^\.\//, "");
+    for (const t of dismissed) {
+      if (t.path !== file) continue;
+      if (similarity(tk, t.tokens) < SIMILARITY) continue;
+      if (fileChangedSince(t) === false) return t;   // untouched since dismissal
+    }
+    return null;
+  };
+
   const stillLive = new Set();
   const fresh = [];
+  let suppressed = 0;
   for (const f of findings) {
     const m = matchOf(f);
-    if (m) stillLive.add(m.id);
-    else fresh.push(f);
+    if (m) { stillLive.add(m.id); continue; }
+    if (dismissedMatch(f)) { suppressed++; continue; }
+    fresh.push(f);
   }
-  const repeats = findings.length - fresh.length;
+  const repeats = findings.length - fresh.length - suppressed;
+  if (suppressed) console.log(`  ${suppressed} finding(s) previously resolved and unchanged — not re-raised`);
 
   const { comments, unanchored } = build(fresh, ranges);
 
