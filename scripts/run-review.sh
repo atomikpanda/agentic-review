@@ -288,11 +288,15 @@ fi
 # already-made decision. CI deletes them; locally we cannot delete a developer's
 # own files, so the choice is explicit.
 _agent_cfg=""
+# `if`, not `[ test ] && assign`. When the test fails it is the last command in
+# that list, so under `set -e` the script exits — silently, with no message and
+# a zero-length output file. This is the same trap already documented in the
+# workflow's argument assembly, repeated here three lines apart.
 for _d in .omp .claude .cursor .codex .gemini .opencode .windsurf; do
-  [ -f "$_d/mcp.json" ] && _agent_cfg="$_agent_cfg $_d/mcp.json"
+  if [ -f "$_d/mcp.json" ]; then _agent_cfg="$_agent_cfg $_d/mcp.json"; fi
 done
-[ -f mcp.json ] && _agent_cfg="$_agent_cfg mcp.json"
-[ -f .mcp.json ] && _agent_cfg="$_agent_cfg .mcp.json"
+if [ -f mcp.json ]; then _agent_cfg="$_agent_cfg mcp.json"; fi
+if [ -f .mcp.json ]; then _agent_cfg="$_agent_cfg .mcp.json"; fi
 if [ -n "$_agent_cfg" ] && [ "${TRUST_REPO:-0}" != "1" ]; then
   _c "0;31"
   printf '  ✗ this checkout contains agent configuration:%s\n' "$_agent_cfg" >&2
@@ -325,7 +329,12 @@ else
   git diff --quiet "$MERGE_BASE" HEAD && die "no changes vs $BASE"
   DIFFSTAT="$(git diff --stat "$MERGE_BASE" HEAD)"
   DIFFTEXT="$(git diff --no-color "$MERGE_BASE" HEAD)"
-  INTENT="$(git log --reverse --format='- %s%n%b' "$MERGE_BASE"..HEAD | head -60)"
+  # -n rather than `| head`: head closes the pipe, git takes SIGPIPE, and with
+  # `set -o pipefail` the whole assignment fails and `set -e` exits the script
+  # with no message at all. It only showed up once this branch had enough
+  # commits to fill sixty lines — which is to say, once the tool was used on a
+  # real branch. Subjects only; the bodies here run to hundreds of lines.
+  INTENT="$(git log --reverse -n 40 --format='- %s' "$MERGE_BASE"..HEAD)"
   RANGE="$BASE"
 fi
 ok "reviewing against $RANGE"
