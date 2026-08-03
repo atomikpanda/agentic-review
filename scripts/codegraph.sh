@@ -65,8 +65,13 @@ while IFS= read -r f; do
   # Files codegraph did not index (docs, config, unknown extensions) return
   # nothing useful; skip them rather than printing an empty section per file.
   body="$(codegraph node --path "$PROJECT" --file "$f" --symbols-only 2>/dev/null || true)"
+  # The real message is "_No indexed symbols in this file._" — the earlier
+  # pattern matched "No symbols" and never fired, so every unindexed file
+  # contributed a heading plus a line saying it had nothing. On a repo codegraph
+  # does not parse (YAML, shell, HCL) that is the WHOLE index: pure prompt noise
+  # in the place where the useful content was supposed to go.
   case "$body" in
-    ""|*"not found"*|*"No symbols"*) continue ;;
+    ""|*"not found"*|*"No indexed symbols"*|*"No symbols"*) continue ;;
   esac
   # The trailing hint is addressed to an interactive agent that can call the
   # tool again; here it is noise.

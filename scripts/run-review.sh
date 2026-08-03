@@ -31,6 +31,7 @@
 #                       suggest prints the fixes it would offer on a PR
 #   --omp-version V     npm version or dist-tag       $AGENTIC_REVIEW_OMP_VERSION
 #   --out FILE          write the review here
+#   --no-codegraph      skip the symbol index (for A/B measurement)
 #   --json              raw findings JSON on stdout, for piping
 #   --no-fail           exit 0 even when findings are reported
 #   -- ARGS...          everything after -- is passed to omp verbatim
@@ -87,7 +88,7 @@ PASSES="${AGENTIC_REVIEW_PASSES:-1}"
 # rules-per-prompt, which is what predicts whether injected knowledge is used.
 LENSES="${AGENTIC_REVIEW_LENSES:-}"
 MIN_VOTES="${AGENTIC_REVIEW_MIN_VOTES:-1}"
-STAGED=0; OUT=""; FAIL_ON_FINDINGS=1; AS_JSON=0
+STAGED=0; OUT=""; FAIL_ON_FINDINGS=1; AS_JSON=0; USE_CODEGRAPH=1
 PASSTHRU=()
 
 while [ $# -gt 0 ]; do
@@ -108,6 +109,7 @@ while [ $# -gt 0 ]; do
     --out)          OUT="${2:-}"; shift 2 ;;
     --staged)       STAGED=1; shift ;;
     --no-fail)      FAIL_ON_FINDINGS=0; shift ;;
+    --no-codegraph) USE_CODEGRAPH=0; shift ;;
     --json)         AS_JSON=1; REVIEW_MODE="${REVIEW_MODE/#summary/suggest}"; shift ;;
     --)             shift; PASSTHRU=("$@"); break ;;
     # Print the header comment, stopping at the first line that isn't one.
@@ -391,7 +393,7 @@ fi
   # NOT auto-initialised: `codegraph init` writes a .codegraph/ directory into
   # the repository, and a review tool should not leave artefacts in someone's
   # working tree without being asked. Run `codegraph init` yourself to enable it.
-  if CG="$(support scripts/codegraph.sh)" && [ -d "$REPO_ROOT/.codegraph" ]; then
+  if [ "$USE_CODEGRAPH" = 1 ] && CG="$(support scripts/codegraph.sh)" && [ -d "$REPO_ROOT/.codegraph" ]; then
     if [ "$STAGED" = 1 ]; then
       STAGED=1 PROJECT="$REPO_ROOT" bash "$CG" 2>/dev/null || true
     else
