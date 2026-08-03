@@ -35,7 +35,8 @@
 #   --all               list every tracked finding, including dismissed
 #   --history           list past runs
 #   --dismiss ID...     stop reporting these findings
-#   --trust-repo        proceed despite agent config in the checkout
+#   --trust-repo        only used if a worktree cannot be created: proceed
+#                       despite agent config in your own checkout
 #   --no-codegraph      skip the symbol index (for A/B measurement)
 #   --json              raw findings JSON on stdout, for piping
 #   --no-fail           exit 0 even when findings are reported
@@ -279,36 +280,73 @@ else
   die "need bun >= $BUN_MIN — omp does not run under node. Install: curl -fsSL https://bun.sh/install | bash"
 fi
 
-# Local runs are NOT stripped: this is your own working tree and deleting a
-# developer's .claude/ or .omp/ would be indefensible. But the exposure is real
-# whenever the branch under review came from someone else, so it is named.
+# Reviewing a branch is not consenting to execute it.
 #
-# omp loads MCP server definitions from these directories and spawns the
-# commands they name, at startup, regardless of --tools or --approval-mode.
-# Refuse, rather than warn. omp loads these at startup and spawns whatever they
-# name, before any tool restriction applies — so a warning printed one line
-# above the thing it warns about is not a control, it is a note attached to an
-# already-made decision. CI deletes them; locally we cannot delete a developer's
-# own files, so the choice is explicit.
-_agent_cfg=""
-# `if`, not `[ test ] && assign`. When the test fails it is the last command in
-# that list, so under `set -e` the script exits — silently, with no message and
-# a zero-length output file. This is the same trap already documented in the
-# workflow's argument assembly, repeated here three lines apart.
-# Same list as the CI strip step. .cline was in that one and not this one,
-# which is what happens when the same set is written out twice.
-for _d in .omp .claude .cursor .codex .gemini .opencode .windsurf .cline; do
-  if [ -f "$_d/mcp.json" ]; then _agent_cfg="$_agent_cfg $_d/mcp.json"; fi
-done
-if [ -f mcp.json ]; then _agent_cfg="$_agent_cfg mcp.json"; fi
-if [ -f .mcp.json ]; then _agent_cfg="$_agent_cfg .mcp.json"; fi
-if [ -n "$_agent_cfg" ] && [ "${TRUST_REPO:-0}" != "1" ]; then
-  _c "0;31"
-  printf '  ✗ this checkout contains agent configuration:%s\n' "$_agent_cfg" >&2
-  printf '    omp loads it at startup and runs whatever command it names, before\n' >&2
-  printf '    any tool restriction applies. If it is yours, re-run with --trust-repo.\n' >&2
-  _c "0"
-  exit 1
+# omp loads MCP server definitions from agent-configuration directories and
+# spawns the commands they name at startup — before --tools and before
+# --approval-mode apply — so the read-only allowlist is not the boundary it
+# looks like. CI deletes that configuration. Locally we used to only *refuse*,
+# because deleting a developer's own .claude/ is indefensible.
+#
+# That was true only because the review ran in the working tree, and it does not
+# have to. Reviewing a throwaway worktree makes stripping free: your checkout is
+# never touched, and the agent sees exactly the committed state the diff
+# describes rather than the working tree's uncommitted drift — which is also
+# more correct, since the diff it is given is committed-only.
+#
+# REVIEW_ROOT is what omp sees. REPO_ROOT stays the real repository, because git
+# range resolution, the codegraph index and local state all belong to it.
+REVIEW_ROOT="$REPO_ROOT"
+WORKTREE=""
+cleanup_worktree() {
+  [ -n "$WORKTREE" ] || return 0
+  git worktree remove --force "$WORKTREE" 2>/dev/null || rm -rf -- "$WORKTREE"
+  WORKTREE=""
+}
+trap cleanup_worktree EXIT
+
+# support_exec, not support: this deletes files, so it must come from the
+# installed copy and never from the repository under review.
+_strip=""
+if _strip="$(support_exec scripts/strip-agent-config.sh)" && [ -n "$_strip" ]; then
+  if [ "$STAGED" = 1 ]; then
+    # The index is not a commit and `git worktree add` needs one. commit-tree
+    # makes a dangling commit that no ref points at; gc collects it.
+    _commit="$(git commit-tree "$(git write-tree)" -p HEAD -m 'agentic-review: staged state')"
+  else
+    _commit="HEAD"
+  fi
+  _wt="$(mktemp -d)"
+  rm -rf -- "$_wt"   # worktree add requires the path NOT to exist
+  if git worktree add --detach "$_wt" "$_commit" >/dev/null 2>&1; then
+    WORKTREE="$_wt"; REVIEW_ROOT="$_wt"
+    _removed="$(bash "$_strip" --strip "$REVIEW_ROOT")"
+    if [ -n "$_removed" ]; then ok "throwaway worktree — $_removed"; else ok "reviewing a throwaway worktree"; fi
+  else
+    rm -rf -- "$_wt"
+  fi
+fi
+
+# Fallback only: a worktree could not be created (older git, unusual layout), so
+# the review runs in your actual tree and nothing can be safely deleted. Back to
+# refusing, which is the honest response when the guard is unavailable.
+if [ -z "$WORKTREE" ]; then
+  # `if`, not `[ test ] && assign`. When the test fails it is the last command
+  # in that list, so under `set -e` the script exits — silently, with no message
+  # and a zero-length output file. Same trap documented in the workflow's
+  # argument assembly.
+  [ -n "$_strip" ] || die "scripts/strip-agent-config.sh is missing from $SELF_ROOT — refusing to run an unguarded review"
+  _agent_cfg=""
+  if _found="$(bash "$_strip" --check "$REPO_ROOT")"; then :; else _agent_cfg="$_found"; fi
+  if [ -n "$_agent_cfg" ] && [ "${TRUST_REPO:-0}" != "1" ]; then
+    _c "0;31"
+    printf '  ✗ could not create a worktree, so this runs in your checkout, which contains\n' >&2
+    printf '    agent configuration: %s\n' "$_agent_cfg" >&2
+    printf '    omp loads it at startup and runs whatever command it names, before\n' >&2
+    printf '    any tool restriction applies. If it is yours, re-run with --trust-repo.\n' >&2
+    _c "0"
+    exit 1
+  fi
 fi
 
 step "Working out what changed"
@@ -550,7 +588,7 @@ run_pass() { # run_pass <prompt-file> <out-file>
     "${ARGS[@]+"${ARGS[@]}"}" \
     --tools="$TOOLS" \
     --approval-mode=always-ask \
-    --cwd="$REPO_ROOT" \
+    --cwd="$REVIEW_ROOT" \
     "@$1" \
     < /dev/null > "$2" 2>"$2.err"
 }

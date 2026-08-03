@@ -730,19 +730,18 @@ jobs:
             fi
           done
 
-          removed=0
-          for d in .omp .claude .codex .gemini .opencode .cursor .windsurf .cline; do
-            if [ -e "$d" ]; then rm -rf -- "$d"; echo "  removed $d/"; removed=1; fi
-          done
-          # Root-level config executes too. The first version of this step only
-          # removed the agent DIRECTORIES, which left ./mcp.json and ./.mcp.json
-          # loaded and spawnable — the fix was incomplete and the reviewer caught
-          # it. Verified: both execute under the production flags.
-          for f in mcp.json .mcp.json .github/mcp.json .github/ssh.json \
-                   .vscode/mcp.json .vscode/ssh.json; do
-            if [ -e "$f" ]; then rm -f -- "$f"; echo "  removed $f"; removed=1; fi
-          done
-          if [ "$removed" = 0 ]; then echo "  no agent configuration present"; fi
+          # The list lives in one file, read by this step and by
+          # scripts/run-review.sh. It was written out twice before and drifted
+          # twice: first .cline was in one copy and not the other, then the four
+          # nested paths above were added here and never reached the local
+          # runner — so a local review, on a developer's own machine, checked
+          # strictly fewer places than this ephemeral runner did.
+          #
+          # From .central-skills, never from the checkout: this deletes files in
+          # the repository under review, so the repository under review must not
+          # be able to supply it.
+          out="$(bash .central-skills/scripts/strip-agent-config.sh --strip .)"
+          if [ -n "$out" ]; then echo "  $out"; else echo "  no agent configuration present"; fi
 
       - name: run agentic review (read-only)
         env:
