@@ -92,6 +92,33 @@ Three things that mechanism forces, all handled:
 - **The review is never lost.** If the inline post is rejected anyway, it falls
   back to posting everything as a summary rather than failing silently.
 
+### Readiness score
+
+Every review opens with a 0–5 readiness score, from the severity and quantity of
+what was found, mapped to an action:
+
+| Score | Meaning | Action |
+|---|---|---|
+| 5/5 | Production ready | Merge |
+| 4/5 | Minor polish needed | Merge after small fixes |
+| 3/5 | Implementation issues | Address feedback first |
+| 2/5 | Significant bugs | Needs rework |
+| 0–1/5 | Critical problems | Major rethink needed |
+
+Findings carry priority badges: **`P0` Critical** (must fix — security, data
+loss, crashes), **`P1` High** (bugs, incorrect behaviour, edge cases), **`P2`
+Medium** (quality, maintainability).
+
+**The score is capped at 3/5 when the review could not do its job** — a
+truncated diff or a failed pass produces few findings for the same reason a
+clean change does, and "production ready" inferred from a review that read half
+the diff is the most dangerous output this tool could emit. The cap only ever
+moves the score down, and says what it was capped from.
+
+Two signals Greptile factors in that this does not: change complexity, and how
+well the code matches existing codebase patterns. Neither is implemented here,
+so the score is a severity aggregate rather than a full readiness model.
+
 ### Merge gate
 
 Every review opens with one of three verdicts:

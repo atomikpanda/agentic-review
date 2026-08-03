@@ -172,7 +172,7 @@ function fenceFor(text) {
 }
 
 function commentBody(f, withSuggestion) {
-  const parts = [`**${f.severity} — ${f.title}**`, "", f.body];
+  const parts = [`${badge(f.severity)} — **${f.title}**`, "", f.body];
   if (withSuggestion && typeof f.suggestion === "string" && f.suggestion.length > 0) {
     // Trailing newline is stripped: the block's lines replace the target lines
     // exactly, and an extra blank line at the end inserts one into the file.
@@ -273,6 +273,49 @@ function reviewConfidence() {
   return { score, why };
 }
 
+// Severity vocabulary. P0/P1/P2 read better on a badge than the words do, and
+// the priority framing states the action rather than the judgement.
+const PRIORITY = { Critical: "P0", High: "P1", Medium: "P2" };
+const badge = (sev) => `\`${PRIORITY[sev] ?? "P2"}\` ${sev}`;
+
+// Readiness: 0-5, from the severity and quantity of what was found, mapped to
+// what to do about it.
+//
+// One deviation from the obvious design. The score is CAPPED when the review
+// could not do its job — a truncated diff or a failed pass yields few findings
+// for the same reason a clean change does, and "production ready" inferred from
+// a review that read half the diff is the single most dangerous output this
+// tool could produce. Capping keeps the scale useful without letting it launder
+// a weak run into a merge recommendation.
+const READINESS = {
+  5: ["Production ready", "Merge"],
+  4: ["Minor polish needed", "Merge after small fixes"],
+  3: ["Implementation issues", "Address feedback first"],
+  2: ["Significant bugs", "Needs rework"],
+  1: ["Critical problems", "Major rethink needed"],
+  0: ["Critical problems", "Major rethink needed"],
+};
+
+function readiness(findings, gate) {
+  const n = (sev) => findings.filter((f) => f.severity === sev).length;
+  const p0 = n("Critical"), p1 = n("High"), p2 = n("Medium");
+
+  let score;
+  if (p0 >= 2) score = 0;
+  else if (p0 === 1) score = 1;
+  else if (p1 >= 3) score = 2;
+  else if (p1 >= 1) score = 3;
+  else if (p2 >= 1) score = 4;
+  else score = 5;
+
+  let capped = null;
+  if (gate.verdict === "inconclusive" && score > 3) {
+    capped = score;
+    score = 3;
+  }
+  return { score, p0, p1, p2, capped, ...{ 0: {}, }[0] };
+}
+
 // A merge gate with THREE outcomes, because two would be dishonest.
 //
 // "Clear" and "blocked" alone force a review that could not do its job into
@@ -312,9 +355,26 @@ function mergeGate(findings) {
 function summaryBody(total, comments, unanchored) {
   const model = env("MODEL", "");
   const tools = env("TOOLS", "");
-  const { score, why } = reviewConfidence();
+  const { score: conf, why } = reviewConfidence();
   const gate = mergeGate(ALL_FINDINGS);
-  const out = ["### 🔎 Agentic review", "", gate.line, ""];
+  const r = readiness(ALL_FINDINGS, gate);
+  const [meaning, action] = READINESS[r.score];
+
+  const out = ["### 🔎 Agentic review", ""];
+  out.push(`## ${r.score}/5 — ${meaning}`, "", `**${action}**`, "");
+  const counts = [
+    r.p0 ? `\`P0\` ${r.p0} critical` : null,
+    r.p1 ? `\`P1\` ${r.p1} high` : null,
+    r.p2 ? `\`P2\` ${r.p2} medium` : null,
+  ].filter(Boolean);
+  if (counts.length) out.push(counts.join(" · "), "");
+  if (r.capped !== null) {
+    out.push(
+      `> Capped from ${r.capped}/5: this review could not do its job, and few findings from a review that did not finish is not the same as few defects.`,
+      "",
+    );
+  }
+  out.push(gate.line, "");
   if (gate.unmet.length) out.push(...gate.unmet.map((u) => `- ${u}`), "");
   out.push(
     `**Review confidence: ${"●".repeat(score)}${"○".repeat(5 - score)} ${score}/5** — how much to trust *this run*, not whether the code is safe.`,
