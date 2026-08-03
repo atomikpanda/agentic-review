@@ -197,7 +197,7 @@ keeps tracking them.
 | Setting | Default | Workflow `with:` | `install-review.sh` | `run-review.sh` |
 |---|---|---|---|---|
 | Model slug | `openrouter/openai/gpt-5.6-luna` | `model` | `--model` | `--model` |
-| Reasoning effort | model default | `thinking` | `--thinking` | `--thinking` |
+| Reasoning effort | `high` | `thinking` | `--thinking` | `--thinking` |
 | Tool allowlist | `read,grep,glob,ast_grep` | `tools` | `--tools` | `--tools` |
 | Wall-clock cap | none | `max_time` | `--max-time` | `--max-time` |
 | Review prompt | `review/prompt.md` | `prompt_path` | `--prompt` | `--prompt` |

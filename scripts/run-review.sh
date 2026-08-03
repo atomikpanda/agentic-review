@@ -63,7 +63,12 @@ BUN_MIN="1.3.14"
 
 BASE="${AGENTIC_REVIEW_BASE:-}"
 MODEL="${AGENTIC_REVIEW_MODEL:-openrouter/openai/gpt-5.6-luna}"
-THINKING="${AGENTIC_REVIEW_THINKING:-}"
+# Default high. At the model's default the agent made 3 turns and 2 tool calls
+# on a 43-file diff — it read the diff and answered, which is the single-shot
+# behaviour this project exists to beat. At `high` the same input produced 11
+# turns and 25 tool calls, and measured recall went 5/11 to 8/11. Roughly 5x
+# the wall clock and 4x the cost of a pass, and worth both.
+THINKING="${AGENTIC_REVIEW_THINKING:-high}"
 TOOLS="${AGENTIC_REVIEW_TOOLS:-read,grep,glob,ast_grep}"
 MAX_TIME="${AGENTIC_REVIEW_MAX_TIME:-}"
 PROMPT_FILE="${AGENTIC_REVIEW_PROMPT:-review/prompt.md}"

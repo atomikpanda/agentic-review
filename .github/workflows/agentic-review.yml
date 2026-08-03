@@ -30,9 +30,14 @@ on:
         type: string
         default: openrouter/openai/gpt-5.6-luna
       thinking:
-        description: Reasoning effort — off|minimal|low|medium|high|xhigh|max|auto. Empty uses the model default.
+        description: >-
+          Reasoning effort — off|minimal|low|medium|high|xhigh|max|auto.
+          Defaults to high: at the model default the agent made 2 tool calls on a
+          43-file diff and behaved like a single-shot reviewer; at high it made
+          25 and measured recall went 5/11 to 8/11. Lower it to trade accuracy
+          for time and cost.
         type: string
-        default: ''
+        default: high
       # --- what the agent may do -------------------------------------------
       tools:
         description: >-
@@ -324,7 +329,7 @@ jobs:
           {
             echo "REVIEW_MODE=$REVIEW_MODE"
             echo "MODEL=${IN_MODEL:-openrouter/openai/gpt-5.6-luna}"
-            echo "THINKING=${IN_THINKING:-}"
+            echo "THINKING=${IN_THINKING:-high}"
             echo "TOOLS=$TOOLS"
             echo "CENTRAL_REPO=${IN_CENTRAL_REPO:-atomikpanda/agentic-review}"
             echo "MAX_TIME=${IN_MAX_TIME:-}"

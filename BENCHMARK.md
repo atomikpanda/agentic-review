@@ -51,14 +51,28 @@ runs of identical code. Repeated sampling is why the union beats any single run.
 
 ## Results so far
 
-| Configuration | Recall | Notes |
-|---|---|---|
-| 1 pass, `gpt-5.6-luna` | 5/11 | ~$0.007 |
-| 1 pass, `gpt-5.6-terra` (10× price) | 5/11 | model tier bought nothing |
-| 1 pass, `deepseek-v4-flash` | 5/11 | 6× slower |
-| 3 passes, `gpt-5.6-luna` | 6–8/11 | ~$0.02 |
-| 3 lens passes (security/correctness/docs) | 5/11 | see below |
-| Union across 6 passes | 9/11 | |
+| Configuration | Samples | Recall | Findings | Notes |
+|---|---|---|---|---|
+| 1 pass, default thinking | 1 | 5/11 | 9 | ~$0.007, ~55s |
+| 1 pass, `gpt-5.6-terra`, default thinking | 1 | 5/11 | 7 | 10× the price bought nothing |
+| 1 pass, `deepseek-v4-flash`, default thinking | 1 | 5/11 | 7 | 6× slower |
+| 3 passes, default thinking | 2 | 6/11, 8/11 | 16–20 | ~$0.02 |
+| 3 lens passes, default thinking | 1 | 5/11 | 9 | mapping was wrong, see below |
+| **1 pass, `thinking: high`** | **4** | **8, 9, 8, 8** | **14–17** | ~$0.03, ~4 min |
+| Union across everything | | 10/11 | | |
+
+**Reasoning effort is the largest lever measured, by a distance.** At the model's
+default the agent made 3 turns and 2 tool calls on a 43-file diff — it read the
+diff and answered, which is the single-shot behaviour this project exists to
+beat. At `high` the same input produced 11 turns and 25 tool calls.
+
+It also *narrows* the variance that makes this benchmark awkward: four samples
+at `high` scored 8, 9, 8, 8, against 5–8 for the default. One high-effort pass
+beats three default passes, at a third of the passes.
+
+Note what did **not** help: a model 10× the price, at default effort, scored the
+same as the cheap one. It is not model strength, it is how long the model is
+allowed to look.
 
 Precision has been 100% in every run scored — no finding has yet failed
 verification against the code.
