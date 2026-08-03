@@ -77,10 +77,12 @@ allowed to look.
 Precision has been 100% in every run scored — no finding has yet failed
 verification against the code.
 
-Two of the 11 have never been found in any configuration: the tailnet CIDR that
-cannot reach the dashboard over a public hostname, and the `validate` task that
-destroys a real `.env`. Both are "the stated thing cannot work" defects, which
-remains this reviewer's weakest class.
+One of the 11 has never been found in any configuration: the tailnet CIDR that
+cannot reach the dashboard over a public hostname. The `validate` task that
+destroys a real `.env` was also unfound until `thinking: high`, which produced
+it — the two hardest findings are both "the stated thing cannot work" defects,
+and raising effort reached one of them. That class remains the weakest, and is
+the case for grounding documentation claims in something authoritative.
 
 The lens result is not a clean refutation of lenses: 5/11 sits inside the
 observed noise band. What *is* solid is the mechanism found while investigating
