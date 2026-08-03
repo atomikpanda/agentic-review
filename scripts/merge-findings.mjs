@@ -25,9 +25,11 @@ import { sameFinding, SIMILARITY_DEFAULT } from "./lib-findings.mjs";
 
 const args = process.argv.slice(2);
 let minVotes = 1;
+let checkOnly = false;
 const files = [];
 for (let i = 0; i < args.length; i++) {
   if (args[i] === "--min-votes") { minVotes = Number(args[++i]) || 1; continue; }
+  if (args[i] === "--check") { checkOnly = true; continue; }
   files.push(args[i]);
 }
 
@@ -46,6 +48,19 @@ function extractJson(text) {
     } catch { /* next */ }
   }
   return null;
+}
+
+// --check: exit 0 if the file holds parseable findings. omp offers no
+// structured-output mode — grepping the bundle finds no json_schema and
+// response_format only in image generation — so the contract cannot be enforced
+// at the API and has to be verified after the fact.
+if (checkOnly) {
+  for (const f of files) {
+    let ok = false;
+    try { ok = !!extractJson(readFileSync(f, "utf8")); } catch { ok = false; }
+    if (!ok) process.exit(1);
+  }
+  process.exit(0);
 }
 
 const merged = [];

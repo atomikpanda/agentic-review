@@ -147,6 +147,21 @@ High — Two lines are wrong
     | FIXED3
 ```
 
+## Reviewer model
+
+Use a model from a **different family than whatever wrote the code**. Greptile
+measured AI reviewers on 500 Claude-authored and 500 Codex-authored PRs, three
+runs each, and found a consistent same-author penalty on high-severity bugs:
+
+| Reviewer | Claude-authored code | GPT-authored code |
+|---|---|---|
+| Claude | 53.7% | **60.0%** |
+| GPT | **62.0%** | 50.5% |
+
+Roughly 8–10 points of recall, purely from not reviewing your own output. The
+default here is an OpenAI model, which is the right side of that table for the
+Claude-written code this project reviews — if you write with Codex, switch it.
+
 ## Symbol index
 
 The prompt carries a symbol and dependency index of the changed files, built

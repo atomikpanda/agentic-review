@@ -447,6 +447,21 @@ TMP_OUT="$(mktemp)"
 
 # One omp invocation. Same allowlist as CI, --tools emitted last so nothing
 # passed after -- can be the winning value, and the prompt supplied as @file.
+# A pass whose output cannot be parsed is wasted compute, and roughly one in
+# three came back that way. omp cannot enforce a JSON schema — it has no
+# structured-output mode — so the only lever is to check afterwards and retry.
+# One retry, because a second failure usually means the prompt, not the dice.
+run_pass_checked() { # run_pass_checked <prompt-file> <out-file>
+  local attempt
+  for attempt in 1 2; do
+    if run_pass "$1" "$2" && [ -s "$2" ]; then
+      if [ -z "${CHECKER:-}" ] || node "$CHECKER" --check "$2" 2>/dev/null; then return 0; fi
+      say "  output unparseable (attempt $attempt)"
+    fi
+  done
+  return 1
+}
+
 run_pass() { # run_pass <prompt-file> <out-file>
   "${OMP[@]}" -p \
     --model="$MODEL" \
@@ -462,6 +477,7 @@ run_pass() { # run_pass <prompt-file> <out-file>
 if [ -n "$LENSES" ]; then
   # One pass per concern. Each gets only its own knowledge, so the prompt stays
   # small and the lenses cannot dilute one another.
+  CHECKER="$(support scripts/merge-findings.mjs 2>/dev/null || true)"
   PASS_OUTS=""; ok_passes=0; li=0
   IFS=',' read -ra _lenses <<< "$LENSES"
   for lens in "${_lenses[@]}"; do
@@ -483,7 +499,7 @@ if [ -n "$LENSES" ]; then
 
     P="$(mktemp)"; O="$(mktemp)"
     build_prompt "$li" "$P" "$lens"
-    if run_pass "$P" "$O" && [ -s "$O" ]; then
+    if run_pass_checked "$P" "$O"; then
       PASS_OUTS="$PASS_OUTS $O"; ok_passes=$((ok_passes + 1))
       say "lens $lens ok ($(grep -cE '^\s*[-*] ' "$TMP_SKILL" 2>/dev/null || echo 0) skill rules)"
     else
@@ -510,12 +526,13 @@ else
   # Repeated sampling. The same model over identical input agreed with itself
   # on only 5 of 9 findings across two runs, so a single pass systematically
   # under-reports; three passes took measured recall from 5/11 to 7/11.
+  CHECKER="$(support scripts/merge-findings.mjs 2>/dev/null || true)"
   PASS_OUTS=""
   ok_passes=0
   for i in $(seq 1 "$PASSES"); do
     P="$(mktemp)"; O="$(mktemp)"
     build_prompt "$i" "$P"
-    if run_pass "$P" "$O" && [ -s "$O" ]; then
+    if run_pass_checked "$P" "$O"; then
       PASS_OUTS="$PASS_OUTS $O"; ok_passes=$((ok_passes + 1)); say "pass $i/$PASSES ok"
     else
       say "pass $i/$PASSES failed — continuing"
