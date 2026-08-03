@@ -14,6 +14,7 @@ reviewing, ask of each change — *if this silently did nothing, what would the
 symptom be?* If the answer is "nothing visible", flag it.
 
 ## Caddy / reverse proxies
+<!-- when: Caddyfile, *.caddy, edge/**, *nginx*, *.conf -->
 
 - **`trusted_proxies` without `trusted_proxies_strict` is an auth bypass.**
   Caddy takes the **leftmost** `X-Forwarded-For` entry as `client_ip`. CDNs
@@ -30,6 +31,7 @@ symptom be?* If the answer is "nothing visible", flag it.
   it cannot match an admin path such as `/api/thing`.
 
 ## cloud-init
+<!-- when: *cloud-init*, *cloud-config*, user-data* -->
 
 - **`runcmd` runs as `/bin/sh` with no `set -e`.** Every failure is logged and
   stepped over; bootstrap "succeeds" regardless. Any cloud-config whose runcmd
@@ -44,6 +46,7 @@ symptom be?* If the answer is "nothing visible", flag it.
 - **Changing user_data does nothing to a running instance** — first boot only.
 
 ## Terraform
+<!-- when: *.tf, *.tfvars, *.hcl, infra/** -->
 
 - **A gitignored `terraform.tfvars` does not exist in CI.** Every variable
   without a default must then come from `TF_VAR_*`, or plan/apply fails — and
@@ -57,6 +60,7 @@ symptom be?* If the answer is "nothing visible", flag it.
 - **Commit `.terraform.lock.hcl`** so CI resolves the tested provider versions.
 
 ## Firewalls and overlay networks
+<!-- when: *.tf, *firewall*, *cloud-init*, *tailscale*, *.hcl -->
 
 - **A cloud firewall filters the public interface only.** WireGuard-based
   overlays (Tailscale etc.) arrive as UDP and are decapsulated *inside* the
@@ -71,6 +75,7 @@ symptom be?* If the answer is "nothing visible", flag it.
   ingress, host firewalls must be disabled, not merely unused.
 
 ## Agents, bouncers, and anything with a shared key
+<!-- when: docker-compose*.yml, *cloud-init*, *.env*, *crowdsec* -->
 
 - **Installed ≠ enforcing.** A package that installs and auto-starts with a
   default key will sit `active` while failing authentication — enforcing
@@ -79,6 +84,7 @@ symptom be?* If the answer is "nothing visible", flag it.
   disabled**, and started only after the key is written.
 
 ## Shell and setup scripts
+<!-- when: *.sh, *.bash, *.zsh, Taskfile.yml, Makefile, *.mk -->
 
 - **`printf "$var"` treats data as a format string.** Any `%s` in user content
   (an SSH key comment, a path) silently mutates output. Use `printf '%s'` or a
@@ -97,6 +103,7 @@ symptom be?* If the answer is "nothing visible", flag it.
   success points config at an unreadable bucket.
 
 ## Docker
+<!-- when: Dockerfile*, docker-compose*.yml, *.dockerfile, .dockerignore -->
 
 - **`COPY` dereferences symlinks.** Copying a global npm binary produces a real
   file outside its package, so `require` resolves from the wrong directory. The
@@ -108,6 +115,7 @@ symptom be?* If the answer is "nothing visible", flag it.
   app writes in place; an atomic rename-based write breaks it.
 
 ## CI/CD
+<!-- when: .github/workflows/**, .gitlab-ci.yml, *.github-actions.yml, Jenkinsfile -->
 
 - **`workflow_run` does not deploy the commit that passed.** `git reset --hard
   origin/main` ships whatever the tip is now; if another commit landed while
@@ -119,6 +127,60 @@ symptom be?* If the answer is "nothing visible", flag it.
   approves nothing, and the job runs unattended.
 - **Path-based secret scanning that excludes `*.example` or `.github/**`** will
   miss a real key pasted there. Detect placeholder *content* instead.
+
+## CLI tools invoked from scripts and CI
+<!-- when: *.sh, .github/workflows/**, Taskfile.yml, *.mjs, *.js, *.ts -->
+
+- **"It reads stdin" is an assumption, not a fact — verify it.** A CLI that
+  takes a prompt or payload may only read piped stdin behind a guard like
+  `if (process.stdin.isTTY !== false) return`. On both node and bun that
+  property is `undefined` for a redirect *or* a pipe — it is never `false` —
+  so the guard always returns early and the input is silently discarded. The
+  program then has no work, does it successfully, and **exits 0 having produced
+  nothing**. `cmd < input.txt` in a workflow is worth checking against the
+  tool's actual argument handling; the alternative is usually a positional
+  argument or an `@file` form.
+- **Exit 0 with empty output is not success.** Any step that captures a
+  command's stdout to a file must assert the file is non-empty before treating
+  it as a result. Without that assertion, "produced a correct empty answer" and
+  "never ran" are the same green check — and the second is far more likely.
+- **Check what an approval or confirmation flag actually maps to.** A name like
+  `always-ask` can be the *tightest* setting rather than an interactive one
+  (auto-approving a read tier while blocking write and exec), and the default
+  when the flag is omitted can be the most permissive one. Read the mapping
+  before assuming the safe-sounding name is the safe behaviour.
+- **A runtime is a hard dependency when the entrypoint names it.** A `#!/usr/bin/env bun`
+  shebang plus `bun:` imports means node cannot run the tool at all — a
+  `node`/`npx` fallback in a script is dead code that fails with an error
+  pointing nowhere near the cause. Honour `engines` too: a too-old runtime can
+  surface as a minified `SyntaxError`.
+
+## Agent tooling run against untrusted code
+<!-- when: .github/workflows/**, *.sh, *.mjs, mcp.json, .mcp.json -->
+
+- **A tool allowlist does not bound what an agent can do if the tool loads
+  configuration from the working directory.** Coding agents discover MCP
+  servers, language servers, hooks and plugins from project-level config —
+  `.omp/mcp.json`, `.claude/mcp.json`, `.cursor/mcp.json`, `lsp.json` — and
+  those files name a *command* the agent then spawns. When the working
+  directory is a checked-out pull request, that config is written by the
+  contributor. Execution happens at startup, before any tool call, so a
+  read-only tool list, an approval mode and flags like `--no-extensions` all
+  miss it entirely. Verified live: `.omp/mcp.json` naming `/bin/sh -c "touch
+  PROOF"` executed under a strict read-only allowlist.
+  **Delete agent configuration from a checkout before pointing an agent at it**,
+  and grep any new agent integration for "config discovered from the project
+  directory" before trusting its sandbox.
+- **Enumerate every path the tool reads, not just the obvious one.** A first
+  attempt at this defence removed the agent *directories* and left `./mcp.json`
+  and `./.mcp.json` at the repository root, which load and spawn exactly the
+  same way. A partial strip reads as a fix in review and leaves the hole open.
+- **Ask which directory a tool treats as "the project".** The dangerous case is
+  a tool whose config search starts at `--cwd`, because that is the attacker's
+  directory in a CI review. A tool that only reads `$HOME` is fine.
+- **A CI step that removes files does not blind the review**, as long as the
+  diff is supplied separately: the content is still visible as text, it just
+  cannot act as configuration.
 
 ## Documentation is reviewable
 

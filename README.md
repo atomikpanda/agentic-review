@@ -3,9 +3,10 @@
 Read-only agentic code review for GitHub pull requests, assembled from existing
 tools rather than built from scratch. One command to enable on a repo.
 
-It reviews what a diff cannot show — whether a referenced config value actually
-exists, whether a dependency is gitignored and therefore absent in CI, whether
-something is installed but never configured.
+The agent gets the diff **and** the checked-out tree, so it reviews what a diff
+alone cannot show — whether a referenced config value actually exists, whether a
+dependency is gitignored and therefore absent in CI, whether something is
+installed but never configured.
 
 ## Enable on a repo
 
@@ -25,13 +26,372 @@ curl -fsSL .../install-review.sh | bash -s -- --repo owner/name --openrouter-key
 
 ## Run it locally
 
+Local runs are first-class: they remember what they have already said.
+
 ```bash
-export OPENROUTER_API_KEY=sk-or-...
-./scripts/run-review.sh            # vs the default branch
-./scripts/run-review.sh --staged   # only what's staged
+review                       # review vs the default branch
+review --review-mode suggest # with the fixes it would offer on a PR
+review --open                # findings still open from earlier runs
+review --dismiss a1b2c3      # stop reporting one you have judged
+review --history             # past runs
 ```
 
-Exits non-zero when there are findings, so it works as a pre-push hook.
+State lives in the repository's git common directory — per-repo, shared across
+worktrees, never committable. Each run reports `N new, N recurring` rather than
+re-listing everything, and a finding is only marked **gone** when the file it
+pointed at actually changed. If the file is untouched the run says
+`unreported but unchanged`, because the reviewer failing to mention something is
+not the same as it being fixed.
+
+[`skills/review-loop/SKILL.md`](skills/review-loop/SKILL.md) describes the
+iterate-until-clean workflow, including when to stop.
+
+[`scripts/watch-pr.sh`](scripts/watch-pr.sh) tails a pull request's review
+comments as they arrive. Read-only — it never comments, resolves or edits.
+
+## Suppressing writes
+
+`suppress_writes: true` (workflow) produces the review and changes **nothing** on
+the pull request: no comment, no resolved thread, no edited comment. The
+artifact is still uploaded and `fail_on_findings` still applies. Use it to trial
+a configuration against a live pull request without touching it.
+
+This is not `post_comment: false`, which skipped the comment while leaving thread
+retirement and the gate in inconsistent states.
+
+## Run it locally (details)
+
+No GitHub involved — it reviews a local diff and writes the result to stdout.
+
+```bash
+export OPENROUTER_API_KEY=sk-or-v1-yourkeyhere   # or see OPENROUTER_API_KEY_FILE
+./scripts/run-review.sh                        # vs the default branch
+./scripts/run-review.sh --staged               # only what's staged
+./scripts/run-review.sh --review-mode suggest  # with the fixes it would offer
+./scripts/run-review.sh --json | jq '.findings[].file'
+```
+
+**Works from any repository.** The prompt, output format and skill file are
+resolved relative to the script itself (symlinks followed), then overridden by
+the repo under review if it ships its own. So you can symlink it onto `PATH`
+and run it anywhere:
+
+```bash
+ln -s "$PWD/scripts/run-review.sh" ~/.local/bin/review
+cd ~/some/other/project && review --base main
+```
+
+Keeping the key out of shell history: set `OPENROUTER_API_KEY_FILE` to a file
+containing it instead of passing the value inline.
+
+```bash
+printf '%s' 'sk-or-v1-...' > ~/.config/openrouter-key && chmod 600 ~/.config/openrouter-key
+OPENROUTER_API_KEY_FILE=~/.config/openrouter-key ./scripts/run-review.sh
+```
+
+All progress goes to stderr and only the review goes to stdout, so it pipes
+cleanly. Exits non-zero when there are findings, so it also works as a pre-push
+hook.
+
+## Suggested fixes
+
+By default the reviewer posts **inline review comments with committable
+`suggestion` blocks** — the same "Commit suggestion" button you get from a
+human reviewer, not a wall of prose at the bottom of the PR.
+
+| `review_mode` | What you get |
+|---|---|
+| `suggest` (default) | Inline comments anchored to the offending lines, each with a ready-to-commit fix where the agent could produce a complete one |
+| `inline` | The same inline comments, explanation only, no fixes |
+| `summary` | One issue comment containing everything — no line anchoring |
+
+This is a different mechanism, not a different format. A suggestion has to be
+an inline review comment attached to a line range **inside the pull request's
+diff**, so the agent emits structured findings (`file`, `start_line`,
+`end_line`, `suggestion`) rather than markdown, and
+[`scripts/post-review.mjs`](scripts/post-review.mjs) turns them into one
+`POST /pulls/{n}/reviews` call.
+
+Three things that mechanism forces, all handled:
+
+- **Anchoring is validated against the real diff.** GitHub rejects the *entire*
+  review if any single comment names a line outside the diff, so every finding
+  is checked against the actual hunk ranges first. Findings that cannot anchor
+  are moved into the summary instead of being dropped — a real defect in
+  untouched code is still worth saying.
+- **A wrong suggestion is worse than none.** The fix has to be the complete
+  replacement for the lines it spans, with original indentation, because
+  someone will click the button. The prompt tells the agent to emit `null`
+  whenever it cannot produce that, and a comment with no suggestion is a
+  perfectly good outcome.
+- **The review is never lost.** If the inline post is rejected anyway, it falls
+  back to posting everything as a summary rather than failing silently.
+
+### Readiness score
+
+Every review opens with a 0–5 readiness score, from the severity and quantity of
+what was found, mapped to an action:
+
+| Score | Meaning | Action |
+|---|---|---|
+| 5/5 | Production ready | Merge |
+| 4/5 | Minor polish needed | Merge after small fixes |
+| 3/5 | Implementation issues | Address feedback first |
+| 2/5 | Significant bugs | Needs rework |
+| 0–1/5 | Critical problems | Major rethink needed |
+
+Findings carry priority badges: **`P0` Critical** (must fix — security, data
+loss, crashes), **`P1` High** (bugs, incorrect behaviour, edge cases), **`P2`
+Medium** (quality, maintainability).
+
+**The score is capped at 3/5 when the review could not do its job** — a
+truncated diff or a failed pass produces few findings for the same reason a
+clean change does, and "production ready" inferred from a review that read half
+the diff is the most dangerous output this tool could emit. The cap only ever
+moves the score down, and says what it was capped from.
+
+Two signals Greptile factors in that this does not: change complexity, and how
+well the code matches existing codebase patterns. Neither is implemented here,
+so the score is a severity aggregate rather than a full readiness model.
+
+### Merge gate
+
+Every review opens with one of three verdicts:
+
+| | Meaning |
+|---|---|
+| ✅ **Clear** | No `Critical`/`High` findings, whole diff reviewed, every pass completed |
+| ⛔ **Blocked** | Findings at or above `block_severities` |
+| ⚠️ **Inconclusive** | Nothing blocking found, but the review could not do its job — truncated diff, a failed pass, or the findings cap reached |
+
+Three states rather than two, because a boolean forces a review that could not
+do its job into "clear". A truncated diff produces no findings for the same
+reason a genuinely clean change does, and the reader cannot tell those apart
+unless the tool says which happened.
+
+`fail_on_findings: true` fails the job when the gate says **blocked** — not on
+any finding. Failing a build over a Medium was never the intent, and an
+inconclusive review is reported rather than failed, because that fault is ours
+rather than the contributor's.
+
+### Review confidence
+
+Every review opens with a 1–5 score. It rates **the review, not the code** —
+how much to trust this particular run — and it is computed from what was
+observed, not from the model's opinion of its own work: passes that returned
+usable output, whether the diff was truncated, whether any injected knowledge
+matched the file types.
+
+A "safe to merge" score would be the more natural feature and the wrong one.
+That is a claim about the code, and measured recall here is 8–9 of 11 known
+defects — so about one in five is missed, and such a score would read highest
+exactly when the reviewer found nothing, which is also what a review that did
+not look hard enough produces. Identical configurations scored 5, 6, 7, 8 and 9
+on the same input, so it would not even be stable across re-runs.
+
+**A clean review is not evidence of safety**, and the comment says so every time.
+
+### Comments don't pile up
+
+Findings are re-derived from scratch on every push, so each comment embeds a
+fingerprint. Matching is **fuzzy**, because an exact hash does not work: the
+same defect came back on this repo's own PR as "bun_version input is not passed
+to setup-bun", "Configured Bun version is ignored" and "Configured Bun version
+is not passed to setup-bun", each producing a new thread and leaving the last
+one un-retired. So a finding matches an existing thread when it is in the same
+file and the significant-word overlap clears `SIMILARITY` (0.30). Measured on
+that PR's real duplicates: same-issue pairs score 0.37–0.49, different-issue
+pairs 0.03–0.16, and the rule classifies 10/10 correctly.
+
+A later run uses that to:
+
+- **stay silent** about a finding whose thread is still open, instead of posting
+  it again on every push — the thing that makes bot reviewers get muted
+- **retire** the threads it opened earlier and no longer reports, including the
+  everything-fixed case where the run returns no findings at all
+
+On retiring: `GITHUB_TOKEN` **cannot resolve review threads**. GitHub answers
+`resolveReviewThread` with `FORBIDDEN — Resource not accessible by integration`
+no matter which permissions the workflow declares; only a PAT or a suitably
+scoped GitHub App can. Editing our own comment is permitted, so a stale finding
+is instead prefixed `✅ No longer reported as of <commit>` — linking the commit
+reviewed — with the original folded into a `<details>`.
+
+It deliberately does **not** say "fixed in <commit>". All that is known is that
+this run did not raise the finding, not that anything fixed it; models give
+inconsistent verdicts across runs of identical code. So the note reports one
+cheap check instead: whether the file changed since the finding was raised. If
+it did not, the marker becomes `⚠️ … but <file> has not changed since`, which
+says plainly that the disappearance is unexplained rather than implying a fix. If you supply a token that can resolve, threads are resolved
+properly and the fallback never runs.
+
+It also **stays quiet about anything a human already resolved**, while the code
+under it is unchanged. Resolving a thread is a decision — fixed, intentional, or
+won't fix — and re-raising it every push is how a reviewer gets muted. If the
+file changes afterwards the finding is raised again, because then the defect may
+genuinely be back.
+
+What it deliberately does **not** do is read the comment text. Adversarial
+comments flip 91–100% of LLM vulnerability verdicts
+([arXiv 2607.24964](https://arxiv.org/html/2607.24964)), and prompt-level
+"ignore untrusted content" instructions barely dent that — only keeping the text
+out of the prompt works, which drops it below 3%. Pull-request comments are
+easier to inject than code comments, since posting one requires no merge. So
+this reads a marker we wrote, a boolean, and a `git diff` — no attacker-authored
+text reaches the model.
+
+Only threads carrying that marker are ever touched; a human's review thread has
+no fingerprint and cannot match. Resolution is skipped when a run hits
+`max_findings`, because there a missing finding may have been squeezed out
+rather than fixed, and resolving it would quietly retract a live defect. Turn
+the whole thing off with `resolve_stale: false`.
+
+The event is always `COMMENT`, never `REQUEST_CHANGES` — use
+`fail_on_findings` if you want the check itself to block.
+
+Locally, `--review-mode suggest` prints each finding with the fix it would
+offer, using the same parser as CI:
+
+```
+High — Two lines are wrong
+  edge/Caddyfile:2-3
+  They break the thing.
+  suggested fix:
+    | FIXED2
+    | FIXED3
+```
+
+## Reviewer model
+
+Use a model from a **different family than whatever wrote the code**. Greptile
+measured AI reviewers on 500 Claude-authored and 500 Codex-authored PRs, three
+runs each, and found a consistent same-author penalty on high-severity bugs:
+
+| Reviewer | Claude-authored code | GPT-authored code |
+|---|---|---|
+| Claude | 53.7% | **60.0%** |
+| GPT | **62.0%** | 50.5% |
+
+Roughly 8–10 points of recall, purely from not reviewing your own output. The
+default here is an OpenAI model, which is the right side of that table for the
+Claude-written code this project reviews — if you write with Codex, switch it.
+
+## Symbol index
+
+The prompt carries a symbol and dependency index of the changed files, built
+with [codegraph](https://github.com/colbymchenry/codegraph): per file, every
+symbol it defines with a line number, and which other files depend on it. That
+is the blast radius a diff cannot show.
+
+It uses tree-sitter and **never runs the project's build system**, which is the
+property that rules out every SCIP-class indexer here — this parses
+attacker-authored pull requests. Indexing 35 Swift files takes under a second.
+It soft-fails: a missing index makes a review worse, never wrong.
+
+Two things the pull request is not allowed to influence: `codegraph.json` is
+restored from the base commit before indexing, so a PR cannot `exclude` the
+files it changes and hide them from its own review, and telemetry is disabled
+in CI (it is on by default).
+
+Locally it is used only if the repo is **already indexed** — `run-review.sh`
+will not run `codegraph init` for you, because a review tool should not leave a
+`.codegraph/` directory in your working tree uninvited:
+
+```bash
+codegraph init .        # once per project
+./scripts/run-review.sh
+```
+
+## Configuration
+
+Every knob is settable on all three surfaces, under the same name. Defaults are
+defined once, in the reusable workflow — an enrolled repo that overrides nothing
+keeps tracking them.
+
+| Setting | Default | Workflow `with:` | `install-review.sh` | `run-review.sh` |
+|---|---|---|---|---|
+| Model slug | `openrouter/openai/gpt-5.6-luna` | `model` | `--model` | `--model` |
+| Reasoning effort | `high` | `thinking` | `--thinking` | `--thinking` |
+| Tool allowlist | `read,grep,glob,ast_grep` | `tools` | `--tools` | `--tools` |
+| Wall-clock cap | none | `max_time` | `--max-time` | `--max-time` |
+| Review prompt | `review/prompt.md` | `prompt_path` | `--prompt` | `--prompt` |
+| Injected knowledge | both skills (comma-separated list) | `skills_path` | `--skill` | `--skill` |
+| Review style | `suggest` | `review_mode` | `--review-mode` | `--review-mode` |
+| Findings cap | `20` (`0` = none) | `max_findings` | `--max-findings` | `--max-findings` |
+| Post a PR comment | `true` | `post_comment` | `--no-comment` | n/a |
+| Resolve stale threads | `true` | `resolve_stale` | n/a | n/a |
+| Block the PR on findings | `false` | `fail_on_findings` | `--fail-on-findings` | `--no-fail` inverts |
+| Job timeout | `20` | `timeout_minutes` | n/a | n/a |
+| Diff size cap | `400000` bytes | `max_diff_bytes` | n/a | `$AGENTIC_REVIEW_MAX_DIFF_BYTES` |
+| Symbol index | on | `codegraph` | n/a | auto when indexed |
+| Pin codegraph | latest | `codegraph_version` | n/a | n/a |
+| Central repo | this repo | `central_repo` | `CENTRAL_REPO=` env | n/a |
+| Pin bun | `latest` | `bun_version` | `--bun-version` | n/a |
+| Pin omp | `latest` | `omp_version` | `--omp-version` | `--omp-version` |
+| Any other omp flag | none | `extra_omp_args` | `--extra-omp-args` | after `--` |
+
+`thinking` accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` or
+`auto`. `max_time` accepts `600`, `10m`, `1h`.
+
+In a workflow:
+
+```yaml
+jobs:
+  review:
+    uses: atomikpanda/agentic-review/.github/workflows/agentic-review.yml@main
+    secrets:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    with:
+      model: openrouter/anthropic/claude-sonnet-5
+      thinking: high
+      max_time: 12m
+      fail_on_findings: true
+```
+
+At install time — the same values, written into the caller for you:
+
+```bash
+curl -fsSL .../install-review.sh | bash -s -- \
+  --repo owner/name --yes \
+  --model openrouter/anthropic/claude-sonnet-5 --thinking high --max-time 12m
+```
+
+Locally, every flag also reads an `AGENTIC_REVIEW_*` environment default, so you
+can set them once in your shell profile:
+
+```bash
+export AGENTIC_REVIEW_MODEL=openrouter/anthropic/claude-sonnet-5
+export AGENTIC_REVIEW_THINKING=high
+./scripts/run-review.sh -- --add-dir ../shared-config
+```
+
+The runner is **not** an input. `runs-on` is resolved before any step executes,
+so a caller-supplied value cannot be validated — the validation would already be
+running on the runner it was meant to vet, and `self-hosted` would put
+attacker-authored PR content on a persistent machine holding your model key.
+
+Fork pull requests are **skipped**, not failed. GitHub never passes secrets to
+them, so the run cannot succeed; failing would put a red X on every outside
+contribution that the contributor has no way to fix. Reviewing forks would
+require `pull_request_target`, which is the trade this project refuses.
+
+### What is not configurable
+
+`tools` is validated against the read-only set below and the job fails on
+anything outside it. `extra_omp_args` (and anything after `--` locally) rejects
+`--tools`, `--no-tools`, `--system-prompt`, `--api-key`, `--approval-mode`,
+`--auto-approve` and `--yolo`, and the validated `--tools` is emitted last on the
+command line so it wins regardless. Widening the reviewer to write or execute is
+a fork, not a flag — see below for why.
+
+## PR-Agent
+
+PR-Agent is configured separately, in each repo's `.pr_agent.toml`, which the
+self-hosted App reads from the default branch. `install-review.sh --pr-agent-model`
+writes one. Setting a model there also writes `custom_model_max_tokens`, which is
+mandatory: PR-Agent's token table is keyed on exact model names and has no
+`openrouter/*` entries, so a model set without a declared context window fails
+every run.
 
 ## How it works
 
@@ -41,11 +401,27 @@ read-only tool allowlist:
 | Enabled | Why |
 |---|---|
 | `read`, `grep`, `glob` | Read files the diff depends on but doesn't touch |
-| `lsp` | Cross-file symbol resolution |
 | `ast_grep` | Structural queries over 50+ tree-sitter grammars |
 
-Excluded: `bash`, `edit`, `write`, `ast_edit`, `eval`, `debug`, `python`,
-`browser`, `computer`, `github`, `task`, `web_search`, `memory_edit`.
+`inspect_image` and `todo` are also permitted but off by default — those six
+are the entire set `tools` will accept.
+
+Excluded: `bash`, `edit`, `write`, `ast_edit`, `eval`, `debug`, `browser`,
+`computer`, `github`, `task`, `hub`, `web_search`, `memory_edit`, `retain`,
+`learn`, `manage_skill`, `checkpoint`, `rewind`, `ask`, `security_scan`, `lsp`.
+
+Three of those read as harmless and are not:
+
+- **`lsp`** — omp discovers language-server configuration from the *project*
+  directory (`lsp.json`, `.lsp.json`, `.lsp.yaml`…), and the project directory
+  here is the checked-out pull request. A PR can commit an `lsp.json` naming
+  any command; `lsp` is read-tier, so the approval mode auto-approves it and
+  omp spawns that command with the model key in its environment. Excluding it
+  cost this project cross-file symbol resolution — `ast_grep` and `grep` carry
+  that load instead.
+- **`security_scan`** — classified `exec` by omp, and reaches an external cloud
+  service.
+- **`web_search`** — network egress. `ask` also blocks forever under `-p`.
 
 A PR diff is attacker-controlled text and this agent reads it, so it must not
 be able to execute anything, modify the checkout, reach the network, or write
@@ -61,6 +437,10 @@ The workflow uses `pull_request`, never `pull_request_target` — the latter run
 a writable token against untrusted head code.
 
 ## Knowledge injection
+
+Two skills ship, and `skills_path` takes a comma-separated list so a repo gets
+both — the infra catalogue contributes almost nothing to a Swift or TypeScript
+project, and the security classes contribute little to a Caddyfile.
 
 [`skills/infra-review/SKILL.md`](skills/infra-review/SKILL.md) is a catalogue of
 tool-default behaviours that look correct in a diff and fail silently in
@@ -94,7 +474,25 @@ overlapping sets of inline comments.
 
 Roughly $0.10–0.30 per review on `gpt-5.6-luna` ($0.10/Mtok in). Agentic cost
 scales with how much the agent explores, so it is less predictable than a
-single-shot reviewer — bound it with the workflow's `timeout-minutes`.
+single-shot reviewer. Three knobs bound it: `max_time` (a hard cap omp enforces
+itself), `timeout_minutes` (the job ceiling), and `thinking` — dropping to `low`
+or `off` cuts reasoning tokens, which dominate on a large diff.
+
+## Requirements
+
+`omp` ships `#!/usr/bin/env bun`, imports `bun:` builtins, and declares
+`engines.bun >= 1.3.14`. It does not run under node — attempting it fails with
+`ERR_UNSUPPORTED_ESM_URL_SCHEME`, and an older bun fails with a minified
+`SyntaxError`. CI installs bun via `oven-sh/setup-bun`; `run-review.sh` checks
+the local version before it starts and says so if it is too old.
+
+## Measuring changes
+
+[`BENCHMARK.md`](BENCHMARK.md) describes a reference set — a real commit with 11
+independently-produced findings — and how to run against it. It also records the
+measured run-to-run variance, which is ±2 findings on an 11-item set: **a single
+run cannot distinguish two configurations.** Several tuning decisions made
+during development looked conclusive on one sample and were not.
 
 ## Licence
 

@@ -14,24 +14,163 @@ name: agentic-review
 #     review:
 #       uses: <owner>/agentic-review/.github/workflows/agentic-review.yml@main
 #       secrets: { OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }} }
+#       with:
+#         model: openrouter/anthropic/claude-sonnet-5
+#         thinking: high
+#
+# Every knob below has a default, so `with:` is optional. See README.md for the
+# full table and the matching flags on scripts/run-review.sh.
 
 on:
   workflow_call:
     inputs:
+      # --- model ------------------------------------------------------------
       model:
-        description: Model slug, provider-prefixed.
+        description: Model slug, provider-prefixed (as it appears on openrouter.ai/models).
         type: string
         default: openrouter/openai/gpt-5.6-luna
-      skills_path:
-        description: File appended to the system prompt (a SKILL.md, or any guidance file).
+      thinking:
+        description: >-
+          Reasoning effort — off|minimal|low|medium|high|xhigh|max|auto.
+          Defaults to high: at the model default the agent made 2 tool calls on a
+          43-file diff and behaved like a single-shot reviewer; at high it made
+          25 and measured recall went 5/11 to 8/11. Lower it to trade accuracy
+          for time and cost.
         type: string
-        default: skills/infra-review/SKILL.md
+        default: high
+      # --- what the agent may do -------------------------------------------
+      tools:
+        description: >-
+          Comma-separated omp tool allowlist. Validated against a read-only set;
+          anything outside it fails the job. See READ_ONLY_TOOLS below.
+        type: string
+        default: read,grep,glob,ast_grep
+      max_time:
+        description: Hard wall-clock cap passed to omp (e.g. 600, 10m, 1h). Empty means no cap.
+        type: string
+        default: ''
+      # --- prompt and injected knowledge ------------------------------------
+      prompt_path:
+        description: >-
+          Review instructions. Resolved from the reviewed repo's BASE commit first,
+          then from the central repo — never from the pull request's own tree.
+        type: string
+        default: review/prompt.md
+      skills_path:
+        description: >-
+          Comma-separated list of files appended to the system prompt. Each is
+          resolved base-then-central like prompt_path, and all are concatenated.
+        type: string
+        default: skills/infra-review/SKILL.md,skills/security-review/SKILL.md
       max_findings:
+        description: Upper bound on findings requested in the prompt. 0 disables the cap.
         type: number
         default: 20
+      codegraph:
+        description: >-
+          Build a symbol/dependency index of the changed files with codegraph
+          (tree-sitter, never runs the project's build) and put it in the prompt.
+          Adds roughly a second of indexing on a small repo.
+        type: boolean
+        default: true
+      codegraph_version:
+        description: codegraph release to pin, e.g. v1.5.0. Empty tracks the latest release.
+        type: string
+        default: ''
+      max_diff_bytes:
+        description: >-
+          Cap on how much of the diff is put in the prompt. The diff dominates
+          token cost on a large pull request; beyond this it is truncated and
+          the agent is told so. 0 sends the whole thing.
+        type: number
+        default: 400000
+      # --- outputs ----------------------------------------------------------
+      review_mode:
+        description: >-
+          suggest — inline review comments with committable ```suggestion blocks
+          where the agent can produce a complete fix (default).
+          inline — the same inline comments, explanations only, no fixes.
+          summary — one issue comment with everything in it, no line anchoring.
+        type: string
+        default: suggest
+      resolve_stale:
+        description: >-
+          On each run, resolve the review threads this reviewer opened earlier
+          and no longer reports, and stay silent about findings whose thread is
+          still open instead of posting them again.
+        type: boolean
+        default: true
+      suppress_writes:
+        description: >-
+          Produce the review but make no change to the pull request at all — no
+          comment, no resolved thread, no edited comment. The artifact is still
+          uploaded and fail_on_findings still applies. Use it to trial a config
+          on a live pull request without touching it.
+        type: boolean
+        default: false
+      post_comment:
+        description: Post the review as a PR comment. Off still uploads the artifact.
+        type: boolean
+        default: true
+      fail_on_findings:
+        description: >-
+          Fail the job when the merge gate says blocked — that is, when a finding
+          lands on one of block_severities. Not on any finding: failing a build
+          over a Medium was never the intent, and an inconclusive review is
+          reported rather than failed, because that fault is ours.
+        type: boolean
+        default: false
+      block_severities:
+        description: Severities that block the merge gate. Empty blocks on nothing.
+        type: string
+        default: Critical,High
+      # --- runner and pinning ----------------------------------------------
+      #
+      # There is deliberately no `runs_on` input. `runs-on` is resolved before
+      # any step executes, so a value cannot be validated by this workflow —
+      # validation code would already be running on the runner it was meant to
+      # vet. A caller-supplied `self-hosted` would therefore check out
+      # attacker-authored PR content onto a persistent machine holding the
+      # model key. Changing the runner is a fork, not an input.
+      # There is deliberately no `central_repo` input. It is derived from
+      # github.workflow_ref — the repository this very workflow file was loaded
+      # from — because a caller-supplied value was an execution hole: a same-repo
+      # pull request could edit its own caller to point at any repository, and
+      # the poster fetched from there runs with a token that can write to the
+      # pull request. Deriving it is also correct for forks, which was the only
+      # reason the input existed.
+      central_ref:
+        description: >-
+          Ref of the central repository to take the prompt, skills and poster
+          from. Should match the ref the caller pins the workflow to, or a pinned
+          install runs pinned workflow logic against moving support files. Only
+          the ref is configurable — the repository is a literal, because that is
+          what a pull request must not be able to redirect.
+        type: string
+        default: main
+      timeout_minutes:
+        description: Job timeout.
+        type: number
+        default: 20
+      bun_version:
+        description: Bun version. omp requires >= 1.3.14 and is bun-only — it does not run under node.
+        type: string
+        default: latest
+      omp_version:
+        description: npm dist-tag or exact version of @oh-my-pi/pi-coding-agent. Pin for reproducible reviews.
+        type: string
+        default: latest
+      extra_omp_args:
+        description: >-
+          Escape hatch for omp flags with no input above (e.g. "--add-dir docs --print-thoughts").
+          Split on whitespace, so values containing spaces are not supported — use the named
+          inputs for those. Flags that would defeat the read-only envelope are rejected.
+        type: string
+        default: ''
     secrets:
       OPENROUTER_API_KEY:
         required: true
+
   # Not `pull_request_target`. That would run with a writable token against
   # untrusted head code, which is the standard way this pattern becomes a
   # repo-compromise. `pull_request` gets a read-only token on forks.
@@ -64,37 +203,282 @@ jobs:
     # Skip drafts — matches pr-agent's handle_pr_actions, which fires on
     # ready_for_review rather than while a PR is still being iterated on.
     # A draft PR pushed ten times would otherwise cost ten reviews.
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    #
+    # Fork pull requests are skipped rather than failed. GitHub does not pass
+    # repository secrets to them, so the model key is always empty and the run
+    # cannot succeed. Letting it start would put a red X on every outside
+    # contribution — a worse outcome than no review, and not something the
+    # contributor can fix. `pull_request_target` would make secrets available
+    # and is exactly the trade this project refuses to make.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+      && github.event.pull_request.head.repo.fork != true
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: ${{ inputs.timeout_minutes || 20 }}
     steps:
       - uses: actions/checkout@v4
         with:
           # Need the base commit to diff against.
           fetch-depth: 0
+          # actions/checkout otherwise writes a basic-auth header containing the
+          # workflow token into .git/config, and it stays there for the rest of
+          # the job. The agent has `read`, so a prompt injection in the diff can
+          # ask for .git/config and the token lands in a public PR comment.
+          # Everything after this point is local git — diff, show, cat-file — so
+          # nothing needs the credential to persist.
+          persist-credentials: false
 
       # The skill library lives in the central repo, so a repo enrolled by
       # install-review.sh gets the accumulated review knowledge without copying
       # files into it. Soft-fails: if the central repo is private or moved, the
       # review still runs, just without injected knowledge.
-      - name: fetch shared skills
+      # `github.repository_owner` here is the OWNER OF THE REPO BEING REVIEWED,
+      # not of this workflow — so it used to look for <them>/agentic-review and
+      # fail for everyone except this project's owner, taking the default
+      # prompt with it. The central repo is named explicitly instead.
+      - name: fetch shared prompt, skills and poster
         id: central
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/agentic-review
-          ref: main
+          # A LITERAL, on purpose, and not an input.
+          #
+          # As an input, a same-repository pull request could edit its own caller
+          # to point this anywhere, and the poster fetched from here runs with a
+          # token that can write to the pull request.
+          #
+          # Deriving it from github.workflow_ref was worse. In a reusable
+          # workflow that context describes the CALLER's entry-point workflow,
+          # not this file, so on an enrolled repository it resolved to the repo
+          # being reviewed — fetching the poster from the very tree under review.
+          # There is no context variable that names the reusable workflow's own
+          # repository.
+          #
+          # A literal is correct because it lives in THIS file: a consuming
+          # repository cannot change it, and a fork's copy names the fork.
+          repository: atomikpanda/agentic-review
+          ref: ${{ inputs.central_ref || 'main' }}
+          persist-credentials: false
           path: .central-skills
           sparse-checkout: |
             skills
             review
+            scripts
+
+      # Every input is resolved here, once, into the environment. Two reasons:
+      #
+      # 1. Inputs are NOT populated when this workflow runs from its own
+      #    `pull_request` trigger rather than via `workflow_call` — and
+      #    `default:` does not apply on that path either. Every value therefore
+      #    needs a shell-side fallback, and having them in one block is the only
+      #    way to keep the two paths honestly identical.
+      # 2. `${{ inputs.x }}` expanded directly inside a `run:` body is template
+      #    substitution into shell source. A value containing a backtick or
+      #    $(...) would execute. Passing through `env:` makes them data.
+      - name: resolve config
+        env:
+          IN_MODEL: ${{ inputs.model }}
+          IN_THINKING: ${{ inputs.thinking }}
+          IN_TOOLS: ${{ inputs.tools }}
+          IN_CENTRAL_REPO: atomikpanda/agentic-review
+          IN_MAX_TIME: ${{ inputs.max_time }}
+          IN_PROMPT_PATH: ${{ inputs.prompt_path }}
+          IN_SKILLS_PATH: ${{ inputs.skills_path }}
+          IN_MAX_FINDINGS: ${{ inputs.max_findings }}
+          IN_MAX_DIFF_BYTES: ${{ inputs.max_diff_bytes }}
+          IN_CODEGRAPH: ${{ inputs.codegraph }}
+          IN_CODEGRAPH_VERSION: ${{ inputs.codegraph_version }}
+          IN_REVIEW_MODE: ${{ inputs.review_mode }}
+          IN_POST_COMMENT: ${{ inputs.post_comment }}
+          IN_SUPPRESS_WRITES: ${{ inputs.suppress_writes }}
+          IN_RESOLVE_STALE: ${{ inputs.resolve_stale }}
+          IN_FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings }}
+          IN_BLOCK_SEVERITIES: ${{ inputs.block_severities }}
+          IN_BUN_VERSION: ${{ inputs.bun_version }}
+          IN_OMP_VERSION: ${{ inputs.omp_version }}
+          IN_EXTRA_ARGS: ${{ inputs.extra_omp_args }}
+        run: |
+          set -euo pipefail
+
+          # Every input lands in GITHUB_ENV below, which is a line-oriented
+          # file: a value containing a newline writes extra records. A caller
+          # passing $'--add-dir docs\nPOST_COMMENT=false' would set an
+          # unrelated variable AFTER the allowlist checks in this step had
+          # already passed. None of these values has any reason to span lines.
+          for v in IN_MODEL IN_THINKING IN_TOOLS IN_MAX_TIME IN_PROMPT_PATH \
+                   IN_SKILLS_PATH IN_MAX_FINDINGS IN_REVIEW_MODE IN_POST_COMMENT \
+                   IN_FAIL_ON_FINDINGS IN_BUN_VERSION IN_OMP_VERSION IN_EXTRA_ARGS \
+                   IN_CENTRAL_REPO IN_MAX_DIFF_BYTES IN_CODEGRAPH_VERSION \
+                   IN_BLOCK_SEVERITIES IN_SUPPRESS_WRITES IN_RESOLVE_STALE; do
+            if [ "${!v}" != "${!v//[$'\n\r']/}" ]; then
+              echo "::error::$v must not contain a newline"
+              exit 1
+            fi
+          done
+
+          # The full read-only subset of omp's builtin tools. Deliberately
+          # excluded and NOT overridable from a caller:
+          #   bash edit write ast_edit eval debug browser computer github task
+          #   hub web_search memory_edit retain learn manage_skill checkpoint
+          #   rewind ask security_scan lsp
+          # A PR diff is attacker-controlled text and this agent reads it, so it
+          # must not be able to execute anything, modify the checkout, reach the
+          # network, or write back to GitHub. Prompt injection then has nothing
+          # to reach for. Note `security_scan` and `web_search` look harmless by
+          # name but both egress to the network; `ask` blocks forever under -p.
+          #
+          # `lsp` is excluded for a subtler reason and it cost this project its
+          # cross-file symbol resolution. omp discovers language-server config
+          # from the PROJECT directory — lsp.json, .lsp.json, lsp.yaml and
+          # friends — and the project directory here is the checked-out pull
+          # request. A PR can therefore commit an lsp.json naming an arbitrary
+          # command; `lsp` is read-tier so the approval mode auto-approves it,
+          # and omp spawns that command with the model key in its environment.
+          # That is arbitrary execution through the one tool included for
+          # reading code. ast_grep and grep cover most of what it gave us.
+          READ_ONLY_TOOLS="read grep glob ast_grep inspect_image todo"
+
+          TOOLS="${IN_TOOLS:-read,grep,glob,ast_grep}"
+          bad=""
+          for t in ${TOOLS//,/ }; do
+            case " $READ_ONLY_TOOLS " in
+              *" $t "*) ;;
+              *) bad="$bad $t" ;;
+            esac
+          done
+          if [ -n "$bad" ]; then
+            echo "::error::tools not permitted:$bad"
+            echo "This workflow only runs read-only tools. Permitted: $READ_ONLY_TOOLS"
+            exit 1
+          fi
+
+          # extra_omp_args must not be able to undo the envelope the inputs
+          # above establish. The list covers three separate ways to do that:
+          # changing which tools exist, changing who the agent is, and — the one
+          # missed until now — widening what it may reach. --add-dir grants read
+          # access to any path on the runner, so an agent restricted to the
+          # checkout could be pointed at the rest of the filesystem while still
+          # holding a read-only tool list. Rejecting by name is the load-bearing check; the
+          # command below additionally emits --tools and --approval-mode last.
+          # Match against whitespace-normalised text. Every pattern below needs
+          # a literal space before the flag, but the word splitting that later
+          # builds the argv treats a tab as a separator too — so `x\t--add-dir /`
+          # sailed through the guard and arrived as a real --add-dir argument.
+          # Newlines and carriage returns are already rejected above; this closes
+          # the remaining whitespace.
+          _extra_norm="$(printf '%s' "$IN_EXTRA_ARGS" | tr '\t\v\f' '   ')"
+          case " $_extra_norm " in
+            *" --tools"*|*"--tools="*|*" --no-tools "*|*" --system-prompt"*|*"--system-prompt="*|\
+            *" --api-key"*|*"--api-key="*|*" --approval-mode"*|*"--approval-mode="*|\
+            *" --auto-approve "*|*" --yolo "*|*" --plan-yolo "*|\
+            *" --add-dir"*|*"--add-dir="*|*" --cwd"*|*"--cwd="*|\
+            *" --config"*|*"--config="*|*" --profile"*|*"--profile="*|\
+            *" --hook"*|*"--hook="*|*" --extension"*|*"--extension="*|*" -e "*|\
+            *" --plugin-dir"*|*"--plugin-dir="*)
+              echo "::error::extra_omp_args may not contain flags that widen scope or change identity: --tools, --no-tools, --system-prompt, --api-key, --approval-mode, --auto-approve, --yolo, --plan-yolo, --add-dir, --cwd, --config, --profile, --hook, --extension, -e, --plugin-dir"
+              exit 1 ;;
+          esac
+
+          REVIEW_MODE="${IN_REVIEW_MODE:-suggest}"
+          case "$REVIEW_MODE" in
+            suggest|inline|summary) ;;
+            *) echo "::error::review_mode must be suggest, inline or summary (got '$REVIEW_MODE')"; exit 1 ;;
+          esac
+
+          # summary mode answers in markdown, so severities cannot be read and
+          # block_severities cannot be honoured. Combining it with
+          # fail_on_findings promised a gate that does not exist, and warning was
+          # not enough — a warning still leaves a check that looks like it is
+          # blocking on severity while failing on anything at all. Refuse it.
+          if [ "$REVIEW_MODE" = "summary" ] && [ "${IN_FAIL_ON_FINDINGS:-false}" = "true" ]; then
+            echo "::error::fail_on_findings requires review_mode suggest or inline — summary mode cannot read severities, so it cannot honour block_severities"
+            exit 1
+          fi
+
+          {
+            echo "REVIEW_MODE=$REVIEW_MODE"
+            echo "MODEL=${IN_MODEL:-openrouter/openai/gpt-5.6-luna}"
+            echo "THINKING=${IN_THINKING:-high}"
+            echo "TOOLS=$TOOLS"
+            echo "CENTRAL_REPO=${IN_CENTRAL_REPO:-atomikpanda/agentic-review}"
+            echo "MAX_TIME=${IN_MAX_TIME:-}"
+            echo "PROMPT_PATH=${IN_PROMPT_PATH:-review/prompt.md}"
+            echo "SKILLS_PATH=${IN_SKILLS_PATH:-skills/infra-review/SKILL.md,skills/security-review/SKILL.md}"
+            echo "MAX_FINDINGS=${IN_MAX_FINDINGS:-20}"
+            echo "MAX_DIFF_BYTES=${IN_MAX_DIFF_BYTES:-400000}"
+            echo "CODEGRAPH=${IN_CODEGRAPH:-true}"
+            echo "CODEGRAPH_VERSION=${IN_CODEGRAPH_VERSION:-}"
+            echo "POST_COMMENT=${IN_POST_COMMENT:-true}"
+            echo "SUPPRESS_WRITES=${IN_SUPPRESS_WRITES:-false}"
+            echo "RESOLVE_STALE=${IN_RESOLVE_STALE:-true}"
+            echo "FAIL_ON_FINDINGS=${IN_FAIL_ON_FINDINGS:-false}"
+            echo "BLOCK_SEVERITIES=${IN_BLOCK_SEVERITIES:-Critical,High}"
+            echo "BUN_VERSION=${IN_BUN_VERSION:-latest}"
+            echo "OMP_VERSION=${IN_OMP_VERSION:-latest}"
+            echo "EXTRA_ARGS=${IN_EXTRA_ARGS:-}"
+          } >> "$GITHUB_ENV"
+
+          echo "  model=${IN_MODEL:-openrouter/openai/gpt-5.6-luna} tools=$TOOLS thinking=${IN_THINKING:-<model default>}"
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # omp ships `#!/usr/bin/env bun` and imports `bun:` builtins, so bun
+          # is not an optional accelerator here — node cannot load it at all.
+          # package.json declares engines.bun >= 1.3.14.
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: install omp
-        run: bun install -g @oh-my-pi/pi-coding-agent
+        run: bun install -g "@oh-my-pi/pi-coding-agent@${OMP_VERSION}"
+
+      # A symbol and dependency index of the changed files, from codegraph.
+      #
+      # tree-sitter extraction, so it never runs the project's build system —
+      # the property that rules out every SCIP-class indexer here, since this
+      # parses attacker-authored pull requests. Soft-fails: a missing index
+      # makes the review worse, not wrong, so it must never fail the job.
+      - name: build code graph
+        continue-on-error: true
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${CODEGRAPH:-true}" != "true" ]; then echo "  disabled"; exit 0; fi
+
+          # A pull request must not shape the index used to review it:
+          # codegraph.json's `exclude` list could hide the very files it
+          # changes. Take the base commit's copy, or none at all.
+          # Delete before writing. `> codegraph.json` FOLLOWS a symlink, so a
+          # pull request replacing that path with a link to somewhere on the
+          # runner would have the restore write through it to an arbitrary file.
+          rm -f codegraph.json
+          if git cat-file -e "$BASE:codegraph.json" 2>/dev/null; then
+            git show "$BASE:codegraph.json" > codegraph.json
+            echo "  codegraph.json restored from the base commit"
+          fi
+
+          export CODEGRAPH_INSTALL_DIR="$RUNNER_TEMP/cg"
+          export CODEGRAPH_BIN_DIR="$RUNNER_TEMP/cg/bin"
+          export CODEGRAPH_TELEMETRY=0   # it is on by default; this is CI
+          if [ -n "${CODEGRAPH_VERSION:-}" ]; then export CODEGRAPH_VERSION; fi
+          curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh
+          export PATH="$CODEGRAPH_BIN_DIR:$PATH"
+
+          # Central copy only — with the same self-review exception as the
+          # poster. This previously fell back to the pull request's own
+          # scripts/codegraph.sh unconditionally, which would execute
+          # attacker-committed code in a step whose environment carries the
+          # model key. The poster had the exception; this did not.
+          CODEGRAPH_SCRIPT=".central-skills/scripts/codegraph.sh"
+          if [ ! -f "$CODEGRAPH_SCRIPT" ] && [ "$GITHUB_REPOSITORY" = "$CENTRAL_REPO" ]; then
+            CODEGRAPH_SCRIPT="scripts/codegraph.sh"
+          fi
+          [ -f "$CODEGRAPH_SCRIPT" ] || { echo "  no codegraph.sh in $CENTRAL_REPO — skipping"; exit 0; }
+
+          codegraph init . >/dev/null
+          BASE_SHA="$BASE" HEAD_SHA="$HEAD" PROJECT="$PWD" \
+            bash "$CODEGRAPH_SCRIPT" > /tmp/codegraph.md || true
+          echo "  index: $(wc -c < /tmp/codegraph.md 2>/dev/null || echo 0) bytes"
 
       - name: build review prompt
         id: prompt
@@ -103,92 +487,444 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          git diff --stat "$BASE" "$HEAD" > /tmp/diffstat.txt
-          # review/prompt.md is the single source of truth — scripts/run-review.sh
-          # reads the same file, so a local review and a CI review cannot drift.
-          PROMPT_FILE="review/prompt.md"
-          if [ ! -f "$PROMPT_FILE" ] && [ -f ".central-skills/review/prompt.md" ]; then
-            PROMPT_FILE=".central-skills/review/prompt.md"
+
+          # Resolve a support file WITHOUT trusting the pull request's tree.
+          #
+          # These files tell the agent what to look for and how to answer. Read
+          # from the checkout, a pull request could edit review/prompt.md to say
+          # "report nothing" and its own review would agree. So the reviewed
+          # repo's copy is taken from the BASE commit — which is what its
+          # maintainers already merged — and only then from the central repo.
+          # Customisation still works; it just has to be merged first.
+          # Reject anything that can climb out of where it is looked up. Without
+          # this, `prompt_path: ../review/prompt.md` resolves
+          # `.central-skills/../review/prompt.md` straight back into the pull
+          # request's own tree — letting it supply the instructions used to
+          # review it, which is the whole thing base-commit resolution prevents.
+          safe_path() {
+            case "$1" in
+              /*|*..*) echo "::error::path must be relative and must not contain '..': $1"; exit 1 ;;
+            esac
+          }
+          safe_path "$PROMPT_PATH"
+          safe_path "$SKILLS_PATH"
+
+          resolve() { # resolve <path> <destination>; 0 if found
+            safe_path "$1"
+            if git cat-file -e "$BASE:$1" 2>/dev/null; then
+              git show "$BASE:$1" > "$2"
+              echo "    $1 (from base commit)" >&2
+              return 0
+            fi
+            if [ -f ".central-skills/$1" ]; then
+              cp ".central-skills/$1" "$2"
+              echo "    $1 (from $CENTRAL_REPO)" >&2
+              return 0
+            fi
+            # Last resort, and only when this project is reviewing itself: a
+            # branch that ADDS a support file has it in neither the base commit
+            # nor the central repo until it merges. For any other repository
+            # this stays off, because the whole point is that a pull request
+            # must not supply its own review instructions.
+            if [ "$GITHUB_REPOSITORY" = "$CENTRAL_REPO" ] && [ -f "$1" ]; then
+              cp "$1" "$2"
+              echo "    $1 (from this branch — self-review)" >&2
+              return 0
+            fi
+            return 1
+          }
+
+          if ! resolve "$PROMPT_PATH" /tmp/prompt-body.md; then
+            # The central checkout is continue-on-error, but requiring its files
+            # afterwards made that meaningless: an enrolled repository ships none
+            # of them, so any central outage failed the job outright. Degrade to
+            # a built-in prompt instead — a weaker review beats no review, and
+            # the run says which it got.
+            echo "::warning::no review instructions found in the base commit or $CENTRAL_REPO — falling back to the built-in prompt"
+            {
+              printf '%s\n' 'Review the changes on this branch.'
+              printf '%s\n' ''
+              printf '%s\n' 'You have read-only tools. Use them: read the files a change depends on, not'
+              printf '%s\n' 'just the ones it touches. The point is to check what the diff alone cannot show.'
+              printf '%s\n' ''
+              printf '%s\n' '- Does a value referenced here exist where it is consumed? Follow it across files.'
+              printf '%s\n' '- Is something the change depends on gitignored, and so absent in CI?'
+              printf '%s\n' '- Is something installed, declared or created but never configured or started?'
+              printf '%s\n' '- Do documented credentials, scopes, flags and commands match what the code'
+              printf '%s\n' '  requires? Instructions that cannot succeed are defects.'
+              printf '%s\n' '- Would this change silently do nothing?'
+              printf '%s\n' ''
+              printf '%s\n' 'Do not report style, formatting, naming, or anything a linter catches. Report'
+              printf '%s\n' 'only defects you verified by reading the relevant files, and state the concrete'
+              printf '%s\n' 'failure: the input or condition, and the wrong behaviour that results.'
+            } > /tmp/prompt-body.md
           fi
-          [ -f "$PROMPT_FILE" ] || { echo "no review/prompt.md found"; exit 1; }
+
+          # The output format is a separate file from the review instructions,
+          # because the two vary independently: what counts as a defect does not
+          # change because the answer is JSON rather than prose.
+          case "$REVIEW_MODE" in
+            summary) FORMAT_NAME="review/format-markdown.md" ;;
+            *)       FORMAT_NAME="review/format-json.md" ;;
+          esac
+          if ! resolve "$FORMAT_NAME" /tmp/format.md; then
+            # The prompt got a fallback and this did not, so a central outage
+            # still aborted — one half of a soft-fail is not a soft-fail.
+            echo "::warning::no output format at $FORMAT_NAME — falling back to the built-in contract"
+            if [ "$REVIEW_MODE" = "summary" ]; then
+              {
+                printf '%s\n' '# Output format'
+                printf '%s\n' ''
+                # shellcheck disable=SC2016  # backticks are markdown, not substitution
+                printf '%s\n' 'Markdown: a `##` heading per finding with a severity (Critical/High/Medium),'
+                # shellcheck disable=SC2016
+                printf '%s\n' 'the `file:line`, what breaks and why. If you find nothing, say exactly:'
+                printf '%s\n' '"No findings."'
+              } > /tmp/format.md
+            else
+              {
+                printf '%s\n' '# Output format'
+                printf '%s\n' ''
+                printf '%s\n' 'Output a single JSON object and nothing else. No prose, no code fence.'
+                printf '%s\n' 'If you found nothing: {"findings": []}'
+                printf '%s\n' ''
+                printf '%s\n' 'Otherwise each entry needs: file (repo-relative), start_line, end_line,'
+                printf '%s\n' 'severity (Critical|High|Medium), title, body, and suggestion — the exact'
+                printf '%s\n' 'replacement text for start_line..end_line with original indentation, or'
+                printf '%s\n' 'null when you cannot produce a correct complete replacement.'
+                printf '%s\n' ''
+                printf '%s\n' 'Line numbers are in the new version of the file and must fall on lines'
+                printf '%s\n' 'this branch changed. Verify them by reading the file.'
+              } > /tmp/format.md
+            fi
+          fi
+
+          # skills_path is a LIST. One file meant choosing between domain
+          # knowledge and security classes; a repo usually wants both, and the
+          # infra catalogue contributes nothing to a Swift or TypeScript repo.
+          : > /tmp/skill.md
+          any_skill=0
+          IFS=',' read -ra _skills <<< "$SKILLS_PATH"
+          for sk in "${_skills[@]}"; do
+            sk="$(printf '%s' "$sk" | tr -d '[:space:]')"
+            [ -n "$sk" ] || continue
+            if resolve "$sk" /tmp/one-skill.md; then
+              cat /tmp/one-skill.md >> /tmp/skill.md
+              printf '\n\n' >> /tmp/skill.md
+              any_skill=1
+            else
+              echo "::warning::skill file not found: $sk"
+            fi
+          done
+          if [ "$any_skill" = 1 ]; then
+            echo "SKILL_FILE=/tmp/skill.md" >> "$GITHUB_ENV"
+          else
+            echo "SKILL_FILE=" >> "$GITHUB_ENV"
+          fi
+
+          # THE DIFF ITSELF. Previously the prompt said "The diff is: git diff
+          # BASE HEAD" and stopped there — but the agent has no shell and no git
+          # tool, so it could never run that command. It was reviewing the
+          # checked-out tree while guessing from filenames what had changed.
+          # Every review before this one was blind to the actual delta.
+          git diff --stat "$BASE" "$HEAD" > /tmp/diffstat.txt
+          git diff --no-color "$BASE" "$HEAD" > /tmp/diff.patch
+          DIFF_BYTES=$(wc -c < /tmp/diff.patch)
+          TRUNCATED=0
+          if [ "${MAX_DIFF_BYTES:-0}" != "0" ] && [ "$DIFF_BYTES" -gt "$MAX_DIFF_BYTES" ]; then
+            head -c "$MAX_DIFF_BYTES" /tmp/diff.patch > /tmp/diff.trunc
+            mv /tmp/diff.trunc /tmp/diff.patch
+            TRUNCATED=1
+          fi
+
           {
-            echo "Changed files:"
+            cat /tmp/prompt-body.md
+            echo
+            # The output contract goes BEFORE the diff. It used to be last, and
+            # once the diff grew to ~100 KB the model stopped honouring it and
+            # answered in markdown — the JSON parser then rejected a review that
+            # had cost a full run. Instructions must not sit behind 100 KB of
+            # data with nothing after them.
+            cat /tmp/format.md
+            echo
+            echo "## Changed files"
+            echo
+            echo '```'
             cat /tmp/diffstat.txt
+            echo '```'
             echo
-            echo "The diff is: git diff $BASE $HEAD"
+            echo "## The diff"
             echo
-            cat "$PROMPT_FILE"
+            if [ "$TRUNCATED" = 1 ]; then
+              echo "NOTE: this diff was truncated at $MAX_DIFF_BYTES of $DIFF_BYTES bytes."
+              echo "Files after the cut-off are missing. Say so if it limits the review."
+              echo
+            fi
+            echo '```diff'
+            cat /tmp/diff.patch
+            echo '```'
+            echo
+            if [ -s /tmp/codegraph.md ]; then
+              echo
+              cat /tmp/codegraph.md
+            fi
+            echo
+            echo "The working tree is checked out at the merge result, so you can read any"
+            echo "file at its post-change state. Use that to check what the diff depends on."
+            if [ "${MAX_FINDINGS:-0}" != "0" ]; then
+              echo
+              echo "Report at most $MAX_FINDINGS findings. If you have more, keep the most severe."
+            fi
+            echo
+            # Restated after the diff so the last thing read is the contract.
+            if [ "$REVIEW_MODE" = "summary" ]; then
+              echo "Reply with the markdown described above, or exactly \"No findings.\""
+            else
+              echo "Reply with the single JSON object described above and nothing else — no prose, no code fence."
+            fi
           } > /tmp/prompt.txt
-          echo "  prompt built ($(wc -c < /tmp/prompt.txt) bytes)"
+          echo "DIFF_TRUNCATED=$TRUNCATED" >> "$GITHUB_ENV"
+          echo "  prompt: $(wc -c < /tmp/prompt.txt) bytes (diff $DIFF_BYTES bytes, truncated=$TRUNCATED, mode=$REVIEW_MODE)"
+
+      # SECURITY-CRITICAL. omp loads MCP server definitions from agent config
+      # directories in the WORKING DIRECTORY and spawns the commands they name.
+      # That happens at startup, before any tool is invoked, and none of
+      # --tools, --approval-mode, --no-extensions, --no-skills or --no-rules
+      # affects it. A pull request that commits .omp/mcp.json therefore gets
+      # arbitrary command execution on this runner, with OPENROUTER_API_KEY in
+      # the environment — completely bypassing the read-only tool allowlist
+      # that the rest of this workflow rests on.
+      #
+      # Verified against omp 17.2.4 with a config naming `/bin/sh -c "touch
+      # PROOF"`, under the exact flags used below. Executed from .omp/,
+      # .claude/ and .cursor/. Did NOT execute from .github/, .vscode/ or
+      # .windsurf/ — so the honoured set is narrower than omp's flavour table
+      # lists. Adding --no-extensions --no-skills --no-rules made no
+      # difference; this is loaded independently of the tool system.
+      #
+      # The whole flavour directories are removed rather than just mcp.json,
+      # because their other settings can also change approval behaviour, and
+      # because which flavours are honoured is an omp implementation detail
+      # that can widen in any release. .github and .vscode are ordinary project
+      # directories — this reviewer exists partly to review .github/workflows —
+      # so only the two files omp reads are taken from those.
+      #
+      # The diff still contains every one of these files, so the agent can
+      # still see and report on them. It simply cannot be configured by them.
+      - name: strip agent configuration from the checkout
+        run: |
+          set -euo pipefail
+          # Assert rather than assume. If a future edit drops
+          # persist-credentials, the token is readable again and nothing else
+          # here would notice.
+          for cfg in .git/config .central-skills/.git/config; do
+            if [ -f "$cfg" ] && grep -qi 'extraheader' "$cfg"; then
+              echo "::error::$cfg contains a persisted credential; the read-only agent can read it"
+              exit 1
+            fi
+          done
+
+          removed=0
+          for d in .omp .claude .codex .gemini .opencode .cursor .windsurf .cline; do
+            if [ -e "$d" ]; then rm -rf -- "$d"; echo "  removed $d/"; removed=1; fi
+          done
+          # Root-level config executes too. The first version of this step only
+          # removed the agent DIRECTORIES, which left ./mcp.json and ./.mcp.json
+          # loaded and spawnable — the fix was incomplete and the reviewer caught
+          # it. Verified: both execute under the production flags.
+          for f in mcp.json .mcp.json .github/mcp.json .github/ssh.json \
+                   .vscode/mcp.json .vscode/ssh.json; do
+            if [ -e "$f" ]; then rm -f -- "$f"; echo "  removed $f"; removed=1; fi
+          done
+          if [ "$removed" = 0 ]; then echo "  no agent configuration present"; fi
 
       - name: run agentic review (read-only)
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           set -euo pipefail
-          # Prefer a skill file in the repo under review, so a project can
-          # override with its own conventions; otherwise fall back to the
-          # shared library fetched above.
-          SKILL="${{ inputs.skills_path || 'skills/infra-review/SKILL.md' }}"
-          APPEND=""
-          if [ -f "$SKILL" ]; then
-            APPEND="--append-system-prompt=$SKILL"
-            echo "  injecting repo-local knowledge base: $SKILL"
-          elif [ -f ".central-skills/$SKILL" ]; then
-            APPEND="--append-system-prompt=.central-skills/$SKILL"
-            echo "  injecting shared knowledge base: .central-skills/$SKILL"
+          # Checked explicitly because omp does NOT fail without it: with no
+          # credential it exits 0, writes nothing to stdout and nothing to
+          # stderr. Left to itself the job goes green having reviewed nothing,
+          # which is the one outcome worse than a red check.
+          case "$MODEL" in
+            openrouter/*)
+              [ -n "${OPENROUTER_API_KEY:-}" ] || {
+                echo "::error::OPENROUTER_API_KEY is empty. Add it to this repository's secrets (Settings > Secrets and variables > Actions), and pass it through in the caller workflow's secrets: block."
+                exit 1
+              } ;;
+          esac
+
+          # The skill file was resolved in the previous step, from the base
+          # commit or the central repo — never from the pull request's tree.
+          ARGS=()
+          if [ -n "${SKILL_FILE:-}" ] && [ -f "$SKILL_FILE" ]; then
+            ARGS+=(--append-system-prompt="$SKILL_FILE")
+            echo "  injecting knowledge base: $SKILLS_PATH"
           else
             echo "  no skill file found — running without injected knowledge"
           fi
+          # `if` rather than `[ -n "$X" ] && ARGS+=(...)`: when the test fails
+          # it is the *last* command in that list, so `set -e` would kill the
+          # step. The && form is only safe when a later command follows.
+          if [ -n "$THINKING" ]; then ARGS+=(--thinking="$THINKING"); fi
+          if [ -n "$MAX_TIME" ]; then ARGS+=(--max-time="$MAX_TIME"); fi
+
+          # Word-split the escape hatch without glob expansion.
+          if [ -n "$EXTRA_ARGS" ]; then
+            set -f
+            # shellcheck disable=SC2206  # deliberate word splitting
+            EXTRA=($EXTRA_ARGS)
+            set +f
+            ARGS+=("${EXTRA[@]}")
+          fi
 
           # --tools is an allowlist and omp validates it — an unknown name is a
-          # hard error, so a typo here fails loudly rather than silently
-          # granting everything. Enabled, all read-only:
-          #   read, grep, glob  — file access
-          #   lsp               — cross-file symbol resolution (14 ops)
-          #   ast_grep          — structural queries over 50+ tree-sitter
-          #                       grammars. Read-only; ast_EDIT is not enabled.
+          # hard error, so a typo fails loudly rather than silently granting
+          # everything. It is emitted AFTER $EXTRA_ARGS so that even if the
+          # name-based rejection in `resolve config` were bypassed, the last
+          # --tools on the line is the validated one.
           #
-          # Deliberately excluded: bash, edit, write, ast_edit, eval, debug,
-          # python, browser, computer, github, task, web_search, memory_edit.
-          # A PR diff is attacker-controlled text and this agent reads it, so it
-          # must not be able to execute anything, modify the checkout, reach the
-          # network, or write back to GitHub. Prompt injection then has nothing
-          # to reach for.
+          # --approval-mode=always-ask is the TIGHTEST of omp's three modes,
+          # not a prompt-on-everything: it maps to the `read` tier, which
+          # auto-approves read-only tools and blocks write and exec. omp's
+          # default is `yolo`, so this must stay explicit.
           #
           # --no-session keeps nothing on the runner.
+          #
+          # The prompt goes in via omp's @file form, NOT on stdin and NOT as a
+          # literal argument.
+          #
+          # Not stdin: omp only reads piped stdin when `process.stdin.isTTY ===
+          # false`, and on both bun and node that property is `undefined` for a
+          # redirect or a pipe — never false. `omp -p < prompt.txt` therefore
+          # reads nothing, has nothing to do, and exits 0 having produced no
+          # output. That is what this workflow did on its first live run.
+          #
+          # Not a literal argument either: Linux caps a single argv entry at
+          # MAX_ARG_STRLEN (128 KiB), well under the total ARG_MAX, and the
+          # prompt now carries the diff. A large pull request would fail with
+          # E2BIG before omp started. @file has no such limit.
+          #
+          # stdin is pointed at /dev/null so nothing can block on a terminal.
           omp -p \
-            --model="${{ inputs.model || 'openrouter/openai/gpt-5.6-luna' }}" \
-            --tools=read,grep,glob,lsp,ast_grep \
-            --approval-mode=always-ask \
+            --model="$MODEL" \
             --no-session \
-            $APPEND \
+            "${ARGS[@]}" \
+            --tools="$TOOLS" \
+            --approval-mode=always-ask \
             --cwd="$PWD" \
-            < /tmp/prompt.txt \
+            "@/tmp/prompt.txt" \
+            < /dev/null \
             > /tmp/review.md 2>/tmp/review.err || {
               echo "omp failed:"; tail -30 /tmp/review.err; exit 1;
             }
+
+          # A zero-byte review is a broken run, not a clean one, and the exit
+          # code does not distinguish them. Without this the two collapse into
+          # the same green check. Anything that makes omp produce nothing —
+          # missing credential, model refusing the request, a flag it rejected
+          # silently — lands here.
+          if [ ! -s /tmp/review.md ]; then
+            echo "::error::omp exited 0 but produced no output. This is not 'no findings' — the review did not run. stderr follows."
+            tail -30 /tmp/review.err
+            exit 1
+          fi
           echo "  review produced $(wc -c < /tmp/review.md) bytes"
 
       - name: post review
-        if: github.event_name == 'pull_request'
+        # success() is implied for a step whose `if` has no status function,
+        # but spelling it out removes the doubt: a failed review must never
+        # reach the commenting step.
+        if: success() && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          if grep -qx "No findings." /tmp/review.md; then
-            echo "  no findings — not commenting"
+
+          # suggest/inline: hand the structured findings to the poster, which
+          # anchors each one to a diff line and attaches a committable
+          # ```suggestion block where the agent produced a complete fix.
+          if [ "$REVIEW_MODE" != "summary" ]; then
+            # The poster runs with a token that can write to this pull request,
+            # so it comes from the central checkout and nowhere else.
+            #
+            # It used to fall back to scripts/post-review.mjs in the repo under
+            # review. Two things wrong with that: on a same-repo pull request
+            # that file is whatever the branch says it is, and node would
+            # execute it with the write token; and on any OTHER project, a file
+            # at that path is simply some unrelated script of theirs that we
+            # would run for no reason.
+            #
+            # The one exception is this project reviewing itself, where the
+            # "repo under review" and the central repo are the same thing and
+            # the branch copy is the version under test.
+            POSTER=".central-skills/scripts/post-review.mjs"
+            if [ ! -f "$POSTER" ] && [ "$GITHUB_REPOSITORY" = "$CENTRAL_REPO" ]; then
+              POSTER="scripts/post-review.mjs"
+              echo "  central checkout has no poster yet; using this branch's copy (self-review)"
+            fi
+            [ -f "$POSTER" ] || { echo "::error::post-review.mjs not found in $CENTRAL_REPO"; exit 1; }
+            echo "  poster: $POSTER"
+
+            if [ "$POST_COMMENT" != "true" ]; then
+              # Still run the poster, with writes off, so the merge gate and
+              # fail_on_findings behave the same as when commenting is on.
+              echo "  post_comment=false — running the gate without writing"
+              FINDINGS_FILE=/tmp/review.md GITHUB_REPO="$GITHUB_REPOSITORY" PR_NUMBER="$PR" \
+              HEAD_SHA="$HEAD" BASE_SHA="$BASE" REVIEW_MODE="$REVIEW_MODE" \
+              RESOLVE_STALE=false MAX_FINDINGS="$MAX_FINDINGS" \
+              FAIL_ON_FINDINGS="$FAIL_ON_FINDINGS" BLOCK_SEVERITIES="$BLOCK_SEVERITIES" \
+              SUPPRESS_WRITES=true DRY_RUN=1 node "$POSTER"
+            else
+              FINDINGS_FILE=/tmp/review.md \
+              GITHUB_REPO="$GITHUB_REPOSITORY" \
+              PR_NUMBER="$PR" \
+              HEAD_SHA="$HEAD" \
+              BASE_SHA="$BASE" \
+              REVIEW_MODE="$REVIEW_MODE" \
+              RESOLVE_STALE="$RESOLVE_STALE" \
+              MAX_FINDINGS="$MAX_FINDINGS" \
+              PASSES_TRIED="${PASSES_TRIED:-1}" \
+              PASSES_OK="${PASSES_OK:-1}" \
+              DIFF_TRUNCATED="${DIFF_TRUNCATED:-0}" \
+              SKILL_SECTIONS="${SKILL_SECTIONS:-}" \
+              FAIL_ON_FINDINGS="$FAIL_ON_FINDINGS" \
+              BLOCK_SEVERITIES="$BLOCK_SEVERITIES" \
+              SUPPRESS_WRITES="$SUPPRESS_WRITES" \
+                node "$POSTER"
+            fi
             exit 0
           fi
-          {
-            echo "### 🔎 Agentic review"
-            echo
-            echo "_Read-only agent (\`read\`,\`grep\`,\`glob\`,\`lsp\`,\`ast_grep\`) — checks things the diff alone cannot show._"
-            echo
-            cat /tmp/review.md
-          } > /tmp/comment.md
-          gh pr comment "$PR" --body-file /tmp/comment.md
+
+          if grep -qx "No findings." /tmp/review.md; then
+            echo "  no findings"
+            exit 0
+          fi
+
+          if [ "$SUPPRESS_WRITES" = "true" ]; then
+            echo "  [suppressed] would comment; see the uploaded artifact"
+          elif [ "$POST_COMMENT" = "true" ]; then
+            {
+              echo "### 🔎 Agentic review"
+              echo
+              # shellcheck disable=SC2016  # backticks here are markdown, not substitution
+              printf '_Read-only agent (`%s`) on `%s` — checks things the diff alone cannot show._\n' \
+                "$TOOLS" "$MODEL"
+              echo
+              cat /tmp/review.md
+            } > /tmp/comment.md
+            gh pr comment "$PR" --body-file /tmp/comment.md
+          else
+            echo "  post_comment=false — see the uploaded artifact"
+          fi
+          if [ "$FAIL_ON_FINDINGS" = "true" ]; then
+            echo "::error::agentic review reported findings and fail_on_findings is set"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -198,3 +934,7 @@ jobs:
             /tmp/review.md
             /tmp/review.err
           retention-days: 7
+          # This step is `always()`, so it also runs when the review failed
+          # before either file existed. Without this the real error is followed
+          # by a "No files were found" warning that reads like a second fault.
+          if-no-files-found: ignore
