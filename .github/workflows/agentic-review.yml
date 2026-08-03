@@ -132,13 +132,13 @@ on:
       # vet. A caller-supplied `self-hosted` would therefore check out
       # attacker-authored PR content onto a persistent machine holding the
       # model key. Changing the runner is a fork, not an input.
-      central_repo:
-        description: >-
-          owner/name of the repository holding the shared prompt, skills and
-          poster. Must be this repository, or a fork of it that you trust — its
-          code runs with a token that can write to your pull requests.
-        type: string
-        default: atomikpanda/agentic-review
+      # There is deliberately no `central_repo` input. It is derived from
+      # github.workflow_ref — the repository this very workflow file was loaded
+      # from — because a caller-supplied value was an execution hole: a same-repo
+      # pull request could edit its own caller to point at any repository, and
+      # the poster fetched from there runs with a token that can write to the
+      # pull request. Deriving it is also correct for forks, which was the only
+      # reason the input existed.
       timeout_minutes:
         description: Job timeout.
         type: number
@@ -223,6 +223,26 @@ jobs:
       # install-review.sh gets the accumulated review knowledge without copying
       # files into it. Soft-fails: if the central repo is private or moved, the
       # review still runs, just without injected knowledge.
+      # Where this workflow file itself came from. github.workflow_ref looks like
+      # `owner/repo/.github/workflows/file.yml@refs/heads/main`, so stripping
+      # from `/.github/` leaves `owner/repo`. Computed in a step because GitHub
+      # expressions have no split(): there is format() and contains(), and
+      # nothing that takes a substring.
+      - name: resolve central repository
+        id: central_repo
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          FALLBACK: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          repo="${WORKFLOW_REF%%/.github/*}"
+          case "$repo" in
+            */*) ;;                       # owner/name, as expected
+            *) repo="$FALLBACK" ;;        # unexpected shape — fail closed to self
+          esac
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "  central repository: $repo"
+
       # `github.repository_owner` here is the OWNER OF THE REPO BEING REVIEWED,
       # not of this workflow — so it used to look for <them>/agentic-review and
       # fail for everyone except this project's owner, taking the default
@@ -232,7 +252,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.central_repo || 'atomikpanda/agentic-review' }}
+          repository: ${{ steps.central_repo.outputs.repo }}
           ref: main
           persist-credentials: false
           path: .central-skills
@@ -256,7 +276,7 @@ jobs:
           IN_MODEL: ${{ inputs.model }}
           IN_THINKING: ${{ inputs.thinking }}
           IN_TOOLS: ${{ inputs.tools }}
-          IN_CENTRAL_REPO: ${{ inputs.central_repo }}
+          IN_CENTRAL_REPO: ${{ steps.central_repo.outputs.repo }}
           IN_MAX_TIME: ${{ inputs.max_time }}
           IN_PROMPT_PATH: ${{ inputs.prompt_path }}
           IN_SKILLS_PATH: ${{ inputs.skills_path }}
@@ -754,7 +774,14 @@ jobs:
             echo "  poster: $POSTER"
 
             if [ "$POST_COMMENT" != "true" ]; then
-              echo "  post_comment=false — see the uploaded artifact"
+              # Still run the poster, with writes off, so the merge gate and
+              # fail_on_findings behave the same as when commenting is on.
+              echo "  post_comment=false — running the gate without writing"
+              FINDINGS_FILE=/tmp/review.md GITHUB_REPO="$GITHUB_REPOSITORY" PR_NUMBER="$PR" \
+              HEAD_SHA="$HEAD" BASE_SHA="$BASE" REVIEW_MODE="$REVIEW_MODE" \
+              RESOLVE_STALE=false MAX_FINDINGS="$MAX_FINDINGS" \
+              FAIL_ON_FINDINGS="$FAIL_ON_FINDINGS" BLOCK_SEVERITIES="$BLOCK_SEVERITIES" \
+              SUPPRESS_WRITES=true DRY_RUN=1 node "$POSTER"
             else
               FINDINGS_FILE=/tmp/review.md \
               GITHUB_REPO="$GITHUB_REPOSITORY" \

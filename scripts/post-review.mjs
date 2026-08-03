@@ -467,7 +467,13 @@ async function ourThreads() {
   const out = [];
   for (const t of nodes) {
     const c = t.comments?.nodes?.[0];
-    const fp = readStamp(c?.body);
+    // Author check, not just the marker. Anyone can paste
+    // `<!-- agentic-review-fp:... -->` into a comment; without this a pull
+    // request could forge a thread that we then resolve or edit, or claim a
+    // finding as "already reported" to suppress a real one.
+    const login = c?.author?.login ?? "";
+    const isOurs = /^github-actions(\[bot\])?$/.test(login) || login === env("BOT_LOGIN", "github-actions[bot]");
+    const fp = isOurs ? readStamp(c?.body) : null;
     if (fp)
       out.push({
         id: t.id, fp, isResolved: t.isResolved,
@@ -783,7 +789,11 @@ async function main() {
   );
 
   if (DRY_RUN) {
-    console.log(JSON.stringify(payload, null, 2));
+    if (env("SUPPRESS_WRITES", "") !== "true") console.log(JSON.stringify(payload, null, 2));
+    console.log(`  [suppressed] ${comments.length} inline comment(s) withheld`);
+    // Suppression stops writes, not judgement. The README promises
+    // fail_on_findings still applies, and this early return was breaking that.
+    enforceGate();
     return;
   }
 

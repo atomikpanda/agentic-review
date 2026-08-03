@@ -314,7 +314,9 @@ printf '%s\n' "$DIFFSTAT" | sed 's/^/    /' >&2
 # RNG so a given pass is reproducible.
 ordered_diff() { # ordered_diff <pass-index>
   local pass="$1"
-  if [ "$pass" -le 1 ]; then printf '%s\n' "$DIFFTEXT"; return 0; fi
+  # Later passes rebuild the diff per file, which bypasses the truncation the
+  # first pass applied — a capped diff would silently become uncapped.
+  if [ "$pass" -le 1 ] || [ "$TRUNCATED" = 1 ]; then printf '%s\n' "$DIFFTEXT"; return 0; fi
   local files n i
   if [ "$STAGED" = 1 ]; then files="$(git diff --cached --name-only --diff-filter=d)"
   else files="$(git diff --name-only --diff-filter=d "$MERGE_BASE" HEAD)"; fi
@@ -606,7 +608,11 @@ fi
 # Remember what was said. Without this a local run has no memory: it re-reports
 # everything every time and there is no way to say "seen it, it's fine". The
 # pull-request side gets that from the threads; locally it has to be stored.
-if ST="$(support scripts/local-state.mjs)" && command -v node >/dev/null 2>&1 && [ "$REVIEW_MODE" != "summary" ]; then
+# Every mode records. The default local mode is `summary`, so gating this on
+# non-summary meant the documented plain `review` never stored anything — the
+# state feature was off by default in the only path most people use.
+if ST="$(support scripts/local-state.mjs)" && command -v node >/dev/null 2>&1 \
+   && grep -q '"findings"' "$TMP_OUT" 2>/dev/null; then
   _head="$(git rev-parse HEAD 2>/dev/null || echo)"
   _base="${MERGE_BASE:-${BASE:-}}"
   if _delta="$(node "$ST" record "$TMP_OUT" "$_base" "$_head" 2>/dev/null)"; then

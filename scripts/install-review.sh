@@ -202,8 +202,7 @@ YAML
   # so it keeps following the central repo's default instead of being frozen at
   # whatever it happened to be on install day.
   emit() { if [ -n "$2" ]; then printf '      %s: %s\n' "$1" "$2" >> "$tmp"; fi; }
-  if [ -n "$I_MODEL$I_THINKING$I_TOOLS$I_MAX_TIME$I_PROMPT$I_SKILL$I_MAX_FINDINGS$I_REVIEW_MODE$I_FAIL$I_COMMENT$I_OMP_VERSION$I_BUN_VERSION$I_EXTRA_ARGS" ] \
-     || [ "$CENTRAL_REPO" != "atomikpanda/agentic-review" ]; then
+  if [ -n "$I_MODEL$I_THINKING$I_TOOLS$I_MAX_TIME$I_PROMPT$I_SKILL$I_MAX_FINDINGS$I_REVIEW_MODE$I_FAIL$I_COMMENT$I_OMP_VERSION$I_BUN_VERSION$I_EXTRA_ARGS" ]; then
     printf '    with:\n' >> "$tmp"
   fi
   emit model            "$I_MODEL"
@@ -216,9 +215,9 @@ YAML
   # The reusable workflow needs to know where to fetch the shared prompt and
   # poster from. It cannot infer it: github.repository_owner there is the owner
   # of the repo being reviewed, not of this project.
-  if [ "$CENTRAL_REPO" != "atomikpanda/agentic-review" ]; then
-    emit central_repo "$CENTRAL_REPO"
-  fi
+  # central_repo is no longer an input — the reusable workflow derives it from
+  # its own workflow_ref, which is correct for forks and cannot be redirected by
+  # a pull request.
   emit max_findings     "$I_MAX_FINDINGS"
   emit fail_on_findings "$I_FAIL"
   emit post_comment     "$I_COMMENT"
@@ -242,14 +241,13 @@ YAML
 #                                   # would spawn commands it names
 #   max_time:         ''            # e.g. 600, 10m, 1h
 #   prompt_path:      review/prompt.md
-#   skills_path:      skills/infra-review/SKILL.md
+#   skills_path:      skills/infra-review/SKILL.md,skills/security-review/SKILL.md
 #   review_mode:      suggest       # suggest | inline | summary
 #   max_findings:     20            # 0 disables the cap
 #   post_comment:     true
 #   fail_on_findings: false         # true makes this a blocking check
 #   timeout_minutes:  20
 #   max_diff_bytes:   400000        # 0 sends the whole diff
-#   central_repo:     atomikpanda/agentic-review
 #   bun_version:      latest        # omp needs >= 1.3.14 and is bun-only
 #   omp_version:      latest        # pin for reproducible reviews
 #   extra_omp_args:   ''            # any other omp flag

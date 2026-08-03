@@ -28,6 +28,10 @@ _c() { if [ -t 1 ]; then printf '\033[%sm' "$1"; fi; }
 die() { _c "0;31"; printf '  ✗ %s\n' "$*" >&2; _c "0"; exit 1; }
 
 command -v gh >/dev/null 2>&1 || die "gh not found"
+# BSD base64 on macOS spells the decode flag -D and rejects GNU's --decode, so
+# every comment body would have arrived empty on the platform this is developed
+# on. Pick whichever the local binary accepts.
+if printf '' | base64 --decode >/dev/null 2>&1; then B64D="base64 --decode"; else B64D="base64 -D"; fi
 [ -n "$PR" ] || die "which pull request? usage: watch-pr.sh <number> [--repo owner/name]"
 [ -n "$REPO" ] || REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)" \
   || die "not in a GitHub repo — pass --repo owner/name"
@@ -45,7 +49,7 @@ while :; do
       grep -qx "$id" "$SEEN" && continue
       printf '%s\n' "$id" >> "$SEEN"
       _c "0;36"; printf '\n● %s  %s:%s\n' "$who" "$path" "$line"; _c "0"
-      printf '%s' "$body" | base64 --decode 2>/dev/null | head -12 | sed 's/^/    /'
+      printf '%s' "$body" | $B64D 2>/dev/null | head -12 | sed 's/^/    /'
     done
   [ "$ONCE" = 1 ] && break
   sleep "$INTERVAL"
