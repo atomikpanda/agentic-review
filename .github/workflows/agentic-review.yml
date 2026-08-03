@@ -299,7 +299,8 @@ jobs:
           for v in IN_MODEL IN_THINKING IN_TOOLS IN_MAX_TIME IN_PROMPT_PATH \
                    IN_SKILLS_PATH IN_MAX_FINDINGS IN_REVIEW_MODE IN_POST_COMMENT \
                    IN_FAIL_ON_FINDINGS IN_BUN_VERSION IN_OMP_VERSION IN_EXTRA_ARGS \
-                   IN_CENTRAL_REPO IN_MAX_DIFF_BYTES IN_CODEGRAPH_VERSION; do
+                   IN_CENTRAL_REPO IN_MAX_DIFF_BYTES IN_CODEGRAPH_VERSION \
+                   IN_BLOCK_SEVERITIES IN_SUPPRESS_WRITES IN_RESOLVE_STALE; do
             if [ "${!v}" != "${!v//[$'\n\r']/}" ]; then
               echo "::error::$v must not contain a newline"
               exit 1
@@ -460,7 +461,21 @@ jobs:
           # repo's copy is taken from the BASE commit — which is what its
           # maintainers already merged — and only then from the central repo.
           # Customisation still works; it just has to be merged first.
+          # Reject anything that can climb out of where it is looked up. Without
+          # this, `prompt_path: ../review/prompt.md` resolves
+          # `.central-skills/../review/prompt.md` straight back into the pull
+          # request's own tree — letting it supply the instructions used to
+          # review it, which is the whole thing base-commit resolution prevents.
+          safe_path() {
+            case "$1" in
+              /*|*..*) echo "::error::path must be relative and must not contain '..': $1"; exit 1 ;;
+            esac
+          }
+          safe_path "$PROMPT_PATH"
+          safe_path "$SKILLS_PATH"
+
           resolve() { # resolve <path> <destination>; 0 if found
+            safe_path "$1"
             if git cat-file -e "$BASE:$1" 2>/dev/null; then
               git show "$BASE:$1" > "$2"
               echo "    $1 (from base commit)" >&2
@@ -801,6 +816,12 @@ jobs:
           if grep -qx "No findings." /tmp/review.md; then
             echo "  no findings"
             exit 0
+          fi
+          # summary mode cannot read severities from markdown, so it must not
+          # claim to honour block_severities. Failing on any finding contradicted
+          # the documented contract; it now says so instead of pretending.
+          if [ "$FAIL_ON_FINDINGS" = "true" ]; then
+            echo "::warning::summary mode cannot read severities, so fail_on_findings cannot honour block_severities here — use suggest or inline for a real gate"
           fi
           if [ "$SUPPRESS_WRITES" = "true" ]; then
             echo "  [suppressed] would comment; see the uploaded artifact"

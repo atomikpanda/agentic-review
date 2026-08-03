@@ -93,6 +93,9 @@ if (cmd === "record") {
       known.severity = f.severity ?? known.severity;
       known.line = f.start_line ?? known.line;
       if (known.status === "dismissed") { muted++; continue; }
+      // Reported again after being marked gone: the defect returned, so the
+      // record has to return with it rather than staying closed forever.
+      if (known.status === "gone") { known.status = "open"; delete known.goneAt; }
       again++;
     } else {
       const id = idFor(f);

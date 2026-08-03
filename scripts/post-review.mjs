@@ -692,12 +692,17 @@ async function main() {
     // is the "you fixed them" path and it still has to run.
     if (env("RESOLVE_STALE", "true") === "true" && !DRY_RUN) {
       try {
-        let n = 0;
+        // Same evidence test as a normal run. This path used to retire every
+        // open thread outright, so one empty review — a model hiccup, a failed
+        // pass — silently closed everything, including findings whose code had
+        // not been touched.
+        let n = 0, held = 0;
         for (const t of await ourThreads()) {
-          if (t.isResolved) continue;
+          if (t.isResolved || t.retired) continue;
+          if (fileChangedSince(t) === false) { held++; continue; }
           if ((await retireThread(t)) !== "skipped") n++;
         }
-        console.log(`  no findings — retired ${n} open thread(s)`);
+        console.log(`  no findings — retired ${n} thread(s)` + (held ? `, held ${held} whose files are unchanged` : ""));
       } catch (e) {
         console.log(`::warning::could not resolve threads (${e.message})`);
       }
