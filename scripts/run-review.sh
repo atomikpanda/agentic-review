@@ -486,7 +486,11 @@ run_pass_checked() { # run_pass_checked <prompt-file> <out-file>
   local attempt
   for attempt in 1 2; do
     if run_pass "$1" "$2" && [ -s "$2" ]; then
-      if [ -z "${CHECKER:-}" ] || node "$CHECKER" --check "$2" 2>/dev/null; then return 0; fi
+      # Only structured modes owe a findings object. summary mode answers in
+      # markdown, and checking it against the JSON contract failed every time —
+      # which retried, failed again, and killed the default local mode outright.
+      if [ "$REVIEW_MODE" = "summary" ] || [ -z "${CHECKER:-}" ] \
+         || node "$CHECKER" --check "$2" 2>/dev/null; then return 0; fi
       say "  output unparseable (attempt $attempt)"
     fi
   done

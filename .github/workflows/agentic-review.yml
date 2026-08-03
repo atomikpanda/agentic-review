@@ -223,26 +223,6 @@ jobs:
       # install-review.sh gets the accumulated review knowledge without copying
       # files into it. Soft-fails: if the central repo is private or moved, the
       # review still runs, just without injected knowledge.
-      # Where this workflow file itself came from. github.workflow_ref looks like
-      # `owner/repo/.github/workflows/file.yml@refs/heads/main`, so stripping
-      # from `/.github/` leaves `owner/repo`. Computed in a step because GitHub
-      # expressions have no split(): there is format() and contains(), and
-      # nothing that takes a substring.
-      - name: resolve central repository
-        id: central_repo
-        env:
-          WORKFLOW_REF: ${{ github.workflow_ref }}
-          FALLBACK: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          repo="${WORKFLOW_REF%%/.github/*}"
-          case "$repo" in
-            */*) ;;                       # owner/name, as expected
-            *) repo="$FALLBACK" ;;        # unexpected shape — fail closed to self
-          esac
-          echo "repo=$repo" >> "$GITHUB_OUTPUT"
-          echo "  central repository: $repo"
-
       # `github.repository_owner` here is the OWNER OF THE REPO BEING REVIEWED,
       # not of this workflow — so it used to look for <them>/agentic-review and
       # fail for everyone except this project's owner, taking the default
@@ -252,7 +232,22 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          repository: ${{ steps.central_repo.outputs.repo }}
+          # A LITERAL, on purpose, and not an input.
+          #
+          # As an input, a same-repository pull request could edit its own caller
+          # to point this anywhere, and the poster fetched from here runs with a
+          # token that can write to the pull request.
+          #
+          # Deriving it from github.workflow_ref was worse. In a reusable
+          # workflow that context describes the CALLER's entry-point workflow,
+          # not this file, so on an enrolled repository it resolved to the repo
+          # being reviewed — fetching the poster from the very tree under review.
+          # There is no context variable that names the reusable workflow's own
+          # repository.
+          #
+          # A literal is correct because it lives in THIS file: a consuming
+          # repository cannot change it, and a fork's copy names the fork.
+          repository: atomikpanda/agentic-review
           ref: main
           persist-credentials: false
           path: .central-skills
@@ -276,7 +271,7 @@ jobs:
           IN_MODEL: ${{ inputs.model }}
           IN_THINKING: ${{ inputs.thinking }}
           IN_TOOLS: ${{ inputs.tools }}
-          IN_CENTRAL_REPO: ${{ steps.central_repo.outputs.repo }}
+          IN_CENTRAL_REPO: atomikpanda/agentic-review
           IN_MAX_TIME: ${{ inputs.max_time }}
           IN_PROMPT_PATH: ${{ inputs.prompt_path }}
           IN_SKILLS_PATH: ${{ inputs.skills_path }}

@@ -639,7 +639,12 @@ async function main() {
     const res = await postReview({
       commit_id: required("HEAD_SHA"),
       event: "COMMENT",
-      body: `### 🔎 Agentic review\n\n_Returned prose rather than structured findings, so there are no inline suggestions on this run._\n\n${raw}`,
+      body:
+        "### 🔎 Agentic review\n\n" +
+        "⚠️ **Inconclusive** — the agent answered in prose rather than the requested " +
+        "structure, so severities could not be read and the merge gate could not run. " +
+        "Treat the text below as unverified, and re-run before relying on it.\n\n" +
+        raw,
     });
     if (!res.ok) {
       console.error(`::error::could not post the review (${res.status})`);
