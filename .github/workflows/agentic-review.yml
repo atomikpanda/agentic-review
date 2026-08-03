@@ -353,13 +353,22 @@ jobs:
           fi
 
           # extra_omp_args must not be able to undo the envelope the inputs
-          # above establish. Rejecting by name is the load-bearing check; the
+          # above establish. The list covers three separate ways to do that:
+          # changing which tools exist, changing who the agent is, and — the one
+          # missed until now — widening what it may reach. --add-dir grants read
+          # access to any path on the runner, so an agent restricted to the
+          # checkout could be pointed at the rest of the filesystem while still
+          # holding a read-only tool list. Rejecting by name is the load-bearing check; the
           # command below additionally emits --tools and --approval-mode last.
           case " $IN_EXTRA_ARGS " in
             *" --tools"*|*"--tools="*|*" --no-tools "*|*" --system-prompt"*|*"--system-prompt="*|\
             *" --api-key"*|*"--api-key="*|*" --approval-mode"*|*"--approval-mode="*|\
-            *" --auto-approve "*|*" --yolo "*|*" --plan-yolo "*)
-              echo "::error::extra_omp_args may not contain --tools, --no-tools, --system-prompt, --api-key, --approval-mode, --auto-approve, --yolo or --plan-yolo"
+            *" --auto-approve "*|*" --yolo "*|*" --plan-yolo "*|\
+            *" --add-dir"*|*"--add-dir="*|*" --cwd"*|*"--cwd="*|\
+            *" --config"*|*"--config="*|*" --profile"*|*"--profile="*|\
+            *" --hook"*|*"--hook="*|*" --extension"*|*"--extension="*|*" -e "*|\
+            *" --plugin-dir"*|*"--plugin-dir="*)
+              echo "::error::extra_omp_args may not contain flags that widen scope or change identity: --tools, --no-tools, --system-prompt, --api-key, --approval-mode, --auto-approve, --yolo, --plan-yolo, --add-dir, --cwd, --config, --profile, --hook, --extension, -e, --plugin-dir"
               exit 1 ;;
           esac
 

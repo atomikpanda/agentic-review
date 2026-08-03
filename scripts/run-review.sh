@@ -597,7 +597,11 @@ else
   # `if` not `A && B || C`: with the && form a merge that fails would fall
   # through to C, and a merge that succeeds but exits non-zero would too.
   merged=0
-  if MERGE="$(support scripts/merge-findings.mjs)" && command -v node >/dev/null 2>&1; then
+  # summary passes are markdown, and the merger parses findings objects: it
+  # would read every pass as unparseable and emit an empty result, silently
+  # discarding the whole review. There is nothing to merge in that mode.
+  if [ "$REVIEW_MODE" != "summary" ] \
+     && MERGE="$(support scripts/merge-findings.mjs)" && command -v node >/dev/null 2>&1; then
     # shellcheck disable=SC2086  # deliberate word splitting over the pass list
     if node "$MERGE" --min-votes "$MIN_VOTES" $PASS_OUTS > "$TMP_OUT"; then merged=1; fi
   fi
