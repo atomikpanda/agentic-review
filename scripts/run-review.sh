@@ -24,6 +24,8 @@
 #   --skill FILE        appended to the system prompt $AGENTIC_REVIEW_SKILL
 #   --max-findings N    0 disables the cap            $AGENTIC_REVIEW_MAX_FINDINGS
 #   --passes N          repeat the review N times and merge   $AGENTIC_REVIEW_PASSES
+#   --lenses a,b,c      one pass per concern, e.g. security,correctness,docs
+#                                                     $AGENTIC_REVIEW_LENSES
 #   --min-votes N       drop findings seen in fewer passes   $AGENTIC_REVIEW_MIN_VOTES
 #   --review-mode M     summary|inline|suggest        $AGENTIC_REVIEW_MODE
 #                       suggest prints the fixes it would offer on a PR
@@ -74,6 +76,11 @@ REVIEW_MODE="${AGENTIC_REVIEW_MODE:-summary}"
 OMP_VERSION="${AGENTIC_REVIEW_OMP_VERSION:-latest}"
 MAX_DIFF_BYTES="${AGENTIC_REVIEW_MAX_DIFF_BYTES:-400000}"
 PASSES="${AGENTIC_REVIEW_PASSES:-1}"
+# Separate passes per concern. Macroscope runs security / correctness / docs as
+# distinct passes, and AgenticSCR measured that MIXING knowledge sources hurt
+# (13.0% -> 12.6%, "semantic noise or conflicting signals"). Splitting also cuts
+# rules-per-prompt, which is what predicts whether injected knowledge is used.
+LENSES="${AGENTIC_REVIEW_LENSES:-}"
 MIN_VOTES="${AGENTIC_REVIEW_MIN_VOTES:-1}"
 STAGED=0; OUT=""; FAIL_ON_FINDINGS=1; AS_JSON=0
 PASSTHRU=()
@@ -90,6 +97,7 @@ while [ $# -gt 0 ]; do
     --max-findings) MAX_FINDINGS="${2:-}"; shift 2 ;;
     --review-mode)  REVIEW_MODE="${2:-}"; shift 2 ;;
     --passes)       PASSES="${2:-}"; shift 2 ;;
+    --lenses)       LENSES="${2:-}"; shift 2 ;;
     --min-votes)    MIN_VOTES="${2:-}"; shift 2 ;;
     --omp-version)  OMP_VERSION="${2:-}"; shift 2 ;;
     --out)          OUT="${2:-}"; shift 2 ;;
@@ -307,7 +315,19 @@ FORMAT_FILE="$(support "$FORMAT_FILE")" \
   || die "no output format at $FORMAT_FILE (looked in this repo and in $SELF_ROOT)"
 
 TMP_PROMPT="$(mktemp)"
-build_prompt() { # build_prompt <pass-index> <destination>
+# Per-lens focus text and the skill files that lens wants. A lens with an empty
+# skills list gets none — the docs lens works from its own instructions, and
+# giving it the infra catalogue would be the heterogeneous-knowledge mistake.
+lens_focus() { # lens_focus <name>; prints the focus block, or nothing
+  local f; f="$(support "review/lenses/$1.md" 2>/dev/null)" || return 1
+  grep -v '^<!-- skills:' "$f"
+}
+lens_skills() { # lens_skills <name>; prints space-separated skill paths
+  local f; f="$(support "review/lenses/$1.md" 2>/dev/null)" || return 1
+  grep -oE '<!-- skills: [^>]*-->' "$f" | sed 's/<!-- skills: //; s/ *-->//'
+}
+
+build_prompt() { # build_prompt <pass-index> <destination> [lens]
 # The diff goes in verbatim. It used to say only "The diff is: git diff A B",
 # but the tool allowlist has no shell and no git, so the agent could never run
 # that — it was reviewing the working tree while guessing from filenames what
@@ -321,6 +341,7 @@ fi
 {
   cat "$PROMPT_FILE"
   echo
+  if [ -n "${3:-}" ]; then echo; lens_focus "$3"; echo; fi
   # WHAT THE CHANGE IS FOR. Several defects are only visible against intent —
   # a documented token scope that cannot work, a CIDR that cannot route. With
   # no statement of intent there is nothing to contradict, and those were
@@ -438,7 +459,48 @@ run_pass() { # run_pass <prompt-file> <out-file>
     < /dev/null > "$2" 2>"$2.err"
 }
 
-if [ "${PASSES:-1}" -le 1 ]; then
+if [ -n "$LENSES" ]; then
+  # One pass per concern. Each gets only its own knowledge, so the prompt stays
+  # small and the lenses cannot dilute one another.
+  PASS_OUTS=""; ok_passes=0; li=0
+  IFS=',' read -ra _lenses <<< "$LENSES"
+  for lens in "${_lenses[@]}"; do
+    lens="$(printf '%s' "$lens" | tr -d '[:space:]')"; [ -n "$lens" ] || continue
+    li=$((li + 1))
+    if ! lens_focus "$lens" >/dev/null 2>&1; then say "no such lens: $lens — skipping"; continue; fi
+
+    # Swap the skill file set for this lens.
+    LENS_SKILLS="$(lens_skills "$lens")"
+    : > "$TMP_SKILL"
+    for sk in $LENS_SKILLS; do
+      if r="$(support "$sk")"; then cat "$r" >> "$TMP_SKILL"; printf '\n\n' >> "$TMP_SKILL"; fi
+    done
+    ARGS=()
+    if [ -s "$TMP_SKILL" ]; then ARGS+=(--append-system-prompt="$TMP_SKILL"); fi
+    if [ -n "$THINKING" ]; then ARGS+=(--thinking="$THINKING"); fi
+    if [ -n "$MAX_TIME" ]; then ARGS+=(--max-time="$MAX_TIME"); fi
+    if [ ${#PASSTHRU[@]} -gt 0 ]; then ARGS+=("${PASSTHRU[@]}"); fi
+
+    P="$(mktemp)"; O="$(mktemp)"
+    build_prompt "$li" "$P" "$lens"
+    if run_pass "$P" "$O" && [ -s "$O" ]; then
+      PASS_OUTS="$PASS_OUTS $O"; ok_passes=$((ok_passes + 1))
+      say "lens $lens ok ($(grep -cE '^\s*[-*] ' "$TMP_SKILL" 2>/dev/null || echo 0) skill rules)"
+    else
+      say "lens $lens failed — continuing"; rm -f "$O" "$O.err"
+    fi
+    rm -f "$P"
+  done
+  [ "$ok_passes" -gt 0 ] || { rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_SKILL"; die "every lens failed"; }
+  merged=0
+  if MERGE="$(support scripts/merge-findings.mjs)" && command -v node >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    if node "$MERGE" --min-votes "$MIN_VOTES" $PASS_OUTS > "$TMP_OUT"; then merged=1; fi
+  fi
+  if [ "$merged" = 0 ]; then cat "${PASS_OUTS%% *}" > "$TMP_OUT" 2>/dev/null || true; fi
+  # shellcheck disable=SC2086
+  rm -f $PASS_OUTS
+elif [ "${PASSES:-1}" -le 1 ]; then
   if ! run_pass "$TMP_PROMPT" "$TMP_OUT"; then
     printf '\n' >&2; sed 's/^/    /' "$TMP_OUT.err" | tail -20 >&2
     rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err" "$TMP_SKILL"
