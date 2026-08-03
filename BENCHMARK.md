@@ -61,6 +61,7 @@ runs of identical code. Repeated sampling is why the union beats any single run.
 | **1 pass, `thinking: high`** | **4** | **8, 9, 8, 8** | **14–17** | ~$0.03, ~4 min |
 | 1 pass, `thinking: high`, **codegraph off** | 7 | 7,7,8,8,8,8,9 | 13–18 | mean 7.9 |
 | 1 pass, `thinking: high`, **codegraph on** | 3 | 7, 0, 7 | 0–16 | one run returned nothing |
+| 1 general pass + docs lens, merged | 1 | **9/11** | 23 | best measured; docs added 8 new |
 | Union across everything | | 10/11 | | |
 
 **Codegraph shows no measurable benefit here, and the test is weak.** Two valid
@@ -92,6 +93,18 @@ destroys a real `.env` was also unfound until `thinking: high`, which produced
 it — the two hardest findings are both "the stated thing cannot work" defects,
 and raising effort reached one of them. That class remains the weakest, and is
 the case for grounding documentation claims in something authoritative.
+
+**Web search was tested and rejected.** The remaining hard findings looked like
+missing knowledge, so the obvious fix was grounding in live documentation. Asked
+directly, the plain model answers all three correctly with no search at all —
+whether a tailnet CGNAT address reaches a public hostname, whether excluding
+`.github/**` from a secret scan is safe, whether `BucketAlreadyExists` differs
+from `BucketAlreadyOwnedByYou`. The `:online` variant was no better and on one
+answer slightly worse. The knowledge is present; it is not applied while reading
+130 KB of diff. That is an attention problem, and an isolated docs pass fixes it
+where retrieval would not. Web search remains plausible for facts the model
+cannot know — current library versions, recently changed API scopes — which is
+the class Macroscope grounds.
 
 The lens result is not a clean refutation of lenses: 5/11 sits inside the
 observed noise band. What *is* solid is the mechanism found while investigating

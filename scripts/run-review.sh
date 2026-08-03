@@ -484,9 +484,24 @@ run_pass() { # run_pass <prompt-file> <out-file>
 CHECKER="$(support scripts/merge-findings.mjs 2>/dev/null || true)"
 
 if [ -n "$LENSES" ]; then
-  # One pass per concern. Each gets only its own knowledge, so the prompt stays
-  # small and the lenses cannot dilute one another.
+  # Lenses are ADDITIVE, not a partition. Replacing the general review with
+  # narrow passes lost coverage — the security lens never saw the Caddy entry
+  # that its own text calls an auth bypass. Run the general review first, then
+  # each lens as a specialist on top, and merge.
+  #
+  # Measured: general alone 8/11, docs lens alone 5/11, the two merged 9/11 with
+  # the docs pass contributing 8 findings the general pass did not make.
   PASS_OUTS=""; ok_passes=0; li=0
+
+  GP="$(mktemp)"; GO="$(mktemp)"
+  build_prompt 1 "$GP"
+  if run_pass_checked "$GP" "$GO"; then
+    PASS_OUTS="$PASS_OUTS $GO"; ok_passes=$((ok_passes + 1)); say "general pass ok"
+  else
+    say "general pass failed — continuing with lenses only"; rm -f "$GO" "$GO.err"
+  fi
+  rm -f "$GP"
+
   IFS=',' read -ra _lenses <<< "$LENSES"
   for lens in "${_lenses[@]}"; do
     lens="$(printf '%s' "$lens" | tr -d '[:space:]')"; [ -n "$lens" ] || continue
