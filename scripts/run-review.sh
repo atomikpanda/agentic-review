@@ -35,6 +35,7 @@
 #   --all               list every tracked finding, including dismissed
 #   --history           list past runs
 #   --dismiss ID...     stop reporting these findings
+#   --trust-repo        proceed despite agent config in the checkout
 #   --no-codegraph      skip the symbol index (for A/B measurement)
 #   --json              raw findings JSON on stdout, for piping
 #   --no-fail           exit 0 even when findings are reported
@@ -92,7 +93,7 @@ PASSES="${AGENTIC_REVIEW_PASSES:-1}"
 # rules-per-prompt, which is what predicts whether injected knowledge is used.
 LENSES="${AGENTIC_REVIEW_LENSES:-}"
 MIN_VOTES="${AGENTIC_REVIEW_MIN_VOTES:-1}"
-STAGED=0; OUT=""; FAIL_ON_FINDINGS=1; AS_JSON=0; USE_CODEGRAPH=1; VIEW=""
+STAGED=0; OUT=""; FAIL_ON_FINDINGS=1; AS_JSON=0; USE_CODEGRAPH=1; VIEW=""; TRUST_REPO="${TRUST_REPO:-0}"
 PASSTHRU=()
 
 while [ $# -gt 0 ]; do
@@ -114,6 +115,7 @@ while [ $# -gt 0 ]; do
     --staged)       STAGED=1; shift ;;
     --no-fail)      FAIL_ON_FINDINGS=0; shift ;;
     --no-codegraph) USE_CODEGRAPH=0; shift ;;
+    --trust-repo)   TRUST_REPO=1; shift ;;
     --open)         VIEW=open; shift ;;
     --history)      VIEW=runs; shift ;;
     --all)          VIEW=all; shift ;;
@@ -150,10 +152,22 @@ SELF_ROOT="$(cd -P "$(dirname "$_self")/.." && pwd)"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not in a git repository"
 cd "$REPO_ROOT"
 
-# Repository under review first (a project may ship its own conventions), then
-# the copy that came with this script.
-support() { # support <relative-path> -> prints an existing path, or fails
+# Two lookups, because the two kinds of file have opposite trust requirements.
+#
+# DATA — prompts, skills, output formats — may be overridden by the repository,
+# because a project shipping its own review conventions is the feature.
+#
+# CODE — anything this script then executes — must come from where this script
+# lives and nowhere else. Preferring the repository's copy meant that running
+# `review` inside someone else's checkout ran their scripts/post-review.mjs and
+# scripts/codegraph.sh on your machine. Reviewing a branch is not consenting to
+# execute it.
+support() { # support <relative-path> -> data file, repo first
   if [ -f "$1" ]; then printf '%s' "$1"; return 0; fi
+  if [ -f "$SELF_ROOT/$1" ]; then printf '%s' "$SELF_ROOT/$1"; return 0; fi
+  return 1
+}
+support_exec() { # support_exec <relative-path> -> executable, installed copy only
   if [ -f "$SELF_ROOT/$1" ]; then printf '%s' "$SELF_ROOT/$1"; return 0; fi
   return 1
 }
@@ -268,15 +282,25 @@ fi
 #
 # omp loads MCP server definitions from these directories and spawns the
 # commands they name, at startup, regardless of --tools or --approval-mode.
+# Refuse, rather than warn. omp loads these at startup and spawns whatever they
+# name, before any tool restriction applies — so a warning printed one line
+# above the thing it warns about is not a control, it is a note attached to an
+# already-made decision. CI deletes them; locally we cannot delete a developer's
+# own files, so the choice is explicit.
+_agent_cfg=""
 for _d in .omp .claude .cursor .codex .gemini .opencode .windsurf; do
-  if [ -f "$_d/mcp.json" ]; then
-    _c "0;33"
-    printf '  ! %s/mcp.json will be loaded by omp, and any command it names will run.\n' "$_d" >&2
-    printf '    That is fine for your own config. If this branch came from someone\n' >&2
-    printf '    else, read that file before continuing. CI deletes it; this does not.\n' >&2
-    _c "0"
-  fi
+  [ -f "$_d/mcp.json" ] && _agent_cfg="$_agent_cfg $_d/mcp.json"
 done
+[ -f mcp.json ] && _agent_cfg="$_agent_cfg mcp.json"
+[ -f .mcp.json ] && _agent_cfg="$_agent_cfg .mcp.json"
+if [ -n "$_agent_cfg" ] && [ "${TRUST_REPO:-0}" != "1" ]; then
+  _c "0;31"
+  printf '  ✗ this checkout contains agent configuration:%s\n' "$_agent_cfg" >&2
+  printf '    omp loads it at startup and runs whatever command it names, before\n' >&2
+  printf '    any tool restriction applies. If it is yours, re-run with --trust-repo.\n' >&2
+  _c "0"
+  exit 1
+fi
 
 step "Working out what changed"
 if [ "$STAGED" = 1 ]; then
@@ -417,7 +441,7 @@ fi
   # NOT auto-initialised: `codegraph init` writes a .codegraph/ directory into
   # the repository, and a review tool should not leave artefacts in someone's
   # working tree without being asked. Run `codegraph init` yourself to enable it.
-  if [ "$USE_CODEGRAPH" = 1 ] && CG="$(support scripts/codegraph.sh)" && [ -d "$REPO_ROOT/.codegraph" ]; then
+  if [ "$USE_CODEGRAPH" = 1 ] && CG="$(support_exec scripts/codegraph.sh)" && [ -d "$REPO_ROOT/.codegraph" ]; then
     if [ "$STAGED" = 1 ]; then
       STAGED=1 PROJECT="$REPO_ROOT" bash "$CG" 2>/dev/null || true
     else
@@ -451,7 +475,7 @@ done
 # Keep only the sections that apply to what changed. Rule count is the thing
 # that predicts whether injected knowledge is used at all, so this matters more
 # than how the rules are worded.
-if SEL="$(support scripts/select-skills.mjs)" && command -v node >/dev/null 2>&1 && [ -s "$TMP_SKILL" ]; then
+if SEL="$(support_exec scripts/select-skills.mjs)" && command -v node >/dev/null 2>&1 && [ -s "$TMP_SKILL" ]; then
   if [ "$STAGED" = 1 ]; then _cf="$(git diff --cached --name-only --diff-filter=d)"
   else _cf="$(git diff --name-only --diff-filter=d "$MERGE_BASE" HEAD)"; fi
   TMP_SEL="$(mktemp)"
@@ -509,7 +533,7 @@ run_pass() { # run_pass <prompt-file> <out-file>
     < /dev/null > "$2" 2>"$2.err"
 }
 
-CHECKER="$(support scripts/merge-findings.mjs 2>/dev/null || true)"
+CHECKER="$(support_exec scripts/merge-findings.mjs 2>/dev/null || true)"
 
 if [ -n "$LENSES" ]; then
   # Lenses are ADDITIVE, not a partition. Replacing the general review with
@@ -560,7 +584,7 @@ if [ -n "$LENSES" ]; then
   done
   [ "$ok_passes" -gt 0 ] || { rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_SKILL"; die "every lens failed"; }
   merged=0
-  if MERGE="$(support scripts/merge-findings.mjs)" && command -v node >/dev/null 2>&1; then
+  if MERGE="$(support_exec scripts/merge-findings.mjs)" && command -v node >/dev/null 2>&1; then
     # shellcheck disable=SC2086
     if node "$MERGE" --min-votes "$MIN_VOTES" $PASS_OUTS > "$TMP_OUT"; then merged=1; fi
   fi
@@ -601,7 +625,7 @@ else
   # would read every pass as unparseable and emit an empty result, silently
   # discarding the whole review. There is nothing to merge in that mode.
   if [ "$REVIEW_MODE" != "summary" ] \
-     && MERGE="$(support scripts/merge-findings.mjs)" && command -v node >/dev/null 2>&1; then
+     && MERGE="$(support_exec scripts/merge-findings.mjs)" && command -v node >/dev/null 2>&1; then
     # shellcheck disable=SC2086  # deliberate word splitting over the pass list
     if node "$MERGE" --min-votes "$MIN_VOTES" $PASS_OUTS > "$TMP_OUT"; then merged=1; fi
   fi
@@ -619,7 +643,7 @@ fi
 # Every mode records. The default local mode is `summary`, so gating this on
 # non-summary meant the documented plain `review` never stored anything — the
 # state feature was off by default in the only path most people use.
-if ST="$(support scripts/local-state.mjs)" && command -v node >/dev/null 2>&1 \
+if ST="$(support_exec scripts/local-state.mjs)" && command -v node >/dev/null 2>&1 \
    && grep -q '"findings"' "$TMP_OUT" 2>/dev/null; then
   _head="$(git rev-parse HEAD 2>/dev/null || echo)"
   _base="${MERGE_BASE:-${BASE:-}}"
@@ -653,7 +677,7 @@ else
   # Render the structured findings, including the fixes that would appear as
   # committable suggestions on a pull request. Shares post-review.mjs's parser
   # so the terminal and the PR cannot disagree about what the agent said.
-  if command -v node >/dev/null 2>&1 && RENDERER="$(support scripts/post-review.mjs)"; then
+  if command -v node >/dev/null 2>&1 && RENDERER="$(support_exec scripts/post-review.mjs)"; then
     FINDINGS_FILE="$TMP_OUT" RENDER=1 node "$RENDERER" || cat "$TMP_OUT"
   else
     cat "$TMP_OUT"
