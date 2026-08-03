@@ -372,6 +372,14 @@ or `off` cuts reasoning tokens, which dominate on a large diff.
 `SyntaxError`. CI installs bun via `oven-sh/setup-bun`; `run-review.sh` checks
 the local version before it starts and says so if it is too old.
 
+## Measuring changes
+
+[`BENCHMARK.md`](BENCHMARK.md) describes a reference set — a real commit with 11
+independently-produced findings — and how to run against it. It also records the
+measured run-to-run variance, which is ±2 findings on an 11-item set: **a single
+run cannot distinguish two configurations.** Several tuning decisions made
+during development looked conclusive on one sample and were not.
+
 ## Licence
 
 MIT.
