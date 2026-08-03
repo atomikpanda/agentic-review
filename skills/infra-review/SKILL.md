@@ -14,6 +14,7 @@ reviewing, ask of each change — *if this silently did nothing, what would the
 symptom be?* If the answer is "nothing visible", flag it.
 
 ## Caddy / reverse proxies
+<!-- when: Caddyfile, *.caddy, edge/**, *nginx*, *.conf -->
 
 - **`trusted_proxies` without `trusted_proxies_strict` is an auth bypass.**
   Caddy takes the **leftmost** `X-Forwarded-For` entry as `client_ip`. CDNs
@@ -30,6 +31,7 @@ symptom be?* If the answer is "nothing visible", flag it.
   it cannot match an admin path such as `/api/thing`.
 
 ## cloud-init
+<!-- when: *cloud-init*, *cloud-config*, user-data* -->
 
 - **`runcmd` runs as `/bin/sh` with no `set -e`.** Every failure is logged and
   stepped over; bootstrap "succeeds" regardless. Any cloud-config whose runcmd
@@ -44,6 +46,7 @@ symptom be?* If the answer is "nothing visible", flag it.
 - **Changing user_data does nothing to a running instance** — first boot only.
 
 ## Terraform
+<!-- when: *.tf, *.tfvars, *.hcl, infra/** -->
 
 - **A gitignored `terraform.tfvars` does not exist in CI.** Every variable
   without a default must then come from `TF_VAR_*`, or plan/apply fails — and
@@ -57,6 +60,7 @@ symptom be?* If the answer is "nothing visible", flag it.
 - **Commit `.terraform.lock.hcl`** so CI resolves the tested provider versions.
 
 ## Firewalls and overlay networks
+<!-- when: *.tf, *firewall*, *cloud-init*, *tailscale*, *.hcl -->
 
 - **A cloud firewall filters the public interface only.** WireGuard-based
   overlays (Tailscale etc.) arrive as UDP and are decapsulated *inside* the
@@ -71,6 +75,7 @@ symptom be?* If the answer is "nothing visible", flag it.
   ingress, host firewalls must be disabled, not merely unused.
 
 ## Agents, bouncers, and anything with a shared key
+<!-- when: docker-compose*.yml, *cloud-init*, *.env*, *crowdsec* -->
 
 - **Installed ≠ enforcing.** A package that installs and auto-starts with a
   default key will sit `active` while failing authentication — enforcing
@@ -79,6 +84,7 @@ symptom be?* If the answer is "nothing visible", flag it.
   disabled**, and started only after the key is written.
 
 ## Shell and setup scripts
+<!-- when: *.sh, *.bash, *.zsh, Taskfile.yml, Makefile, *.mk -->
 
 - **`printf "$var"` treats data as a format string.** Any `%s` in user content
   (an SSH key comment, a path) silently mutates output. Use `printf '%s'` or a
@@ -97,6 +103,7 @@ symptom be?* If the answer is "nothing visible", flag it.
   success points config at an unreadable bucket.
 
 ## Docker
+<!-- when: Dockerfile*, docker-compose*.yml, *.dockerfile, .dockerignore -->
 
 - **`COPY` dereferences symlinks.** Copying a global npm binary produces a real
   file outside its package, so `require` resolves from the wrong directory. The
@@ -108,6 +115,7 @@ symptom be?* If the answer is "nothing visible", flag it.
   app writes in place; an atomic rename-based write breaks it.
 
 ## CI/CD
+<!-- when: .github/workflows/**, .gitlab-ci.yml, *.github-actions.yml, Jenkinsfile -->
 
 - **`workflow_run` does not deploy the commit that passed.** `git reset --hard
   origin/main` ships whatever the tip is now; if another commit landed while
@@ -121,6 +129,7 @@ symptom be?* If the answer is "nothing visible", flag it.
   miss a real key pasted there. Detect placeholder *content* instead.
 
 ## CLI tools invoked from scripts and CI
+<!-- when: *.sh, .github/workflows/**, Taskfile.yml, *.mjs, *.js, *.ts -->
 
 - **"It reads stdin" is an assumption, not a fact — verify it.** A CLI that
   takes a prompt or payload may only read piped stdin behind a guard like
@@ -147,6 +156,7 @@ symptom be?* If the answer is "nothing visible", flag it.
   surface as a minified `SyntaxError`.
 
 ## Agent tooling run against untrusted code
+<!-- when: .github/workflows/**, *.sh, *.mjs, mcp.json, .mcp.json -->
 
 - **A tool allowlist does not bound what an agent can do if the tool loads
   configuration from the working directory.** Coding agents discover MCP

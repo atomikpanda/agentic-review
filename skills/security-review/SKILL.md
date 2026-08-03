@@ -24,6 +24,7 @@ Three rules govern everything here:
    finding. Harm must land on someone other than the attacker.
 
 ## Injection — command, SQL, template, argument
+<!-- when: *.py, *.ts, *.tsx, *.js, *.jsx, *.go, *.rb, *.php, *.java, *.kt, *.cs, *.swift, *.sh -->
 
 - **Trigger.** A string reaches an interpreter: a shell, a SQL engine, a
   template renderer, an `exec`/`spawn` argument list, an `eval`.
@@ -35,6 +36,7 @@ Three rules govern everything here:
   value already validated against an allowlist on every reachable path.
 
 ## Argument and option injection
+<!-- when: *.py, *.ts, *.js, *.go, *.rb, *.php, *.java, *.kt, *.cs, *.swift, *.sh, *.mjs -->
 
 - **Trigger.** Attacker-influenced text placed in an argument list, even without
   a shell.
@@ -43,6 +45,7 @@ Three rules govern everything here:
   terminator before positional arguments. This survives "we avoided the shell".
 
 ## Path traversal and unsafe extraction
+<!-- when: *.py, *.ts, *.js, *.go, *.rb, *.php, *.java, *.kt, *.cs, *.swift, *.sh, *.mjs -->
 
 - **Trigger.** A path is built from input: an upload name, an archive entry, a
   URL path segment, a config value.
@@ -52,6 +55,7 @@ Three rules govern everything here:
   is the wrong way round.
 
 ## TOCTOU and race conditions
+<!-- when: *.py, *.ts, *.js, *.go, *.rb, *.php, *.java, *.kt, *.cs, *.swift, *.sh, *.mjs -->
 
 - **Trigger.** A check followed by a use of the same resource: `exists` then
   `open`, permission test then act, read-modify-write on shared state.
@@ -64,6 +68,7 @@ Three rules govern everything here:
   the actor are mandatory.
 
 ## Authorization gaps
+<!-- when: *.py, *.ts, *.js, *.go, *.rb, *.php, *.java, *.kt, *.cs, *.swift -->
 
 - **Trigger.** More than one code path reaches the same resource, or an
   identifier from the request selects a record.
@@ -73,6 +78,7 @@ Three rules govern everything here:
   *whether they may* — a route behind login can still expose another tenant.
 
 ## Server-side request forgery and unvalidated redirects
+<!-- when: *.py, *.ts, *.js, *.go, *.rb, *.php, *.java, *.kt, *.cs, *.swift -->
 
 - **Trigger.** A URL, host or port from input reaches a fetch, a webhook, a
   redirect, or a metadata lookup.
@@ -82,6 +88,7 @@ Three rules govern everything here:
   URL does not survive a redirect the client follows.
 
 ## Deserialization and dynamic loading
+<!-- when: *.py, *.ts, *.js, *.go, *.rb, *.php, *.java, *.kt, *.cs, *.swift -->
 
 - **Trigger.** Untrusted bytes become objects, or a name from input selects code
   to load: pickle, Java/`ObjectInputStream`, YAML with arbitrary tags, `NSCoding`
@@ -91,6 +98,7 @@ Three rules govern everything here:
   (`yaml.safe_load`, JSON) are not this class.
 
 ## Configuration that names something to execute
+<!-- when: .github/workflows/**, *.sh, *.json, *.yml, *.yaml, *.toml, *.mjs -->
 
 - **Trigger.** A tool reads configuration **from a directory that untrusted
   content controls**, and that configuration can name a command, a plugin, a
@@ -106,6 +114,7 @@ Three rules govern everything here:
   what in there can name a program?*
 
 ## Secret exposure
+<!-- when: *.py, *.ts, *.js, *.go, *.rb, *.php, *.java, *.kt, *.cs, *.swift, *.sh, *.yml, *.yaml, *.env*, .github/workflows/** -->
 
 - **Trigger.** A credential is placed somewhere with a wider audience than the
   process: a log line, an error message, a URL query string, a build artifact, a
@@ -115,6 +124,7 @@ Three rules govern everything here:
   aggregators are usually readable by a wider group than the service's operators.
 
 ## Cryptography and randomness
+<!-- when: *.py, *.ts, *.js, *.go, *.rb, *.php, *.java, *.kt, *.cs, *.swift -->
 
 - **Trigger.** Hand-rolled crypto, a comparison of secrets, a token generator, a
   key or IV that is constant.
@@ -124,6 +134,7 @@ Three rules govern everything here:
   distinguishable ciphertext — not the mere presence of a primitive.
 
 ## Resource exhaustion
+<!-- when: *.py, *.ts, *.js, *.go, *.rb, *.php, *.java, *.kt, *.cs, *.swift -->
 
 - **Trigger.** Input controls an allocation, an iteration count, a recursion
   depth, a decompression ratio, or a regex evaluated against attacker text.
@@ -132,6 +143,7 @@ Three rules govern everything here:
   the alternation that backtracks.
 
 ## Memory and lifetime (Swift, Kotlin, C-family)
+<!-- when: *.swift, *.kt, *.kts, *.c, *.cc, *.cpp, *.h, *.hpp, *.m, *.mm, *.rs -->
 
 - **Trigger.** Unsafe pointer APIs, manual buffer arithmetic, `unowned`
   references, force-unwraps on values crossing a boundary, and concurrency

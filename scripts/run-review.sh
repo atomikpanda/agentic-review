@@ -23,6 +23,8 @@
 #   --prompt FILE       review instructions           $AGENTIC_REVIEW_PROMPT
 #   --skill FILE        appended to the system prompt $AGENTIC_REVIEW_SKILL
 #   --max-findings N    0 disables the cap            $AGENTIC_REVIEW_MAX_FINDINGS
+#   --passes N          repeat the review N times and merge   $AGENTIC_REVIEW_PASSES
+#   --min-votes N       drop findings seen in fewer passes   $AGENTIC_REVIEW_MIN_VOTES
 #   --review-mode M     summary|inline|suggest        $AGENTIC_REVIEW_MODE
 #                       suggest prints the fixes it would offer on a PR
 #   --omp-version V     npm version or dist-tag       $AGENTIC_REVIEW_OMP_VERSION
@@ -71,6 +73,8 @@ MAX_FINDINGS="${AGENTIC_REVIEW_MAX_FINDINGS:-20}"
 REVIEW_MODE="${AGENTIC_REVIEW_MODE:-summary}"
 OMP_VERSION="${AGENTIC_REVIEW_OMP_VERSION:-latest}"
 MAX_DIFF_BYTES="${AGENTIC_REVIEW_MAX_DIFF_BYTES:-400000}"
+PASSES="${AGENTIC_REVIEW_PASSES:-1}"
+MIN_VOTES="${AGENTIC_REVIEW_MIN_VOTES:-1}"
 STAGED=0; OUT=""; FAIL_ON_FINDINGS=1; AS_JSON=0
 PASSTHRU=()
 
@@ -85,6 +89,8 @@ while [ $# -gt 0 ]; do
     --skill)        SKILL="${2:-}"; shift 2 ;;
     --max-findings) MAX_FINDINGS="${2:-}"; shift 2 ;;
     --review-mode)  REVIEW_MODE="${2:-}"; shift 2 ;;
+    --passes)       PASSES="${2:-}"; shift 2 ;;
+    --min-votes)    MIN_VOTES="${2:-}"; shift 2 ;;
     --omp-version)  OMP_VERSION="${2:-}"; shift 2 ;;
     --out)          OUT="${2:-}"; shift 2 ;;
     --staged)       STAGED=1; shift ;;
@@ -241,6 +247,7 @@ if [ "$STAGED" = 1 ]; then
   git diff --cached --quiet && die "nothing staged"
   DIFFSTAT="$(git diff --cached --stat)"
   DIFFTEXT="$(git diff --cached --no-color)"
+  INTENT=""
 else
   if [ -z "$BASE" ]; then
     # origin/HEAD is the reliable default-branch pointer; fall back sensibly.
@@ -257,10 +264,33 @@ else
   git diff --quiet "$MERGE_BASE" HEAD && die "no changes vs $BASE"
   DIFFSTAT="$(git diff --stat "$MERGE_BASE" HEAD)"
   DIFFTEXT="$(git diff --no-color "$MERGE_BASE" HEAD)"
+  INTENT="$(git log --reverse --format='- %s%n%b' "$MERGE_BASE"..HEAD | head -60)"
   RANGE="$BASE"
 fi
 ok "reviewing against $RANGE"
 printf '%s\n' "$DIFFSTAT" | sed 's/^/    /' >&2
+
+# Emit the diff with files in a pass-dependent order. Bugbot randomises diff
+# order across its eight passes because it "nudged the model toward different
+# lines of reasoning" — with a U-shaped attention bias, what sits in the middle
+# changes with the order, and so does what gets noticed. Rotation rather than
+# RNG so a given pass is reproducible.
+ordered_diff() { # ordered_diff <pass-index>
+  local pass="$1"
+  if [ "$pass" -le 1 ]; then printf '%s\n' "$DIFFTEXT"; return 0; fi
+  local files n i
+  if [ "$STAGED" = 1 ]; then files="$(git diff --cached --name-only --diff-filter=d)"
+  else files="$(git diff --name-only --diff-filter=d "$MERGE_BASE" HEAD)"; fi
+  n="$(printf '%s\n' "$files" | grep -c . || true)"
+  [ "$n" -gt 1 ] || { printf '%s\n' "$DIFFTEXT"; return 0; }
+  i=$(( (pass - 1) % n ))
+  { printf '%s\n' "$files" | tail -n +$((i + 1)); printf '%s\n' "$files" | head -n "$i"; } \
+  | while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      if [ "$STAGED" = 1 ]; then git diff --cached --no-color -- "$f"
+      else git diff --no-color "$MERGE_BASE" HEAD -- "$f"; fi
+    done
+}
 
 step "Building prompt"
 PROMPT_FILE="$(support "$PROMPT_FILE")" \
@@ -277,6 +307,7 @@ FORMAT_FILE="$(support "$FORMAT_FILE")" \
   || die "no output format at $FORMAT_FILE (looked in this repo and in $SELF_ROOT)"
 
 TMP_PROMPT="$(mktemp)"
+build_prompt() { # build_prompt <pass-index> <destination>
 # The diff goes in verbatim. It used to say only "The diff is: git diff A B",
 # but the tool allowlist has no shell and no git, so the agent could never run
 # that — it was reviewing the working tree while guessing from filenames what
@@ -290,6 +321,20 @@ fi
 {
   cat "$PROMPT_FILE"
   echo
+  # WHAT THE CHANGE IS FOR. Several defects are only visible against intent —
+  # a documented token scope that cannot work, a CIDR that cannot route. With
+  # no statement of intent there is nothing to contradict, and those were
+  # exactly the findings this reviewer never produced. Locally the commit
+  # messages are the closest thing to a PR description.
+  if [ -n "${INTENT:-}" ]; then
+    echo "## What this change is meant to do"
+    echo
+    printf '%s\n' "$INTENT"
+    echo
+    echo "Check the change against this. An instruction or setting that cannot"
+    echo "achieve what is stated here is a defect, even if the code is valid."
+    echo
+  fi
   # Output contract before the diff — see the workflow for why.
   cat "$FORMAT_FILE"
   echo
@@ -333,7 +378,9 @@ fi
   else
     echo "Reply with the single JSON object described above and nothing else — no prose, no code fence."
   fi
-} > "$TMP_PROMPT"
+} > "$2"
+}
+build_prompt 1 "$TMP_PROMPT"
 ok "$(wc -c < "$TMP_PROMPT" | tr -d ' ') bytes (diff ${DIFF_BYTES}B, truncated=$TRUNCATED)"
 
 ARGS=()
@@ -349,6 +396,21 @@ for sk in "${_skills[@]}"; do
     skill_names="$skill_names $sk"
   fi
 done
+# Keep only the sections that apply to what changed. Rule count is the thing
+# that predicts whether injected knowledge is used at all, so this matters more
+# than how the rules are worded.
+if SEL="$(support scripts/select-skills.mjs)" && command -v node >/dev/null 2>&1 && [ -s "$TMP_SKILL" ]; then
+  if [ "$STAGED" = 1 ]; then _cf="$(git diff --cached --name-only --diff-filter=d)"
+  else _cf="$(git diff --name-only --diff-filter=d "$MERGE_BASE" HEAD)"; fi
+  TMP_SEL="$(mktemp)"
+  if CHANGED_FILES="$_cf" SKILL_FILES="$TMP_SKILL" node "$SEL" > "$TMP_SEL" 2>>"$TMP_SKILL.log" && [ -s "$TMP_SEL" ]; then
+    mv "$TMP_SEL" "$TMP_SKILL"
+    [ -f "$TMP_SKILL.log" ] && sed 's/^/ /' "$TMP_SKILL.log" >&2 && rm -f "$TMP_SKILL.log"
+  else
+    rm -f "$TMP_SEL"
+  fi
+fi
+
 if [ -s "$TMP_SKILL" ]; then
   ARGS+=(--append-system-prompt="$TMP_SKILL"); ok "knowledge base:$skill_names"
 else
@@ -359,42 +421,60 @@ if [ -n "$MAX_TIME" ]; then ARGS+=(--max-time="$MAX_TIME"); fi
 if [ ${#PASSTHRU[@]} -gt 0 ]; then ARGS+=("${PASSTHRU[@]}"); fi
 
 step "Reviewing with $MODEL"
-say "read-only tools: $TOOLS${THINKING:+ | thinking: $THINKING}"
+say "read-only tools: $TOOLS${THINKING:+ | thinking: $THINKING}${PASSES:+ | passes: $PASSES}"
 TMP_OUT="$(mktemp)"
-# Same allowlist as CI, and emitted last for the same reason: whatever came
-# through -- cannot be the winning --tools. omp validates these names, so a
-# typo fails loudly.
-#
-# The prompt goes in via omp's @file form. Not stdin: omp only reads piped
-# stdin when `process.stdin.isTTY === false`, and that property is `undefined`
-# for a redirect or a pipe on both bun and node — never false, so `omp -p <
-# prompt` reads nothing and exits 0 with no output at all. Not a literal
-# argument either: Linux caps one argv entry at 128 KiB and the prompt now
-# carries the diff.
-#
-# --approval-mode=always-ask matches CI. It is omp's tightest mode (the `read`
-# tier: auto-approve read-only, block write and exec); the default is `yolo`.
-if ! "${OMP[@]}" -p \
-      --model="$MODEL" \
-      --no-session \
-      "${ARGS[@]+"${ARGS[@]}"}" \
-      --tools="$TOOLS" \
-      --approval-mode=always-ask \
-      --cwd="$REPO_ROOT" \
-      "@$TMP_PROMPT" \
-      < /dev/null > "$TMP_OUT" 2>"$TMP_OUT.err"; then
-  printf '\n' >&2; sed 's/^/    /' "$TMP_OUT.err" | tail -20 >&2
-  rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err" "$TMP_SKILL"
-  die "review failed"
-fi
 
-# A zero-byte review is a broken run, not a clean one, and omp's exit code does
-# not distinguish them — with no credential it exits 0 and writes nothing to
-# either stream. Without this check that silently reads as "no findings".
-if [ ! -s "$TMP_OUT" ]; then
-  printf '\n' >&2; sed 's/^/    /' "$TMP_OUT.err" | tail -20 >&2
-  rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err" "$TMP_SKILL"
-  die "omp exited 0 but produced no output — the review did not run (check OPENROUTER_API_KEY)"
+# One omp invocation. Same allowlist as CI, --tools emitted last so nothing
+# passed after -- can be the winning value, and the prompt supplied as @file.
+run_pass() { # run_pass <prompt-file> <out-file>
+  "${OMP[@]}" -p \
+    --model="$MODEL" \
+    --no-session \
+    "${ARGS[@]+"${ARGS[@]}"}" \
+    --tools="$TOOLS" \
+    --approval-mode=always-ask \
+    --cwd="$REPO_ROOT" \
+    "@$1" \
+    < /dev/null > "$2" 2>"$2.err"
+}
+
+if [ "${PASSES:-1}" -le 1 ]; then
+  if ! run_pass "$TMP_PROMPT" "$TMP_OUT"; then
+    printf '\n' >&2; sed 's/^/    /' "$TMP_OUT.err" | tail -20 >&2
+    rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err" "$TMP_SKILL"
+    die "review failed"
+  fi
+else
+  # Repeated sampling. The same model over identical input agreed with itself
+  # on only 5 of 9 findings across two runs, so a single pass systematically
+  # under-reports; three passes took measured recall from 5/11 to 7/11.
+  PASS_OUTS=""
+  ok_passes=0
+  for i in $(seq 1 "$PASSES"); do
+    P="$(mktemp)"; O="$(mktemp)"
+    build_prompt "$i" "$P"
+    if run_pass "$P" "$O" && [ -s "$O" ]; then
+      PASS_OUTS="$PASS_OUTS $O"; ok_passes=$((ok_passes + 1)); say "pass $i/$PASSES ok"
+    else
+      say "pass $i/$PASSES failed — continuing"
+      rm -f "$O" "$O.err"
+    fi
+    rm -f "$P"
+  done
+  [ "$ok_passes" -gt 0 ] || { rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_SKILL"; die "every pass failed"; }
+  # `if` not `A && B || C`: with the && form a merge that fails would fall
+  # through to C, and a merge that succeeds but exits non-zero would too.
+  merged=0
+  if MERGE="$(support scripts/merge-findings.mjs)" && command -v node >/dev/null 2>&1; then
+    # shellcheck disable=SC2086  # deliberate word splitting over the pass list
+    if node "$MERGE" --min-votes "$MIN_VOTES" $PASS_OUTS > "$TMP_OUT"; then merged=1; fi
+  fi
+  if [ "$merged" = 0 ]; then
+    say "merge unavailable — using the first successful pass"
+    cat "${PASS_OUTS%% *}" > "$TMP_OUT" 2>/dev/null || true
+  fi
+  # shellcheck disable=SC2086  # deliberate word splitting over the pass list
+  rm -f $PASS_OUTS
 fi
 
 # Read the verdict BEFORE cleanup: $OUT is empty when printing to stdout and

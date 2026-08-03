@@ -66,30 +66,8 @@ const stamp = (fp) => `\n\n<!-- ${MARKER}:${fp} -->`;
 // of significant words, within the same file. Measured on this PR's real
 // duplicates, pairs that are the same issue score 0.37-0.49 and pairs that are
 // different issues score 0.03-0.16, so the threshold sits between them.
-const SIMILARITY = Number(env("SIMILARITY", "0.30"));
-const STOPWORDS_FP = new Set(
-  ("this that with from have when then than been they them there which while would could" +
-    " should must into over under only also more most much some such very each other same" +
-    " about after before again where whether because during through does not"
-  ).split(" "),
-);
-function tokenSet(text) {
-  return new Set(
-    String(text ?? "")
-      .toLowerCase()
-      .replace(/```[\s\S]*?```/g, " ")   // suggestion blocks are not identity
-      .replace(/<!--[\s\S]*?-->/g, " ")  // our own marker
-      .replace(/<\/?details>|<\/?summary>/g, " ")
-      .replace(/[^a-z0-9_]+/g, " ")
-      .split(" ")
-      .filter((w) => w.length > 3 && !STOPWORDS_FP.has(w)),
-  );
-}
-function similarity(a, b) {
-  const inter = [...a].filter((x) => b.has(x)).length;
-  const union = a.size + b.size - inter;
-  return union ? inter / union : 0;
-}
+import { tokenSet, similarity, SIMILARITY_DEFAULT } from "./lib-findings.mjs";
+const SIMILARITY = Number(env("SIMILARITY", String(SIMILARITY_DEFAULT)));
 const readStamp = (body) => {
   const m = String(body ?? "").match(new RegExp(`<!-- ${MARKER}:([0-9a-f]{16}) -->`));
   return m ? m[1] : null;
