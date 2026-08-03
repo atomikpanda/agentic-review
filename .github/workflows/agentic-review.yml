@@ -360,7 +360,14 @@ jobs:
           # checkout could be pointed at the rest of the filesystem while still
           # holding a read-only tool list. Rejecting by name is the load-bearing check; the
           # command below additionally emits --tools and --approval-mode last.
-          case " $IN_EXTRA_ARGS " in
+          # Match against whitespace-normalised text. Every pattern below needs
+          # a literal space before the flag, but the word splitting that later
+          # builds the argv treats a tab as a separator too — so `x\t--add-dir /`
+          # sailed through the guard and arrived as a real --add-dir argument.
+          # Newlines and carriage returns are already rejected above; this closes
+          # the remaining whitespace.
+          _extra_norm="$(printf '%s' "$IN_EXTRA_ARGS" | tr '\t\v\f' '   ')"
+          case " $_extra_norm " in
             *" --tools"*|*"--tools="*|*" --no-tools "*|*" --system-prompt"*|*"--system-prompt="*|\
             *" --api-key"*|*"--api-key="*|*" --approval-mode"*|*"--approval-mode="*|\
             *" --auto-approve "*|*" --yolo "*|*" --plan-yolo "*|\
