@@ -380,7 +380,7 @@ fi
     echo
   fi
   echo '```diff'
-  printf '%s\n' "$DIFFTEXT"
+  ordered_diff "${1:-1}"
   echo '```'
   echo
   echo "The working tree is checked out at the post-change state, so you can read any"

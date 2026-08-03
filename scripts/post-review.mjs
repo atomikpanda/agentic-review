@@ -97,6 +97,12 @@ function extractJson(text) {
   const last = trimmed.lastIndexOf("}");
   if (first !== -1 && last > first) candidates.push(trimmed.slice(first, last + 1));
 
+  // Trailing commas. JSON.parse rejects `{"a":1,}` outright, and models emit it
+  // often enough that this reviewer lost a whole run to it — the findings were
+  // complete and correct and went out as prose. Stripping them is safe here
+  // because the only commas removed are ones immediately before } or ].
+  for (const c of [...candidates]) candidates.push(c.replace(/,(\s*[}\]])/g, "$1"));
+
   for (const c of candidates) {
     try {
       const parsed = JSON.parse(c);
@@ -377,7 +383,7 @@ function summaryBody(total, comments, unanchored) {
   out.push(gate.line, "");
   if (gate.unmet.length) out.push(...gate.unmet.map((u) => `- ${u}`), "");
   out.push(
-    `**Review confidence: ${"●".repeat(score)}${"○".repeat(5 - score)} ${score}/5** — how much to trust *this run*, not whether the code is safe.`,
+    `**Review confidence: ${"●".repeat(conf)}${"○".repeat(5 - conf)} ${conf}/5** — how much to trust *this run*, not whether the code is safe.`,
   );
   if (why.length) out.push("", ...why.map((w) => `- ${w}`));
   out.push(
@@ -591,6 +597,14 @@ async function postReview(payload) {
   return { ok: res.ok, status: res.status, text: await res.text() };
 }
 
+function enforceGate() {
+  const gate = mergeGate(ALL_FINDINGS);
+  if (env("FAIL_ON_FINDINGS", "false") === "true" && gate.verdict === "blocked") {
+    console.error(`::error::${gate.blocking.length} blocking finding(s): ${env("BLOCK_SEVERITIES", "Critical,High")}`);
+    process.exit(1);
+  }
+}
+
 async function main() {
   const raw = readFileSync(FINDINGS_FILE, "utf8");
   const parsed = extractJson(raw);
@@ -789,6 +803,9 @@ async function main() {
 
   if (comments.length === 0 && unanchored.length === 0) {
     console.log("  nothing new to say");
+    // Still gate. A Critical does not stop blocking because it was already
+    // reported on an earlier push — the early return skipped the check entirely.
+    enforceGate();
     return;
   }
 
@@ -818,20 +835,22 @@ async function main() {
   // not "fail on any finding" — failing a build over a Medium was never the
   // intent, and an inconclusive review is reported, not failed, because the
   // fault is ours rather than the contributor's.
-  const gate = mergeGate(ALL_FINDINGS);
-  if (env("FAIL_ON_FINDINGS", "false") === "true" && gate.verdict === "blocked") {
-    console.error(`::error::${gate.blocking.length} blocking finding(s): ${env("BLOCK_SEVERITIES", "Critical,High")}`);
-    process.exit(1);
-  }
+  enforceGate();
 }
 
 // When falling back, the anchored findings still have to appear somewhere.
 function findingsOf(comments, findings) {
+  // Match the badge format actually emitted: `P1` High — **Title**. The earlier
+  // version stripped leading/trailing ** from the whole first line, which never
+  // matched once the badge was added, so the fallback silently dropped every
+  // anchored finding — the opposite of what a fallback is for.
   const anchoredTitles = new Set(
-    comments.map((c) => c.body.split("\n")[0].replace(/^\*\*|\*\*$/g, "")),
+    comments
+      .map((c) => c.body.match(/^`P[012]` \w+ — \*\*(.*?)\*\*/)?.[1])
+      .filter(Boolean),
   );
   return findings
-    .filter((f) => anchoredTitles.has(`${f.severity} — ${f.title}`))
+    .filter((f) => anchoredTitles.has(f.title))
     .map((f) => ({ ...f, reason: "inline anchoring was rejected" }));
 }
 
