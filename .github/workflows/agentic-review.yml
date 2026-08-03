@@ -139,6 +139,15 @@ on:
       # the poster fetched from there runs with a token that can write to the
       # pull request. Deriving it is also correct for forks, which was the only
       # reason the input existed.
+      central_ref:
+        description: >-
+          Ref of the central repository to take the prompt, skills and poster
+          from. Should match the ref the caller pins the workflow to, or a pinned
+          install runs pinned workflow logic against moving support files. Only
+          the ref is configurable — the repository is a literal, because that is
+          what a pull request must not be able to redirect.
+        type: string
+        default: main
       timeout_minutes:
         description: Job timeout.
         type: number
@@ -248,7 +257,7 @@ jobs:
           # A literal is correct because it lives in THIS file: a consuming
           # repository cannot change it, and a fork's copy names the fork.
           repository: atomikpanda/agentic-review
-          ref: main
+          ref: ${{ inputs.central_ref || 'main' }}
           persist-credentials: false
           path: .central-skills
           sparse-checkout: |
@@ -359,6 +368,16 @@ jobs:
             suggest|inline|summary) ;;
             *) echo "::error::review_mode must be suggest, inline or summary (got '$REVIEW_MODE')"; exit 1 ;;
           esac
+
+          # summary mode answers in markdown, so severities cannot be read and
+          # block_severities cannot be honoured. Combining it with
+          # fail_on_findings promised a gate that does not exist, and warning was
+          # not enough — a warning still leaves a check that looks like it is
+          # blocking on severity while failing on anything at all. Refuse it.
+          if [ "$REVIEW_MODE" = "summary" ] && [ "${IN_FAIL_ON_FINDINGS:-false}" = "true" ]; then
+            echo "::error::fail_on_findings requires review_mode suggest or inline — summary mode cannot read severities, so it cannot honour block_severities"
+            exit 1
+          fi
 
           {
             echo "REVIEW_MODE=$REVIEW_MODE"
@@ -499,8 +518,31 @@ jobs:
             return 1
           }
 
-          resolve "$PROMPT_PATH" /tmp/prompt-body.md \
-            || { echo "::error::no review instructions at $PROMPT_PATH in the base commit or $CENTRAL_REPO"; exit 1; }
+          if ! resolve "$PROMPT_PATH" /tmp/prompt-body.md; then
+            # The central checkout is continue-on-error, but requiring its files
+            # afterwards made that meaningless: an enrolled repository ships none
+            # of them, so any central outage failed the job outright. Degrade to
+            # a built-in prompt instead — a weaker review beats no review, and
+            # the run says which it got.
+            echo "::warning::no review instructions found in the base commit or $CENTRAL_REPO — falling back to the built-in prompt"
+            {
+              printf '%s\n' 'Review the changes on this branch.'
+              printf '%s\n' ''
+              printf '%s\n' 'You have read-only tools. Use them: read the files a change depends on, not'
+              printf '%s\n' 'just the ones it touches. The point is to check what the diff alone cannot show.'
+              printf '%s\n' ''
+              printf '%s\n' '- Does a value referenced here exist where it is consumed? Follow it across files.'
+              printf '%s\n' '- Is something the change depends on gitignored, and so absent in CI?'
+              printf '%s\n' '- Is something installed, declared or created but never configured or started?'
+              printf '%s\n' '- Do documented credentials, scopes, flags and commands match what the code'
+              printf '%s\n' '  requires? Instructions that cannot succeed are defects.'
+              printf '%s\n' '- Would this change silently do nothing?'
+              printf '%s\n' ''
+              printf '%s\n' 'Do not report style, formatting, naming, or anything a linter catches. Report'
+              printf '%s\n' 'only defects you verified by reading the relevant files, and state the concrete'
+              printf '%s\n' 'failure: the input or condition, and the wrong behaviour that results.'
+            } > /tmp/prompt-body.md
+          fi
 
           # The output format is a separate file from the review instructions,
           # because the two vary independently: what counts as a defect does not
@@ -817,12 +859,7 @@ jobs:
             echo "  no findings"
             exit 0
           fi
-          # summary mode cannot read severities from markdown, so it must not
-          # claim to honour block_severities. Failing on any finding contradicted
-          # the documented contract; it now says so instead of pretending.
-          if [ "$FAIL_ON_FINDINGS" = "true" ]; then
-            echo "::warning::summary mode cannot read severities, so fail_on_findings cannot honour block_severities here — use suggest or inline for a real gate"
-          fi
+
           if [ "$SUPPRESS_WRITES" = "true" ]; then
             echo "  [suppressed] would comment; see the uploaded artifact"
           elif [ "$POST_COMMENT" = "true" ]; then

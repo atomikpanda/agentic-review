@@ -202,7 +202,8 @@ YAML
   # so it keeps following the central repo's default instead of being frozen at
   # whatever it happened to be on install day.
   emit() { if [ -n "$2" ]; then printf '      %s: %s\n' "$1" "$2" >> "$tmp"; fi; }
-  if [ -n "$I_MODEL$I_THINKING$I_TOOLS$I_MAX_TIME$I_PROMPT$I_SKILL$I_MAX_FINDINGS$I_REVIEW_MODE$I_FAIL$I_COMMENT$I_OMP_VERSION$I_BUN_VERSION$I_EXTRA_ARGS" ]; then
+  if [ -n "$I_MODEL$I_THINKING$I_TOOLS$I_MAX_TIME$I_PROMPT$I_SKILL$I_MAX_FINDINGS$I_REVIEW_MODE$I_FAIL$I_COMMENT$I_OMP_VERSION$I_BUN_VERSION$I_EXTRA_ARGS" ] \
+     || [ "$CENTRAL_REF" != "main" ]; then
     printf '    with:\n' >> "$tmp"
   fi
   emit model            "$I_MODEL"
@@ -212,6 +213,9 @@ YAML
   emit prompt_path      "$I_PROMPT"
   emit skills_path      "$I_SKILL"
   emit review_mode      "$I_REVIEW_MODE"
+  # A pinned install must pin the support files too, or pinned workflow logic
+  # runs against whatever main happens to hold.
+  if [ "$CENTRAL_REF" != "main" ]; then emit central_ref "$CENTRAL_REF"; fi
   # The reusable workflow needs to know where to fetch the shared prompt and
   # poster from. It cannot infer it: github.repository_owner there is the owner
   # of the repo being reviewed, not of this project.
@@ -243,6 +247,7 @@ YAML
 #   prompt_path:      review/prompt.md
 #   skills_path:      skills/infra-review/SKILL.md,skills/security-review/SKILL.md
 #   review_mode:      suggest       # suggest | inline | summary
+#   central_ref:      main          # pin support files to the same ref
 #   max_findings:     20            # 0 disables the cap
 #   post_comment:     true
 #   fail_on_findings: false         # true makes this a blocking check
