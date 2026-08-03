@@ -92,6 +92,23 @@ Three things that mechanism forces, all handled:
 - **The review is never lost.** If the inline post is rejected anyway, it falls
   back to posting everything as a summary rather than failing silently.
 
+### Review confidence
+
+Every review opens with a 1–5 score. It rates **the review, not the code** —
+how much to trust this particular run — and it is computed from what was
+observed, not from the model's opinion of its own work: passes that returned
+usable output, whether the diff was truncated, whether any injected knowledge
+matched the file types.
+
+A "safe to merge" score would be the more natural feature and the wrong one.
+That is a claim about the code, and measured recall here is 8–9 of 11 known
+defects — so about one in five is missed, and such a score would read highest
+exactly when the reviewer found nothing, which is also what a review that did
+not look hard enough produces. Identical configurations scored 5, 6, 7, 8 and 9
+on the same input, so it would not even be stable across re-runs.
+
+**A clean review is not evidence of safety**, and the comment says so every time.
+
 ### Comments don't pile up
 
 Findings are re-derived from scratch on every push, so each comment embeds a

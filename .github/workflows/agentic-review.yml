@@ -546,6 +546,7 @@ jobs:
               echo "Reply with the single JSON object described above and nothing else — no prose, no code fence."
             fi
           } > /tmp/prompt.txt
+          echo "DIFF_TRUNCATED=$TRUNCATED" >> "$GITHUB_ENV"
           echo "  prompt: $(wc -c < /tmp/prompt.txt) bytes (diff $DIFF_BYTES bytes, truncated=$TRUNCATED, mode=$REVIEW_MODE)"
 
       # SECURITY-CRITICAL. omp loads MCP server definitions from agent config
@@ -743,6 +744,10 @@ jobs:
               REVIEW_MODE="$REVIEW_MODE" \
               RESOLVE_STALE="$RESOLVE_STALE" \
               MAX_FINDINGS="$MAX_FINDINGS" \
+              PASSES_TRIED="${PASSES_TRIED:-1}" \
+              PASSES_OK="${PASSES_OK:-1}" \
+              DIFF_TRUNCATED="${DIFF_TRUNCATED:-0}" \
+              SKILL_SECTIONS="${SKILL_SECTIONS:-}" \
                 node "$POSTER"
             fi
             if [ "$FAIL_ON_FINDINGS" = "true" ] && ! grep -q '"findings"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]' /tmp/review.md; then

@@ -232,10 +232,58 @@ function build(findings, ranges) {
   return { comments, unanchored };
 }
 
+// A confidence score about the REVIEW, not about the code.
+//
+// The obvious feature is "safe to merge: 5/5". It is the wrong thing to ship.
+// That is a claim about the code, and measured recall here is 8-9 findings out
+// of 11 — so roughly a fifth of real defects go unreported, and the score would
+// read highest exactly when the reviewer found nothing, which is also what a
+// review that failed to look hard enough produces. Run-to-run variance makes it
+// worse: identical configurations scored 5, 6, 7, 8 and 9 out of 11 on the same
+// input, so the same pull request would score differently on a re-run.
+//
+// So this scores how much the READER should trust this particular run, from
+// facts that were observed rather than judged: passes that completed, whether
+// the diff was cut short, whether any injected knowledge matched the files.
+// Absence of findings is never evidence of safety, and the wording says so.
+function reviewConfidence() {
+  // Number("") is 0 and passes isFinite, so an unset variable would read as
+  // zero passes and score the run down for no reason. Absent must mean unknown.
+  const num = (k) => {
+    const raw = env(k, "");
+    if (raw === "" || raw === undefined) return null;
+    const v = Number(raw);
+    return Number.isFinite(v) ? v : null;
+  };
+  const tried = num("PASSES_TRIED") ?? 1;
+  const ok = num("PASSES_OK") ?? tried;
+  const truncated = env("DIFF_TRUNCATED", "0") === "1";
+  const skillSections = num("SKILL_SECTIONS");
+
+  let score = 5;
+  const why = [];
+  if (ok < tried) { score -= 2; why.push(`${tried - ok} of ${tried} passes failed to return usable output`); }
+  if (truncated) { score -= 2; why.push("the diff was truncated, so later files were never reviewed"); }
+  if (skillSections === 0) { score -= 1; why.push("no injected knowledge matched these file types"); }
+  if (ok === 1 && tried === 1) { score -= 1; why.push("a single pass — repeated sampling finds materially more"); }
+  score = Math.max(1, Math.min(5, score));
+  return { score, why };
+}
+
 function summaryBody(total, comments, unanchored) {
   const model = env("MODEL", "");
   const tools = env("TOOLS", "");
+  const { score, why } = reviewConfidence();
   const out = ["### 🔎 Agentic review", ""];
+  out.push(
+    `**Review confidence: ${"●".repeat(score)}${"○".repeat(5 - score)} ${score}/5** — how much to trust *this run*, not whether the code is safe.`,
+  );
+  if (why.length) out.push("", ...why.map((w) => `- ${w}`));
+  out.push(
+    "",
+    "_A clean review is not evidence of safety. Measured recall on a reference set is 8–9 of 11 known defects, so roughly one in five is missed._",
+    "",
+  );
   if (model || tools) {
     out.push(
       `_Read-only agent${tools ? ` (\`${tools}\`)` : ""}${model ? ` on \`${model}\`` : ""} — checks things the diff alone cannot show._`,
