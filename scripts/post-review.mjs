@@ -44,6 +44,9 @@ const required = (k) => {
 };
 
 const FINDINGS_FILE = required("FINDINGS_FILE");
+// The gate judges every finding, including ones suppressed as duplicates —
+// a blocking defect does not stop blocking because it was reported last week.
+let ALL_FINDINGS = [];
 // Findings are re-derived from scratch on every push, so without identity the
 // same defect is posted again on each run. A stable fingerprint over file+title
 // is embedded in each comment so a later run can recognise its own earlier
@@ -270,11 +273,49 @@ function reviewConfidence() {
   return { score, why };
 }
 
+// A merge gate with THREE outcomes, because two would be dishonest.
+//
+// "Clear" and "blocked" alone force a review that could not do its job into
+// "clear" — a truncated diff or a failed pass produces no findings for the same
+// reason a genuinely clean change does, and the reader cannot tell them apart.
+// The third state says so explicitly.
+//
+//   blocked       findings at or above the blocking severities
+//   inconclusive  the review did not meet its own preconditions
+//   clear         preconditions met AND nothing blocking found
+function mergeGate(findings) {
+  const blockingSeverities = env("BLOCK_SEVERITIES", "Critical,High")
+    .split(",").map((x) => x.trim()).filter(Boolean);
+  const blocking = findings.filter((f) => blockingSeverities.includes(f.severity));
+
+  // Preconditions: things that make an absence of findings meaningless.
+  const num = (k) => { const r = env(k, ""); if (r === "") return null; const v = Number(r); return Number.isFinite(v) ? v : null; };
+  const unmet = [];
+  const tried = num("PASSES_TRIED"), ok = num("PASSES_OK");
+  if (tried !== null && ok !== null && ok < tried) unmet.push(`${tried - ok} of ${tried} passes returned nothing usable`);
+  if (env("DIFF_TRUNCATED", "0") === "1") unmet.push("the diff was truncated, so later files were never read");
+  const cap = num("MAX_FINDINGS");
+  if (cap && findings.length >= cap) unmet.push(`the findings cap (${cap}) was reached, so more may exist`);
+
+  if (blocking.length) {
+    return { verdict: "blocked", blocking, unmet,
+      line: `⛔ **Blocked** — ${blocking.length} ${blockingSeverities.join("/")} finding(s) to resolve.` };
+  }
+  if (unmet.length) {
+    return { verdict: "inconclusive", blocking, unmet,
+      line: "⚠️ **Inconclusive** — nothing blocking was found, but this review could not do its job, so that is not the same as clear." };
+  }
+  return { verdict: "clear", blocking, unmet,
+    line: `✅ **Clear** — no ${blockingSeverities.join(" or ")} findings, whole diff reviewed, every pass completed.` };
+}
+
 function summaryBody(total, comments, unanchored) {
   const model = env("MODEL", "");
   const tools = env("TOOLS", "");
   const { score, why } = reviewConfidence();
-  const out = ["### 🔎 Agentic review", ""];
+  const gate = mergeGate(ALL_FINDINGS);
+  const out = ["### 🔎 Agentic review", "", gate.line, ""];
+  if (gate.unmet.length) out.push(...gate.unmet.map((u) => `- ${u}`), "");
   out.push(
     `**Review confidence: ${"●".repeat(score)}${"○".repeat(5 - score)} ${score}/5** — how much to trust *this run*, not whether the code is safe.`,
   );
@@ -519,6 +560,7 @@ async function main() {
   }
 
   const findings = parsed.findings;
+  ALL_FINDINGS = findings;
 
   // RENDER=1 is the local path: there is no pull request to anchor to, so
   // print the findings and their proposed fixes for a human instead. Shares
@@ -710,6 +752,17 @@ async function main() {
     }
   }
   console.log("  review posted");
+
+  // Blocking is decided here because this is the only place that knows the
+  // severities. fail_on_findings now means "fail when the gate says blocked",
+  // not "fail on any finding" — failing a build over a Medium was never the
+  // intent, and an inconclusive review is reported, not failed, because the
+  // fault is ours rather than the contributor's.
+  const gate = mergeGate(ALL_FINDINGS);
+  if (env("FAIL_ON_FINDINGS", "false") === "true" && gate.verdict === "blocked") {
+    console.error(`::error::${gate.blocking.length} blocking finding(s): ${env("BLOCK_SEVERITIES", "Critical,High")}`);
+    process.exit(1);
+  }
 }
 
 // When falling back, the anchored findings still have to appear somewhere.

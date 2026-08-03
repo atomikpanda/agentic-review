@@ -105,9 +105,17 @@ on:
         type: boolean
         default: true
       fail_on_findings:
-        description: Exit non-zero when the review reports anything (makes this a blocking check).
+        description: >-
+          Fail the job when the merge gate says blocked — that is, when a finding
+          lands on one of block_severities. Not on any finding: failing a build
+          over a Medium was never the intent, and an inconclusive review is
+          reported rather than failed, because that fault is ours.
         type: boolean
         default: false
+      block_severities:
+        description: Severities that block the merge gate. Empty blocks on nothing.
+        type: string
+        default: Critical,High
       # --- runner and pinning ----------------------------------------------
       #
       # There is deliberately no `runs_on` input. `runs-on` is resolved before
@@ -252,6 +260,7 @@ jobs:
           IN_POST_COMMENT: ${{ inputs.post_comment }}
           IN_RESOLVE_STALE: ${{ inputs.resolve_stale }}
           IN_FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings }}
+          IN_BLOCK_SEVERITIES: ${{ inputs.block_severities }}
           IN_BUN_VERSION: ${{ inputs.bun_version }}
           IN_OMP_VERSION: ${{ inputs.omp_version }}
           IN_EXTRA_ARGS: ${{ inputs.extra_omp_args }}
@@ -342,6 +351,7 @@ jobs:
             echo "POST_COMMENT=${IN_POST_COMMENT:-true}"
             echo "RESOLVE_STALE=${IN_RESOLVE_STALE:-true}"
             echo "FAIL_ON_FINDINGS=${IN_FAIL_ON_FINDINGS:-false}"
+            echo "BLOCK_SEVERITIES=${IN_BLOCK_SEVERITIES:-Critical,High}"
             echo "BUN_VERSION=${IN_BUN_VERSION:-latest}"
             echo "OMP_VERSION=${IN_OMP_VERSION:-latest}"
             echo "EXTRA_ARGS=${IN_EXTRA_ARGS:-}"
@@ -748,11 +758,9 @@ jobs:
               PASSES_OK="${PASSES_OK:-1}" \
               DIFF_TRUNCATED="${DIFF_TRUNCATED:-0}" \
               SKILL_SECTIONS="${SKILL_SECTIONS:-}" \
+              FAIL_ON_FINDINGS="$FAIL_ON_FINDINGS" \
+              BLOCK_SEVERITIES="$BLOCK_SEVERITIES" \
                 node "$POSTER"
-            fi
-            if [ "$FAIL_ON_FINDINGS" = "true" ] && ! grep -q '"findings"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]' /tmp/review.md; then
-              echo "::error::agentic review reported findings and fail_on_findings is set"
-              exit 1
             fi
             exit 0
           fi

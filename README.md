@@ -92,6 +92,26 @@ Three things that mechanism forces, all handled:
 - **The review is never lost.** If the inline post is rejected anyway, it falls
   back to posting everything as a summary rather than failing silently.
 
+### Merge gate
+
+Every review opens with one of three verdicts:
+
+| | Meaning |
+|---|---|
+| ✅ **Clear** | No `Critical`/`High` findings, whole diff reviewed, every pass completed |
+| ⛔ **Blocked** | Findings at or above `block_severities` |
+| ⚠️ **Inconclusive** | Nothing blocking found, but the review could not do its job — truncated diff, a failed pass, or the findings cap reached |
+
+Three states rather than two, because a boolean forces a review that could not
+do its job into "clear". A truncated diff produces no findings for the same
+reason a genuinely clean change does, and the reader cannot tell those apart
+unless the tool says which happened.
+
+`fail_on_findings: true` fails the job when the gate says **blocked** — not on
+any finding. Failing a build over a Medium was never the intent, and an
+inconclusive review is reported rather than failed, because that fault is ours
+rather than the contributor's.
+
 ### Review confidence
 
 Every review opens with a 1–5 score. It rates **the review, not the code** —
