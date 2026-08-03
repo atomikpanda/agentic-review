@@ -567,8 +567,35 @@ jobs:
             summary) FORMAT_NAME="review/format-markdown.md" ;;
             *)       FORMAT_NAME="review/format-json.md" ;;
           esac
-          resolve "$FORMAT_NAME" /tmp/format.md \
-            || { echo "::error::no output format at $FORMAT_NAME in the base commit or $CENTRAL_REPO"; exit 1; }
+          if ! resolve "$FORMAT_NAME" /tmp/format.md; then
+            # The prompt got a fallback and this did not, so a central outage
+            # still aborted — one half of a soft-fail is not a soft-fail.
+            echo "::warning::no output format at $FORMAT_NAME — falling back to the built-in contract"
+            if [ "$REVIEW_MODE" = "summary" ]; then
+              {
+                printf '%s\n' '# Output format'
+                printf '%s\n' ''
+                printf '%s\n' 'Markdown: a `##` heading per finding with a severity (Critical/High/Medium),'
+                printf '%s\n' 'the `file:line`, what breaks and why. If you find nothing, say exactly:'
+                printf '%s\n' '"No findings."'
+              } > /tmp/format.md
+            else
+              {
+                printf '%s\n' '# Output format'
+                printf '%s\n' ''
+                printf '%s\n' 'Output a single JSON object and nothing else. No prose, no code fence.'
+                printf '%s\n' 'If you found nothing: {"findings": []}'
+                printf '%s\n' ''
+                printf '%s\n' 'Otherwise each entry needs: file (repo-relative), start_line, end_line,'
+                printf '%s\n' 'severity (Critical|High|Medium), title, body, and suggestion — the exact'
+                printf '%s\n' 'replacement text for start_line..end_line with original indentation, or'
+                printf '%s\n' 'null when you cannot produce a correct complete replacement.'
+                printf '%s\n' ''
+                printf '%s\n' 'Line numbers are in the new version of the file and must fall on lines'
+                printf '%s\n' 'this branch changed. Verify them by reading the file.'
+              } > /tmp/format.md
+            fi
+          fi
 
           # skills_path is a LIST. One file meant choosing between domain
           # knowledge and security classes; a repo usually wants both, and the

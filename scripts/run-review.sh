@@ -81,9 +81,12 @@ PROMPT_FILE="${AGENTIC_REVIEW_PROMPT:-review/prompt.md}"
 SKILL="${AGENTIC_REVIEW_SKILL:-}"
 SKILL_DEFAULT="skills/infra-review/SKILL.md,skills/security-review/SKILL.md"
 MAX_FINDINGS="${AGENTIC_REVIEW_MAX_FINDINGS:-20}"
-# summary by default locally: there is no pull request to anchor comments to,
-# so suggest/inline render the proposed fixes to the terminal instead.
-REVIEW_MODE="${AGENTIC_REVIEW_MODE:-summary}"
+# suggest by default. summary was the old default and it quietly disabled two
+# advertised features: local state cannot track markdown, so `--open` and
+# `--dismiss` had nothing to work with, and the proposed fixes were never shown.
+# There is no pull request locally, so suggest simply renders the fixes to the
+# terminal, which is strictly more useful than prose.
+REVIEW_MODE="${AGENTIC_REVIEW_MODE:-suggest}"
 OMP_VERSION="${AGENTIC_REVIEW_OMP_VERSION:-latest}"
 MAX_DIFF_BYTES="${AGENTIC_REVIEW_MAX_DIFF_BYTES:-400000}"
 PASSES="${AGENTIC_REVIEW_PASSES:-1}"
@@ -292,7 +295,9 @@ _agent_cfg=""
 # that list, so under `set -e` the script exits — silently, with no message and
 # a zero-length output file. This is the same trap already documented in the
 # workflow's argument assembly, repeated here three lines apart.
-for _d in .omp .claude .cursor .codex .gemini .opencode .windsurf; do
+# Same list as the CI strip step. .cline was in that one and not this one,
+# which is what happens when the same set is written out twice.
+for _d in .omp .claude .cursor .codex .gemini .opencode .windsurf .cline; do
   if [ -f "$_d/mcp.json" ]; then _agent_cfg="$_agent_cfg $_d/mcp.json"; fi
 done
 if [ -f mcp.json ]; then _agent_cfg="$_agent_cfg mcp.json"; fi
@@ -396,12 +401,17 @@ build_prompt() { # build_prompt <pass-index> <destination> [lens]
 # but the tool allowlist has no shell and no git, so the agent could never run
 # that — it was reviewing the working tree while guessing from filenames what
 # had changed.
+# Decided once, before any pass. This used to be recomputed inside prompt
+# building: the first pass truncated DIFFTEXT in place, so the second measured
+# the already-shortened value, concluded it was within the cap, and rebuilt the
+# diff per file at full length. The cap applied to pass one only.
 DIFF_BYTES=${#DIFFTEXT}
 TRUNCATED=0
 if [ "$MAX_DIFF_BYTES" != "0" ] && [ "$DIFF_BYTES" -gt "$MAX_DIFF_BYTES" ]; then
   DIFFTEXT="${DIFFTEXT:0:$MAX_DIFF_BYTES}"
   TRUNCATED=1
 fi
+readonly TRUNCATED DIFF_BYTES
 {
   cat "$PROMPT_FILE"
   echo
@@ -652,7 +662,11 @@ fi
 # Every mode records. The default local mode is `summary`, so gating this on
 # non-summary meant the documented plain `review` never stored anything — the
 # state feature was off by default in the only path most people use.
-if ST="$(support_exec scripts/local-state.mjs)" && command -v node >/dev/null 2>&1 \
+# summary mode answers in markdown, which has no findings to track. Say so
+# rather than appearing to record and silently not.
+if [ "$REVIEW_MODE" = "summary" ]; then
+  say "state: not tracked in summary mode — use suggest or inline"
+elif ST="$(support_exec scripts/local-state.mjs)" && command -v node >/dev/null 2>&1 \
    && grep -q '"findings"' "$TMP_OUT" 2>/dev/null; then
   _head="$(git rev-parse HEAD 2>/dev/null || echo)"
   _base="${MERGE_BASE:-${BASE:-}}"
