@@ -100,6 +100,14 @@ on:
           still open instead of posting them again.
         type: boolean
         default: true
+      suppress_writes:
+        description: >-
+          Produce the review but make no change to the pull request at all — no
+          comment, no resolved thread, no edited comment. The artifact is still
+          uploaded and fail_on_findings still applies. Use it to trial a config
+          on a live pull request without touching it.
+        type: boolean
+        default: false
       post_comment:
         description: Post the review as a PR comment. Off still uploads the artifact.
         type: boolean
@@ -258,6 +266,7 @@ jobs:
           IN_CODEGRAPH_VERSION: ${{ inputs.codegraph_version }}
           IN_REVIEW_MODE: ${{ inputs.review_mode }}
           IN_POST_COMMENT: ${{ inputs.post_comment }}
+          IN_SUPPRESS_WRITES: ${{ inputs.suppress_writes }}
           IN_RESOLVE_STALE: ${{ inputs.resolve_stale }}
           IN_FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings }}
           IN_BLOCK_SEVERITIES: ${{ inputs.block_severities }}
@@ -349,6 +358,7 @@ jobs:
             echo "CODEGRAPH=${IN_CODEGRAPH:-true}"
             echo "CODEGRAPH_VERSION=${IN_CODEGRAPH_VERSION:-}"
             echo "POST_COMMENT=${IN_POST_COMMENT:-true}"
+            echo "SUPPRESS_WRITES=${IN_SUPPRESS_WRITES:-false}"
             echo "RESOLVE_STALE=${IN_RESOLVE_STALE:-true}"
             echo "FAIL_ON_FINDINGS=${IN_FAIL_ON_FINDINGS:-false}"
             echo "BLOCK_SEVERITIES=${IN_BLOCK_SEVERITIES:-Critical,High}"
@@ -760,6 +770,7 @@ jobs:
               SKILL_SECTIONS="${SKILL_SECTIONS:-}" \
               FAIL_ON_FINDINGS="$FAIL_ON_FINDINGS" \
               BLOCK_SEVERITIES="$BLOCK_SEVERITIES" \
+              SUPPRESS_WRITES="$SUPPRESS_WRITES" \
                 node "$POSTER"
             fi
             exit 0
@@ -769,7 +780,9 @@ jobs:
             echo "  no findings"
             exit 0
           fi
-          if [ "$POST_COMMENT" = "true" ]; then
+          if [ "$SUPPRESS_WRITES" = "true" ]; then
+            echo "  [suppressed] would comment; see the uploaded artifact"
+          elif [ "$POST_COMMENT" = "true" ]; then
             {
               echo "### 🔎 Agentic review"
               echo

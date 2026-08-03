@@ -76,7 +76,12 @@ const readStamp = (body) => {
   return m ? m[1] : null;
 };
 const REVIEW_MODE = env("REVIEW_MODE", "suggest");
-const DRY_RUN = env("DRY_RUN", "") === "1";
+// One switch that blocks EVERY mutation of the pull request: no review posted,
+// no thread resolved, no comment edited. The review is still produced, still
+// uploaded as an artifact, and still decides the exit code — only the writes
+// stop. post_comment: false was not this; it skipped the comment while leaving
+// thread retirement and the gate in inconsistent states.
+const DRY_RUN = env("DRY_RUN", "") === "1" || env("SUPPRESS_WRITES", "") === "true";
 
 // ---------------------------------------------------------------------------
 // 1. Extract the JSON object from the agent's output.
@@ -524,6 +529,7 @@ function retirementNote(t) {
 }
 
 async function resolveThread(id) {
+  if (DRY_RUN) { console.log(`  [suppressed] would resolve thread ${id}`); return; }
   await graphql(
     `mutation($id:ID!){ resolveReviewThread(input:{threadId:$id}){ thread{ id } } }`,
     { id },
@@ -539,6 +545,7 @@ async function resolveThread(id) {
 // the reader can see at a glance that the reviewer withdrew it.
 async function collapseComment(t) {
   if (!t.commentId) return false;
+  if (DRY_RUN) { console.log(`  [suppressed] would mark comment ${t.commentId} as no longer reported`); return true; }
   if (RETIRED_RE.test(t.body)) return false; // already done
   const repo = required("GITHUB_REPO");
   const body =
@@ -579,6 +586,10 @@ async function retireThread(t) {
 }
 
 async function postReview(payload) {
+  if (DRY_RUN) {
+    console.log("  [suppressed] would post a review with " + (payload.comments?.length ?? 0) + " inline comment(s)");
+    return { ok: true, status: 0, text: "" };
+  }
   const repo = required("GITHUB_REPO");
   const pr = required("PR_NUMBER");
   const res = await fetch(

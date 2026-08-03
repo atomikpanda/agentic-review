@@ -31,6 +31,10 @@
 #                       suggest prints the fixes it would offer on a PR
 #   --omp-version V     npm version or dist-tag       $AGENTIC_REVIEW_OMP_VERSION
 #   --out FILE          write the review here
+#   --open              list findings still open from previous runs
+#   --all               list every tracked finding, including dismissed
+#   --history           list past runs
+#   --dismiss ID...     stop reporting these findings
 #   --no-codegraph      skip the symbol index (for A/B measurement)
 #   --json              raw findings JSON on stdout, for piping
 #   --no-fail           exit 0 even when findings are reported
@@ -88,7 +92,7 @@ PASSES="${AGENTIC_REVIEW_PASSES:-1}"
 # rules-per-prompt, which is what predicts whether injected knowledge is used.
 LENSES="${AGENTIC_REVIEW_LENSES:-}"
 MIN_VOTES="${AGENTIC_REVIEW_MIN_VOTES:-1}"
-STAGED=0; OUT=""; FAIL_ON_FINDINGS=1; AS_JSON=0; USE_CODEGRAPH=1
+STAGED=0; OUT=""; FAIL_ON_FINDINGS=1; AS_JSON=0; USE_CODEGRAPH=1; VIEW=""
 PASSTHRU=()
 
 while [ $# -gt 0 ]; do
@@ -110,6 +114,10 @@ while [ $# -gt 0 ]; do
     --staged)       STAGED=1; shift ;;
     --no-fail)      FAIL_ON_FINDINGS=0; shift ;;
     --no-codegraph) USE_CODEGRAPH=0; shift ;;
+    --open)         VIEW=open; shift ;;
+    --history)      VIEW=runs; shift ;;
+    --all)          VIEW=all; shift ;;
+    --dismiss)      VIEW=dismiss; shift; DISMISS_IDS="$*"; break ;;
     --json)         AS_JSON=1; REVIEW_MODE="${REVIEW_MODE/#summary/suggest}"; shift ;;
     --)             shift; PASSTHRU=("$@"); break ;;
     # Print the header comment, stopping at the first line that isn't one.
@@ -149,6 +157,20 @@ support() { # support <relative-path> -> prints an existing path, or fails
   if [ -f "$SELF_ROOT/$1" ]; then printf '%s' "$SELF_ROOT/$1"; return 0; fi
   return 1
 }
+
+# Viewing stored state needs no model and no key — answer and exit.
+if [ -n "$VIEW" ]; then
+  _self2="${BASH_SOURCE[0]}"
+  while [ -L "$_self2" ]; do _d="$(cd -P "$(dirname "$_self2")" && pwd)"; _self2="$(readlink "$_self2")"; case "$_self2" in /*) ;; *) _self2="$_d/$_self2";; esac; done
+  ST="$(cd -P "$(dirname "$_self2")" && pwd)/local-state.mjs"
+  case "$VIEW" in
+    dismiss) # shellcheck disable=SC2086
+             node "$ST" dismiss ${DISMISS_IDS:-} ;;
+    runs)    node "$ST" runs ;;
+    *)       node "$ST" list "$VIEW" ;;
+  esac
+  exit $?
+fi
 
 step "Checking prerequisites"
 
@@ -579,6 +601,17 @@ else
   fi
   # shellcheck disable=SC2086  # deliberate word splitting over the pass list
   rm -f $PASS_OUTS
+fi
+
+# Remember what was said. Without this a local run has no memory: it re-reports
+# everything every time and there is no way to say "seen it, it's fine". The
+# pull-request side gets that from the threads; locally it has to be stored.
+if ST="$(support scripts/local-state.mjs)" && command -v node >/dev/null 2>&1 && [ "$REVIEW_MODE" != "summary" ]; then
+  _head="$(git rev-parse HEAD 2>/dev/null || echo)"
+  _base="${MERGE_BASE:-${BASE:-}}"
+  if _delta="$(node "$ST" record "$TMP_OUT" "$_base" "$_head" 2>/dev/null)"; then
+    say "state: $_delta"
+  fi
 fi
 
 # Read the verdict BEFORE cleanup: $OUT is empty when printing to stdout and

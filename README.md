@@ -26,6 +26,41 @@ curl -fsSL .../install-review.sh | bash -s -- --repo owner/name --openrouter-key
 
 ## Run it locally
 
+Local runs are first-class: they remember what they have already said.
+
+```bash
+review                       # review vs the default branch
+review --review-mode suggest # with the fixes it would offer on a PR
+review --open                # findings still open from earlier runs
+review --dismiss a1b2c3      # stop reporting one you have judged
+review --history             # past runs
+```
+
+State lives in the repository's git common directory — per-repo, shared across
+worktrees, never committable. Each run reports `N new, N recurring` rather than
+re-listing everything, and a finding is only marked **gone** when the file it
+pointed at actually changed. If the file is untouched the run says
+`unreported but unchanged`, because the reviewer failing to mention something is
+not the same as it being fixed.
+
+[`skills/review-loop/SKILL.md`](skills/review-loop/SKILL.md) describes the
+iterate-until-clean workflow, including when to stop.
+
+[`scripts/watch-pr.sh`](scripts/watch-pr.sh) tails a pull request's review
+comments as they arrive. Read-only — it never comments, resolves or edits.
+
+## Suppressing writes
+
+`suppress_writes: true` (workflow) produces the review and changes **nothing** on
+the pull request: no comment, no resolved thread, no edited comment. The
+artifact is still uploaded and `fail_on_findings` still applies. Use it to trial
+a configuration against a live pull request without touching it.
+
+This is not `post_comment: false`, which skipped the comment while leaving thread
+retirement and the gate in inconsistent states.
+
+## Run it locally (details)
+
 No GitHub involved — it reviews a local diff and writes the result to stdout.
 
 ```bash
