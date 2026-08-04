@@ -176,6 +176,15 @@ on:
     secrets:
       OPENROUTER_API_KEY:
         required: true
+      # Only App mode uses these, and only this repository holds them — a
+      # consuming repo calling the reusable workflow never passes them and
+      # never needs to. They are declared because a reusable workflow cannot
+      # read a secret it has not declared, so without these two entries the
+      # dispatch path would find them empty at runtime rather than fail here.
+      APP_ID:
+        required: false
+      APP_PRIVATE_KEY:
+        required: false
 
   # App mode. A GitHub App receives the webhook, and a receiver that does
   # nothing but verify the HMAC signature dispatches this workflow with the
@@ -256,7 +265,11 @@ jobs:
       - name: resolve the review target
         id: target
         env:
-          GH_TOKEN: ${{ steps.target.outputs.token }}
+          # The workflow token, not the resolved one: this step PRODUCES the
+          # resolved token, so referencing its own output here would always be
+          # empty. In App mode the minted token is used from a local variable
+          # further down instead.
+          GH_TOKEN: ${{ github.token }}
           APP_ID: ${{ secrets.APP_ID }}
           APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
           IN_REPO: ${{ inputs.target_repo }}
@@ -274,7 +287,12 @@ jobs:
               echo "head=${{ github.event.pull_request.head.sha }}"
               echo "ref=${{ github.event.pull_request.head.sha }}"
             } >> "$GITHUB_OUTPUT"
-            echo "token=${GH_TOKEN}" >> "$GITHUB_OUTPUT"
+            # Deliberately NO token output here. github.token is a registered
+            # secret and GitHub scrubs it out of step outputs, so routing it
+            # through one yields an empty string — which surfaced as
+            # "Input required and not supplied: token" at checkout, not as
+            # anything mentioning secrets. Consumers fall back to github.token
+            # directly when this output is absent.
             echo "  pull_request mode: ${GITHUB_REPOSITORY}#${{ github.event.pull_request.number }}"
             exit 0
           fi
@@ -358,7 +376,7 @@ jobs:
         with:
           repository: ${{ steps.target.outputs.repo }}
           ref: ${{ steps.target.outputs.head }}
-          token: ${{ steps.target.outputs.token }}
+          token: ${{ steps.target.outputs.token || github.token }}
           # Need the base commit to diff against.
           fetch-depth: 0
           # actions/checkout otherwise writes a basic-auth header containing the
@@ -982,7 +1000,7 @@ jobs:
         # It is really "do we have a pull request to post to", so ask that.
         if: success() && steps.target.outputs.pr != ''
         env:
-          GH_TOKEN: ${{ steps.target.outputs.token }}
+          GH_TOKEN: ${{ steps.target.outputs.token || github.token }}
           TARGET_REPO: ${{ steps.target.outputs.repo }}
           PR: ${{ steps.target.outputs.pr }}
           BASE: ${{ steps.target.outputs.base }}
