@@ -176,6 +176,36 @@ on:
     secrets:
       OPENROUTER_API_KEY:
         required: true
+      # Only App mode uses these, and only this repository holds them — a
+      # consuming repo calling the reusable workflow never passes them and
+      # never needs to. They are declared because a reusable workflow cannot
+      # read a secret it has not declared, so without these two entries the
+      # dispatch path would find them empty at runtime rather than fail here.
+      APP_ID:
+        required: false
+      APP_PRIVATE_KEY:
+        required: false
+
+  # App mode. A GitHub App receives the webhook, and a receiver that does
+  # nothing but verify the HMAC signature dispatches this workflow with the
+  # target coordinates. The review then runs HERE, on an ephemeral runner,
+  # rather than on whatever host received the webhook.
+  #
+  # That placement is the whole point. The alternative — reviewing on the host
+  # that owns the App private key — means untrusted pull request code executes
+  # next to a key that mints write tokens for every repository the App is
+  # installed on. On a runner, the worst case is an ephemeral VM and a rotatable
+  # model key.
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: owner/name of the repository to review.
+        type: string
+        required: true
+      target_pr:
+        description: Pull request number to review.
+        type: string
+        required: true
 
   # Not `pull_request_target`. That would run with a writable token against
   # untrusted head code, which is the standard way this pattern becomes a
@@ -201,7 +231,12 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: agentic-review-${{ github.event.pull_request.number || github.ref }}
+  # In dispatch mode the ref is always the default branch, so grouping on it
+  # would make two reviews of two different repositories cancel each other.
+  # Group on the target instead.
+  group: >-
+    agentic-review-${{ inputs.target_repo || github.repository }}-${{
+      inputs.target_pr || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -222,8 +257,126 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.timeout_minutes || 20 }}
     steps:
+      # ONE place that answers "what am I reviewing, and with what credential".
+      # Everything downstream reads these outputs instead of
+      # github.event.pull_request.*, which does not exist in dispatch mode.
+      # Six scattered reads of the event context would have meant six places to
+      # get the second mode wrong.
+      - name: resolve the review target
+        id: target
+        env:
+          # The workflow token, not the resolved one: this step PRODUCES the
+          # resolved token, so referencing its own output here would always be
+          # empty. In App mode the minted token is used from a local variable
+          # further down instead.
+          GH_TOKEN: ${{ github.token }}
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          IN_REPO: ${{ inputs.target_repo }}
+          IN_PR: ${{ inputs.target_pr }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${IN_REPO:-}" ]; then
+            # pull_request mode: the event already carries everything, and the
+            # workflow token is scoped to this repository.
+            {
+              echo "repo=${GITHUB_REPOSITORY}"
+              echo "pr=${{ github.event.pull_request.number }}"
+              echo "base=${{ github.event.pull_request.base.sha }}"
+              echo "head=${{ github.event.pull_request.head.sha }}"
+              echo "ref=${{ github.event.pull_request.head.sha }}"
+            } >> "$GITHUB_OUTPUT"
+            # Deliberately NO token output here. github.token is a registered
+            # secret and GitHub scrubs it out of step outputs, so routing it
+            # through one yields an empty string — which surfaced as
+            # "Input required and not supplied: token" at checkout, not as
+            # anything mentioning secrets. Consumers fall back to github.token
+            # directly when this output is absent.
+            echo "  pull_request mode: ${GITHUB_REPOSITORY}#${{ github.event.pull_request.number }}"
+            exit 0
+          fi
+
+          # App mode. The workflow token cannot read another repository, so the
+          # credential has to come from the App installation.
+          [ -n "${APP_ID:-}" ] && [ -n "${APP_PRIVATE_KEY:-}" ] \
+            || { echo "::error::target_repo was given but APP_ID/APP_PRIVATE_KEY are not set — dispatch mode needs the App credentials to mint an installation token"; exit 1; }
+
+          case "$IN_REPO" in
+            */*[!A-Za-z0-9._/-]*|*/*/*|/*|*/) echo "::error::target_repo is not a plain owner/name: $IN_REPO"; exit 1 ;;
+            */*) ;;
+            *) echo "::error::target_repo is not owner/name: $IN_REPO"; exit 1 ;;
+          esac
+          case "$IN_PR" in ''|*[!0-9]*) echo "::error::target_pr is not a number: $IN_PR"; exit 1 ;; esac
+
+          # Minted inline rather than from a checked-out script: this step runs
+          # BEFORE any checkout, because the checkout needs the credential this
+          # produces. Node's crypto signs the RS256 assertion; there is no
+          # dependency to install.
+          cat > "${RUNNER_TEMP}/app-token.mjs" <<'NODE'
+          import { createSign } from "node:crypto";
+          const [repo] = process.argv.slice(2);
+          const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+          const now = Math.floor(Date.now() / 1000);
+          // iat backdated 60s: GitHub rejects an assertion whose iat is in the
+          // future, and runner clocks drift.
+          const claims = { iat: now - 60, exp: now + 540, iss: process.env.APP_ID };
+          const body = `${b64({ alg: "RS256", typ: "JWT" })}.${b64(claims)}`;
+          const sig = createSign("RSA-SHA256").update(body).end()
+            .sign(process.env.APP_PRIVATE_KEY, "base64url");
+          const jwt = `${body}.${sig}`;
+
+          const api = async (url, opts = {}) => {
+            const r = await fetch(url, {
+              ...opts,
+              headers: { authorization: `Bearer ${jwt}`, accept: "application/vnd.github+json", ...opts.headers },
+            });
+            if (!r.ok) throw new Error(`${opts.method ?? "GET"} ${url} -> ${r.status} ${await r.text()}`);
+            return r.json();
+          };
+
+          // Ask which installation covers this repository rather than taking an
+          // installation id as input: an id supplied by the caller would let a
+          // compromised receiver point the review at an unrelated installation.
+          const inst = await api(`https://api.github.com/repos/${repo}/installation`);
+          const tok = await api(inst.access_tokens_url, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            // Scope the token to the one repository and the two permissions the
+            // review actually uses. The App may be installed far more widely;
+            // this token must not be.
+            body: JSON.stringify({
+              repositories: [repo.split("/")[1]],
+              permissions: { contents: "read", pull_requests: "write" },
+            }),
+          });
+          process.stdout.write(tok.token);
+          NODE
+          token="$(node "${RUNNER_TEMP}/app-token.mjs" "$IN_REPO")"
+          # Mask before it can reach any log. add-mask is what keeps a minted
+          # token out of error traces and `set -x` output.
+          echo "::add-mask::$token"
+
+          gh_t() { GH_TOKEN="$token" gh api "repos/${IN_REPO}/pulls/${IN_PR}" --jq "$1"; }
+          [ "$(gh_t .state)" = "open" ] || { echo "::error::${IN_REPO}#${IN_PR} is not open"; exit 1; }
+          # Same stance as pull_request mode: forks are skipped, not failed
+          # differently. The head commit may not even exist in the base repo.
+          [ "$(gh_t '.head.repo.fork')" != "true" ] || { echo "::error::${IN_REPO}#${IN_PR} is from a fork — not reviewed"; exit 1; }
+
+          {
+            echo "repo=$IN_REPO"
+            echo "pr=$IN_PR"
+            echo "base=$(gh_t .base.sha)"
+            echo "head=$(gh_t .head.sha)"
+            echo "token=$token"
+          } >> "$GITHUB_OUTPUT"
+          echo "  app mode: ${IN_REPO}#${IN_PR}"
+
       - uses: actions/checkout@v4
         with:
+          repository: ${{ steps.target.outputs.repo }}
+          ref: ${{ steps.target.outputs.head }}
+          token: ${{ steps.target.outputs.token || github.token }}
           # Need the base commit to diff against.
           fetch-depth: 0
           # actions/checkout otherwise writes a basic-auth header containing the
@@ -445,8 +598,8 @@ jobs:
       - name: build code graph
         continue-on-error: true
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
+          BASE: ${{ steps.target.outputs.base }}
+          HEAD: ${{ steps.target.outputs.head }}
         run: |
           set -euo pipefail
           if [ "${CODEGRAPH:-true}" != "true" ]; then echo "  disabled"; exit 0; fi
@@ -489,8 +642,8 @@ jobs:
       - name: build review prompt
         id: prompt
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
+          BASE: ${{ steps.target.outputs.base }}
+          HEAD: ${{ steps.target.outputs.head }}
         run: |
           set -euo pipefail
 
@@ -841,12 +994,17 @@ jobs:
         # success() is implied for a step whose `if` has no status function,
         # but spelling it out removes the doubt: a failed review must never
         # reach the commenting step.
-        if: success() && github.event_name == 'pull_request'
+        #
+        # The gate was `github.event_name == 'pull_request'`, which in dispatch
+        # mode would have run the whole review and then silently posted nothing.
+        # It is really "do we have a pull request to post to", so ask that.
+        if: success() && steps.target.outputs.pr != ''
         env:
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ steps.target.outputs.token || github.token }}
+          TARGET_REPO: ${{ steps.target.outputs.repo }}
+          PR: ${{ steps.target.outputs.pr }}
+          BASE: ${{ steps.target.outputs.base }}
+          HEAD: ${{ steps.target.outputs.head }}
         run: |
           set -euo pipefail
 
@@ -879,14 +1037,14 @@ jobs:
               # Still run the poster, with writes off, so the merge gate and
               # fail_on_findings behave the same as when commenting is on.
               echo "  post_comment=false — running the gate without writing"
-              FINDINGS_FILE=/tmp/review.md GITHUB_REPO="$GITHUB_REPOSITORY" PR_NUMBER="$PR" \
+              FINDINGS_FILE=/tmp/review.md GITHUB_REPO="$TARGET_REPO" PR_NUMBER="$PR" \
               HEAD_SHA="$HEAD" BASE_SHA="$BASE" REVIEW_MODE="$REVIEW_MODE" \
               RESOLVE_STALE=false MAX_FINDINGS="$MAX_FINDINGS" \
               FAIL_ON_FINDINGS="$FAIL_ON_FINDINGS" BLOCK_SEVERITIES="$BLOCK_SEVERITIES" \
               SUPPRESS_WRITES=true DRY_RUN=1 node "$POSTER"
             else
               FINDINGS_FILE=/tmp/review.md \
-              GITHUB_REPO="$GITHUB_REPOSITORY" \
+              GITHUB_REPO="$TARGET_REPO" \
               PR_NUMBER="$PR" \
               HEAD_SHA="$HEAD" \
               BASE_SHA="$BASE" \
