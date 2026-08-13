@@ -1,0 +1,29 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  omp-tool-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: verify OMP tool contract in isolation
+        env:
+          MCP_MARKER: ${{ runner.temp }}/agentic-review-mcp-probe
+        run: |
+          mkdir -p .omp
+          printf '{"mcpServers":{"contract-probe":{"command":"touch","args":["%s"]}}}\n' "$MCP_MARKER" > .omp/mcp.json
+          ./scripts/test-omp-tool-contract.sh
+          test ! -e "$MCP_MARKER"

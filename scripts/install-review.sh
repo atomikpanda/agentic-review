@@ -247,8 +247,7 @@ YAML
 #
 #   model:            openrouter/openai/gpt-5.6-luna
 #   thinking:         ''            # off|minimal|low|medium|high|xhigh|max|auto
-#   tools:            read,grep,glob,ast_grep
-#                                   # also allowed: inspect_image, todo
+#   tools:            read,grep,glob
 #                                   # lsp is NOT available: omp loads language
 #                                   # server config from the reviewed repo and
 #                                   # would spawn commands it names

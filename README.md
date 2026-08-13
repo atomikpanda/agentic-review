@@ -312,7 +312,7 @@ keeps tracking them.
 |---|---|---|---|---|
 | Model slug | `openrouter/openai/gpt-5.6-luna` | `model` | `--model` | `--model` |
 | Reasoning effort | `high` | `thinking` | `--thinking` | `--thinking` |
-| Tool allowlist | `read,grep,glob,ast_grep` | `tools` | `--tools` | `--tools` |
+| Tool allowlist | `read,grep,glob` | `tools` | `--tools` | `--tools` |
 | Wall-clock cap | none | `max_time` | `--max-time` | `--max-time` |
 | Review prompt | `review/prompt.md` | `prompt_path` | `--prompt` | `--prompt` |
 | Injected knowledge | both skills (comma-separated list) | `skills_path` | `--skill` | `--skill` |
@@ -419,10 +419,8 @@ read-only tool allowlist:
 | Enabled | Why |
 |---|---|
 | `read`, `grep`, `glob` | Read files the diff depends on but doesn't touch |
-| `ast_grep` | Structural queries over 50+ tree-sitter grammars |
 
-`inspect_image` and `todo` are also permitted but off by default — those six
-are the entire set `tools` will accept.
+Those three are the entire set `tools` will accept.
 
 Excluded: `bash`, `edit`, `write`, `ast_edit`, `eval`, `debug`, `browser`,
 `computer`, `github`, `task`, `hub`, `web_search`, `memory_edit`, `retain`,
@@ -435,8 +433,8 @@ Three of those read as harmless and are not:
   here is the checked-out pull request. A PR can commit an `lsp.json` naming
   any command; `lsp` is read-tier, so the approval mode auto-approves it and
   omp spawns that command with the model key in its environment. Excluding it
-  cost this project cross-file symbol resolution — `ast_grep` and `grep` carry
-  that load instead.
+  cost this project cross-file symbol resolution — the precomputed code graph
+  and `grep` carry that load instead.
 - **`security_scan`** — classified `exec` by omp, and reaches an external cloud
   service.
 - **`web_search`** — network egress. `ask` also blocks forever under `-p`.
