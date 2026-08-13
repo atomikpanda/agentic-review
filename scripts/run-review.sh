@@ -61,7 +61,7 @@ set -euo pipefail
 # name an arbitrary command there; lsp is read-tier, so the approval mode
 # auto-approves it and omp spawns that command. That is arbitrary execution
 # via the one tool included for reading code.
-READ_ONLY_TOOLS="read grep glob ast_grep inspect_image todo"
+READ_ONLY_TOOLS="read grep glob"
 
 # omp ships `#!/usr/bin/env bun`, imports `bun:` builtins, and declares
 # engines.bun >= 1.3.14. It cannot run under node at all, and an older bun
@@ -76,7 +76,7 @@ MODEL="${AGENTIC_REVIEW_MODEL:-openrouter/openai/gpt-5.6-luna}"
 # turns and 25 tool calls, and measured recall went 5/11 to 8/11. Roughly 5x
 # the wall clock and 4x the cost of a pass, and worth both.
 THINKING="${AGENTIC_REVIEW_THINKING:-high}"
-TOOLS="${AGENTIC_REVIEW_TOOLS:-read,grep,glob,ast_grep}"
+TOOLS="${AGENTIC_REVIEW_TOOLS:-read,grep,glob}"
 MAX_TIME="${AGENTIC_REVIEW_MAX_TIME:-}"
 PROMPT_FILE="${AGENTIC_REVIEW_PROMPT:-review/prompt.md}"
 SKILL="${AGENTIC_REVIEW_SKILL:-}"

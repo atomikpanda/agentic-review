@@ -50,7 +50,7 @@ on:
           Comma-separated omp tool allowlist. Validated against a read-only set;
           anything outside it fails the job. See READ_ONLY_TOOLS below.
         type: string
-        default: read,grep,glob,ast_grep
+        default: read,grep,glob
       max_time:
         description: Hard wall-clock cap passed to omp (e.g. 600, 10m, 1h). Empty means no cap.
         type: string
@@ -341,10 +341,10 @@ jobs:
           # command; `lsp` is read-tier so the approval mode auto-approves it,
           # and omp spawns that command with the model key in its environment.
           # That is arbitrary execution through the one tool included for
-          # reading code. ast_grep and grep cover most of what it gave us.
-          READ_ONLY_TOOLS="read grep glob ast_grep inspect_image todo"
+          # reading code. The precomputed code graph and grep carry that load.
+          READ_ONLY_TOOLS="read grep glob"
 
-          TOOLS="${IN_TOOLS:-read,grep,glob,ast_grep}"
+          TOOLS="${IN_TOOLS:-read,grep,glob}"
           bad=""
           for t in ${TOOLS//,/ }; do
             case " $READ_ONLY_TOOLS " in
