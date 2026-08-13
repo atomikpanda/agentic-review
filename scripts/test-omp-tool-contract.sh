@@ -5,6 +5,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OMP_VERSION="${OMP_VERSION:-latest}"
 MISSING_MODEL="definitely-not-a-provider/agentic-review-contract-test"
+PROBE_ROOT="$(mktemp -d)"
+trap 'rm -rf -- "$PROBE_ROOT"' EXIT
+mkdir -p "$PROBE_ROOT/project"
 
 workflow_tools="$(sed -n '/^      tools:$/,/^      [a-z_][a-z_]*:$/s/^        default: //p' "$ROOT/.github/workflows/agentic-review.yml")"
 runner_tools="$(sed -n 's/^TOOLS="${AGENTIC_REVIEW_TOOLS:-\([^}]*\)}"$/\1/p' "$ROOT/scripts/run-review.sh")"
@@ -14,8 +17,9 @@ runner_tools="$(sed -n 's/^TOOLS="${AGENTIC_REVIEW_TOOLS:-\([^}]*\)}"$/\1/p' "$R
 
 check_tools() {
   local surface="$1" tools="$2" output
-  output="$(bunx --bun "@oh-my-pi/pi-coding-agent@$OMP_VERSION" \
-    -p --no-extensions --no-skills \
+  output="$(PI_CODING_AGENT_DIR="$PROBE_ROOT/agent" \
+    bunx --bun "@oh-my-pi/pi-coding-agent@$OMP_VERSION" \
+    -p --no-extensions --no-skills --cwd="$PROBE_ROOT/project" \
     --tools="$tools" --model="$MISSING_MODEL" x 2>&1 || true)"
 
   if [[ "$output" == *"Unknown tool in --tools"* ]]; then
