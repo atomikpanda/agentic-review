@@ -361,7 +361,7 @@ jobs:
           [ "$(gh_t .state)" = "open" ] || { echo "::error::${IN_REPO}#${IN_PR} is not open"; exit 1; }
           # Same stance as pull_request mode: forks are skipped, not failed
           # differently. The head commit may not even exist in the base repo.
-          [ "$(gh_t '.head.repo.fork')" != "true" ] || { echo "::error::${IN_REPO}#${IN_PR} is from a fork — not reviewed"; exit 1; }
+          [ "$(gh_t '.head.repo.full_name == .base.repo.full_name')" = "true" ] || { echo "::error::${IN_REPO}#${IN_PR} is from a fork — not reviewed"; exit 1; }
 
           {
             echo "repo=$IN_REPO"
@@ -600,6 +600,7 @@ jobs:
         env:
           BASE: ${{ steps.target.outputs.base }}
           HEAD: ${{ steps.target.outputs.head }}
+          TARGET_REPO: ${{ steps.target.outputs.repo }}
         run: |
           set -euo pipefail
           if [ "${CODEGRAPH:-true}" != "true" ]; then echo "  disabled"; exit 0; fi
@@ -629,7 +630,7 @@ jobs:
           # attacker-committed code in a step whose environment carries the
           # model key. The poster had the exception; this did not.
           CODEGRAPH_SCRIPT=".central-skills/scripts/codegraph.sh"
-          if [ ! -f "$CODEGRAPH_SCRIPT" ] && [ "$GITHUB_REPOSITORY" = "$CENTRAL_REPO" ]; then
+          if [ ! -f "$CODEGRAPH_SCRIPT" ] && [ "$TARGET_REPO" = "$CENTRAL_REPO" ]; then
             CODEGRAPH_SCRIPT="scripts/codegraph.sh"
           fi
           [ -f "$CODEGRAPH_SCRIPT" ] || { echo "  no codegraph.sh in $CENTRAL_REPO — skipping"; exit 0; }
@@ -644,6 +645,7 @@ jobs:
         env:
           BASE: ${{ steps.target.outputs.base }}
           HEAD: ${{ steps.target.outputs.head }}
+          TARGET_REPO: ${{ steps.target.outputs.repo }}
         run: |
           set -euo pipefail
 
@@ -685,7 +687,7 @@ jobs:
             # nor the central repo until it merges. For any other repository
             # this stays off, because the whole point is that a pull request
             # must not supply its own review instructions.
-            if [ "$GITHUB_REPOSITORY" = "$CENTRAL_REPO" ] && [ -f "$1" ]; then
+            if [ "$TARGET_REPO" = "$CENTRAL_REPO" ] && [ -f "$1" ]; then
               cp "$1" "$2"
               echo "    $1 (from this branch — self-review)" >&2
               return 0
@@ -1026,7 +1028,7 @@ jobs:
             # "repo under review" and the central repo are the same thing and
             # the branch copy is the version under test.
             POSTER=".central-skills/scripts/post-review.mjs"
-            if [ ! -f "$POSTER" ] && [ "$GITHUB_REPOSITORY" = "$CENTRAL_REPO" ]; then
+            if [ ! -f "$POSTER" ] && [ "$TARGET_REPO" = "$CENTRAL_REPO" ]; then
               POSTER="scripts/post-review.mjs"
               echo "  central checkout has no poster yet; using this branch's copy (self-review)"
             fi
