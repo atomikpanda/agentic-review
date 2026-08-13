@@ -286,6 +286,7 @@ jobs:
               echo "base=${{ github.event.pull_request.base.sha }}"
               echo "head=${{ github.event.pull_request.head.sha }}"
               echo "ref=${{ github.event.pull_request.head.sha }}"
+              echo "eligible=true"
             } >> "$GITHUB_OUTPUT"
             # Deliberately NO token output here. github.token is a registered
             # secret and GitHub scrubs it out of step outputs, so routing it
@@ -359,12 +360,22 @@ jobs:
 
           gh_t() { GH_TOKEN="$token" gh api "repos/${IN_REPO}/pulls/${IN_PR}" --jq "$1"; }
           [ "$(gh_t .state)" = "open" ] || { echo "::error::${IN_REPO}#${IN_PR} is not open"; exit 1; }
-          # Same stance as pull_request mode: forks are skipped, not failed
-          # differently. The head commit may not even exist in the base repo.
-          [ "$(gh_t '.head.repo.full_name == .base.repo.full_name')" = "true" ] || { echo "::error::${IN_REPO}#${IN_PR} is from a fork — not reviewed"; exit 1; }
+          if [ "$(gh_t .draft)" = "true" ]; then
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            echo "  app mode: ${IN_REPO}#${IN_PR} is a draft — skipped"
+            exit 0
+          fi
+          # Same stance as pull_request mode: forks are skipped, not failed.
+          # The head commit may not even exist in the base repo.
+          if [ "$(gh_t '.head.repo.full_name == .base.repo.full_name')" != "true" ]; then
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            echo "  app mode: ${IN_REPO}#${IN_PR} is from a fork — skipped"
+            exit 0
+          fi
 
           {
             echo "repo=$IN_REPO"
+            echo "eligible=true"
             echo "pr=$IN_PR"
             echo "base=$(gh_t .base.sha)"
             echo "head=$(gh_t .head.sha)"
@@ -373,6 +384,7 @@ jobs:
           echo "  app mode: ${IN_REPO}#${IN_PR}"
 
       - uses: actions/checkout@v4
+        if: steps.target.outputs.eligible == 'true'
         with:
           repository: ${{ steps.target.outputs.repo }}
           ref: ${{ steps.target.outputs.head }}
@@ -396,6 +408,7 @@ jobs:
       # fail for everyone except this project's owner, taking the default
       # prompt with it. The central repo is named explicitly instead.
       - name: fetch shared prompt, skills and poster
+        if: steps.target.outputs.eligible == 'true'
         id: central
         continue-on-error: true
         uses: actions/checkout@v4
@@ -435,6 +448,7 @@ jobs:
       #    substitution into shell source. A value containing a backtick or
       #    $(...) would execute. Passing through `env:` makes them data.
       - name: resolve config
+        if: steps.target.outputs.eligible == 'true'
         env:
           IN_MODEL: ${{ inputs.model }}
           IN_THINKING: ${{ inputs.thinking }}
@@ -580,6 +594,7 @@ jobs:
           echo "  model=${IN_MODEL:-openrouter/openai/gpt-5.6-luna} tools=$TOOLS thinking=${IN_THINKING:-<model default>}"
 
       - uses: oven-sh/setup-bun@v2
+        if: steps.target.outputs.eligible == 'true'
         with:
           # omp ships `#!/usr/bin/env bun` and imports `bun:` builtins, so bun
           # is not an optional accelerator here — node cannot load it at all.
@@ -587,6 +602,7 @@ jobs:
           bun-version: ${{ env.BUN_VERSION }}
 
       - name: install omp
+        if: steps.target.outputs.eligible == 'true'
         run: bun install -g "@oh-my-pi/pi-coding-agent@${OMP_VERSION}"
 
       # A symbol and dependency index of the changed files, from codegraph.
@@ -596,6 +612,7 @@ jobs:
       # parses attacker-authored pull requests. Soft-fails: a missing index
       # makes the review worse, not wrong, so it must never fail the job.
       - name: build code graph
+        if: steps.target.outputs.eligible == 'true'
         continue-on-error: true
         env:
           BASE: ${{ steps.target.outputs.base }}
@@ -641,6 +658,7 @@ jobs:
           echo "  index: $(wc -c < /tmp/codegraph.md 2>/dev/null || echo 0) bytes"
 
       - name: build review prompt
+        if: steps.target.outputs.eligible == 'true'
         id: prompt
         env:
           BASE: ${{ steps.target.outputs.base }}
@@ -873,6 +891,7 @@ jobs:
       # The diff still contains every one of these files, so the agent can
       # still see and report on them. It simply cannot be configured by them.
       - name: strip agent configuration from the checkout
+        if: steps.target.outputs.eligible == 'true'
         run: |
           set -euo pipefail
           # Assert rather than assume. If a future edit drops
@@ -899,6 +918,7 @@ jobs:
           if [ -n "$out" ]; then echo "  $out"; else echo "  no agent configuration present"; fi
 
       - name: run agentic review (read-only)
+        if: steps.target.outputs.eligible == 'true'
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
@@ -1000,7 +1020,7 @@ jobs:
         # The gate was `github.event_name == 'pull_request'`, which in dispatch
         # mode would have run the whole review and then silently posted nothing.
         # It is really "do we have a pull request to post to", so ask that.
-        if: success() && steps.target.outputs.pr != ''
+        if: success() && steps.target.outputs.eligible == 'true' && steps.target.outputs.pr != ''
         env:
           GH_TOKEN: ${{ steps.target.outputs.token || github.token }}
           TARGET_REPO: ${{ steps.target.outputs.repo }}
@@ -1092,7 +1112,7 @@ jobs:
           fi
 
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.target.outputs.eligible == 'true'
         with:
           name: agentic-review
           path: |
