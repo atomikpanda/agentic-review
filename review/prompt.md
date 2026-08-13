@@ -1,6 +1,6 @@
 Review the changes on this branch.
 
-You have read-only tools: `read`, `grep`, `glob`, `lsp`, `ast_grep`. Use them.
+You have read-only tools: `read`, `grep`, `glob`. Use them.
 The whole point of this review is to check things the diff alone cannot show —
 read the files a change depends on, not just the ones it touches.
 
