@@ -523,7 +523,7 @@ function fileChangedSince(t) {
           ),
         );
       }
-      return diffTouchesSpan(fileDiffCache.get(key), t.startLine, t.endLine) ?? true;
+      return diffTouchesSpan(fileDiffCache.get(key), t.startLine, t.endLine);
     } catch {
       return null;
     }
