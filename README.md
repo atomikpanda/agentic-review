@@ -220,16 +220,19 @@ reviewed — with the original folded into a `<details>`.
 It deliberately does **not** say "fixed in <commit>". All that is known is that
 this run did not raise the finding, not that anything fixed it; models give
 inconsistent verdicts across runs of identical code. So the note reports one
-cheap check instead: whether the file changed since the finding was raised. If
-it did not, the marker becomes `⚠️ … but <file> has not changed since`, which
-says plainly that the disappearance is unexplained rather than implying a fix. If you supply a token that can resolve, threads are resolved
-properly and the fallback never runs.
+cheap check instead: whether a changed hunk overlaps the finding's original line
+span, including a three-line margin. If it did not, the marker becomes
+`⚠️ … but <file>:<lines> has not changed since`, which says plainly that the
+disappearance is unexplained rather than implying a fix. If you supply a token
+that can resolve, threads are resolved properly and the fallback never runs.
 
-It also **stays quiet about anything a human already resolved**, while the code
-under it is unchanged. Resolving a thread is a decision — fixed, intentional, or
-won't fix — and re-raising it every push is how a reviewer gets muted. If the
-file changes afterwards the finding is raised again, because then the defect may
-genuinely be back.
+It also **stays quiet about anything a human already resolved** while the code
+in and immediately around its original line span is unchanged. Resolving a
+thread is a decision — fixed, intentional, or won't fix — and re-raising it
+after an unrelated edit elsewhere in a large file is how a reviewer gets muted.
+If an overlapping hunk changes afterwards, the finding is raised again because
+then the defect may genuinely be back. Threads without line data retain the
+conservative whole-file check.
 
 What it deliberately does **not** do is read the comment text. Adversarial
 comments flip 91–100% of LLM vulnerability verdicts

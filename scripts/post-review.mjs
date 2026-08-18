@@ -70,6 +70,7 @@ const stamp = (fp) => `\n\n<!-- ${MARKER}:${fp} -->`;
 // duplicates, pairs that are the same issue score 0.37-0.49 and pairs that are
 // different issues score 0.03-0.16, so the threshold sits between them.
 import { tokenSet, similarity, SIMILARITY_DEFAULT } from "./lib-findings.mjs";
+import { diffTouchesSpan } from "./thread-change.mjs";
 const SIMILARITY = Number(env("SIMILARITY", String(SIMILARITY_DEFAULT)));
 const readStamp = (body) => {
   const m = String(body ?? "").match(new RegExp(`<!-- ${MARKER}:([0-9a-f]{16}) -->`));
@@ -458,7 +459,7 @@ async function ourThreads() {
        repository(owner:$owner,name:$name){
          pullRequest(number:$pr){
            reviewThreads(first:100){
-             nodes{ id isResolved isOutdated path
+             nodes{ id isResolved isOutdated path originalStartLine originalLine
                     comments(first:1){ nodes{ databaseId body author{login}
                                               originalCommit{ oid } } } } } } } }`,
     { owner, name, pr: Number(required("PR_NUMBER")) },
@@ -467,6 +468,8 @@ async function ourThreads() {
   const out = [];
   for (const t of nodes) {
     const c = t.comments?.nodes?.[0];
+    const startLine = Number(t.originalStartLine ?? t.originalLine);
+    const endLine = Number(t.originalLine);
     // Author check, not just the marker. Anyone can paste
     // `<!-- agentic-review-fp:... -->` into a comment; without this a pull
     // request could forge a thread that we then resolve or edit, or claim a
@@ -479,6 +482,8 @@ async function ourThreads() {
         id: t.id, fp, isResolved: t.isResolved,
         commentId: c?.databaseId, body: c?.body ?? "",
         path: t.path, origOid: c?.originalCommit?.oid ?? null,
+        startLine: Number.isInteger(startLine) && startLine > 0 ? startLine : null,
+        endLine: Number.isInteger(endLine) && endLine > 0 ? endLine : null,
         retired: RETIRED_RE.test(c?.body ?? ""),
         tokens: tokenSet(c?.body ?? ""),
       });
@@ -488,13 +493,35 @@ async function ourThreads() {
 
 const RETIRED_RE = /^(?:✅|⚠️) \*\*No longer reported\*\*/;
 
-// Did the file change between the commit a thread was raised on and now?
-// null when it cannot be determined — usually the original commit is gone
-// after a force-push.
+// Did a changed hunk overlap the lines a thread was raised on? Thread spans are
+// in original-commit coordinates, so compare them with the old side of a
+// zero-context diff. Missing spans retain the conservative whole-file check.
+const fileDiffCache = new Map();
 function fileChangedSince(t) {
   if (!t.path || !t.origOid) return null;
+  const head = required("HEAD_SHA");
+
+  if (t.startLine && t.endLine) {
+    const key = `${t.origOid}\0${head}\0${t.path}`;
+    try {
+      if (!fileDiffCache.has(key)) {
+        fileDiffCache.set(
+          key,
+          execFileSync(
+            "git",
+            ["diff", "--unified=0", "--no-ext-diff", t.origOid, head, "--", t.path],
+            { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+          ),
+        );
+      }
+      return diffTouchesSpan(fileDiffCache.get(key), t.startLine, t.endLine) ?? true;
+    } catch {
+      return null;
+    }
+  }
+
   try {
-    execFileSync("git", ["diff", "--quiet", t.origOid, required("HEAD_SHA"), "--", t.path], { stdio: "ignore" });
+    execFileSync("git", ["diff", "--quiet", t.origOid, head, "--", t.path], { stdio: "ignore" });
     return false;
   } catch (e) {
     return e.status === 1 ? true : null;
@@ -507,27 +534,29 @@ function fileChangedSince(t) {
 // inconsistent verdicts across runs of identical code, and this project has
 // already seen the same defect come back under a reworded title.
 //
-// So the commit is reported as context, and the one cheap check that
-// distinguishes the two cases is run: did the file actually change since the
-// finding was raised? If it did not, the disappearance is unexplained and the
-// note says so rather than implying a fix.
+// So the commit is reported as context, and one cheap check distinguishes the
+// two cases: did a changed hunk overlap the original thread span? If it did not,
+// the disappearance is unexplained and the note says so rather than implying a
+// fix.
 function retirementNote(t) {
   const head = required("HEAD_SHA");
   const short = head.slice(0, 7);
   const repo = required("GITHUB_REPO");
   const link = `[\`${short}\`](https://github.com/${repo}/commit/${head})`;
+  const span = t.startLine === t.endLine ? `${t.startLine}` : `${t.startLine}-${t.endLine}`;
+  const location = `\`${t.path}${t.startLine && t.endLine ? `:${span}` : ""}\``;
 
   if (!t.path || !t.origOid) {
     return `✅ **No longer reported** as of ${link}.`;
   }
   const changed = fileChangedSince(t);
   if (changed === true) {
-    return `✅ **No longer reported** as of ${link} — \`${t.path}\` has changed since this was raised.`;
+    return `✅ **No longer reported** as of ${link} — ${location} has changed since this was raised.`;
   }
   if (changed === false) {
     return (
-      `⚠️ **No longer reported** as of ${link} — but \`${t.path}\` has **not changed** ` +
-      `since this was raised, so nothing here was fixed. Treat it as unconfirmed: ` +
+      `⚠️ **No longer reported** as of ${link} — but ${location} has **not changed** ` +
+      `since this was raised, so nothing there was fixed. Treat it as unconfirmed: ` +
       `the reviewer may simply not have raised it on this run.`
     );
   }
@@ -702,7 +731,7 @@ async function main() {
           if (fileChangedSince(t) === false) { held++; continue; }
           if ((await retireThread(t)) !== "skipped") n++;
         }
-        console.log(`  no findings — retired ${n} thread(s)` + (held ? `, held ${held} whose files are unchanged` : ""));
+        console.log(`  no findings — retired ${n} thread(s)` + (held ? `, held ${held} whose spans are unchanged` : ""));
       } catch (e) {
         console.log(`::warning::could not resolve threads (${e.message})`);
       }
@@ -747,11 +776,11 @@ async function main() {
 
   // A finding already sitting in an open thread is not repeated. Re-posting it
   // on every push is how a bot reviewer becomes noise people mute.
-  // A thread someone RESOLVED is a decision: fixed, or intentional, or won't
+  // A thread someone RESOLVED is a decision: fixed, intentional, or won't
   // fix. Re-raising it every push is how a reviewer gets muted. So a finding
-  // that matches a resolved thread is dropped — but only while the code under
-  // it is untouched. If the file changed since, the defect may genuinely be
-  // back, and silence would be the worse error.
+  // that matches a resolved thread is dropped while the code in and immediately
+  // around its original line span is untouched. If an overlapping hunk changes,
+  // the defect may genuinely be back, and silence would be the worse error.
   //
   // Note what this deliberately does NOT do: read the comment text. Adversarial
   // comments flip 91-100% of LLM vulnerability verdicts (arXiv 2607.24964), and

@@ -27,3 +27,10 @@ jobs:
           printf '{"mcpServers":{"contract-probe":{"command":"touch","args":["%s"]}}}\n' "$MCP_MARKER" > .omp/mcp.json
           ./scripts/test-omp-tool-contract.sh
           test ! -e "$MCP_MARKER"
+
+  thread-change:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: verify review-thread hunk matching
+        run: node --test scripts/thread-change.test.mjs
