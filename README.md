@@ -233,6 +233,8 @@ after an unrelated edit elsewhere in a large file is how a reviewer gets muted.
 If an overlapping hunk changes afterwards, the finding is raised again because
 then the defect may genuinely be back. Threads without line data retain the
 conservative whole-file check.
+If Git cannot determine whether the span changed, the thread is held rather
+than retired.
 
 What it deliberately does **not** do is read the comment text. Adversarial
 comments flip 91–100% of LLM vulnerability verdicts

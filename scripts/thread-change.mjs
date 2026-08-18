@@ -1,6 +1,9 @@
 export const THREAD_CHANGE_MARGIN_LINES = 3;
+export const GIT_DIFF_MAX_BUFFER_BYTES = 256 * 1024 * 1024;
 
 export const literalPathspec = (path) => `:(literal)${path}`;
+
+export const changeIsConfirmed = (changed) => changed === true;
 
 const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@/gm;
 

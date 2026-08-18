@@ -70,7 +70,12 @@ const stamp = (fp) => `\n\n<!-- ${MARKER}:${fp} -->`;
 // duplicates, pairs that are the same issue score 0.37-0.49 and pairs that are
 // different issues score 0.03-0.16, so the threshold sits between them.
 import { tokenSet, similarity, SIMILARITY_DEFAULT } from "./lib-findings.mjs";
-import { diffTouchesSpan, literalPathspec } from "./thread-change.mjs";
+import {
+  GIT_DIFF_MAX_BUFFER_BYTES,
+  changeIsConfirmed,
+  diffTouchesSpan,
+  literalPathspec,
+} from "./thread-change.mjs";
 const SIMILARITY = Number(env("SIMILARITY", String(SIMILARITY_DEFAULT)));
 const readStamp = (body) => {
   const m = String(body ?? "").match(new RegExp(`<!-- ${MARKER}:([0-9a-f]{16}) -->`));
@@ -132,7 +137,7 @@ function commentableRanges(baseSha, headSha) {
   const diff = execFileSync(
     "git",
     ["diff", "--unified=3", "--no-color", `${baseSha}`, `${headSha}`],
-    { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 },
+    { encoding: "utf8", maxBuffer: GIT_DIFF_MAX_BUFFER_BYTES },
   );
 
   const byFile = new Map();
@@ -510,7 +515,11 @@ function fileChangedSince(t) {
           execFileSync(
             "git",
             ["diff", "--unified=0", "--no-ext-diff", t.origOid, head, "--", literalPathspec(t.path)],
-            { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+            {
+              encoding: "utf8",
+              maxBuffer: GIT_DIFF_MAX_BUFFER_BYTES,
+              stdio: ["ignore", "pipe", "ignore"],
+            },
           ),
         );
       }
@@ -728,7 +737,7 @@ async function main() {
         let n = 0, held = 0;
         for (const t of await ourThreads()) {
           if (t.isResolved || t.retired) continue;
-          if (fileChangedSince(t) === false) { held++; continue; }
+          if (!changeIsConfirmed(fileChangedSince(t))) { held++; continue; }
           if ((await retireThread(t)) !== "skipped") n++;
         }
         console.log(`  no findings — retired ${n} thread(s)` + (held ? `, held ${held} whose spans are unchanged` : ""));
