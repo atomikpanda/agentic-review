@@ -8,6 +8,7 @@ import { join } from "node:path";
 import {
   THREAD_CHANGE_MARGIN_LINES,
   diffTouchesSpan,
+  literalPathspec,
 } from "./thread-change.mjs";
 
 const hunk = (header) => `diff --git a/example.py b/example.py
@@ -85,6 +86,32 @@ test("matches old-side coordinates from a real zero-context git diff", () => {
 
     assert.equal(diffTouchesSpan(diff, 80, 80), true);
     assert.equal(diffTouchesSpan(diff, 40, 40), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("literal pathspecs do not select files through wildcard magic", () => {
+  const directory = mkdtempSync(join(tmpdir(), "thread-pathspec-"));
+  const git = (...args) => execFileSync("git", args, { cwd: directory, encoding: "utf8" }).trim();
+
+  try {
+    git("init", "--quiet");
+    git("config", "user.email", "test@example.com");
+    git("config", "user.name", "Thread Change Test");
+    writeFileSync(join(directory, "literal*.py"), "unchanged\n");
+    writeFileSync(join(directory, "literal-other.py"), "before\n");
+    git("add", ".");
+    git("commit", "--quiet", "-m", "base");
+    const base = git("rev-parse", "HEAD");
+
+    writeFileSync(join(directory, "literal-other.py"), "after\n");
+    git("add", ".");
+    git("commit", "--quiet", "-m", "head");
+    const head = git("rev-parse", "HEAD");
+
+    assert.notEqual(git("diff", "--unified=0", base, head, "--", "literal*.py"), "");
+    assert.equal(git("diff", "--unified=0", base, head, "--", literalPathspec("literal*.py")), "");
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

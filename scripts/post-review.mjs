@@ -70,7 +70,7 @@ const stamp = (fp) => `\n\n<!-- ${MARKER}:${fp} -->`;
 // duplicates, pairs that are the same issue score 0.37-0.49 and pairs that are
 // different issues score 0.03-0.16, so the threshold sits between them.
 import { tokenSet, similarity, SIMILARITY_DEFAULT } from "./lib-findings.mjs";
-import { diffTouchesSpan } from "./thread-change.mjs";
+import { diffTouchesSpan, literalPathspec } from "./thread-change.mjs";
 const SIMILARITY = Number(env("SIMILARITY", String(SIMILARITY_DEFAULT)));
 const readStamp = (body) => {
   const m = String(body ?? "").match(new RegExp(`<!-- ${MARKER}:([0-9a-f]{16}) -->`));
@@ -509,7 +509,7 @@ function fileChangedSince(t) {
           key,
           execFileSync(
             "git",
-            ["diff", "--unified=0", "--no-ext-diff", t.origOid, head, "--", t.path],
+            ["diff", "--unified=0", "--no-ext-diff", t.origOid, head, "--", literalPathspec(t.path)],
             { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
           ),
         );
@@ -521,7 +521,7 @@ function fileChangedSince(t) {
   }
 
   try {
-    execFileSync("git", ["diff", "--quiet", t.origOid, head, "--", t.path], { stdio: "ignore" });
+    execFileSync("git", ["diff", "--quiet", t.origOid, head, "--", literalPathspec(t.path)], { stdio: "ignore" });
     return false;
   } catch (e) {
     return e.status === 1 ? true : null;

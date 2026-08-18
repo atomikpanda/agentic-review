@@ -1,5 +1,7 @@
 export const THREAD_CHANGE_MARGIN_LINES = 3;
 
+export const literalPathspec = (path) => `:(literal)${path}`;
+
 const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@/gm;
 
 export function diffTouchesSpan(
