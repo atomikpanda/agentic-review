@@ -740,7 +740,7 @@ async function main() {
           if (!changeIsConfirmed(fileChangedSince(t))) { held++; continue; }
           if ((await retireThread(t)) !== "skipped") n++;
         }
-        console.log(`  no findings — retired ${n} thread(s)` + (held ? `, held ${held} whose spans are unchanged` : ""));
+        console.log(`  no findings — retired ${n} thread(s)` + (held ? `, held ${held} without confirmed span changes` : ""));
       } catch (e) {
         console.log(`::warning::could not resolve threads (${e.message})`);
       }
@@ -855,9 +855,10 @@ async function main() {
     if (truncated) {
       console.log(`::warning::${findings.length} findings hit the max_findings cap, so nothing is being resolved — a missing finding may have been dropped rather than fixed`);
     } else {
-      const tally = { resolved: 0, marked: 0, skipped: 0 };
+      const tally = { resolved: 0, marked: 0, skipped: 0, held: 0 };
       for (const t of standing) {
         if (stillLive.has(t.id)) continue;
+        if (!changeIsConfirmed(fileChangedSince(t))) { tally.held++; continue; }
         try {
           tally[await retireThread(t)]++;
         } catch (e) {
@@ -867,6 +868,7 @@ async function main() {
       if (tally.resolved || tally.marked) {
         console.log(`  retired ${tally.resolved + tally.marked} stale finding(s) (${tally.resolved} resolved, ${tally.marked} marked)`);
       }
+      if (tally.held) console.log(`  held ${tally.held} stale finding(s) without confirmed span changes`);
     }
   }
 
