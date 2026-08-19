@@ -18,21 +18,30 @@
 // step, and does not depend on bun being present.
 //
 // Env:
-//   FINDINGS_FILE  path to the agent's output           (required)
-//   GITHUB_REPO    owner/name                           (required)
-//   PR_NUMBER      pull request number                  (required)
-//   HEAD_SHA       commit the review is anchored to     (required)
-//   BASE_SHA       base of the diff                     (required)
-//   GH_TOKEN       token with pull-requests: write      (required)
-//   REVIEW_MODE    "suggest" | "inline"                 (default suggest)
-//   MODEL          shown in the review header           (optional)
-//   TOOLS          shown in the review header           (optional)
-//   DRY_RUN        "1" prints the payload, posts nothing
+//   FINDINGS_FILE         merged structured findings          (required)
+//   REVIEW_METADATA_FILE validated schema-v1 run metadata     (required)
+//   GITHUB_REPO           owner/name                           (required except RENDER)
+//   PR_NUMBER             pull request number                  (required except RENDER)
+//   GH_TOKEN              token with pull-requests: write      (required except RENDER)
+//   REVIEW_MODE           "summary" | "inline" | "suggest"     (default suggest)
+//   DRY_RUN               "1" reads and reconciles but does not write
+//   SUPPRESS_WRITES       "true" reads and reconciles but does not write
+//   POST_COMMENT          "false" reads and reconciles but does not write
 
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { appendFileSync, readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+import { deflateRawSync, inflateRawSync } from "node:zlib";
 
+import { sameFinding, tokenSet, similarity, SIMILARITY_DEFAULT } from "./lib-findings.mjs";
+import { deriveReviewState, validateRunMetadata } from "./review-result.mjs";
+import {
+  GIT_DIFF_MAX_BUFFER_BYTES,
+  changeIsConfirmed,
+  diffTouchesSpan,
+  literalPathspec,
+} from "./thread-change.mjs";
 const env = (k, d) => process.env[k] ?? d;
 const required = (k) => {
   const v = process.env[k];
@@ -43,10 +52,6 @@ const required = (k) => {
   return v;
 };
 
-const FINDINGS_FILE = required("FINDINGS_FILE");
-// The gate judges every finding, including ones suppressed as duplicates —
-// a blocking defect does not stop blocking because it was reported last week.
-let ALL_FINDINGS = [];
 // Findings are re-derived from scratch on every push, so without identity the
 // same defect is posted again on each run. A stable fingerprint over file+title
 // is embedded in each comment so a later run can recognise its own earlier
@@ -59,6 +64,125 @@ const fingerprint = (f) =>
     .slice(0, 16);
 const stamp = (fp) => `\n\n<!-- ${MARKER}:${fp} -->`;
 
+const SUMMARY_MARKER = "agentic-review-summary";
+const SUMMARY_MARKER_VERSION = 1;
+const SUMMARY_STATE_MAX_BYTES = 1024 * 1024;
+const SUMMARY_MARKER_RE = /<!-- agentic-review-summary:v1:([A-Za-z0-9_-]+) -->/;
+const SUMMARY_MARKER_PRESENT_RE = /<!-- agentic-review-summary:v\d+:[^>]*-->/;
+const SUMMARY_SEVERITIES = new Set(["Critical", "High", "Medium"]);
+const SHA_RE = /^[0-9a-f]{40}$/;
+
+function normalizeSummaryFinding(value, index) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`summary findings[${index}] must be an object`);
+  }
+  const file = String(value.file ?? "").replace(/^\.\//, "");
+  const startLine = Number(value.start_line);
+  const endLine = Number(value.end_line ?? value.start_line);
+  if (!file || !Number.isInteger(startLine) || startLine < 1 || !Number.isInteger(endLine) || endLine < startLine) {
+    throw new TypeError(`summary findings[${index}] must have a path and valid inclusive line span`);
+  }
+  if (!SUMMARY_SEVERITIES.has(value.severity)) {
+    throw new TypeError(`summary findings[${index}].severity is invalid`);
+  }
+  if (typeof value.title !== "string" || !value.title || typeof value.body !== "string" || !value.body) {
+    throw new TypeError(`summary findings[${index}] must have a title and body`);
+  }
+  return {
+    file,
+    start_line: startLine,
+    end_line: endLine,
+    severity: value.severity,
+    title: value.title,
+    body: value.body,
+  };
+}
+
+export function encodeSummaryMarker({ headSha, findings }) {
+  if (!SHA_RE.test(headSha)) throw new TypeError("summary headSha must be a lowercase 40-character SHA");
+  if (!Array.isArray(findings)) throw new TypeError("summary findings must be an array");
+  const state = {
+    head_sha: headSha,
+    findings: findings.map(normalizeSummaryFinding),
+  };
+  const encoded = deflateRawSync(Buffer.from(JSON.stringify(state))).toString("base64url");
+  return `<!-- ${SUMMARY_MARKER}:v${SUMMARY_MARKER_VERSION}:${encoded} -->`;
+}
+
+export function decodeSummaryMarker(body) {
+  const encoded = String(body ?? "").match(SUMMARY_MARKER_RE)?.[1];
+  if (!encoded) return null;
+  try {
+    const text = inflateRawSync(Buffer.from(encoded, "base64url"), {
+      maxOutputLength: SUMMARY_STATE_MAX_BYTES,
+    }).toString("utf8");
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !SHA_RE.test(parsed.head_sha)) {
+      return null;
+    }
+    if (!Array.isArray(parsed.findings)) return null;
+    return {
+      head_sha: parsed.head_sha,
+      findings: parsed.findings.map(normalizeSummaryFinding),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isBotComment(comment, botLogin) {
+  const login = comment?.user?.login ?? "";
+  return comment?.user?.type === "Bot"
+    && (/^github-actions(?:\[bot\])?$/.test(login) || (botLogin && login === botLogin));
+}
+
+export function selectSummaryHistory(comments, { botLogin = "github-actions[bot]" } = {}) {
+  const candidates = (Array.isArray(comments) ? comments : [])
+    .filter((comment) => isBotComment(comment, botLogin) && SUMMARY_MARKER_PRESENT_RE.test(String(comment.body ?? "")))
+    .sort((left, right) => {
+      const byTime = String(right.created_at ?? "").localeCompare(String(left.created_at ?? ""));
+      return byTime || Number(right.id ?? 0) - Number(left.id ?? 0);
+    });
+  if (candidates.length === 0) {
+    return { comment: null, findings: [], headSha: null, reconciliationKnown: true };
+  }
+  const comment = candidates[0];
+  const decoded = decodeSummaryMarker(comment.body);
+  if (!decoded) {
+    return { comment, findings: [], headSha: null, reconciliationKnown: false };
+  }
+  return {
+    comment,
+    findings: decoded.findings,
+    headSha: decoded.head_sha,
+    reconciliationKnown: true,
+  };
+}
+
+export async function reconcileSummaryFindings({
+  current,
+  prior,
+  priorHeadSha,
+  headSha,
+  spanChanged,
+}) {
+  const held = [];
+  const retired = [];
+  let reconciliationKnown = true;
+  for (const previous of prior) {
+    if (current.some((candidate) => sameFinding(candidate, previous))) continue;
+    let changed = null;
+    try {
+      changed = await spanChanged(previous, priorHeadSha, headSha);
+    } catch {
+      reconciliationKnown = false;
+    }
+    if (changeIsConfirmed(changed)) retired.push(previous);
+    else held.push(previous);
+  }
+  return { current, held, retired, reconciliationKnown };
+}
+
 // A hash over file+title only matches when the model phrases a finding exactly
 // as before, and it does not: the same defect came back on this pull request as
 // "bun_version input is not passed to setup-bun", "Configured Bun version is
@@ -69,25 +193,19 @@ const stamp = (fp) => `\n\n<!-- ${MARKER}:${fp} -->`;
 // of significant words, within the same file. Measured on this PR's real
 // duplicates, pairs that are the same issue score 0.37-0.49 and pairs that are
 // different issues score 0.03-0.16, so the threshold sits between them.
-import { tokenSet, similarity, SIMILARITY_DEFAULT } from "./lib-findings.mjs";
-import {
-  GIT_DIFF_MAX_BUFFER_BYTES,
-  changeIsConfirmed,
-  diffTouchesSpan,
-  literalPathspec,
-} from "./thread-change.mjs";
+
 const SIMILARITY = Number(env("SIMILARITY", String(SIMILARITY_DEFAULT)));
 const readStamp = (body) => {
   const m = String(body ?? "").match(new RegExp(`<!-- ${MARKER}:([0-9a-f]{16}) -->`));
   return m ? m[1] : null;
 };
 const REVIEW_MODE = env("REVIEW_MODE", "suggest");
-// One switch that blocks EVERY mutation of the pull request: no review posted,
-// no thread resolved, no comment edited. The review is still produced, still
-// uploaded as an artifact, and still decides the exit code — only the writes
-// stop. post_comment: false was not this; it skipped the comment while leaving
-// thread retirement and the gate in inconsistent states.
-const DRY_RUN = env("DRY_RUN", "") === "1" || env("SUPPRESS_WRITES", "") === "true";
+// One switch blocks every pull-request mutation while preserving reads, state
+// reconciliation, outputs, and gate enforcement.
+const WRITES_ENABLED = env("DRY_RUN", "") !== "1"
+  && env("SUPPRESS_WRITES", "") !== "true"
+  && env("POST_COMMENT", "true") !== "false";
+const DRY_RUN = !WRITES_ENABLED;
 
 // ---------------------------------------------------------------------------
 // 1. Extract the JSON object from the agent's output.
@@ -252,186 +370,84 @@ function build(findings, ranges) {
   return { comments, unanchored };
 }
 
-// A confidence score about the REVIEW, not about the code.
-//
-// The obvious feature is "safe to merge: 5/5". It is the wrong thing to ship.
-// That is a claim about the code, and measured recall here is 8-9 findings out
-// of 11 — so roughly a fifth of real defects go unreported, and the score would
-// read highest exactly when the reviewer found nothing, which is also what a
-// review that failed to look hard enough produces. Run-to-run variance makes it
-// worse: identical configurations scored 5, 6, 7, 8 and 9 out of 11 on the same
-// input, so the same pull request would score differently on a re-run.
-//
-// So this scores how much the READER should trust this particular run, from
-// facts that were observed rather than judged: passes that completed, whether
-// the diff was cut short, whether any injected knowledge matched the files.
-// Absence of findings is never evidence of safety, and the wording says so.
-function reviewConfidence() {
-  // Number("") is 0 and passes isFinite, so an unset variable would read as
-  // zero passes and score the run down for no reason. Absent must mean unknown.
-  const num = (k) => {
-    const raw = env(k, "");
-    if (raw === "" || raw === undefined) return null;
-    const v = Number(raw);
-    return Number.isFinite(v) ? v : null;
-  };
-  const tried = num("PASSES_TRIED") ?? 1;
-  const ok = num("PASSES_OK") ?? tried;
-  const truncated = env("DIFF_TRUNCATED", "0") === "1";
-  const skillSections = num("SKILL_SECTIONS");
-
-  let score = 5;
-  const why = [];
-  if (ok < tried) { score -= 2; why.push(`${tried - ok} of ${tried} passes failed to return usable output`); }
-  if (truncated) { score -= 2; why.push("the diff was truncated, so later files were never reviewed"); }
-  if (skillSections === 0) { score -= 1; why.push("no injected knowledge matched these file types"); }
-  if (ok === 1 && tried === 1) { score -= 1; why.push("a single pass — repeated sampling finds materially more"); }
-  score = Math.max(1, Math.min(5, score));
-  return { score, why };
-}
-
-// Severity vocabulary. P0/P1/P2 read better on a badge than the words do, and
-// the priority framing states the action rather than the judgement.
+// Severity vocabulary. P0/P1/P2 keeps existing inline comment presentation.
 const PRIORITY = { Critical: "P0", High: "P1", Medium: "P2" };
 const badge = (sev) => `\`${PRIORITY[sev] ?? "P2"}\` ${sev}`;
 
-// Readiness: 0-5, from the severity and quantity of what was found, mapped to
-// what to do about it.
-//
-// One deviation from the obvious design. The score is CAPPED when the review
-// could not do its job — a truncated diff or a failed pass yields few findings
-// for the same reason a clean change does, and "production ready" inferred from
-// a review that read half the diff is the single most dangerous output this
-// tool could produce. Capping keeps the scale useful without letting it launder
-// a weak run into a merge recommendation.
-const READINESS = {
-  5: ["Production ready", "Merge"],
-  4: ["Minor polish needed", "Merge after small fixes"],
-  3: ["Implementation issues", "Address feedback first"],
-  2: ["Significant bugs", "Needs rework"],
-  1: ["Critical problems", "Major rethink needed"],
-  0: ["Critical problems", "Major rethink needed"],
-};
-
-function readiness(findings, gate) {
-  const n = (sev) => findings.filter((f) => f.severity === sev).length;
-  const p0 = n("Critical"), p1 = n("High"), p2 = n("Medium");
-
-  let score;
-  if (p0 >= 2) score = 0;
-  else if (p0 === 1) score = 1;
-  else if (p1 >= 3) score = 2;
-  else if (p1 >= 1) score = 3;
-  else if (p2 >= 1) score = 4;
-  else score = 5;
-
-  let capped = null;
-  if (gate.verdict === "inconclusive" && score > 3) {
-    capped = score;
-    score = 3;
-  }
-  return { score, p0, p1, p2, capped, ...{ 0: {}, }[0] };
+function formatCounts(counts) {
+  return `Critical: ${counts.Critical} · High: ${counts.High} · Medium: ${counts.Medium}`;
 }
 
-// A merge gate with THREE outcomes, because two would be dishonest.
-//
-// "Clear" and "blocked" alone force a review that could not do its job into
-// "clear" — a truncated diff or a failed pass produces no findings for the same
-// reason a genuinely clean change does, and the reader cannot tell them apart.
-// The third state says so explicitly.
-//
-//   blocked       findings at or above the blocking severities
-//   inconclusive  the review did not meet its own preconditions
-//   clear         preconditions met AND nothing blocking found
-function mergeGate(findings) {
-  const blockingSeverities = env("BLOCK_SEVERITIES", "Critical,High")
-    .split(",").map((x) => x.trim()).filter(Boolean);
-  const blocking = findings.filter((f) => blockingSeverities.includes(f.severity));
-
-  // Preconditions: things that make an absence of findings meaningless.
-  const num = (k) => { const r = env(k, ""); if (r === "") return null; const v = Number(r); return Number.isFinite(v) ? v : null; };
-  const unmet = [];
-  const tried = num("PASSES_TRIED"), ok = num("PASSES_OK");
-  if (tried !== null && ok !== null && ok < tried) unmet.push(`${tried - ok} of ${tried} passes returned nothing usable`);
-  if (env("DIFF_TRUNCATED", "0") === "1") unmet.push("the diff was truncated, so later files were never read");
-  const cap = num("MAX_FINDINGS");
-  if (cap && findings.length >= cap) unmet.push(`the findings cap (${cap}) was reached, so more may exist`);
-
-  if (blocking.length) {
-    return { verdict: "blocked", blocking, unmet,
-      line: `⛔ **Blocked** — ${blocking.length} ${blockingSeverities.join("/")} finding(s) to resolve.` };
-  }
-  if (unmet.length) {
-    return { verdict: "inconclusive", blocking, unmet,
-      line: "⚠️ **Inconclusive** — nothing blocking was found, but this review could not do its job, so that is not the same as clear." };
-  }
-  return { verdict: "clear", blocking, unmet,
-    line: `✅ **Clear** — no ${blockingSeverities.join(" or ")} findings, whole diff reviewed, every pass completed.` };
+export function renderStateTable(metadata, state) {
+  return [
+    "| Result | Value |",
+    "| --- | --- |",
+    `| Analysis | \`${state.analysis_state}\` |`,
+    `| Merge gate | \`${state.merge_state}\` |`,
+    `| Sample | \`${state.sample_state}\` |`,
+    `| Bounded convergence | \`${state.bounded_converged ? "yes" : "no"}\` |`,
+    `| Base SHA | \`${metadata.base_sha}\` |`,
+    `| Head SHA | \`${metadata.head_sha}\` |`,
+    `| Configuration fingerprint | \`${metadata.configuration_fingerprint}\` |`,
+    `| Passes | \`${metadata.passes.requested.length} requested / ${metadata.passes.completed.length} completed\` |`,
+    `| Current findings | \`${formatCounts(state.current_counts)}\` |`,
+    `| Held/unresolved findings | \`${formatCounts(state.unresolved_counts)}\` |`,
+  ].join("\n");
 }
 
-function summaryBody(total, comments, unanchored) {
-  const model = env("MODEL", "");
-  const tools = env("TOOLS", "");
-  const { score: conf, why } = reviewConfidence();
-  const gate = mergeGate(ALL_FINDINGS);
-  const r = readiness(ALL_FINDINGS, gate);
-  const [meaning, action] = READINESS[r.score];
-
-  const out = ["### 🔎 Agentic review", ""];
-  out.push(`## ${r.score}/5 — ${meaning}`, "", `**${action}**`, "");
-  const counts = [
-    r.p0 ? `\`P0\` ${r.p0} critical` : null,
-    r.p1 ? `\`P1\` ${r.p1} high` : null,
-    r.p2 ? `\`P2\` ${r.p2} medium` : null,
-  ].filter(Boolean);
-  if (counts.length) out.push(counts.join(" · "), "");
-  if (r.capped !== null) {
+function appendFindings(out, heading, findings) {
+  if (findings.length === 0) return;
+  out.push("", `#### ${heading}`, "");
+  for (const finding of findings) {
+    const start = finding.start_line;
+    const end = finding.end_line ?? start;
+    const span = start ? `:${start}${end !== start ? `-${end}` : ""}` : "";
     out.push(
-      `> Capped from ${r.capped}/5: this review could not do its job, and few findings from a review that did not finish is not the same as few defects.`,
+      `${badge(finding.severity)} — **${finding.title}**`,
+      "",
+      `\`${String(finding.file).replace(/^\.\//, "")}${span}\``,
+      "",
+      finding.body,
       "",
     );
   }
-  out.push(gate.line, "");
-  if (gate.unmet.length) out.push(...gate.unmet.map((u) => `- ${u}`), "");
-  out.push(
-    `**Review confidence: ${"●".repeat(conf)}${"○".repeat(5 - conf)} ${conf}/5** — how much to trust *this run*, not whether the code is safe.`,
-  );
-  if (why.length) out.push("", ...why.map((w) => `- ${w}`));
-  out.push(
-    "",
-    "_A clean review is not evidence of safety. Measured recall on a reference set is 8–9 of 11 known defects, so roughly one in five is missed._",
-    "",
-  );
-  if (model || tools) {
-    out.push(
-      `_Read-only agent${tools ? ` (\`${tools}\`)` : ""}${model ? ` on \`${model}\`` : ""} — checks things the diff alone cannot show._`,
-      "",
-    );
-  }
+  if (out.at(-1) === "") out.pop();
+}
 
-  const withFix = comments.filter((c) => c.body.includes("suggestion\n")).length;
-  out.push(
-    `${total} finding${total === 1 ? "" : "s"} — ${comments.length} inline${
-      withFix ? `, ${withFix} with a suggested fix` : ""
-    }${unanchored.length ? `, ${unanchored.length} below` : ""}.`,
-  );
-
-  if (unanchored.length) {
-    out.push(
-      "",
-      "These could not be anchored to a line in this diff, so they appear here instead:",
-      "",
-    );
-    for (const f of unanchored) {
-      out.push(`#### ${f.severity ?? "Medium"} — ${f.title ?? "(untitled)"}`);
-      out.push("");
-      out.push(`\`${f.file}${f.start_line ? `:${f.start_line}` : ""}\` — _${f.reason}_`);
-      out.push("");
-      out.push(f.body ?? "");
-      out.push("");
-    }
+export function renderReviewBody({ mode, metadata, state, current, unresolved }) {
+  if (!["summary", "inline", "suggest"].includes(mode)) {
+    throw new TypeError("review mode must be summary, inline, or suggest");
   }
+  const out = ["### Agentic review", "", renderStateTable(metadata, state)];
+  appendFindings(out, "Current findings", current);
+  appendFindings(out, "Held findings", unresolved);
   return out.join("\n");
+}
+
+export function emitWorkflowResult({ metadata, state, outputFile, summaryFile }) {
+  if (outputFile) {
+    appendFileSync(outputFile, [
+      `analysis_state=${state.analysis_state}`,
+      `merge_state=${state.merge_state}`,
+      `sample_state=${state.sample_state}`,
+      `bounded_converged=${state.bounded_converged}`,
+      `base_sha=${metadata.base_sha}`,
+      `head_sha=${metadata.head_sha}`,
+      `configuration_fingerprint=${metadata.configuration_fingerprint}`,
+      `passes_requested=${metadata.passes.requested.length}`,
+      `passes_completed=${metadata.passes.completed.length}`,
+      `current_counts=${JSON.stringify(state.current_counts)}`,
+      `unresolved_counts=${JSON.stringify(state.unresolved_counts)}`,
+      "",
+    ].join("\n"));
+  }
+  if (summaryFile) {
+    appendFileSync(summaryFile, `## Agentic review\n\n${renderStateTable(metadata, state)}\n`);
+  }
+}
+
+export function shouldFailGate(state, failOnFindings) {
+  return Boolean(failOnFindings) && state.merge_state === "blocked";
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +468,59 @@ async function graphql(query, variables) {
     throw new Error(`graphql ${res.status}: ${JSON.stringify(json?.errors ?? {}).slice(0, 300)}`);
   }
   return json.data;
+}
+
+export async function fetchSummaryComments({ repo, pr, token, fetchImpl = fetch }) {
+  const comments = [];
+  for (let page = 1; ; page += 1) {
+    const res = await fetchImpl(
+      `https://api.github.com/repos/${repo}/issues/${pr}/comments?per_page=100&page=${page}`,
+      {
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: "application/vnd.github+json",
+          "x-github-api-version": "2022-11-28",
+        },
+      },
+    );
+    if (!res.ok) throw new Error(`GET issue comments ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const pageComments = await res.json();
+    if (!Array.isArray(pageComments)) throw new Error("GET issue comments returned a non-array response");
+    comments.push(...pageComments);
+    if (pageComments.length < 100) return comments;
+  }
+}
+
+export async function upsertSummaryComment({
+  repo,
+  pr,
+  token,
+  existingComment,
+  body,
+  hasFindings,
+  writesEnabled,
+  fetchImpl = fetch,
+}) {
+  if (!existingComment && !hasFindings) return "skipped";
+  if (!writesEnabled) return "suppressed";
+  const updating = Boolean(existingComment);
+  const url = updating
+    ? `https://api.github.com/repos/${repo}/issues/comments/${existingComment.id}`
+    : `https://api.github.com/repos/${repo}/issues/${pr}/comments`;
+  const res = await fetchImpl(url, {
+    method: updating ? "PATCH" : "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      accept: "application/vnd.github+json",
+      "content-type": "application/json",
+      "x-github-api-version": "2022-11-28",
+    },
+    body: JSON.stringify({ body }),
+  });
+  if (!res.ok) {
+    throw new Error(`${updating ? "PATCH" : "POST"} summary comment ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  }
+  return updating ? "updated" : "created";
 }
 
 // Only threads this reviewer started are ever touched. A human's thread has no
@@ -502,10 +571,8 @@ const RETIRED_RE = /^(?:✅|⚠️) \*\*No longer reported\*\*/;
 // in original-commit coordinates, so compare them with the old side of a
 // zero-context diff. Missing spans retain the conservative whole-file check.
 const fileDiffCache = new Map();
-function fileChangedSince(t) {
-  if (!t.path || !t.origOid) return null;
-  const head = required("HEAD_SHA");
-
+function fileChangedSince(t, head) {
+  if (!t.path || !t.origOid || !head) return null;
   if (t.startLine && t.endLine) {
     const key = `${t.origOid}\0${head}\0${t.path}`;
     try {
@@ -537,6 +604,30 @@ function fileChangedSince(t) {
   }
 }
 
+function summarySpanChanged(finding, fromHead, toHead) {
+  return fileChangedSince({
+    path: String(finding.file).replace(/^\.\//, ""),
+    origOid: fromHead,
+    startLine: finding.start_line,
+    endLine: finding.end_line ?? finding.start_line,
+  }, toHead);
+}
+
+function threadAsFinding(thread) {
+  const firstLine = String(thread.body ?? "").split("\n", 1)[0];
+  const match = firstLine.match(/^`P[012]` (Critical|High|Medium) — \*\*(.+?)\*\*/);
+  if (!thread.path || !match) return null;
+  return {
+    file: thread.path,
+    start_line: thread.startLine,
+    end_line: thread.endLine,
+    severity: match[1],
+    title: match[2],
+    body: thread.body,
+    suggestion: null,
+  };
+}
+
 // "Fixed in <sha>" would be a nicer sentence and a false one. All that is known
 // at this point is that THIS run did not raise the finding — not that anything
 // fixed it, and not which commit would have. Models are documented to give
@@ -547,8 +638,7 @@ function fileChangedSince(t) {
 // two cases: did a changed hunk overlap the original thread span? If it did not,
 // the disappearance is unexplained and the note says so rather than implying a
 // fix.
-function retirementNote(t) {
-  const head = required("HEAD_SHA");
+function retirementNote(t, head) {
   const short = head.slice(0, 7);
   const repo = required("GITHUB_REPO");
   const link = `[\`${short}\`](https://github.com/${repo}/commit/${head})`;
@@ -558,7 +648,7 @@ function retirementNote(t) {
   if (!t.path || !t.origOid) {
     return `✅ **No longer reported** as of ${link}.`;
   }
-  const changed = fileChangedSince(t);
+  const changed = fileChangedSince(t, head);
   if (changed === true) {
     return `✅ **No longer reported** as of ${link} — ${location} has changed since this was raised.`;
   }
@@ -587,13 +677,13 @@ async function resolveThread(id) {
 // Editing our own review comment IS permitted, so a stale finding is marked and
 // folded away instead. Less tidy than a resolved thread, same practical effect:
 // the reader can see at a glance that the reviewer withdrew it.
-async function collapseComment(t) {
+async function collapseComment(t, head) {
   if (!t.commentId) return false;
   if (DRY_RUN) { console.log(`  [suppressed] would mark comment ${t.commentId} as no longer reported`); return true; }
   if (RETIRED_RE.test(t.body)) return false; // already done
   const repo = required("GITHUB_REPO");
   const body =
-    `${retirementNote(t)}\n\n` +
+    `${retirementNote(t, head)}\n\n` +
     `<details><summary>Original finding</summary>\n\n${t.body}\n\n</details>`;
   const res = await fetch(
     `https://api.github.com/repos/${repo}/pulls/comments/${t.commentId}`,
@@ -615,7 +705,7 @@ async function collapseComment(t) {
 // and remembers, so a run with twenty stale threads makes one failed attempt
 // rather than twenty.
 let canResolveThreads = true;
-async function retireThread(t) {
+async function retireThread(t, head) {
   if (canResolveThreads) {
     try {
       await resolveThread(t.id);
@@ -626,7 +716,7 @@ async function retireThread(t) {
       console.log("::notice::this token cannot resolve review threads (GITHUB_TOKEN never can); marking stale findings instead");
     }
   }
-  return (await collapseComment(t)) ? "marked" : "skipped";
+  return (await collapseComment(t, head)) ? "marked" : "skipped";
 }
 
 async function postReview(payload) {
@@ -652,280 +742,282 @@ async function postReview(payload) {
   return { ok: res.ok, status: res.status, text: await res.text() };
 }
 
-function enforceGate() {
-  const gate = mergeGate(ALL_FINDINGS);
-  if (env("FAIL_ON_FINDINGS", "false") === "true" && gate.verdict === "blocked") {
-    console.error(`::error::${gate.blocking.length} blocking finding(s): ${env("BLOCK_SEVERITIES", "Critical,High")}`);
-    process.exit(1);
+function blockSeverities() {
+  return env("BLOCK_SEVERITIES", "Critical,High")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function deriveState(metadata, current, unresolved, reconciliationKnown) {
+  return deriveReviewState({
+    analysisState: metadata.analysis_state,
+    current,
+    unresolved,
+    reconciliationKnown,
+    blockSeverities: blockSeverities(),
+  });
+}
+
+function emitState(metadata, state) {
+  emitWorkflowResult({
+    metadata,
+    state,
+    outputFile: env("GITHUB_OUTPUT", ""),
+    summaryFile: env("GITHUB_STEP_SUMMARY", ""),
+  });
+}
+
+function enforceGate(state) {
+  if (shouldFailGate(state, env("FAIL_ON_FINDINGS", "false") === "true")) {
+    const blocking = Object.entries(state.current_counts)
+      .concat(Object.entries(state.unresolved_counts))
+      .filter(([severity]) => blockSeverities().includes(severity))
+      .reduce((total, [, count]) => total + count, 0);
+    console.error(`::error::${blocking} blocking finding(s): ${blockSeverities().join(",")}`);
+    process.exitCode = 1;
   }
 }
 
-async function main() {
-  const raw = readFileSync(FINDINGS_FILE, "utf8");
-  const parsed = extractJson(raw);
-
-  if (!parsed) {
-    // The model answered, just not in the requested shape — most likely prose.
-    // Discarding it loses a review that has already been paid for, so post it
-    // verbatim as a summary and warn. Still not silent: the annotation says the
-    // contract was broken, and there are no inline comments to imply otherwise.
-    console.log("::warning::agent output was not the requested JSON; posting it as a summary comment");
-    if (env("DRY_RUN", "") === "1" || env("RENDER", "") === "1") {
-      process.stdout.write(raw);
-      return;
+function findStandingMatch(finding, threads) {
+  const fp = fingerprint(finding);
+  const exact = threads.find((thread) => thread.fp === fp);
+  if (exact) return exact;
+  const tokens = tokenSet(`${finding.title} ${finding.body}`);
+  const file = String(finding.file).replace(/^\.\//, "");
+  let best = null;
+  let bestScore = 0;
+  for (const thread of threads) {
+    if (thread.path !== file) continue;
+    const score = similarity(tokens, thread.tokens);
+    if (score > bestScore) {
+      best = thread;
+      bestScore = score;
     }
-    const res = await postReview({
-      commit_id: required("HEAD_SHA"),
-      event: "COMMENT",
-      body:
-        "### 🔎 Agentic review\n\n" +
-        "⚠️ **Inconclusive** — the agent answered in prose rather than the requested " +
-        "structure, so severities could not be read and the merge gate could not run. " +
-        "Treat the text below as unverified, and re-run before relying on it.\n\n" +
-        raw,
+  }
+  return bestScore >= SIMILARITY ? best : null;
+}
+
+function matchesUnchangedResolvedThread(finding, threads, headSha) {
+  const tokens = tokenSet(`${finding.title} ${finding.body}`);
+  const file = String(finding.file).replace(/^\.\//, "");
+  return threads.some((thread) => (
+    thread.path === file
+    && similarity(tokens, thread.tokens) >= SIMILARITY
+    && fileChangedSince(thread, headSha) === false
+  ));
+}
+
+async function runSummaryMode({ metadata, findings, repo, pr, token }) {
+  let history = { comment: null, findings: [], headSha: null, reconciliationKnown: true };
+  try {
+    const comments = await fetchSummaryComments({ repo, pr, token });
+    history = selectSummaryHistory(comments, { botLogin: env("BOT_LOGIN", "github-actions[bot]") });
+  } catch (error) {
+    history = { comment: null, findings: [], headSha: null, reconciliationKnown: false };
+    console.log(`::warning::could not read standing summary comment (${error.message})`);
+  }
+
+  const reconciled = history.reconciliationKnown
+    ? await reconcileSummaryFindings({
+      current: findings,
+      prior: history.findings,
+      priorHeadSha: history.headSha,
+      headSha: metadata.head_sha,
+      spanChanged: summarySpanChanged,
+    })
+    : { current: findings, held: [], retired: [], reconciliationKnown: false };
+  const reconciliationKnown = history.reconciliationKnown && reconciled.reconciliationKnown;
+  const state = deriveState(metadata, reconciled.current, reconciled.held, reconciliationKnown);
+  const carried = [...reconciled.current, ...reconciled.held];
+  const body = `${renderReviewBody({
+    mode: "summary",
+    metadata,
+    state,
+    current: reconciled.current,
+    unresolved: reconciled.held,
+  })}\n\n${encodeSummaryMarker({ headSha: metadata.head_sha, findings: carried })}`;
+
+  emitState(metadata, state);
+  if (reconciliationKnown) {
+    const action = await upsertSummaryComment({
+      repo,
+      pr,
+      token,
+      existingComment: history.comment,
+      body,
+      hasFindings: carried.length > 0,
+      writesEnabled: WRITES_ENABLED,
     });
-    if (!res.ok) {
-      console.error(`::error::could not post the review (${res.status})`);
-      console.error(res.text.slice(0, 1000));
-      process.exit(1);
-    }
-    console.log("  posted as a summary comment");
-    return;
+    console.log(`  summary comment ${action}`);
+  } else {
+    console.log("::warning::summary reconciliation is unknown; standing comment was not changed");
   }
-
-  const findings = parsed.findings;
-  ALL_FINDINGS = findings;
-
-  // RENDER=1 is the local path: there is no pull request to anchor to, so
-  // print the findings and their proposed fixes for a human instead. Shares
-  // this file's parser so the local and CI views cannot disagree about what
-  // the agent actually said.
-  if (env("RENDER", "") === "1") {
-    if (findings.length === 0) {
-      console.log("No findings.");
-      return;
-    }
-    const order = (f) => SEVERITY_ORDER[f.severity] ?? 9;
-    for (const f of [...findings].sort((a, b) => order(a) - order(b))) {
-      const span =
-        f.end_line && f.end_line !== f.start_line
-          ? `${f.start_line}-${f.end_line}`
-          : `${f.start_line}`;
-      console.log(`\n${f.severity} — ${f.title}`);
-      console.log(`  ${f.file}:${span}`);
-      console.log(`  ${String(f.body ?? "").replace(/\n/g, "\n  ")}`);
-      if (typeof f.suggestion === "string" && f.suggestion.length > 0) {
-        console.log("  suggested fix:");
-        console.log(
-          f.suggestion.replace(/\n+$/, "").split("\n").map((l) => `    | ${l}`).join("\n"),
-        );
-      }
-    }
-    console.log(`\n${findings.length} finding(s).`);
-    return;
+  if (DRY_RUN && env("SUPPRESS_WRITES", "") !== "true" && env("POST_COMMENT", "true") !== "false") {
+    process.stdout.write(`${body}\n`);
   }
+  enforceGate(state);
+}
 
-  if (findings.length === 0) {
-    // Everything previously reported is now absent, so close it all out. This
-    // is the "you fixed them" path and it still has to run.
-    if (env("RESOLVE_STALE", "true") === "true" && !DRY_RUN) {
-      try {
-        // Same evidence test as a normal run. This path used to retire every
-        // open thread outright, so one empty review — a model hiccup, a failed
-        // pass — silently closed everything, including findings whose code had
-        // not been touched.
-        let n = 0, held = 0;
-        for (const t of await ourThreads()) {
-          if (t.isResolved || t.retired) continue;
-          if (!changeIsConfirmed(fileChangedSince(t))) { held++; continue; }
-          if ((await retireThread(t)) !== "skipped") n++;
-        }
-        console.log(`  no findings — retired ${n} thread(s)` + (held ? `, held ${held} without confirmed span changes` : ""));
-      } catch (e) {
-        console.log(`::warning::could not resolve threads (${e.message})`);
-      }
-    } else {
-      console.log("  no findings — not posting a review");
-    }
-    return;
-  }
-
-  const ranges = commentableRanges(required("BASE_SHA"), required("HEAD_SHA"));
-
-  // What this reviewer already said on this pull request.
+async function runInlineMode({ metadata, findings }) {
   let prior = [];
-  if (env("RESOLVE_STALE", "true") === "true" && !DRY_RUN) {
-    try {
-      prior = await ourThreads();
-    } catch (e) {
-      // Never let comment housekeeping cost us the review itself.
-      console.log(`::warning::could not read existing review threads (${e.message}); posting without dedupe`);
-    }
+  let reconciliationKnown = true;
+  try {
+    prior = await ourThreads();
+  } catch (error) {
+    reconciliationKnown = false;
+    console.log(`::warning::could not read existing review threads (${error.message}); posting without dedupe`);
   }
-  // Threads still standing: not resolved, and not already retired. A retired
-  // thread is deliberately excluded so a finding that comes BACK is raised
-  // again rather than silently suppressed by its own tombstone.
-  const standing = prior.filter((t) => !t.isResolved && !t.retired);
 
-  const matchOf = (f) => {
-    const fp = fingerprint(f);
-    const exact = standing.find((t) => t.fp === fp);
-    if (exact) return exact;
-    const tk = tokenSet(`${f.title} ${f.body}`);
-    const file = String(f.file).replace(/^\.\//, "");
-    let best = null;
-    let bestScore = 0;
-    for (const t of standing) {
-      if (t.path !== file) continue;
-      const sc = similarity(tk, t.tokens);
-      if (sc > bestScore) { bestScore = sc; best = t; }
-    }
-    return bestScore >= SIMILARITY ? best : null;
-  };
-
-  // A finding already sitting in an open thread is not repeated. Re-posting it
-  // on every push is how a bot reviewer becomes noise people mute.
-  // A thread someone RESOLVED is a decision: fixed, intentional, or won't
-  // fix. Re-raising it every push is how a reviewer gets muted. So a finding
-  // that matches a resolved thread is dropped while the code in and immediately
-  // around its original line span is untouched. If an overlapping hunk changes,
-  // the defect may genuinely be back, and silence would be the worse error.
-  //
-  // Note what this deliberately does NOT do: read the comment text. Adversarial
-  // comments flip 91-100% of LLM vulnerability verdicts (arXiv 2607.24964), and
-  // prompt-level "ignore untrusted content" defences barely dent it — only
-  // keeping the text out works. Pull-request comments are easier to inject than
-  // code comments, since posting one needs no merge. So this reads our own
-  // marker, a boolean, and a git diff. No attacker-authored text reaches the
-  // model.
-  const dismissed = prior.filter((t) => t.isResolved);
-  const dismissedMatch = (f) => {
-    const tk = tokenSet(`${f.title} ${f.body}`);
-    const file = String(f.file).replace(/^\.\//, "");
-    for (const t of dismissed) {
-      if (t.path !== file) continue;
-      if (similarity(tk, t.tokens) < SIMILARITY) continue;
-      if (fileChangedSince(t) === false) return t;   // untouched since dismissal
-    }
-    return null;
-  };
-
-  const stillLive = new Set();
+  const standing = prior.filter((thread) => !thread.isResolved && !thread.retired);
+  const dismissed = prior.filter((thread) => thread.isResolved);
+  const current = [];
   const fresh = [];
+  const stillLive = new Set();
   let suppressed = 0;
-  for (const f of findings) {
-    const m = matchOf(f);
-    if (m) { stillLive.add(m.id); continue; }
-    if (dismissedMatch(f)) { suppressed++; continue; }
-    fresh.push(f);
+
+  for (const finding of findings) {
+    const match = findStandingMatch(finding, standing);
+    if (match) {
+      stillLive.add(match.id);
+      current.push(finding);
+      continue;
+    }
+    if (matchesUnchangedResolvedThread(finding, dismissed, metadata.head_sha)) {
+      suppressed += 1;
+      continue;
+    }
+    current.push(finding);
+    fresh.push(finding);
   }
-  const repeats = findings.length - fresh.length - suppressed;
-  if (suppressed) console.log(`  ${suppressed} finding(s) previously resolved and unchanged — not re-raised`);
+  if (suppressed) {
+    console.log(`  ${suppressed} finding(s) previously resolved and unchanged — not re-raised`);
+  }
 
+  const unresolved = [];
+  const resolveStale = env("RESOLVE_STALE", "true") === "true";
+  for (const thread of standing) {
+    if (stillLive.has(thread.id)) continue;
+    const changed = fileChangedSince(thread, metadata.head_sha);
+    if (changeIsConfirmed(changed) && resolveStale) {
+      if (WRITES_ENABLED) {
+        try {
+          await retireThread(thread, metadata.head_sha);
+          continue;
+        } catch (error) {
+          reconciliationKnown = false;
+          console.log(`::warning::could not retire a thread (${error.message})`);
+        }
+      } else {
+        console.log(`  [suppressed] would retire thread ${thread.id}`);
+        continue;
+      }
+    }
+    const carried = threadAsFinding(thread);
+    if (carried) unresolved.push(carried);
+    else reconciliationKnown = false;
+  }
+
+  const ranges = fresh.length > 0
+    ? commentableRanges(metadata.base_sha, metadata.head_sha)
+    : new Map();
   const { comments, unanchored } = build(fresh, ranges);
-
+  const state = deriveState(metadata, current, unresolved, reconciliationKnown);
+  const body = renderReviewBody({
+    mode: REVIEW_MODE,
+    metadata,
+    state,
+    current,
+    unresolved,
+  });
   const payload = {
-    commit_id: required("HEAD_SHA"),
-    event: "COMMENT", // never REQUEST_CHANGES — that blocks the PR on a bot's opinion
-    body: summaryBody(fresh.length, comments, unanchored),
+    commit_id: metadata.head_sha,
+    event: "COMMENT",
+    body,
     comments,
   };
 
+  emitState(metadata, state);
   console.log(
-    `  ${findings.length} finding(s): ${comments.length} anchored, ` +
-      `${unanchored.length} summary-only, ${repeats} already open`,
+    `  ${findings.length} finding(s): ${comments.length} anchored, `
+      + `${unanchored.length} summary-only, ${findings.length - fresh.length - suppressed} already open`,
   );
 
   if (DRY_RUN) {
-    if (env("SUPPRESS_WRITES", "") !== "true") console.log(JSON.stringify(payload, null, 2));
+    if (env("SUPPRESS_WRITES", "") !== "true" && env("POST_COMMENT", "true") !== "false") {
+      console.log(JSON.stringify(payload, null, 2));
+    }
     console.log(`  [suppressed] ${comments.length} inline comment(s) withheld`);
-    // Suppression stops writes, not judgement. The README promises
-    // fail_on_findings still applies, and this early return was breaking that.
-    enforceGate();
+    enforceGate(state);
     return;
   }
-
-  // Resolve what this reviewer no longer reports — but NOT when the findings
-  // cap truncated the run. At the cap, a finding can be missing because it was
-  // squeezed out rather than fixed, and resolving it would quietly retract a
-  // live defect.
-  const cap = Number(env("MAX_FINDINGS", "0"));
-  const truncated = cap > 0 && findings.length >= cap;
-  if (env("RESOLVE_STALE", "true") === "true" && prior.length > 0) {
-    if (truncated) {
-      console.log(`::warning::${findings.length} findings hit the max_findings cap, so nothing is being resolved — a missing finding may have been dropped rather than fixed`);
-    } else {
-      const tally = { resolved: 0, marked: 0, skipped: 0, held: 0 };
-      for (const t of standing) {
-        if (stillLive.has(t.id)) continue;
-        if (!changeIsConfirmed(fileChangedSince(t))) { tally.held++; continue; }
-        try {
-          tally[await retireThread(t)]++;
-        } catch (e) {
-          console.log(`::warning::could not retire a thread (${e.message})`);
-        }
-      }
-      if (tally.resolved || tally.marked) {
-        console.log(`  retired ${tally.resolved + tally.marked} stale finding(s) (${tally.resolved} resolved, ${tally.marked} marked)`);
-      }
-      if (tally.held) console.log(`  held ${tally.held} stale finding(s) without confirmed span changes`);
-    }
-  }
-
   if (comments.length === 0 && unanchored.length === 0) {
     console.log("  nothing new to say");
-    // Still gate. A Critical does not stop blocking because it was already
-    // reported on an earlier push — the early return skipped the check entirely.
-    enforceGate();
+    enforceGate(state);
     return;
   }
 
-  let res = await postReview(payload);
-
-  if (!res.ok) {
-    // 422 means at least one comment would not anchor. Rather than lose the
-    // whole review, drop the inline comments and post everything as prose.
-    console.log(`::warning::inline review rejected (${res.status}) — falling back to a summary comment`);
-    console.log(res.text.slice(0, 1000));
-    const flat = {
+  let response = await postReview(payload);
+  if (!response.ok) {
+    console.log(`::warning::inline review rejected (${response.status}) — falling back to a non-inline review`);
+    console.log(response.text.slice(0, 1000));
+    response = await postReview({
       commit_id: payload.commit_id,
       event: "COMMENT",
-      body: summaryBody(findings.length, [], [...unanchored, ...findingsOf(comments, findings)]),
-    };
-    res = await postReview(flat);
-    if (!res.ok) {
-      console.error(`::error::could not post the review (${res.status})`);
-      console.error(res.text.slice(0, 1000));
-      process.exit(1);
+      body,
+    });
+    if (!response.ok) {
+      throw new Error(`could not post the review (${response.status}): ${response.text.slice(0, 1000)}`);
     }
   }
   console.log("  review posted");
-
-  // Blocking is decided here because this is the only place that knows the
-  // severities. fail_on_findings now means "fail when the gate says blocked",
-  // not "fail on any finding" — failing a build over a Medium was never the
-  // intent, and an inconclusive review is reported, not failed, because the
-  // fault is ours rather than the contributor's.
-  enforceGate();
+  enforceGate(state);
 }
 
-// When falling back, the anchored findings still have to appear somewhere.
-function findingsOf(comments, findings) {
-  // Match the badge format actually emitted: `P1` High — **Title**. The earlier
-  // version stripped leading/trailing ** from the whole first line, which never
-  // matched once the badge was added, so the fallback silently dropped every
-  // anchored finding — the opposite of what a fallback is for.
-  const anchoredTitles = new Set(
-    comments
-      .map((c) => c.body.match(/^`P[012]` \w+ — \*\*(.*?)\*\*/)?.[1])
-      .filter(Boolean),
-  );
-  return findings
-    .filter((f) => anchoredTitles.has(f.title))
-    .map((f) => ({ ...f, reason: "inline anchoring was rejected" }));
+async function main() {
+  const findingsPath = required("FINDINGS_FILE");
+  const metadataPath = required("REVIEW_METADATA_FILE");
+  const metadata = validateRunMetadata(JSON.parse(readFileSync(metadataPath, "utf8")));
+  const parsed = extractJson(readFileSync(findingsPath, "utf8"));
+  if (!parsed) throw new TypeError("findings artifact is not the requested structured JSON");
+  const findings = parsed.findings;
+  const mode = env("REVIEW_MODE", "suggest");
+  if (!["summary", "inline", "suggest"].includes(mode)) {
+    throw new TypeError("REVIEW_MODE must be summary, inline, or suggest");
+  }
+
+  if (env("RENDER", "") === "1") {
+    const state = deriveState(metadata, findings, [], true);
+    emitState(metadata, state);
+    process.stdout.write(`${renderReviewBody({
+      mode,
+      metadata,
+      state,
+      current: findings,
+      unresolved: [],
+    })}${mode === "summary"
+      ? `\n\n${encodeSummaryMarker({ headSha: metadata.head_sha, findings })}`
+      : ""}\n`);
+    enforceGate(state);
+    return;
+  }
+
+  if (mode === "summary") {
+    await runSummaryMode({
+      metadata,
+      findings,
+      repo: required("GITHUB_REPO"),
+      pr: Number(required("PR_NUMBER")),
+      token: required("GH_TOKEN"),
+    });
+    return;
+  }
+  await runInlineMode({ metadata, findings });
 }
 
-main().catch((e) => {
-  console.error(`::error::${e?.message ?? e}`);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    console.error(`::error::${error?.message ?? error}`);
+    process.exitCode = 1;
+  });
+}
