@@ -82,13 +82,29 @@ process.stdout.write(typeof choice === "string" ? choice : JSON.stringify(choice
 `;
 
 const fakeCodegraph = `#!/usr/bin/env node
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+const operation = process.argv[2];
+if (operation === "init") {
+  const project = process.cwd();
+  const source = readFileSync(join(project, "alpha.txt"), "utf8").trim();
+  let config = null;
+  try { config = readFileSync(join(project, "codegraph.json"), "utf8").trim(); } catch {}
+  appendFileSync(process.env.FAKE_CODEGRAPH_LOG, JSON.stringify({
+    operation: "init", project, source, config,
+  }) + "\\n");
+  if (process.env.FAKE_CODEGRAPH_INIT_FAIL === "1") process.exit(9);
+  mkdirSync(join(project, ".codegraph"), { recursive: true });
+  writeFileSync(join(project, ".codegraph", "source-marker"), "INDEX:" + source + "\\n");
+  process.exit(0);
+}
 const pathIndex = process.argv.indexOf("--path");
 const project = pathIndex === -1 ? "" : process.argv[pathIndex + 1];
 let marker = "missing";
 try { marker = readFileSync(join(project, ".codegraph", "source-marker"), "utf8").trim(); } catch {}
-appendFileSync(process.env.FAKE_CODEGRAPH_LOG, JSON.stringify({ project, marker }) + "\\n");
+appendFileSync(process.env.FAKE_CODEGRAPH_LOG, JSON.stringify({
+  operation: "query", project, marker,
+}) + "\\n");
 process.stdout.write("# Snapshot symbol index\\n\\n" + marker + "\\n");
 `;
 
@@ -165,10 +181,15 @@ function runReview(t, plan, {
   failMerge = false,
   failWorktree = false,
   fakeCodegraph: useFakeCodegraph = false,
+  untrackedCodegraph = false,
   mutateAfterWorktree = null,
   outputPaths = null,
 } = {}) {
   const fixture = createFixture(t, { targetFiles, baseFiles, deleteFiles, staged });
+  if (untrackedCodegraph) {
+    mkdirSync(join(fixture.repository, ".codegraph"), { recursive: true });
+    writeFileSync(join(fixture.repository, ".codegraph", "source-marker"), "SOURCE_INDEX_BEFORE\\n");
+  }
   const planFile = join(fixture.directory, "plan.json");
   const logFile = join(fixture.directory, "omp.log");
   const codegraphLogFile = join(fixture.directory, "codegraph.log");
@@ -591,18 +612,48 @@ test("codegraph context comes only from the pinned review snapshot", (t) => {
     correctness: [{ findings: [] }],
     boundaries: [{ findings: [] }],
   }, {
-    targetFiles: { ".codegraph/source-marker": "SNAPSHOT_INDEX\n" },
+    baseFiles: { "codegraph.json": "{\"trusted\":\"base\"}\n" },
+    targetFiles: { "codegraph.json": "{\"untrusted\":\"target\"}\n" },
     fakeCodegraph: true,
+    untrackedCodegraph: true,
     mutateAfterWorktree: "branch-codegraph",
   });
 
   assert.equal(run.result.status, 0, run.result.stderr);
-  assert.ok(run.codegraphLogs.length > 0);
-  assert.ok(run.codegraphLogs.every(({ project }) => project === run.logs[0].cwd));
-  assert.ok(run.codegraphLogs.every(({ project }) => project !== run.repository));
-  assert.ok(run.codegraphLogs.every(({ marker }) => marker === "SNAPSHOT_INDEX"));
-  assert.ok(run.logs.every(({ prompt }) => prompt.includes("SNAPSHOT_INDEX")));
+  const initializations = run.codegraphLogs.filter(({ operation }) => operation === "init");
+  const queries = run.codegraphLogs.filter(({ operation }) => operation === "query");
+  assert.equal(initializations.length, 1);
+  assert.equal(initializations[0].project, run.logs[0].cwd);
+  assert.notEqual(initializations[0].project, run.repository);
+  assert.equal(initializations[0].source, "alpha head");
+  assert.equal(initializations[0].config, "{\"trusted\":\"base\"}");
+  assert.ok(queries.length > 0);
+  assert.ok(queries.every(({ project }) => project === run.logs[0].cwd));
+  assert.ok(queries.every(({ marker }) => marker === "INDEX:alpha head"));
+  assert.ok(run.logs.every(({ prompt }) => prompt.includes("INDEX:alpha head")));
   assert.ok(run.logs.every(({ prompt }) => !prompt.includes("LIVE_INDEX_MUTATION")));
+  assert.equal(
+    readFileSync(join(run.repository, ".codegraph", "source-marker"), "utf8"),
+    "LIVE_INDEX_MUTATION\n",
+  );
+});
+
+test("codegraph snapshot initialization failure omits optional context without failing review", (t) => {
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    fakeCodegraph: true,
+    untrackedCodegraph: true,
+    env: { FAKE_CODEGRAPH_INIT_FAIL: "1" },
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.equal(run.metadata.analysis_state, "complete");
+  assert.equal(run.codegraphLogs.filter(({ operation }) => operation === "init").length, 1);
+  assert.equal(run.codegraphLogs.filter(({ operation }) => operation === "query").length, 0);
+  assert.ok(run.logs.every(({ prompt }) => !prompt.includes("# Snapshot symbol index")));
 });
 
 test("summary, inline, and suggest all ask OMP for the structured JSON contract", (t) => {

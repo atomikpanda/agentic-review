@@ -398,6 +398,10 @@ DIFFSTAT="$(git diff --stat "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA")"
 DIFFTEXT="$(git diff --no-color "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA")"
 ok "reviewing against $RANGE"
 printf '%s\n' "$DIFFSTAT" | sed 's/^/    /' >&2
+SOURCE_CODEGRAPH_OPT_IN=0
+if [ "$USE_CODEGRAPH" = 1 ] && [ -d "$REPO_ROOT/.codegraph" ]; then
+  SOURCE_CODEGRAPH_OPT_IN=1
+fi
 
 # support_exec, not support: this deletes files, so it must come from the
 # installed copy and never from the repository under review.
@@ -478,6 +482,27 @@ MERGE="$(support_exec scripts/merge-findings.mjs)" \
 command -v node >/dev/null 2>&1 || die "node is required for structured review results"
 
 RUN_TMP="$(mktemp -d)"
+CODEGRAPH_READY=0
+CG=""
+if [ "$SOURCE_CODEGRAPH_OPT_IN" = 1 ] && [ "$SNAPSHOT_IMMUTABLE" = 1 ] \
+   && command -v codegraph >/dev/null 2>&1 \
+   && CG="$(support_exec scripts/codegraph.sh)"; then
+  # The live index only records local opt-in. Rebuild against the pinned tree so
+  # stale symbols and concurrent checkout changes cannot enter any pass.
+  _codegraph_prepared=1
+  rm -rf -- "$REVIEW_ROOT/.codegraph" 2>/dev/null || _codegraph_prepared=0
+  rm -f -- "$REVIEW_ROOT/codegraph.json" 2>/dev/null || _codegraph_prepared=0
+  if [ "$_codegraph_prepared" = 1 ] \
+     && git cat-file -e "$SOURCE_BASE_SHA:codegraph.json" 2>/dev/null; then
+    git show "$SOURCE_BASE_SHA:codegraph.json" > "$REVIEW_ROOT/codegraph.json" \
+      || _codegraph_prepared=0
+  fi
+  if [ "$_codegraph_prepared" = 1 ] \
+     && (cd "$REVIEW_ROOT" && CODEGRAPH_TELEMETRY=0 codegraph init . >/dev/null 2>&1) \
+     && [ -d "$REVIEW_ROOT/.codegraph" ]; then
+    CODEGRAPH_READY=1
+  fi
+fi
 CHANGED_PATHS_FILE="$RUN_TMP/changed-paths"
 git diff --name-only -z "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" > "$CHANGED_PATHS_FILE"
 CHANGED_PATH_COUNT="$(node -e '
@@ -617,8 +642,7 @@ build_prompt() {
       echo
       echo "Report at most $MAX_FINDINGS findings. If you have more, keep the most severe."
     fi
-    if [ "$USE_CODEGRAPH" = 1 ] && [ "$SNAPSHOT_IMMUTABLE" = 1 ] \
-       && CG="$(support_exec scripts/codegraph.sh)" && [ -d "$REVIEW_ROOT/.codegraph" ]; then
+    if [ "$CODEGRAPH_READY" = 1 ]; then
       BASE_SHA="$SOURCE_BASE_SHA" HEAD_SHA="$SOURCE_TARGET_SHA" PROJECT="$REVIEW_ROOT" \
         bash "$CG" 2>/dev/null || true
     fi
