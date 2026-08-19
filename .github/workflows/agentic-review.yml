@@ -181,11 +181,9 @@ on:
       # reason the input existed.
       central_ref:
         description: >-
-          Ref of the central repository to take the prompt, skills and poster
-          from. Should match the ref the caller pins the workflow to, or a pinned
-          install runs pinned workflow logic against moving support files. Only
-          the ref is configurable — the repository is a literal, because that is
-          what a pull request must not be able to redirect.
+          Trusted central support ref. Accepts only literal main or central
+          release tags such as v1 and v1.2.3; pull refs, branches, SHAs, URLs,
+          and revision expressions are rejected before checkout.
         type: string
         default: main
       timeout_minutes:
@@ -202,9 +200,9 @@ on:
         default: latest
       extra_omp_args:
         description: >-
-          Escape hatch for omp flags with no input above (e.g. "--add-dir docs --print-thoughts").
-          Split on whitespace, so values containing spaces are not supported — use the named
-          inputs for those. Flags that would defeat the read-only envelope are rejected.
+          Space-separated harmless display flags not covered above. Currently
+          allowed: --print-thoughts, --hide-thinking, and --no-title. Prompt,
+          session, code-loading, model, tool, and scope flags are rejected.
         type: string
         default: ''
     secrets:
@@ -449,8 +447,31 @@ jobs:
       # targets must use this checkout; a missing central checkout is therefore
       # diagnosed by the trusted-support selection below rather than falling
       # back to anything in the reviewed repository.
+      - name: resolve trusted central ref
+        id: central-ref
+        if: >-
+          steps.target.outputs.eligible == 'true'
+          && steps.target.outputs.repo != 'atomikpanda/agentic-review'
+        env:
+          IN_CENTRAL_REF: ${{ inputs.central_ref }}
+        run: |
+          set -euo pipefail
+          CENTRAL_REF="${IN_CENTRAL_REF:-main}"
+          if [ "$CENTRAL_REF" = "main" ]; then
+            RESOLVED_REF="refs/heads/main"
+          elif [[ "$CENTRAL_REF" =~ ^v(0|[1-9][0-9]*)$ ]] \
+            || [[ "$CENTRAL_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            RESOLVED_REF="refs/tags/$CENTRAL_REF"
+          else
+            echo "::error::central_ref must be main or a central release tag (vN or vN.N.N): $CENTRAL_REF"
+            exit 1
+          fi
+          echo "ref=$RESOLVED_REF" >> "$GITHUB_OUTPUT"
+
       - name: prepare trusted support checkout
-        if: steps.target.outputs.eligible == 'true'
+        if: >-
+          steps.target.outputs.eligible == 'true'
+          && steps.target.outputs.repo != 'atomikpanda/agentic-review'
         run: |
           # The reviewed tree may contain this path or make it a symlink. Remove
           # it before checkout so a failed central fetch cannot leave a
@@ -458,7 +479,9 @@ jobs:
           rm -rf -- .central-skills
 
       - name: fetch shared prompt, skills and poster
-        if: steps.target.outputs.eligible == 'true'
+        if: >-
+          steps.target.outputs.eligible == 'true'
+          && steps.target.outputs.repo != 'atomikpanda/agentic-review'
         id: central
         continue-on-error: true
         uses: actions/checkout@v4
@@ -479,7 +502,7 @@ jobs:
           # A literal is correct because it lives in THIS file: a consuming
           # repository cannot change it, and a fork's copy names the fork.
           repository: atomikpanda/agentic-review
-          ref: ${{ inputs.central_ref || 'main' }}
+          ref: ${{ steps.central-ref.outputs.ref }}
           persist-credentials: false
           path: .central-skills
           sparse-checkout: |
@@ -575,32 +598,32 @@ jobs:
             exit 1
           fi
 
-          # extra_omp_args must not be able to undo the envelope the inputs
-          # above establish. The list covers three separate ways to do that:
-          # changing which tools exist, changing who the agent is, and — the one
-          # missed until now — widening what it may reach. --add-dir grants read
-          # access to any path on the runner, so an agent restricted to the
-          # checkout could be pointed at the rest of the filesystem while still
-          # holding a read-only tool list. Rejecting by name is the load-bearing check; the
-          # command below additionally emits --tools and --approval-mode last.
-          # Match against whitespace-normalised text. Every pattern below needs
-          # a literal space before the flag, but the word splitting that later
-          # builds the argv treats a tab as a separator too — so `x\t--add-dir /`
-          # sailed through the guard and arrived as a real --add-dir argument.
-          # Newlines and carriage returns are already rejected above; this closes
-          # the remaining whitespace.
-          _extra_norm="$(printf '%s' "$IN_EXTRA_ARGS" | tr '\t\v\f' '   ')"
-          case " $_extra_norm " in
-            *" --tools"*|*"--tools="*|*" --no-tools "*|*" --system-prompt"*|*"--system-prompt="*|\
-            *" --api-key"*|*"--api-key="*|*" --approval-mode"*|*"--approval-mode="*|\
-            *" --auto-approve "*|*" --yolo "*|*" --plan-yolo "*|\
-            *" --add-dir"*|*"--add-dir="*|*" --cwd"*|*"--cwd="*|\
-            *" --config"*|*"--config="*|*" --profile"*|*"--profile="*|\
-            *" --hook"*|*"--hook="*|*" --extension"*|*"--extension="*|*" -e "*|\
-            *" --plugin-dir"*|*"--plugin-dir="*)
-              echo "::error::extra_omp_args may not contain flags that widen scope or change identity: --tools, --no-tools, --system-prompt, --api-key, --approval-mode, --auto-approve, --yolo, --plan-yolo, --add-dir, --cwd, --config, --profile, --hook, --extension, -e, --plugin-dir"
-              exit 1 ;;
-          esac
+          # Treat the escape hatch as a tiny allowlist rather than trying to
+          # enumerate every flag that can terminate option parsing, inject
+          # instructions, load code/config, resume state, or widen scope.
+          EXTRA_ARGS="${IN_EXTRA_ARGS:-}"
+          if [ -n "$EXTRA_ARGS" ]; then
+            set -f
+            # shellcheck disable=SC2206  # deliberate validated word splitting
+            _extra=($EXTRA_ARGS)
+            set +f
+            for arg in "${_extra[@]}"; do
+              case "$arg" in
+                --print-thoughts|--hide-thinking|--no-title) ;;
+                *)
+                  echo "::error::extra_omp_args token is not permitted: $arg"
+                  echo "Permitted: --print-thoughts --hide-thinking --no-title"
+                  exit 1 ;;
+              esac
+            done
+          fi
+
+          OMP_VERSION="${IN_OMP_VERSION:-latest}"
+          if [[ ! "$OMP_VERSION" =~ ^[A-Za-z][A-Za-z0-9._-]*$ ]] \
+            && [[ ! "$OMP_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo "::error::omp_version must be a safe npm dist-tag or exact semver: $OMP_VERSION"
+            exit 1
+          fi
 
           REVIEW_MODE="${IN_REVIEW_MODE:-suggest}"
           case "$REVIEW_MODE" in
@@ -628,8 +651,8 @@ jobs:
             echo "FAIL_ON_FINDINGS=${IN_FAIL_ON_FINDINGS:-false}"
             echo "BLOCK_SEVERITIES=${IN_BLOCK_SEVERITIES:-Critical,High}"
             echo "BUN_VERSION=${IN_BUN_VERSION:-latest}"
-            echo "OMP_VERSION=${IN_OMP_VERSION:-latest}"
-            echo "EXTRA_ARGS=${IN_EXTRA_ARGS:-}"
+            echo "OMP_VERSION=$OMP_VERSION"
+            echo "EXTRA_ARGS=$EXTRA_ARGS"
           } >> "$GITHUB_ENV"
 
           echo "  model=${IN_MODEL:-openrouter/openai/gpt-5.6-luna} tools=$TOOLS thinking=${IN_THINKING:-<model default>}"

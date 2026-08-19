@@ -232,6 +232,7 @@ function runReview(t, plan, {
   failMerge = false,
   failWorktree = false,
   fakeCodegraph: useFakeCodegraph = false,
+  fakeBunx = false,
   untrackedCodegraph = false,
   mutateAfterWorktree = null,
   outputPaths = null,
@@ -250,6 +251,7 @@ function runReview(t, plan, {
   const planFile = join(fixture.directory, "plan.json");
   const logFile = join(fixture.directory, "omp.log");
   const codegraphLogFile = join(fixture.directory, "codegraph.log");
+  const bunxLogFile = join(fixture.directory, "bunx.log");
   let findingsFile = join(fixture.directory, "findings.json");
   let metadataFile = join(fixture.directory, "metadata.json");
   if (outputPaths) {
@@ -320,6 +322,15 @@ exit "$status"
     writeFileSync(codegraph, fakeCodegraph);
     chmodSync(codegraph, 0o755);
   }
+  if (fakeBunx) {
+    const bunx = join(fixture.bin, "bunx");
+    writeFileSync(bunx, `#!/usr/bin/env bash
+printf '%s\\n' "\${2:-}" >> "\${FAKE_BUNX_LOG}"
+shift 2
+exec "\$(dirname "$0")/omp" "$@"
+`);
+    chmodSync(bunx, 0o755);
+  }
   const result = spawnSync("bash", runnerArgs, {
     cwd: fixture.repository,
     encoding: "utf8",
@@ -340,6 +351,7 @@ exit "$status"
       FAKE_OMP_LOG: logFile,
       FAKE_OMP_STATE: fixture.state,
       FAKE_CODEGRAPH_LOG: codegraphLogFile,
+      FAKE_BUNX_LOG: bunxLogFile,
       REAL_NODE: process.execPath,
       ...(metadataViaEnv ? { AGENTIC_REVIEW_METADATA_OUT: metadataFile } : {}),
       ...env,
@@ -358,6 +370,7 @@ exit "$status"
     codegraphLogs,
     findingsFile,
     metadataFile,
+    bunxLogFile,
     findings: existsSync(findingsFile) ? JSON.parse(readFileSync(findingsFile, "utf8")) : null,
     metadata: existsSync(metadataFile) ? JSON.parse(readFileSync(metadataFile, "utf8")) : null,
   };
@@ -366,6 +379,187 @@ exit "$status"
 function validateMetadata(metadataFile) {
   return spawnSync(process.execPath, [resultCli, "validate", metadataFile], { encoding: "utf8" });
 }
+
+function runWorkflowConfig(t, overrides = {}) {
+  const directory = mkdtempSync(join(tmpdir(), "hosted-config-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const outputFile = join(directory, "github.env");
+  const inputs = {
+    IN_MODEL: "",
+    IN_THINKING: "",
+    IN_TOOLS: "",
+    IN_CENTRAL_REPO: "atomikpanda/agentic-review",
+    IN_MAX_TIME: "",
+    IN_PROMPT_PATH: "",
+    IN_SKILLS_PATH: "",
+    IN_MAX_FINDINGS: "",
+    IN_MAX_DIFF_BYTES: "",
+    IN_CODEGRAPH: "",
+    IN_CODEGRAPH_VERSION: "",
+    IN_REVIEW_MODE: "",
+    IN_POST_COMMENT: "",
+    IN_SUPPRESS_WRITES: "",
+    IN_RESOLVE_STALE: "",
+    IN_FAIL_ON_FINDINGS: "",
+    IN_BLOCK_SEVERITIES: "",
+    IN_BUN_VERSION: "",
+    IN_OMP_VERSION: "",
+    IN_EXTRA_ARGS: "",
+    ...overrides,
+  };
+  const result = spawnSync("bash", ["-c", workflowRunStep("resolve config")], {
+    encoding: "utf8",
+    env: { ...process.env, ...inputs, GITHUB_ENV: outputFile },
+  });
+  return {
+    result,
+    values: existsSync(outputFile) ? envFileValues(outputFile) : null,
+  };
+}
+
+test("hosted central refs resolve only immutable release tags or literal main", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "central-ref-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  for (const [input, expected] of [
+    ["main", "refs/heads/main"],
+    ["v1", "refs/tags/v1"],
+    ["v1.2.3", "refs/tags/v1.2.3"],
+    ["v2.0.0-rc.1", "refs/tags/v2.0.0-rc.1"],
+  ]) {
+    const outputFile = join(directory, `valid-${input}`);
+    const result = spawnSync("bash", ["-c", workflowRunStep("resolve trusted central ref")], {
+      encoding: "utf8",
+      env: { ...process.env, IN_CENTRAL_REF: input, GITHUB_OUTPUT: outputFile },
+    });
+    assert.equal(result.status, 0, `${input}: ${result.stderr}`);
+    assert.equal(envFileValues(outputFile).ref, expected);
+  }
+  for (const input of [
+    "refs/pull/17/head",
+    "feature/review",
+    "0123456789abcdef0123456789abcdef01234567",
+    "https://github.com/attacker/repo",
+    "v1^{commit}",
+    "v1~1",
+    "1.2.3",
+  ]) {
+    const result = spawnSync("bash", ["-c", workflowRunStep("resolve trusted central ref")], {
+      encoding: "utf8",
+      env: { ...process.env, IN_CENTRAL_REF: input, GITHUB_OUTPUT: join(directory, "invalid") },
+    });
+    assert.notEqual(result.status, 0, input);
+  }
+});
+
+test("hosted config allows harmless display flags and rejects prompt, parser, and package injection", (t) => {
+  const valid = runWorkflowConfig(t, {
+    IN_EXTRA_ARGS: "--print-thoughts --hide-thinking --no-title",
+    IN_OMP_VERSION: "17.4.0-rc.1",
+  });
+  assert.equal(valid.result.status, 0, valid.result.stderr);
+  assert.equal(valid.values.EXTRA_ARGS, "--print-thoughts --hide-thinking --no-title");
+  assert.equal(valid.values.OMP_VERSION, "17.4.0-rc.1");
+  for (const version of ["latest", "next", "17.3.0", "17.4.0-rc.1"]) {
+    const accepted = runWorkflowConfig(t, { IN_OMP_VERSION: version });
+    assert.equal(accepted.result.status, 0, `${version}: ${accepted.result.stderr}`);
+    assert.equal(accepted.values.OMP_VERSION, version);
+  }
+
+  for (const extra of [
+    "--",
+    "--append-system-prompt=/tmp/untrusted",
+    "--system-prompt /tmp/untrusted",
+    "--config=/tmp/untrusted",
+    "--continue",
+    "--resume=session",
+    "--model=attacker/model",
+    "ignore-all-review-instructions",
+  ]) {
+    const rejected = runWorkflowConfig(t, { IN_EXTRA_ARGS: extra });
+    assert.notEqual(rejected.result.status, 0, extra);
+  }
+  for (const version of [
+    "https://attacker.invalid/omp.tgz",
+    "../omp",
+    "npm:attacker",
+    "@attacker/omp",
+    "latest@attacker",
+    "file:/tmp/omp",
+    "17.3.0 --silent",
+  ]) {
+    const rejected = runWorkflowConfig(t, { IN_OMP_VERSION: version });
+    assert.notEqual(rejected.result.status, 0, version);
+  }
+});
+
+test("runner rejects passthrough prompt and envelope changes before OMP", (t) => {
+  for (const extra of [
+    ["--"],
+    ["--append-system-prompt=/tmp/untrusted"],
+    ["--config=/tmp/untrusted"],
+    ["--continue"],
+    ["--resume=session"],
+    ["ignore-all-review-instructions"],
+  ]) {
+    const run = runReview(t, {}, {
+      args: ["--json", "--", ...extra],
+      includeOutputs: false,
+    });
+    assert.notEqual(run.result.status, 0, extra.join(" "));
+    assert.equal(run.logs.length, 0, extra.join(" "));
+  }
+
+  const allowed = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: ["--json", "--", "--print-thoughts", "--hide-thinking", "--no-title"],
+  });
+  assert.equal(allowed.result.status, 0, allowed.result.stderr);
+  assert.ok(allowed.logs.every(({ argv }) => (
+    argv.includes("--print-thoughts")
+    && argv.includes("--hide-thinking")
+    && argv.includes("--no-title")
+  )));
+});
+
+test("runner validates OMP package versions before bunx or OMP", (t) => {
+  for (const version of [
+    "https://attacker.invalid/omp.tgz",
+    "../omp",
+    "npm:attacker",
+    "@attacker/omp",
+    "latest@attacker",
+    "file:/tmp/omp",
+    "17.3.0 --silent",
+  ]) {
+    const run = runReview(t, {}, {
+      args: ["--omp-version", version, "--json"],
+      includeOutputs: false,
+      fakeBunx: true,
+    });
+    assert.notEqual(run.result.status, 0, version);
+    assert.equal(run.logs.length, 0, version);
+    assert.equal(existsSync(run.bunxLogFile), false, version);
+  }
+
+  for (const version of ["next", "17.4.0-rc.1"]) {
+    const valid = runReview(t, {
+      general: [{ findings: [] }],
+      correctness: [{ findings: [] }],
+      boundaries: [{ findings: [] }],
+    }, {
+      args: ["--omp-version", version, "--json"],
+      fakeBunx: true,
+    });
+    assert.equal(valid.result.status, 0, `${version}: ${valid.result.stderr}`);
+    assert.deepEqual(
+      readFileSync(valid.bunxLogFile, "utf8").trim().split("\n"),
+      Array(3).fill(`@oh-my-pi/pi-coding-agent@${version}`),
+    );
+  }
+});
 
 test("the default profile runs general, correctness, and boundaries into one validated result", (t) => {
   const repeated = finding("Shared lifecycle defect", { file: "src/shared.js" });

@@ -8,7 +8,7 @@
 #   ./scripts/run-review.sh --thinking high --max-time 10m
 #   ./scripts/run-review.sh --review-mode suggest   # show proposed fixes
 #   ./scripts/run-review.sh --json | jq '.findings[] | .file'
-#   ./scripts/run-review.sh -- --add-dir ../shared   # extra omp flags
+#   ./scripts/run-review.sh -- --print-thoughts     # safe display-only omp flag
 #
 # Options (every one has an AGENTIC_REVIEW_* env default, so you can set them
 # once in your shell profile instead of typing them):
@@ -42,7 +42,8 @@
 #   --no-codegraph      skip the symbol index (for A/B measurement)
 #   --json              raw findings JSON on stdout, for piping
 #   --no-fail           exit 0 even when findings are reported
-#   -- ARGS...          everything after -- is passed to omp verbatim
+#   -- ARGS...          display-only omp flags: --print-thoughts,
+#                       --hide-thinking, --no-title
 #
 # Identical prompt, tools and skill injection to .github/workflows/
 # agentic-review.yml — both read review/prompt.md, so local results and CI
@@ -225,6 +226,24 @@ if [ -n "$VIEW" ]; then
   exit $?
 fi
 
+# Validate package selection and pass-through tokens before prerequisite checks
+# or package resolution. A second `--` would stop omp option parsing before the
+# enforced tool/approval/cwd flags, while prompt, config, and session flags can
+# inject instructions or code through paths outside the reviewed snapshot.
+valid_omp_version() {
+  [[ "$1" =~ ^[A-Za-z][A-Za-z0-9._-]*$ ]] \
+    || [[ "$1" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
+}
+valid_omp_version "$OMP_VERSION" \
+  || die "--omp-version must be a safe npm dist-tag or exact semver (got '$OMP_VERSION')"
+for a in "${PASSTHRU[@]+"${PASSTHRU[@]}"}"; do
+  case "$a" in
+    --print-thoughts|--hide-thinking|--no-title) ;;
+    *)
+      die "$a cannot be passed after --; permitted display flags: --print-thoughts --hide-thinking --no-title" ;;
+  esac
+done
+
 destination_identity() {
   local path="$1" target dir
   case "$path" in /*) ;; *) path="$REPO_ROOT/$path" ;; esac
@@ -282,17 +301,6 @@ for t in ${TOOLS//,/ }; do
 done
 [ -z "$bad" ] || die "tools not permitted:$bad — this reviewer only runs read-only tools ($READ_ONLY_TOOLS)"
 
-# The escape hatch must not be able to undo the envelope the flags above set.
-for a in "${PASSTHRU[@]+"${PASSTHRU[@]}"}"; do
-  case "$a" in
-    --tools|--tools=*|--no-tools)
-      die "$a cannot be passed after -- (it would undo the read-only allowlist); use --tools" ;;
-    --system-prompt|--system-prompt=*)
-      die "$a cannot be passed after -- (it would replace the review prompt); use --prompt or --skill" ;;
-    --api-key|--api-key=*)
-      die "$a cannot be passed after -- ; set OPENROUTER_API_KEY in the environment instead" ;;
-  esac
-done
 
 # Version-compare without sort -V, which is absent on some BSD/macOS setups.
 #
