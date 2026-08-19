@@ -37,7 +37,13 @@ const RUNS_DIR = join(STATE_DIR, "runs");
 const STATE_FILE = join(STATE_DIR, "state.json");
 const STORED_STATUSES = new Set(["open", "dismissed", "gone"]);
 const STORED_SEVERITIES = new Set(["Critical", "High", "Medium"]);
-const COMMIT_SHA = /^[0-9a-f]{40}$/i;
+const COMMIT_SHA = /^[0-9a-f]{40}$/;
+
+function isTimestamp(value) {
+  if (typeof value !== "string") return false;
+  const epoch = Date.parse(value);
+  return Number.isFinite(epoch) && new Date(epoch).toISOString() === value;
+}
 
 function migrateAndValidateStoredFinding(finding, index) {
   const label = `local review state findings[${index}]`;
@@ -46,9 +52,14 @@ function migrateAndValidateStoredFinding(finding, index) {
   }
   if (finding.endLine === undefined) finding.endLine = finding.line;
   if (finding.lastCommit === undefined) finding.lastCommit = finding.firstCommit;
-  for (const field of ["id", "file", "title", "firstSeen", "lastSeen"]) {
+  for (const field of ["id", "file", "title"]) {
     if (typeof finding[field] !== "string" || finding[field].length === 0) {
       throw new TypeError(`${label}.${field} must be a non-empty string`);
+    }
+  }
+  for (const field of ["firstSeen", "lastSeen"]) {
+    if (!isTimestamp(finding[field])) {
+      throw new TypeError(`${label}.${field} must be an ISO timestamp`);
     }
   }
   if (typeof finding.body !== "string") {
@@ -60,6 +71,13 @@ function migrateAndValidateStoredFinding(finding, index) {
   if (!STORED_STATUSES.has(finding.status)) {
     throw new TypeError(`${label}.status is invalid`);
   }
+  if (finding.status === "gone") {
+    if (!isTimestamp(finding.goneAt)) {
+      throw new TypeError(`${label}.goneAt must be an ISO timestamp for gone findings`);
+    }
+  } else if (Object.hasOwn(finding, "goneAt")) {
+    throw new TypeError(`${label}.goneAt is only valid for gone findings`);
+  }
   if (
     !Number.isInteger(finding.line)
     || finding.line < 1
@@ -68,8 +86,10 @@ function migrateAndValidateStoredFinding(finding, index) {
   ) {
     throw new TypeError(`${label} has an invalid inclusive line span`);
   }
-  if (!COMMIT_SHA.test(finding.firstCommit) || !COMMIT_SHA.test(finding.lastCommit)) {
-    throw new TypeError(`${label} has an invalid commit SHA`);
+  for (const field of ["firstCommit", "lastCommit"]) {
+    if (typeof finding[field] !== "string" || !COMMIT_SHA.test(finding[field])) {
+      throw new TypeError(`${label}.${field} must be a lowercase 40-hex commit SHA`);
+    }
   }
   if (!Number.isInteger(finding.count) || finding.count < 1) {
     throw new TypeError(`${label}.count must be a positive integer`);
@@ -255,6 +275,7 @@ if (cmd === "dismiss" || cmd === "reopen") {
   for (const f of state.findings) {
     if (!ids.includes(f.id)) continue;
     f.status = cmd === "dismiss" ? "dismissed" : "open";
+    delete f.goneAt;
     n++;
   }
   save(state);

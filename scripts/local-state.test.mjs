@@ -99,9 +99,15 @@ test("malformed readable state fails without overwriting its bytes", (t) => {
   const findingsFile = join(repository, "findings.json");
   writeFileSync(findingsFile, JSON.stringify({ findings: [] }));
 
-  assert.equal(run(repository, "export-open").status, 1);
-  assert.equal(run(repository, "list", "open").status, 1);
-  assert.equal(run(repository, "record", findingsFile, head, head).status, 1);
+  for (const args of [
+    ["export-open"],
+    ["list", "open"],
+    ["record", findingsFile, head, head],
+    ["dismiss", "stored"],
+    ["reopen", "stored"],
+  ]) {
+    assert.equal(run(repository, ...args).status, 1, args.join(" "));
+  }
   assert.equal(readFileSync(stateFile, "utf8"), malformed);
 });
 
@@ -128,11 +134,24 @@ test("structurally invalid stored findings fail every reader and preserve bytes"
     lastCommit: head,
     count: 1,
   };
+  const validTimestamp = "2026-08-19T00:00:00.000Z";
+  const validCommit = "a".repeat(40);
   const invalidStates = [
     JSON.stringify({ findings: [{}] }),
     JSON.stringify({ findings: [{ ...valid, status: "waiting" }] }),
     JSON.stringify({ findings: [{ ...valid, endLine: 0 }] }),
     JSON.stringify({ findings: [{ ...valid, firstCommit: "not-a-commit", lastCommit: undefined }] }),
+    JSON.stringify({ findings: [{ ...valid, firstCommit: [validCommit] }] }),
+    JSON.stringify({ findings: [{ ...valid, firstCommit: { toString: validCommit } }] }),
+    JSON.stringify({ findings: [{ ...valid, firstCommit: Number("1".repeat(40)) }] }),
+    JSON.stringify({ findings: [{ ...valid, firstCommit: validCommit.toUpperCase() }] }),
+    JSON.stringify({ findings: [{ ...valid, firstSeen: "not-a-timestamp" }] }),
+    JSON.stringify({ findings: [{ ...valid, lastSeen: "not-a-timestamp" }] }),
+    JSON.stringify({ findings: [{ ...valid, status: "gone" }] }),
+    JSON.stringify({ findings: [{ ...valid, status: "gone", goneAt: 1 }] }),
+    JSON.stringify({ findings: [{ ...valid, status: "gone", goneAt: "not-a-timestamp" }] }),
+    JSON.stringify({ findings: [{ ...valid, status: "open", goneAt: validTimestamp }] }),
+    JSON.stringify({ findings: [{ ...valid, status: "dismissed", goneAt: validTimestamp }] }),
   ];
   mkdirSync(stateDirectory, { recursive: true });
   const findingsFile = join(repository, "findings.json");
@@ -143,11 +162,50 @@ test("structurally invalid stored findings fail every reader and preserve bytes"
       ["export-open"],
       ["list", "open"],
       ["record", findingsFile, head, head],
+      ["dismiss", "stored"],
+      ["reopen", "stored"],
     ]) {
       writeFileSync(stateFile, invalid);
       assert.equal(run(repository, ...args).status, 1, args.join(" "));
       assert.equal(readFileSync(stateFile, "utf8"), invalid);
     }
+  }
+});
+
+test("changing a gone finding to a non-gone status removes goneAt", (t) => {
+  const repository = createRepository(t, "local-state-reopen-");
+  writeFileSync(join(repository, "alpha.txt"), "base\n");
+  git(repository, "add", "alpha.txt");
+  git(repository, "commit", "-m", "base");
+  const head = git(repository, "rev-parse", "HEAD");
+  const stateDirectory = join(repository, ".git", "agentic-review");
+  const stateFile = join(stateDirectory, "state.json");
+  const gone = {
+    id: "stored",
+    file: "alpha.txt",
+    title: "Stored finding",
+    body: "Stored body.",
+    severity: "High",
+    line: 1,
+    endLine: 1,
+    status: "gone",
+    firstSeen: "2026-08-19T00:00:00.000Z",
+    lastSeen: "2026-08-19T00:00:00.000Z",
+    firstCommit: head,
+    lastCommit: head,
+    count: 1,
+    goneAt: "2026-08-19T00:00:00.000Z",
+  };
+  mkdirSync(stateDirectory, { recursive: true });
+
+  const { goneAt, ...nonGone } = gone;
+  for (const command of ["dismiss", "reopen"]) {
+    writeFileSync(stateFile, JSON.stringify({ findings: [gone] }));
+    const result = run(repository, command, gone.id);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, "utf8")), {
+      findings: [{ ...nonGone, status: command === "dismiss" ? "dismissed" : "open" }],
+    });
   }
 });
 
