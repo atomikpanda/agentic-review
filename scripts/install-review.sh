@@ -34,7 +34,7 @@
 #   --no-comment             don't post a PR comment (artifact only)
 #   --omp-version V          pin @oh-my-pi/pi-coding-agent
 #   --bun-version V          pin bun
-#   --extra-omp-args ARGS    passed through to omp verbatim
+#   --extra-omp-args ARGS    display flags only: --print-thoughts, --hide-thinking, --no-title
 #   --pr-agent-model SLUG    model for PR-Agent on this repo
 
 set -euo pipefail
@@ -94,6 +94,26 @@ while [ $# -gt 0 ]; do
     *) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
+
+if [ -n "$I_EXTRA_ARGS" ]; then
+  if [ "$I_EXTRA_ARGS" != "${I_EXTRA_ARGS//[$'\n\r']/}" ]; then
+    printf '%s\n' "--extra-omp-args must not contain a newline" >&2
+    exit 2
+  fi
+  set -f
+  # shellcheck disable=SC2206  # deliberate validated word splitting
+  _installer_extra=($I_EXTRA_ARGS)
+  set +f
+  for arg in "${_installer_extra[@]}"; do
+    case "$arg" in
+      --print-thoughts|--hide-thinking|--no-title) ;;
+      *)
+        printf 'extra-omp-args token is not permitted: %s\n' "$arg" >&2
+        printf '%s\n' "permitted: --print-thoughts --hide-thinking --no-title" >&2
+        exit 2 ;;
+    esac
+  done
+fi
 
 _c() { if [ -t 1 ]; then printf '\033[%sm' "$1"; fi; }
 say()  { _c "0;36"; printf '  %s\n' "$*"; _c "0"; }
@@ -187,7 +207,7 @@ if [ "$existing_sha" != "SKIP" ]; then
 name: agentic-review
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, reopened, ready_for_review, synchronize]
 
 # A called workflow cannot grant itself more than the caller has. Without this
@@ -225,12 +245,6 @@ YAML
   # anything else has to be stated. Since CENTRAL_REF now defaults to v1, the
   # normal install emits `central_ref: v1` and both halves stay in step.
   if [ "$CENTRAL_REF" != "main" ]; then emit central_ref "$CENTRAL_REF"; fi
-  # The reusable workflow needs to know where to fetch the shared prompt and
-  # poster from. It cannot infer it: github.repository_owner there is the owner
-  # of the repo being reviewed, not of this project.
-  # central_repo is no longer an input — the reusable workflow derives it from
-  # its own workflow_ref, which is correct for forks and cannot be redirected by
-  # a pull request.
   emit max_findings     "$I_MAX_FINDINGS"
   emit fail_on_findings "$I_FAIL"
   emit post_comment     "$I_COMMENT"
@@ -263,7 +277,7 @@ YAML
 #   max_diff_bytes:   400000        # 0 sends the whole diff
 #   bun_version:      latest        # omp needs >= 1.3.14 and is bun-only
 #   omp_version:      latest        # pin for reproducible reviews
-#   extra_omp_args:   ''            # any other omp flag
+#   extra_omp_args:   ''            # display only: --print-thoughts, --hide-thinking, --no-title
 YAML
 
   args=(-f "message=chore: enable agentic code review"

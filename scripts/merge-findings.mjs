@@ -21,84 +21,192 @@
 //        reads the agent's raw output (bare JSON, fenced, or prose-wrapped)
 
 import { readFileSync } from "node:fs";
-import { sameFinding, SIMILARITY_DEFAULT } from "./lib-findings.mjs";
+import { pathToFileURL } from "node:url";
+import {
+  isValidFinding,
+  projectPublicFinding,
+  sameFinding,
+  SIMILARITY_DEFAULT,
+} from "./lib-findings.mjs";
 
-const args = process.argv.slice(2);
-let minVotes = 1;
-let checkOnly = false;
-const files = [];
-for (let i = 0; i < args.length; i++) {
-  if (args[i] === "--min-votes") { minVotes = Number(args[++i]) || 1; continue; }
-  if (args[i] === "--check") { checkOnly = true; continue; }
-  files.push(args[i]);
+const SEVERITY_RANK = { Critical: 0, High: 1, Medium: 2 };
+
+
+function isValidDocument(value) {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Array.isArray(value.findings)
+    && value.findings.every(isValidFinding);
 }
 
-function extractJson(text) {
-  const t = String(text).trim();
-  const cands = [];
-  const fence = t.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
-  if (fence) cands.push(fence[1]);
-  cands.push(t);
-  const a = t.indexOf("{"), b = t.lastIndexOf("}");
-  if (a !== -1 && b > a) cands.push(t.slice(a, b + 1));
-  for (const c of cands) {
+function extractJson(text, { strict = false } = {}) {
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed) return null;
+
+  const candidates = [trimmed];
+  if (!strict) {
+    const fence = trimmed.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
+    if (fence) candidates.unshift(fence[1]);
+    const first = trimmed.indexOf("{");
+    const last = trimmed.lastIndexOf("}");
+    if (first !== -1 && last > first) candidates.push(trimmed.slice(first, last + 1));
+  }
+
+  for (const candidate of candidates) {
     try {
-      const p = JSON.parse(c);
-      if (p && Array.isArray(p.findings)) return p;
-    } catch { /* next */ }
+      const parsed = JSON.parse(candidate);
+      if (isValidDocument(parsed)) return parsed;
+    } catch {
+      /* try the next candidate */
+    }
   }
   return null;
 }
 
-// --check: exit 0 if the file holds parseable findings. omp offers no
-// structured-output mode — grepping the bundle finds no json_schema and
-// response_format only in image generation — so the contract cannot be enforced
-// at the API and has to be verified after the fact.
-if (checkOnly) {
-  for (const f of files) {
-    let ok = false;
-    try { ok = !!extractJson(readFileSync(f, "utf8")); } catch { ok = false; }
-    if (!ok) process.exit(1);
-  }
-  process.exit(0);
+function compareText(a, b) {
+  const left = String(a ?? "");
+  const right = String(b ?? "");
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
-const merged = [];
-let passes = 0;
+function compareFindings(a, b) {
+  return (SEVERITY_RANK[a.severity] ?? 9) - (SEVERITY_RANK[b.severity] ?? 9)
+    || b.votes - a.votes
+    || compareText(a.file, b.file)
+    || (Number(a.start_line) || 0) - (Number(b.start_line) || 0)
+    || (Number(a.end_line) || 0) - (Number(b.end_line) || 0)
+    || compareText(a.title, b.title)
+    || compareText(a.body, b.body);
+}
 
-for (const f of files) {
-  let parsed;
-  try { parsed = extractJson(readFileSync(f, "utf8")); } catch { parsed = null; }
-  if (!parsed) { process.stderr.write(`  pass ${f}: unparseable, skipped\n`); continue; }
-  passes++;
-  for (const finding of parsed.findings) {
-    if (!finding || typeof finding.file !== "string") continue;
-    const hit = merged.find((m) => sameFinding(m, finding, SIMILARITY_DEFAULT));
-    if (hit) {
-      hit.votes++;
-      // Keep the variant that carries a concrete fix, and the more severe
-      // reading — a defect seen as Critical once and Medium twice is worth
-      // showing at Critical.
-      const rank = { Critical: 0, High: 1, Medium: 2 };
-      if ((rank[finding.severity] ?? 9) < (rank[hit.severity] ?? 9)) hit.severity = finding.severity;
-      if (!hit.suggestion && finding.suggestion) {
-        hit.suggestion = finding.suggestion;
-        hit.start_line = finding.start_line;
-        hit.end_line = finding.end_line;
+function compareVariants(a, b) {
+  return compareText(String(a.file ?? "").replace(/^\.\//, ""), String(b.file ?? "").replace(/^\.\//, ""))
+    || compareText(a.title, b.title)
+    || compareText(a.body, b.body)
+    || (Number(a.start_line) || 0) - (Number(b.start_line) || 0)
+    || (Number(a.end_line) || 0) - (Number(b.end_line) || 0);
+}
+
+function mergeVariant(target, candidate) {
+  const votes = target.votes;
+  const severity = (SEVERITY_RANK[candidate.severity] ?? 9) < (SEVERITY_RANK[target.severity] ?? 9)
+    ? candidate.severity
+    : target.severity;
+  const fixSource = [target, candidate]
+    .filter((finding) => finding.suggestion)
+    .sort((left, right) =>
+      compareText(left.suggestion, right.suggestion)
+      || (Number(left.start_line) || 0) - (Number(right.start_line) || 0)
+      || (Number(left.end_line) || 0) - (Number(right.end_line) || 0))[0];
+  const fix = fixSource ? { ...fixSource } : null;
+  const representative = compareVariants(candidate, target) < 0 ? candidate : target;
+  Object.assign(target, representative);
+  if (votes !== undefined) target.votes = votes;
+  target.severity = severity;
+  if (fix) {
+    target.suggestion = fix.suggestion;
+    target.start_line = fix.start_line;
+    target.end_line = fix.end_line;
+  }
+}
+
+export function mergeFindingDocuments(documents, { minVotes = 1 } = {}) {
+  const merged = [];
+  const statuses = [];
+  let passes = 0;
+
+  for (const document of documents) {
+    const parsed = document && typeof document === "object"
+      ? (isValidDocument(document) ? document : null)
+      : extractJson(document);
+    if (!parsed) {
+      statuses.push({ status: "malformed", finding_count: 0 });
+      continue;
+    }
+
+    passes++;
+    statuses.push({ status: "valid", finding_count: parsed.findings.length });
+    const uniqueFindings = [];
+    for (const rawFinding of parsed.findings) {
+      const finding = projectPublicFinding(rawFinding);
+      if (!finding) continue;
+      const duplicate = uniqueFindings.find((candidate) =>
+        sameFinding(candidate, finding, SIMILARITY_DEFAULT));
+      if (duplicate) {
+        mergeVariant(duplicate, finding);
+      } else {
+        uniqueFindings.push(finding);
       }
-    } else {
-      merged.push({ ...finding, votes: 1 });
+    }
+    for (const finding of uniqueFindings) {
+      const hit = merged.find((candidate) =>
+        sameFinding(candidate, finding, SIMILARITY_DEFAULT));
+      if (hit) {
+        hit.votes++;
+        mergeVariant(hit, finding);
+      } else {
+        merged.push({ ...finding, votes: 1 });
+      }
     }
   }
+
+  const kept = merged.filter((finding) => finding.votes >= minVotes);
+  kept.sort(compareFindings);
+  return {
+    findings: kept,
+    passes,
+    statuses,
+    summary: {
+      distinct: merged.length,
+      kept: kept.length,
+      seen_once: merged.filter((finding) => finding.votes === 1).length,
+    },
+  };
 }
 
-const kept = merged.filter((m) => m.votes >= minVotes);
-const rank = { Critical: 0, High: 1, Medium: 2 };
-kept.sort((a, b) => (rank[a.severity] ?? 9) - (rank[b.severity] ?? 9) || b.votes - a.votes);
+function main(args) {
+  let minVotes = 1;
+  let checkOnly = false;
+  const files = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--min-votes") { minVotes = Number(args[++i]) || 1; continue; }
+    if (args[i] === "--check") { checkOnly = true; continue; }
+    files.push(args[i]);
+  }
 
-process.stdout.write(JSON.stringify({ findings: kept, passes }, null, 2));
-process.stderr.write(
-  `  merged ${passes} pass(es): ${merged.length} distinct, ${kept.length} kept` +
-    (minVotes > 1 ? ` (min-votes ${minVotes})` : "") +
-    `; seen-once ${merged.filter((m) => m.votes === 1).length}\n`,
-);
+  // --check: exit 0 if every file holds a structured findings document. omp
+  // offers no structured-output mode, so the contract is verified after the
+  // fact. A JSON object embedded in prose is not a structured response.
+  if (checkOnly) {
+    for (const file of files) {
+      let parsed = null;
+      try { parsed = extractJson(readFileSync(file, "utf8"), { strict: true }); } catch { /* invalid */ }
+      if (!parsed) return 1;
+    }
+    return 0;
+  }
+
+  const documents = files.map((file) => {
+    try { return readFileSync(file, "utf8"); } catch { return null; }
+  });
+  const result = mergeFindingDocuments(documents, { minVotes });
+
+  result.statuses.forEach((status, index) => {
+    if (status.status === "malformed") {
+      process.stderr.write(`  pass ${files[index]}: unparseable, skipped\n`);
+    }
+  });
+  process.stdout.write(JSON.stringify({ findings: result.findings, passes: result.passes }, null, 2));
+  process.stderr.write(
+    `  merged ${result.passes} pass(es): ${result.summary.distinct} distinct, ` +
+      `${result.summary.kept} kept` +
+      (minVotes > 1 ? ` (min-votes ${minVotes})` : "") +
+      `; seen-once ${result.summary.seen_once}\n`,
+  );
+  return 0;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  process.exitCode = main(process.argv.slice(2));
+}

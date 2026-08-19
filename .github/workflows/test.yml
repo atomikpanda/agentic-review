@@ -32,5 +32,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: verify review-thread hunk matching
-        run: node --test scripts/thread-change.test.mjs
+      - name: verify review result contracts
+        run: node --test scripts/thread-change.test.mjs scripts/review-result.test.mjs scripts/post-review.test.mjs scripts/merge-findings.test.mjs scripts/run-review.test.mjs

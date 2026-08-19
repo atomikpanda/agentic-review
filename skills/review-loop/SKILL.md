@@ -1,12 +1,12 @@
 ---
 name: review-loop
-description: Use when iterating on a branch until its review is clean — run the local reviewer, triage findings, fix, re-run, and confirm each finding actually went away rather than merely going unmentioned.
+description: Use when applying merged review findings to a branch with a bounded fix/re-review loop — validate the batch, repair shared causes, push once, and stop after three non-clean rounds.
 ---
 
 # Review loop
 
-The loop is: **review → triage → fix → re-review → confirm gone.** The last step
-is the one people skip, and it is the one that matters.
+The loop is: **review one immutable head → triage the merged batch → fix shared
+causes → verify → push once → review the new immutable head.**
 
 ```bash
 review --review-mode suggest      # findings + proposed fixes, nothing posted
@@ -18,10 +18,16 @@ review --history                  # past runs
 State lives in the repository's git directory, so the loop remembers across runs
 and across worktrees, and cannot be committed.
 
-## Triage before fixing
+## Triage one merged batch before fixing
 
-Take findings in severity order — `P0`, then `P1`, then `P2` — and for each,
-decide one of three things:
+Treat the review as one batch merged from every successful pass for the current
+immutable head. Validate **every** finding against the current code before
+editing, then group the valid findings by shared invariant and affected
+callsites. One broken contract may explain several reported symptoms; find its
+owner and every caller before choosing the repair.
+
+Take the groups in severity order — `P0`, then `P1`, then `P2` — and decide one
+of three things for each finding:
 
 - **Real** → fix it.
 - **Wrong** → dismiss it with a reason you would say aloud. Reviewers are wrong
@@ -43,29 +49,43 @@ identical in the output:
 2. The reviewer did not mention it this time.
 
 The second happens often — identical configurations have produced 5, 6, 7, 8 and
-9 findings out of the same 11 on unchanged input. So `review --open` reports a
-finding as gone only when the **file it pointed at actually changed**. If the
-file is untouched, it stays open and the run says `unreported but unchanged`.
+9 findings out of the same 11 on unchanged input. `review --open` reports a
+finding as gone only after a changed hunk overlaps its latest confirmed line
+span. Unrelated same-file changes and indeterminate comparisons leave it open,
+and the run says `unreported without confirmed overlap`.
 
 Treat that phrase as a warning, not as progress.
 
+An earlier finding that is still valid remains actionable even when a later
+stochastic sample omits it. Do not treat omission as dismissal.
+
 ## Confirm the fix, not the silence
 
-After fixing, verify directly rather than trusting the next review:
+Repair the shared owner or invariant and update every affected callsite rather
+than patching each reported symptom independently. Add an observable behavior
+regression when the contract is otherwise uncovered.
 
-- Read the code path the finding described and check the failure it stated can
-  no longer happen.
-- Where a test can express it, write the test first, watch it fail, then fix.
-- Re-run the review and confirm the finding is reported as gone rather than
-  absent.
+Verify the integrated batch directly: read the affected paths, exercise the
+stated failures, and run the relevant focused checks. Then make **one
+consolidated push** for the batch and review that new immutable head. Do not
+push and re-review one comment at a time.
 
 ## When to stop
 
-Stop when every `P0` and `P1` is fixed or dismissed with a reason, and the run
-reports no `unreported but unchanged` findings. Remaining `P2`s are a judgement
-call.
+For one objective and head lineage, run at most **three non-clean review/fix
+rounds**. Each round consumes one merged batch, applies and verifies the
+integrated repair, makes one consolidated push, and reviews the new immutable
+head.
 
-Do not loop for a clean sheet. Recall is roughly 8 or 9 real defects out of 11,
-so a clean run is evidence that the reviewer found nothing, not that nothing is
-there. Two or three iterations exhaust most of what it can see; beyond that you
-are sampling noise.
+Stop earlier only when the latest immutable head has
+`analysis_state=complete`, `sample_state=clean`, and no held earlier finding.
+Every reported finding must already be fixed or dismissed with a stated reason.
+A bounded clean result means this sample found nothing actionable; it does not
+prove the repository defect-free.
+
+If the result after round three does not meet that stop condition, stop the
+loop. Report the unresolved findings and/or why analysis is inconclusive, their
+shared invariants or callsites, and the actual verification outcome; do **not**
+assume verification failed, launch a fourth broad pass, or restart per-comment
+patching. The cap constrains fixer churn, not the reviewer's obligation to
+preserve and report valid evidence.

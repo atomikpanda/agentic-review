@@ -23,6 +23,40 @@
 
 export const SIMILARITY_DEFAULT = 0.20;
 
+const FINDING_SEVERITIES = new Set(["Critical", "High", "Medium"]);
+
+export function isValidFinding(value) {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && typeof value.file === "string"
+    && value.file.trim().length > 0
+    && typeof value.title === "string"
+    && value.title.trim().length > 0
+    && !/[\r\n]/.test(value.title)
+    && typeof value.body === "string"
+    && value.body.trim().length > 0
+    && FINDING_SEVERITIES.has(value.severity)
+    && Number.isInteger(value.start_line)
+    && value.start_line > 0
+    && Number.isInteger(value.end_line)
+    && value.end_line >= value.start_line
+    && (typeof value.suggestion === "string" || value.suggestion === null);
+}
+
+export function projectPublicFinding(value) {
+  if (!isValidFinding(value)) return null;
+  return {
+    title: value.title,
+    body: value.body,
+    severity: value.severity,
+    file: value.file,
+    start_line: value.start_line,
+    end_line: value.end_line,
+    suggestion: value.suggestion,
+  };
+}
+
 const STOPWORDS = new Set(
   ("this that with from have when then than been they them there which while would could" +
     " should must into over under only also more most much some such very each other same" +
@@ -49,10 +83,26 @@ export function similarity(a, b) {
   return union ? inter / union : 0;
 }
 
+export function identityTokens(value) {
+  if (!value || typeof value !== "object" || !Object.hasOwn(value, "identity_tokens")) {
+    return [...tokenSet(`${value?.title} ${value?.body}`)];
+  }
+  if (!Array.isArray(value.identity_tokens) || value.identity_tokens.length === 0) return null;
+  const normalized = [];
+  for (const token of value.identity_tokens) {
+    if (typeof token !== "string" || token.trim().length === 0) return null;
+    normalized.push(token.trim().toLowerCase());
+  }
+  return normalized;
+}
+
 // Same file, and enough shared vocabulary.
 export function sameFinding(a, b, threshold = SIMILARITY_DEFAULT) {
   const fa = String(a.file ?? "").replace(/^\.\//, "");
   const fb = String(b.file ?? "").replace(/^\.\//, "");
   if (fa !== fb) return false;
-  return similarity(tokenSet(`${a.title} ${a.body}`), tokenSet(`${b.title} ${b.body}`)) >= threshold;
+  const left = identityTokens(a);
+  const right = identityTokens(b);
+  if (!left || !right) return false;
+  return similarity(new Set(left), new Set(right)) >= threshold;
 }

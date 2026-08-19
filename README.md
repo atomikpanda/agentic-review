@@ -26,7 +26,8 @@ curl -fsSL .../install-review.sh | bash -s -- --repo owner/name --openrouter-key
 
 ## Run it locally
 
-Local runs are first-class: they remember what they have already said.
+Local runs use the same bounded ensemble as hosted reviews and remember what
+they have already said.
 
 ```bash
 review                       # review vs the default branch
@@ -38,13 +39,14 @@ review --history             # past runs
 
 State lives in the repository's git common directory — per-repo, shared across
 worktrees, never committable. Each run reports `N new, N recurring` rather than
-re-listing everything, and a finding is only marked **gone** when the file it
-pointed at actually changed. If the file is untouched the run says
-`unreported but unchanged`, because the reviewer failing to mention something is
-not the same as it being fixed.
+re-listing everything. A finding is marked **gone** only when a complete review
+omits it after a changed hunk overlaps its latest confirmed inclusive line span.
+An inconclusive review, an unrelated change in the same file, an invalid old
+span, or an indeterminate Git result keeps it open: a later sample failing to
+mention it is not the same as it being fixed.
 
 [`skills/review-loop/SKILL.md`](skills/review-loop/SKILL.md) describes the
-iterate-until-clean workflow, including when to stop.
+bounded review/fix workflow, including its three-round stop.
 
 [`scripts/watch-pr.sh`](scripts/watch-pr.sh) tails a pull request's review
 comments as they arrive. Read-only — it never comments, resolves or edits.
@@ -56,20 +58,41 @@ the pull request: no comment, no resolved thread, no edited comment. The
 artifact is still uploaded and `fail_on_findings` still applies. Use it to trial
 a configuration against a live pull request without touching it.
 
-This is not `post_comment: false`, which skipped the comment while leaving thread
-retirement and the gate in inconsistent states.
+`post_comment: false` is retained as a compatibility switch and also suppresses
+review writes; `suppress_writes` is the explicit choice for trial runs.
 
 ## Run it locally (details)
 
-No GitHub involved — it reviews a local diff and writes the result to stdout.
+No GitHub is involved. The default terminal output is a structured rendering of
+the findings result and metadata; `--json` emits only the structured findings
+document.
 
 ```bash
 export OPENROUTER_API_KEY=sk-or-v1-yourkeyhere   # or see OPENROUTER_API_KEY_FILE
-./scripts/run-review.sh                        # vs the default branch
-./scripts/run-review.sh --staged               # only what's staged
-./scripts/run-review.sh --review-mode suggest  # with the fixes it would offer
+./scripts/run-review.sh                          # vs the default branch
+./scripts/run-review.sh --staged                 # only what's staged
+./scripts/run-review.sh --review-mode suggest    # with the fixes it would offer
 ./scripts/run-review.sh --json | jq '.findings[].file'
+./scripts/run-review.sh --out review.json --metadata-out review-meta.json
+./scripts/run-review.sh --no-state               # leave local history unchanged
 ```
+
+`--out FILE` atomically writes the validated structured findings result.
+Normally it is the union of every valid pass. If union fails, the runner
+preserves the first valid structured pass and marks the separate schema-v1
+metadata inconclusive rather than presenting the fallback as merged.
+`--metadata-out FILE` writes that bounded-run metadata: immutable base and head
+SHAs, the configuration fingerprint, diff and cap status, requested/completed
+pass identifiers, per-pass status, and `analysis_state`. Both outputs reject a
+symlink destination before model work, and the paths must resolve to different
+destinations. `--no-state` still reads existing history for the
+rendered state and exit status but never mutates it. Advanced local experiments
+can change the ensemble with `--passes N`, `--lenses a,b,c`, and
+`--min-votes N`; pass/lens changes appear in the metadata identifiers, and all
+three change the configuration fingerprint. A vote threshold above one is
+experimental and always inconclusive. If it would hide any valid finding, the
+runner emits the complete union instead so state, history, and safety gating
+retain that evidence.
 
 **Works from any repository.** The prompt, output format and skill file are
 resolved relative to the script itself (symlinks followed), then overridden by
@@ -103,7 +126,7 @@ human reviewer, not a wall of prose at the bottom of the PR.
 |---|---|
 | `suggest` (default) | Inline comments anchored to the offending lines, each with a ready-to-commit fix where the agent could produce a complete one |
 | `inline` | The same inline comments, explanation only, no fixes |
-| `summary` | One issue comment containing everything — no line anchoring |
+| `summary` | One standing issue comment rendered from the structured findings result and metadata — no line anchoring |
 
 This is a different mechanism, not a different format. A suggestion has to be
 an inline review comment attached to a line range **inside the pull request's
@@ -127,132 +150,102 @@ Three things that mechanism forces, all handled:
 - **The review is never lost.** If the inline post is rejected anyway, it falls
   back to posting everything as a summary rather than failing silently.
 
-### Readiness score
+## Bounded ensemble and result states
 
-Every review opens with a 0–5 readiness score, from the severity and quantity of
-what was found, mapped to an action:
+The default local and hosted profile runs three sequential passes — **general**,
+**correctness**, and **boundaries** — against one immutable base SHA, head SHA,
+and configuration fingerprint. It performs approximately three times the model
+work of one general pass. Each pass gets one retry if its output is malformed.
+Every valid pass contributes to one union with `min_votes=1`, so a finding seen
+by only one pass survives. One result is rendered or posted: the union, or an
+explicitly inconclusive first-valid structured fallback if union fails.
 
-| Score | Meaning | Action |
+The result separates four operator-visible values:
+
+| Output | Values | Meaning |
 |---|---|---|
-| 5/5 | Production ready | Merge |
-| 4/5 | Minor polish needed | Merge after small fixes |
-| 3/5 | Implementation issues | Address feedback first |
-| 2/5 | Significant bugs | Needs rework |
-| 0–1/5 | Critical problems | Major rethink needed |
+| `analysis_state` | `complete`, `inconclusive` | Whether every requested pass returned valid structured output for the same immutable snapshot and configuration, the complete diff was included, no pass reached its findings cap, and the union succeeded |
+| `merge_state` | `ready`, `blocked` | Whether any current or held finding has a severity in `block_severities` |
+| `sample_state` | `clean`, `findings`, `unknown` | Whether actionable evidence remains; `clean` additionally requires complete analysis and known reconciliation |
+| `bounded_converged` | `true`, `false` | `true` exactly when `analysis_state=complete` **and** `sample_state=clean` |
 
-Findings carry priority badges: **`P0` Critical** (must fix — security, data
-loss, crashes), **`P1` High** (bugs, incorrect behaviour, edge cases), **`P2`
-Medium** (quality, maintainability).
+In short, `complete` qualifies execution, `ready` applies the configured
+severity policy, `clean` describes the reconciled bounded sample, and bounded
+convergence requires both complete analysis and a clean sample.
 
-**The score is capped at 3/5 when the review could not do its job** — a
-truncated diff or a failed pass produces few findings for the same reason a
-clean change does, and "production ready" inferred from a review that read half
-the diff is the most dangerous output this tool could emit. The cap only ever
-moves the score down, and says what it was capped from.
+These values are deliberately independent. `merge_state=ready` only says that
+no unresolved finding crosses the configured merge gate; it may coexist with
+Medium findings or with an incomplete analysis. It does not mean the sample is
+clean. `sample_state=clean` means the complete bounded sample and prior
+reconciled evidence contain no actionable finding; it does not claim exhaustive
+repository coverage.
 
-Two signals Greptile factors in that this does not: change complexity, and how
-well the code matches existing codebase patterns. Neither is implemented here,
-so the score is a severity aggregate rather than a full readiness model.
+A mutable snapshot, failed pass after its retry, base/head/configuration
+mismatch, truncated diff, findings cap, or failed union makes analysis
+`inconclusive`. Known findings still produce `sample_state=findings`; no known
+finding produces `sample_state=unknown`, never `clean`. None of those runs can
+set `bounded_converged=true`.
 
-### Merge gate
+`fail_on_findings: true` fails the hosted job only when
+`merge_state=blocked`. Without it, job success means execution succeeded, not
+that the sample was clean or converged.
 
-Every review opens with one of three verdicts:
+The reusable workflow exposes these exact outputs:
 
-| | Meaning |
+| Output | Content |
 |---|---|
-| ✅ **Clear** | No `Critical`/`High` findings, whole diff reviewed, every pass completed |
-| ⛔ **Blocked** | Findings at or above `block_severities` |
-| ⚠️ **Inconclusive** | Nothing blocking found, but the review could not do its job — truncated diff, a failed pass, or the findings cap reached |
+| `analysis_state`, `merge_state`, `sample_state`, `bounded_converged` | The four result values above |
+| `base_sha`, `head_sha`, `configuration_fingerprint` | The immutable review identity |
+| `passes_requested`, `passes_completed` | Counts of configured and valid passes |
+| `current_counts`, `unresolved_counts` | JSON severity maps for current and held findings |
 
-Three states rather than two, because a boolean forces a review that could not
-do its job into "clear". A truncated diff produces no findings for the same
-reason a genuinely clean change does, and the reader cannot tell those apart
-unless the tool says which happened.
+The same values appear in the review body and GitHub job summary. The hosted
+`agentic-review` artifact retains the structured findings result (`review.md`),
+bounded-run metadata (`review-meta.json`), and runner stdout and stderr for
+seven days. Locally, `--out` and `--metadata-out` write the first two artifacts
+directly.
 
-`fail_on_findings: true` fails the job when the gate says **blocked** — not on
-any finding. Failing a build over a Medium was never the intent, and an
-inconclusive review is reported rather than failed, because that fault is ours
-rather than the contributor's.
+### Standing summaries and finding history
 
-### Review confidence
+Summary mode does not ask the model for Markdown. It deterministically renders
+the same structured findings result and metadata used by inline and suggest
+modes.
 
-Every review opens with a 1–5 score. It rates **the review, not the code** —
-how much to trust this particular run — and it is computed from what was
-observed, not from the model's opinion of its own work: passes that returned
-usable output, whether the diff was truncated, whether any injected knowledge
-matched the file types.
+When findings exist, summary mode maintains one bot-authored standing issue
+comment with an embedded state marker and edits it on later runs instead of
+appending another. A no-findings run creates no empty comment, but updates an
+existing standing comment when prior findings can be retired. Deleting that
+comment explicitly resets summary-mode history.
 
-A "safe to merge" score would be the more natural feature and the wrong one.
-That is a claim about the code, and measured recall here is 8–9 of 11 known
-defects — so about one in five is missed, and such a score would read highest
-exactly when the reviewer found nothing, which is also what a review that did
-not look hard enough produces. Identical configurations scored 5, 6, 7, 8 and 9
-on the same input, so it would not even be stable across re-runs.
+Because the standing summary is an issue comment, it has no per-finding GitHub
+resolved-thread signal; use `inline` or `suggest` when that signal is required.
 
-**A clean review is not evidence of safety**, and the comment says so every time.
+A prior finding omitted by a later stochastic sample remains held while the run
+is inconclusive or its original span is unchanged or indeterminate, and still
+affects `merge_state`/`sample_state`. It is retired only when a complete run
+confirms that span changed. Suppressed-write runs read and reconcile the standing
+state for outputs and gating but do not edit it. If identity lookup or
+reconciliation fails, the comment is left untouched and the result cannot be
+clean or converged.
 
-### Comments don't pile up
+Only the currently authenticated **Bot** identity can own standing state. A
+human user's manual PAT or an unrecognized viewer makes identity unknown; the
+poster emits conservative outputs and gate state but suppresses every PR write.
+It neither trusts nor edits a marker in a human or attacker-authored comment.
 
-Findings are re-derived from scratch on every push, so each comment embeds a
-fingerprint. Matching is **fuzzy**, because an exact hash does not work: the
-same defect came back on this repo's own PR as "bun_version input is not passed
-to setup-bun", "Configured Bun version is ignored" and "Configured Bun version
-is not passed to setup-bun", each producing a new thread and leaving the last
-one un-retired. So a finding matches an existing thread when it is in the same
-file and the significant-word overlap clears `SIMILARITY` (0.30). Measured on
-that PR's real duplicates: same-issue pairs score 0.37–0.49, different-issue
-pairs 0.03–0.16, and the rule classifies 10/10 correctly.
+Inline and suggest modes use bot-authored fingerprinted threads. A recurring
+finding stays silent while its thread is open and is not repeated in a new
+review body. An omitted open finding stays held when the run is inconclusive or
+its span is unchanged or indeterminate. After a complete run confirms a span
+change, `resolve_stale` removes it from held state; a write-enabled run then
+retires the thread when the token permits. `GITHUB_TOKEN` cannot resolve review
+threads, so the fallback edits the bot's own comment to mark it no longer
+reported. Human-resolved findings stay dismissed while their span is unchanged
+and may be raised again only after an overlapping change. Thread-query or
+change-state uncertainty is conservative: it cannot manufacture a clean result.
 
-A later run uses that to:
-
-- **stay silent** about a finding whose thread is still open, instead of posting
-  it again on every push — the thing that makes bot reviewers get muted
-- **retire** the threads it opened earlier and no longer reports, including the
-  everything-fixed case where the run returns no findings at all
-
-On retiring: `GITHUB_TOKEN` **cannot resolve review threads**. GitHub answers
-`resolveReviewThread` with `FORBIDDEN — Resource not accessible by integration`
-no matter which permissions the workflow declares; only a PAT or a suitably
-scoped GitHub App can. Editing our own comment is permitted, so a stale finding
-is instead prefixed `✅ No longer reported as of <commit>` — linking the commit
-reviewed — with the original folded into a `<details>`.
-
-It deliberately does **not** say "fixed in <commit>". All that is known is that
-this run did not raise the finding, not that anything fixed it; models give
-inconsistent verdicts across runs of identical code. So the note reports one
-cheap check instead: whether a changed hunk overlaps the finding's original line
-span, including a three-line margin. If it did not, the marker becomes
-`⚠️ … but <file>:<lines> has not changed since`, which says plainly that the
-disappearance is unexplained rather than implying a fix. If you supply a token
-that can resolve, threads are resolved properly and the fallback never runs.
-
-It also **stays quiet about anything a human already resolved** while the code
-in and immediately around its original line span is unchanged. Resolving a
-thread is a decision — fixed, intentional, or won't fix — and re-raising it
-after an unrelated edit elsewhere in a large file is how a reviewer gets muted.
-If an overlapping hunk changes afterwards, the finding is raised again because
-then the defect may genuinely be back. Threads without line data retain the
-conservative whole-file check.
-If Git cannot determine whether the span changed, the thread is held rather
-than retired.
-
-What it deliberately does **not** do is read the comment text. Adversarial
-comments flip 91–100% of LLM vulnerability verdicts
-([arXiv 2607.24964](https://arxiv.org/html/2607.24964)), and prompt-level
-"ignore untrusted content" instructions barely dent that — only keeping the text
-out of the prompt works, which drops it below 3%. Pull-request comments are
-easier to inject than code comments, since posting one requires no merge. So
-this reads a marker we wrote, a boolean, and a `git diff` — no attacker-authored
-text reaches the model.
-
-Only threads carrying that marker are ever touched; a human's review thread has
-no fingerprint and cannot match. Resolution is skipped when a run hits
-`max_findings`, because there a missing finding may have been squeezed out
-rather than fixed, and resolving it would quietly retract a live defect. Turn
-the whole thing off with `resolve_stale: false`.
-
-The event is always `COMMENT`, never `REQUEST_CHANGES` — use
-`fail_on_findings` if you want the check itself to block.
+The event is always `COMMENT`, never `REQUEST_CHANGES`; use
+`fail_on_findings` if the merge gate should fail the check.
 
 Locally, `--review-mode suggest` prints each finding with the fix it would
 offer, using the same parser as CI:
@@ -309,34 +302,47 @@ codegraph init .        # once per project
 
 ## Configuration
 
-Every knob is settable on all three surfaces, under the same name. Defaults are
-defined once, in the reusable workflow — an enrolled repo that overrides nothing
-keeps tracking them.
+Workflow inputs are defined by
+`.github/workflows/agentic-review.yml`; matching local controls use the runner
+flags shown below. The installer emits the supported workflow subset. A blank
+cell means that surface does not expose the setting.
 
-| Setting | Default | Workflow `with:` | `install-review.sh` | `run-review.sh` |
+| Setting | Workflow default | Workflow `with:` | `install-review.sh` | `run-review.sh` |
 |---|---|---|---|---|
 | Model slug | `openrouter/openai/gpt-5.6-luna` | `model` | `--model` | `--model` |
 | Reasoning effort | `high` | `thinking` | `--thinking` | `--thinking` |
 | Tool allowlist | `read,grep,glob` | `tools` | `--tools` | `--tools` |
 | Wall-clock cap | none | `max_time` | `--max-time` | `--max-time` |
 | Review prompt | `review/prompt.md` | `prompt_path` | `--prompt` | `--prompt` |
-| Injected knowledge | both skills (comma-separated list) | `skills_path` | `--skill` | `--skill` |
+| Injected knowledge | both skills | `skills_path` | `--skill` | `--skill` |
 | Review style | `suggest` | `review_mode` | `--review-mode` | `--review-mode` |
 | Findings cap | `20` (`0` = none) | `max_findings` | `--max-findings` | `--max-findings` |
-| Post a PR comment | `true` | `post_comment` | `--no-comment` | n/a |
-| Resolve stale threads | `true` | `resolve_stale` | n/a | n/a |
-| Block the PR on findings | `false` | `fail_on_findings` | `--fail-on-findings` | `--no-fail` inverts |
-| Job timeout | `20` | `timeout_minutes` | n/a | n/a |
-| Diff size cap | `400000` bytes | `max_diff_bytes` | n/a | `$AGENTIC_REVIEW_MAX_DIFF_BYTES` |
-| Symbol index | on | `codegraph` | n/a | auto when indexed |
-| Pin codegraph | latest | `codegraph_version` | n/a | n/a |
-| Central repo | this repo | `central_repo` | `CENTRAL_REPO=` env | n/a |
-| Pin bun | `latest` | `bun_version` | `--bun-version` | n/a |
+| Post a PR comment | `true` | `post_comment` | `--no-comment` |  |
+| Resolve stale threads | `true` | `resolve_stale` |  |  |
+| Suppress every PR write | `false` | `suppress_writes` |  |  |
+| Block the hosted job on a blocked gate | `false` | `fail_on_findings` | `--fail-on-findings` | `--no-fail` separately suppresses the local any-finding exit |
+| Blocking severities | `Critical,High` | `block_severities` |  |  |
+| Job timeout | `20` minutes | `timeout_minutes` |  |  |
+| Diff size cap | `400000` bytes | `max_diff_bytes` |  | `$AGENTIC_REVIEW_MAX_DIFF_BYTES` |
+| Symbol index | on | `codegraph` |  | auto when indexed; `--no-codegraph` disables |
+| Pin codegraph | latest release | `codegraph_version` |  |  |
+| Trusted support ref | `main` | `central_ref` | `--ref` (installer defaults to `v1`) |  |
+| Pin bun | `latest` | `bun_version` | `--bun-version` |  |
 | Pin omp | `latest` | `omp_version` | `--omp-version` | `--omp-version` |
-| Any other omp flag | none | `extra_omp_args` | `--extra-omp-args` | after `--` |
+| OMP display flags | none | `extra_omp_args` | `--extra-omp-args` | after `--` |
 
-`thinking` accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` or
-`auto`. `max_time` accepts `600`, `10m`, `1h`.
+The shared runner owns these advanced local ensemble controls; hosted reviews
+use their defaults:
+
+| Setting | Default | Local option |
+|---|---|---|
+| General passes | `1` | `--passes N` |
+| Additive lenses | `correctness,boundaries` | `--lenses a,b,c` |
+| Experimental vote threshold (always inconclusive) | `1` | `--min-votes N` |
+
+Those defaults produce the general/correctness/boundaries profile described
+above. `thinking` accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+`max` or `auto`; `max_time` accepts values such as `600`, `10m`, or `1h`.
 
 In a workflow:
 
@@ -356,15 +362,22 @@ jobs:
 
 ### Which ref to point at
 
-`uses:` selects the workflow; `central_ref` selects the prompt, skills and
-poster it fetches. **Set both to the same thing** — a pinned workflow reading a
-moving prompt is the worst of both.
+`uses:` selects the workflow; `central_ref` selects the trusted prompt, skills,
+runner, and poster it fetches. Supported configurations point both at the same
+release line:
 
 | Ref | Moves when | Use for |
 |---|---|---|
-| `@v1` | a release is cut | the default; fixes arrive, the interface does not break |
-| `@v1.0.0` | never | reproducible runs, or when you want to approve every change |
-| `@main` | every commit | this repo's own PRs, and anyone actively developing the reviewer |
+| `@v1` / `central_ref: v1` | a release is cut | the default installed configuration; fixes arrive, the interface does not break |
+| `@v1.0.0` / `central_ref: v1.0.0` | never | reproducible released runs |
+| `@main` / `central_ref: main` | every commit | this repo's own PRs and active reviewer development |
+| `@<40-hex SHA>` / `central_ref: <same SHA>` | never | immutable source pin, including installer `--ref <sha>` |
+
+`central_ref` accepts literal `main`, a central major release tag of the form
+`vN`, a full release tag of the form `vN.N.N` with an optional accepted
+prerelease/build suffix, or an exact lowercase 40-hex commit SHA. Arbitrary
+branches, pull refs, abbreviated or uppercase SHAs, URLs, and revision
+expressions are rejected before checkout.
 
 `@main` was the original default and is a poor one for consumers: the review
 runs with a token that can write to the pull request, so every commit here
@@ -379,13 +392,13 @@ curl -fsSL .../install-review.sh | bash -s -- \
   --model openrouter/anthropic/claude-sonnet-5 --thinking high --max-time 12m
 ```
 
-Locally, every flag also reads an `AGENTIC_REVIEW_*` environment default, so you
-can set them once in your shell profile:
+Locally, configuration flags also read matching `AGENTIC_REVIEW_*` environment
+defaults where shown by `./scripts/run-review.sh --help`:
 
 ```bash
 export AGENTIC_REVIEW_MODEL=openrouter/anthropic/claude-sonnet-5
 export AGENTIC_REVIEW_THINKING=high
-./scripts/run-review.sh -- --add-dir ../shared-config
+./scripts/run-review.sh -- --hide-thinking
 ```
 
 The runner is **not** an input. `runs-on` is resolved before any step executes,
@@ -393,19 +406,24 @@ so a caller-supplied value cannot be validated — the validation would already 
 running on the runner it was meant to vet, and `self-hosted` would put
 attacker-authored PR content on a persistent machine holding your model key.
 
-Fork pull requests are **skipped**, not failed. GitHub never passes secrets to
-them, so the run cannot succeed; failing would put a red X on every outside
-contribution that the contributor has no way to fix. Reviewing forks would
-require `pull_request_target`, which is the trade this project refuses.
+Fork pull requests are **skipped**, not failed. The trusted
+`pull_request_target` entry point could receive secrets for them, but this
+project deliberately confines the write-capable token and model key to
+same-repository reviews.
 
 ### What is not configurable
 
 `tools` is validated against the read-only set below and the job fails on
-anything outside it. `extra_omp_args` (and anything after `--` locally) rejects
-`--tools`, `--no-tools`, `--system-prompt`, `--api-key`, `--approval-mode`,
-`--auto-approve` and `--yolo`, and the validated `--tools` is emitted last on the
-command line so it wins regardless. Widening the reviewer to write or execute is
-a fork, not a flag — see below for why.
+anything outside it. `extra_omp_args`, installer `--extra-omp-args`, and tokens
+after `--` locally accept only `--print-thoughts`, `--hide-thinking`, and
+`--no-title`; every other token, including `--add-dir`, is rejected before
+workflow installation or invocation.
+
+`omp_version` / `--omp-version` accepts only a safe npm dist-tag or an exact
+semantic version. Values that select another package, URLs, git specs, file
+specs, version ranges, and arbitrary package expressions are rejected. Widening
+the reviewer to write, execute, load code, or expand its scope is a fork, not a
+flag.
 
 ## PR-Agent
 
@@ -454,8 +472,12 @@ untrusted PR content is processed in a throwaway VM. That is a deliberate
 choice over a self-hosted GitHub App, which would trade one command per repo
 for running attacker-controlled input next to your production secrets.
 
-The workflow uses `pull_request`, never `pull_request_target` — the latter runs
-a writable token against untrusted head code.
+The direct and installer-generated entry points use `pull_request_target`, so
+GitHub loads their workflow YAML from the trusted base branch. They check out the
+reviewed head only as data. Runner, merger, stripper, prompt, skills, and poster
+come from a separate central checkout at the validated `central_ref`, including
+when this repository reviews its own pull requests; reviewed replacements never
+execute with the model key or write-capable token.
 
 ## Knowledge injection
 
@@ -478,11 +500,11 @@ Enrolled repos inherit it automatically. A repo can override by adding its own
 
 No single tool covers everything. Categorised from a real 19-finding review:
 
-| Tier | Tool | Cost/PR | Catches |
+| Tier | Tool | Cost | Catches |
 |---|---|---|---|
 | Deterministic | shellcheck, actionlint, hadolint, tflint, trivy, gitleaks | $0 | Tool-specific rules, IaC misconfig, secrets |
-| Semantic | PR-Agent + skills | ~$0.02 | Tool-behaviour knowledge, single-file logic |
-| Agentic | this | ~$0.10–0.30 | Cross-file discovery |
+| Semantic | PR-Agent + skills | ~$0.02/PR | Tool-behaviour knowledge, single-file logic |
+| Agentic | this | historically ~$0.10–0.30/pass | Cross-file discovery |
 
 PR-Agent makes single-shot model calls with no tool-use loop — [its own docs say
 so](https://github.com/The-PR-Agent/pr-agent/blob/main/docs/docs/core-abilities/agent_skills.md)
@@ -493,11 +515,15 @@ overlapping sets of inline comments.
 
 ## Cost
 
-Roughly $0.10–0.30 per review on `gpt-5.6-luna` ($0.10/Mtok in). Agentic cost
-scales with how much the agent explores, so it is less predictable than a
-single-shot reviewer. Three knobs bound it: `max_time` (a hard cap omp enforces
-itself), `timeout_minutes` (the job ceiling), and `thinking` — dropping to `low`
-or `off` cuts reasoning tokens, which dominate on a large diff.
+The default ensemble performs approximately three times the model work of one
+general pass. Historical runs on `gpt-5.6-luna` cost roughly $0.10–0.30 per
+pass ($0.10/Mtok input), so do not read the old per-pass figure as the cost of a
+three-pass result. Actual cost scales with how much each pass explores and is
+less predictable than a single-shot reviewer.
+
+`max_time` bounds each model invocation and `timeout_minutes` bounds the hosted
+job; lowering `thinking` reduces reasoning tokens. These limits bound execution,
+not semantic coverage, and do not make the sample exhaustive.
 
 ## Requirements
 
