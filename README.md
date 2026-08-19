@@ -39,10 +39,11 @@ review --history             # past runs
 
 State lives in the repository's git common directory — per-repo, shared across
 worktrees, never committable. Each run reports `N new, N recurring` rather than
-re-listing everything. A finding is marked **gone** only when a changed hunk
-overlaps its latest confirmed inclusive line span. An unrelated change in the
-same file, an invalid old span, or an indeterminate Git result keeps it open: a
-later sample failing to mention it is not the same as it being fixed.
+re-listing everything. A finding is marked **gone** only when a complete review
+omits it after a changed hunk overlaps its latest confirmed inclusive line span.
+An inconclusive review, an unrelated change in the same file, an invalid old
+span, or an indeterminate Git result keeps it open: a later sample failing to
+mention it is not the same as it being fixed.
 
 [`skills/review-loop/SKILL.md`](skills/review-loop/SKILL.md) describes the
 bounded review/fix workflow, including its three-round stop.
@@ -219,12 +220,13 @@ comment explicitly resets summary-mode history.
 Because the standing summary is an issue comment, it has no per-finding GitHub
 resolved-thread signal; use `inline` or `suggest` when that signal is required.
 
-A prior finding omitted by a later stochastic sample remains held while its
-original span is unchanged or indeterminate, and still affects
-`merge_state`/`sample_state`. It is retired only after that span changes.
-Suppressed-write runs read and reconcile the standing state for outputs and
-gating but do not edit it. If identity lookup or reconciliation fails, the
-comment is left untouched and the result cannot be clean or converged.
+A prior finding omitted by a later stochastic sample remains held while the run
+is inconclusive or its original span is unchanged or indeterminate, and still
+affects `merge_state`/`sample_state`. It is retired only when a complete run
+confirms that span changed. Suppressed-write runs read and reconcile the standing
+state for outputs and gating but do not edit it. If identity lookup or
+reconciliation fails, the comment is left untouched and the result cannot be
+clean or converged.
 
 Only the currently authenticated **Bot** identity can own standing state. A
 human user's manual PAT or an unrecognized viewer makes identity unknown; the
@@ -232,15 +234,15 @@ poster emits conservative outputs and gate state but suppresses every PR write.
 It neither trusts nor edits a marker in a human or attacker-authored comment.
 
 Inline and suggest modes use bot-authored fingerprinted threads. A recurring
-finding stays silent while its thread is open. An omitted open finding stays
-held when its span is unchanged or indeterminate. After a confirmed span change,
-`resolve_stale` removes it from held state; a write-enabled run then retires the
-thread when the token permits. `GITHUB_TOKEN`
-cannot resolve review threads, so the fallback edits the bot's own comment to
-mark it no longer reported. Human-resolved findings stay dismissed while their
-span is unchanged and may be raised again only after an overlapping change.
-Thread-query or change-state uncertainty is conservative: it cannot manufacture
-a clean result.
+finding stays silent while its thread is open and is not repeated in a new
+review body. An omitted open finding stays held when the run is inconclusive or
+its span is unchanged or indeterminate. After a complete run confirms a span
+change, `resolve_stale` removes it from held state; a write-enabled run then
+retires the thread when the token permits. `GITHUB_TOKEN` cannot resolve review
+threads, so the fallback edits the bot's own comment to mark it no longer
+reported. Human-resolved findings stay dismissed while their span is unchanged
+and may be raised again only after an overlapping change. Thread-query or
+change-state uncertainty is conservative: it cannot manufacture a clean result.
 
 The event is always `COMMENT`, never `REQUEST_CHANGES`; use
 `fail_on_findings` if the merge gate should fail the check.
@@ -369,12 +371,13 @@ release line:
 | `@v1` / `central_ref: v1` | a release is cut | the default installed configuration; fixes arrive, the interface does not break |
 | `@v1.0.0` / `central_ref: v1.0.0` | never | reproducible released runs |
 | `@main` / `central_ref: main` | every commit | this repo's own PRs and active reviewer development |
+| `@<40-hex SHA>` / `central_ref: <same SHA>` | never | immutable source pin, including installer `--ref <sha>` |
 
-`central_ref` accepts only literal `main`, a central major release tag of the
-form `vN`, or a full release tag of the form `vN.N.N` with an optional accepted
-prerelease/build suffix. Arbitrary branches, pull refs, SHAs, URLs, and
-revision expressions are rejected before checkout, even though GitHub's `uses:`
-syntax can represent some of them.
+`central_ref` accepts literal `main`, a central major release tag of the form
+`vN`, a full release tag of the form `vN.N.N` with an optional accepted
+prerelease/build suffix, or an exact lowercase 40-hex commit SHA. Arbitrary
+branches, pull refs, abbreviated or uppercase SHAs, URLs, and revision
+expressions are rejected before checkout.
 
 `@main` was the original default and is a poor one for consumers: the review
 runs with a token that can write to the pull request, so every commit here
@@ -403,17 +406,18 @@ so a caller-supplied value cannot be validated — the validation would already 
 running on the runner it was meant to vet, and `self-hosted` would put
 attacker-authored PR content on a persistent machine holding your model key.
 
-Fork pull requests are **skipped**, not failed. GitHub never passes secrets to
-them, so the run cannot succeed; failing would put a red X on every outside
-contribution that the contributor has no way to fix. Reviewing forks would
-require `pull_request_target`, which is the trade this project refuses.
+Fork pull requests are **skipped**, not failed. The trusted
+`pull_request_target` entry point could receive secrets for them, but this
+project deliberately confines the write-capable token and model key to
+same-repository reviews.
 
 ### What is not configurable
 
 `tools` is validated against the read-only set below and the job fails on
-anything outside it. `extra_omp_args` and tokens after `--` locally accept only
-`--print-thoughts`, `--hide-thinking`, and `--no-title`; every other token,
-including `--add-dir`, is rejected before invocation.
+anything outside it. `extra_omp_args`, installer `--extra-omp-args`, and tokens
+after `--` locally accept only `--print-thoughts`, `--hide-thinking`, and
+`--no-title`; every other token, including `--add-dir`, is rejected before
+workflow installation or invocation.
 
 `omp_version` / `--omp-version` accepts only a safe npm dist-tag or an exact
 semantic version. Values that select another package, URLs, git specs, file
@@ -468,8 +472,12 @@ untrusted PR content is processed in a throwaway VM. That is a deliberate
 choice over a self-hosted GitHub App, which would trade one command per repo
 for running attacker-controlled input next to your production secrets.
 
-The workflow uses `pull_request`, never `pull_request_target` — the latter runs
-a writable token against untrusted head code.
+The direct and installer-generated entry points use `pull_request_target`, so
+GitHub loads their workflow YAML from the trusted base branch. They check out the
+reviewed head only as data. Runner, merger, stripper, prompt, skills, and poster
+come from a separate central checkout at the validated `central_ref`, including
+when this repository reviews its own pull requests; reviewed replacements never
+execute with the model key or write-capable token.
 
 ## Knowledge injection
 

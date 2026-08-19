@@ -79,6 +79,42 @@ test("fuzzy duplicates use the shared finding identity and retain vote count", (
   assert.equal(merged.findings[0].severity, "High");
 });
 
+test("duplicate rows within one pass contribute one vote while separate passes each vote once", () => {
+  const first = finding("Duplicate lifecycle finding", {
+    body: "The duplicated lifecycle finding drops the same queued retry.",
+    file: "src/queue.js",
+  });
+  const samePassVariant = finding("Duplicated lifecycle finding", {
+    body: "The same queued retry is dropped by the duplicated lifecycle finding.",
+    file: "./src/queue.js",
+    severity: "High",
+  });
+  const crossPassVariant = finding("Lifecycle finding duplicated", {
+    body: "The duplicated lifecycle finding still drops that same queued retry.",
+    file: "src/queue.js",
+  });
+
+  const onePass = mergeFindingDocuments([
+    { findings: [first, samePassVariant] },
+  ], { minVotes: 2 });
+  assert.deepEqual(onePass.findings, []);
+  assert.equal(onePass.summary.distinct, 1);
+  assert.equal(onePass.summary.seen_once, 1);
+
+  const twoPasses = mergeFindingDocuments([
+    { findings: [first, samePassVariant] },
+    { findings: [crossPassVariant] },
+  ], { minVotes: 2 });
+  assert.equal(twoPasses.findings.length, 1);
+  assert.equal(twoPasses.findings[0].votes, 2);
+  assert.equal(twoPasses.findings[0].severity, "High");
+  const reordered = mergeFindingDocuments([
+    { findings: [samePassVariant, first] },
+    { findings: [crossPassVariant] },
+  ], { minVotes: 2 });
+  assert.deepEqual(reordered.findings, twoPasses.findings);
+});
+
 test("an explicit stricter min-votes filters findings without changing the default", () => {
   const repeated = finding("Repeated finding", {
     body: "Repeated finding shares enough specific lifecycle transition vocabulary.",
@@ -152,6 +188,7 @@ test("an invalid finding makes the whole document malformed for imports and the 
     { ...valid, file: " \t" },
     { ...valid, title: "" },
     { ...valid, title: "\n " },
+    { ...valid, title: "Valid title\nInjected continuation" },
     { ...valid, body: "" },
     { ...valid, body: " \n" },
   ];

@@ -608,7 +608,7 @@ lens_focus_file() {
   grep -v '^<!-- skills:' "$1"
 }
 lens_skills_file() {
-  grep -oE '<!-- skills: [^>]*-->' "$1" | sed 's/<!-- skills: //; s/ *-->//'
+  grep -oE '<!-- skills: [^>]*-->' "$1" | sed 's/<!-- skills: //; s/ *-->//' || :
 }
 
 prepare_skill() {
@@ -926,6 +926,8 @@ if [ -n "$OUT" ]; then
   ok "written to $OUT"
 fi
 write_metadata "$MERGE_SUCCEEDED"
+ANALYSIS_STATE="$(node "$RESULT_HELPER" analysis "$RUN_TMP/metadata.json")" \
+  || die "could not derive validated analysis state"
 
 LOCAL_UNRESOLVED_FILE="$RUN_TMP/local-unresolved.json"
 printf '%s\n' '{"findings":[]}' > "$LOCAL_UNRESOLVED_FILE"
@@ -934,7 +936,7 @@ local_unresolved_tmp="$LOCAL_UNRESOLVED_FILE.tmp"
 if ST="$(support_exec scripts/local-state.mjs)"; then
   state_ready=1
   if [ "$RECORD_STATE" = 1 ]; then
-    if _delta="$(node "$ST" record "$TMP_OUT" "$BASE_SHA" "$HEAD_SHA" 2>/dev/null)"; then
+    if _delta="$(node "$ST" record "$TMP_OUT" "$BASE_SHA" "$HEAD_SHA" "$ANALYSIS_STATE" 2>/dev/null)"; then
       say "state: $_delta"
     else
       state_ready=0

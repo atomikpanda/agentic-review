@@ -19,8 +19,10 @@ import test from "node:test";
 
 const runner = fileURLToPath(new URL("./run-review.sh", import.meta.url));
 const resultCli = fileURLToPath(new URL("./review-result.mjs", import.meta.url));
+const localState = fileURLToPath(new URL("./local-state.mjs", import.meta.url));
 const poster = fileURLToPath(new URL("./post-review.mjs", import.meta.url));
 const workflow = fileURLToPath(new URL("../.github/workflows/agentic-review.yml", import.meta.url));
+const installer = fileURLToPath(new URL("./install-review.sh", import.meta.url));
 const trustedRoot = dirname(dirname(runner));
 
 function workflowRunStep(name) {
@@ -438,7 +440,7 @@ function runWorkflowConfig(t, overrides = {}) {
   };
 }
 
-test("hosted central refs resolve only immutable release tags or literal main", (t) => {
+test("hosted central refs resolve literal main, release tags, and exact immutable SHAs", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "central-ref-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   for (const [input, expected] of [
@@ -446,6 +448,7 @@ test("hosted central refs resolve only immutable release tags or literal main", 
     ["v1", "refs/tags/v1"],
     ["v1.2.3", "refs/tags/v1.2.3"],
     ["v2.0.0-rc.1", "refs/tags/v2.0.0-rc.1"],
+    ["a".repeat(40), "a".repeat(40)],
   ]) {
     const outputFile = join(directory, `valid-${input}`);
     const result = spawnSync("bash", ["-c", workflowRunStep("resolve trusted central ref")], {
@@ -458,7 +461,8 @@ test("hosted central refs resolve only immutable release tags or literal main", 
   for (const input of [
     "refs/pull/17/head",
     "feature/review",
-    "0123456789abcdef0123456789abcdef01234567",
+    "0123456789abcdef0123456789abcdef0123456",
+    "A".repeat(40),
     "https://github.com/attacker/repo",
     "v1^{commit}",
     "v1~1",
@@ -513,6 +517,71 @@ test("hosted config allows harmless display flags and rejects prompt, parser, an
   }
 });
 
+test("installer validates display-only extra args before side effects and emits a SHA-pinned target workflow", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "install-review-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const bin = join(directory, "bin");
+  const log = join(directory, "gh.log");
+  mkdirSync(bin);
+  const gh = join(bin, "gh");
+  writeFileSync(gh, `#!/usr/bin/env bash
+case "\${1:-} \${2:-}" in
+  "auth status") printf "Token scopes: 'repo', 'workflow'\\n"; exit 0 ;;
+  "repo view") exit 0 ;;
+  "secret list") printf "OPENROUTER_API_KEY\\n"; exit 0 ;;
+esac
+if [ "\${1:-}" = api ]; then
+  for arg in "$@"; do
+    if [ "$arg" = PUT ]; then printf '%s\\n' "$@" > "$GH_LOG"; exit 0; fi
+  done
+  exit 1
+fi
+exit 1
+`);
+  chmodSync(gh, 0o755);
+  const baseEnv = { ...process.env, PATH: `${bin}:${process.env.PATH}`, GH_LOG: log };
+
+  const rejected = spawnSync("bash", [
+    installer,
+    "--repo", "owner/repo",
+    "--extra-omp-args", "--model=attacker/model",
+    "--no-pr-agent",
+    "--yes",
+  ], { encoding: "utf8", env: baseEnv });
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /extra-omp-args.*not permitted/);
+  assert.equal(existsSync(log), false, "installer must reject before invoking gh");
+
+  const sha = "a".repeat(40);
+  const installed = spawnSync("bash", [
+    installer,
+    "--repo", "owner/repo",
+    "--ref", sha,
+    "--extra-omp-args", "--print-thoughts --no-title",
+    "--no-pr-agent",
+    "--yes",
+  ], { encoding: "utf8", env: baseEnv });
+  assert.equal(installed.status, 0, installed.stderr);
+  const encoded = readFileSync(log, "utf8")
+    .split("\n")
+    .find((line) => line.startsWith("content="))
+    ?.slice("content=".length);
+  assert.ok(encoded);
+  const generated = Buffer.from(encoded, "base64").toString("utf8");
+  assert.match(generated, /^on:\n  pull_request_target:/m);
+  assert.match(generated, new RegExp(`uses: atomikpanda/agentic-review/.github/workflows/agentic-review.yml@${sha}`));
+  assert.match(generated, new RegExp(`central_ref: ${sha}`));
+  assert.match(generated, /extra_omp_args: --print-thoughts --no-title/);
+
+  const outputFile = join(directory, "sha-output");
+  const resolved = spawnSync("bash", ["-c", workflowRunStep("resolve trusted central ref")], {
+    encoding: "utf8",
+    env: { ...process.env, IN_CENTRAL_REF: sha, GITHUB_OUTPUT: outputFile },
+  });
+  assert.equal(resolved.status, 0, resolved.stderr);
+  assert.equal(envFileValues(outputFile).ref, sha);
+});
+
 test("runner rejects passthrough prompt and envelope changes before OMP", (t) => {
   for (const extra of [
     ["--"],
@@ -543,6 +612,21 @@ test("runner rejects passthrough prompt and envelope changes before OMP", (t) =>
     && argv.includes("--hide-thinking")
     && argv.includes("--no-title")
   )));
+});
+
+test("runner rejects CR or LF in finding titles before merge or posting", (t) => {
+  for (const title of ["Visible title\nInjected continuation", "Visible title\rInjected continuation"]) {
+    const malformed = finding(title, { file: "alpha.txt" });
+    const run = runReview(t, {
+      general: [{ findings: [malformed] }, { findings: [malformed] }],
+    }, {
+      args: ["--passes", "1", "--lenses", "", "--json"],
+      includeOutputs: false,
+    });
+    assert.notEqual(run.result.status, 0);
+    assert.match(run.result.stderr, /every configured pass failed/);
+    assert.equal(run.logs.length, 2);
+  }
 });
 
 test("runner validates OMP package versions before bunx or OMP", (t) => {
@@ -624,6 +708,10 @@ test("the default profile runs general, correctness, and boundaries into one val
 });
 
 test("hosted contract runs one trusted ensemble and one suppressed poster gate", (t) => {
+  const workflowSource = readFileSync(workflow, "utf8");
+  assert.match(workflowSource, /^  pull_request_target:/m);
+  assert.doesNotMatch(workflowSource, /^  pull_request:/m);
+  assert.match(workflowSource, /github\.event_name != 'pull_request'/);
   const maliciousExecutableMarker = join(tmpdir(), `hosted-target-executed-${process.pid}-${Date.now()}`);
   const targetDataMarker = "UNTRUSTED_TARGET_SUPPORT";
   const shared = finding("Shared hosted defect", {
@@ -646,6 +734,13 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
       "scripts/run-review.sh": `#!/usr/bin/env bash\nprintf target > "$MALICIOUS_EXEC_MARKER"\n`,
       "scripts/post-review.mjs": `import { writeFileSync } from "node:fs"; writeFileSync(process.env.MALICIOUS_EXEC_MARKER, "poster");\n`,
       "scripts/strip-agent-config.sh": `#!/usr/bin/env bash\nprintf target > "$MALICIOUS_EXEC_MARKER"\n`,
+    },
+    baseFiles: {
+      "review/prompt.md": `${targetDataMarker}_BASE_PROMPT\n`,
+      "review/format-json.md": `${targetDataMarker}_BASE_FORMAT\n`,
+      "review/lenses/correctness.md": `# This pass: correctness\n${targetDataMarker}_BASE_CORRECTNESS\n`,
+      "review/lenses/boundaries.md": `# This pass: boundaries\n${targetDataMarker}_BASE_BOUNDARIES\n`,
+      "skills/infra-review/SKILL.md": `${targetDataMarker}_BASE_SKILL\n`,
     },
   });
   t.after(() => rmSync(maliciousExecutableMarker, { force: true }));
@@ -703,11 +798,26 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
       GITHUB_ENV: selfSupportEnvFile,
     },
   });
-  assert.equal(selfSelection.status, 0, selfSelection.stderr);
-  const selfSupport = envFileValues(selfSupportEnvFile);
-  assert.equal(selfSupport.TRUSTED_DATA_ROOT, fixture.repository);
-  assert.equal(selfSupport.REVIEW_RUNNER, join(fixture.repository, "scripts/run-review.sh"));
-  assert.equal(selfSupport.REVIEW_POSTER, join(fixture.repository, "scripts/post-review.mjs"));
+  assert.notEqual(selfSelection.status, 0);
+  assert.match(`${selfSelection.stdout}${selfSelection.stderr}`, /trusted support checkout .* failed/);
+
+  const selfTrustedEnvFile = join(fixture.directory, "self-trusted.env");
+  const selfTrustedSelection = spawnSync("bash", ["-c", workflowRunStep("select trusted support")], {
+    cwd: fixture.repository,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      TARGET_REPO: "atomikpanda/agentic-review",
+      CENTRAL_REPO: "atomikpanda/agentic-review",
+      CENTRAL_OUTCOME: "success",
+      GITHUB_ENV: selfTrustedEnvFile,
+    },
+  });
+  assert.equal(selfTrustedSelection.status, 0, selfTrustedSelection.stderr);
+  const selfSupport = envFileValues(selfTrustedEnvFile);
+  assert.equal(selfSupport.TRUSTED_DATA_ROOT, trustedRoot);
+  assert.equal(selfSupport.REVIEW_RUNNER, runner);
+  assert.equal(selfSupport.REVIEW_POSTER, poster);
 
   for (const path of ["/tmp/prompt-body.md", "/tmp/skill.md", "/tmp/one-skill.md"]) {
     rmSync(path, { force: true });
@@ -1011,6 +1121,7 @@ test("--no-state reads held findings for state and default exit without mutating
     general: [{ findings: [] }],
     correctness: [{ findings: [] }],
     boundaries: [{ findings: [] }],
+
   }, {
     args: [],
     existingFixture: first,
@@ -1039,6 +1150,61 @@ test("--no-state reads held findings for state and default exit without mutating
   assert.match(recurring.result.stdout, /\| Held\/unresolved findings \| `Critical: 0 · High: 0 · Medium: 0` \|/);
   assert.doesNotMatch(recurring.result.stdout, /#### Held findings/);
   assert.deepEqual(readFileSync(statePath), stateBefore);
+});
+test("runner records validated incompleteness so partial local reviews cannot retire held evidence", (t) => {
+  const fixture = createFixture(t);
+  const blocker = finding("Standing local blocker", {
+    file: "alpha.txt",
+    severity: "High",
+    start_line: 1,
+    end_line: 1,
+  });
+  const first = runReview(t, {
+    general: [{ findings: [blocker] }],
+    correctness: [{ findings: [blocker] }],
+    boundaries: [{ findings: [blocker] }],
+  }, {
+    existingFixture: fixture,
+    noState: false,
+  });
+  assert.equal(first.result.status, 0, first.result.stderr);
+  assert.equal(first.metadata.analysis_state, "complete");
+
+  writeFileSync(join(fixture.repository, "alpha.txt"), "alpha changed after report\n");
+  git(fixture.repository, "commit", "-am", "change standing finding span");
+  const emptyPlan = {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  };
+  const partial = runReview(t, emptyPlan, {
+    args: ["--json"],
+    env: { AGENTIC_REVIEW_MAX_DIFF_BYTES: "1" },
+    existingFixture: fixture,
+    noState: false,
+  });
+  assert.equal(partial.result.status, 0, partial.result.stderr);
+  assert.equal(partial.metadata.analysis_state, "inconclusive");
+  const held = spawnSync(process.execPath, [localState, "export-open"], {
+    cwd: fixture.repository,
+    encoding: "utf8",
+  });
+  assert.equal(held.status, 0, held.stderr);
+  assert.deepEqual(JSON.parse(held.stdout).findings.map(({ title }) => title), [blocker.title]);
+
+  const complete = runReview(t, emptyPlan, {
+    args: ["--json"],
+    existingFixture: fixture,
+    noState: false,
+  });
+  assert.equal(complete.result.status, 0, complete.result.stderr);
+  assert.equal(complete.metadata.analysis_state, "complete");
+  const retired = spawnSync(process.execPath, [localState, "export-open"], {
+    cwd: fixture.repository,
+    encoding: "utf8",
+  });
+  assert.equal(retired.status, 0, retired.stderr);
+  assert.deepEqual(JSON.parse(retired.stdout), { findings: [] });
 });
 
 
@@ -1649,6 +1815,18 @@ test("advanced pass and lens overrides produce finite descriptors with stable un
   }, {
     args: ["--passes", "2", "--lenses", "security,docs", "--json"],
   });
+
+  const noSkillDeclaration = runReview(t, {
+    general: [{ findings: [] }],
+    "empty-skills": [{ findings: [] }],
+  }, {
+    args: ["--passes", "1", "--lenses", "empty-skills", "--json"],
+    targetFiles: {
+      "review/lenses/empty-skills.md": "# This pass: empty skills\n\nNo optional skills are needed.\n",
+    },
+  });
+  assert.equal(noSkillDeclaration.result.status, 0, noSkillDeclaration.result.stderr);
+  assert.deepEqual(noSkillDeclaration.logs.map(({ id }) => id), ["general", "general"]);
 
   assert.equal(run.result.status, 0, run.result.stderr);
   assert.deepEqual(run.logs.map(({ id }) => id), ["general", "general", "security", "docs"]);

@@ -33,6 +33,7 @@ export function isValidFinding(value) {
     && value.file.trim().length > 0
     && typeof value.title === "string"
     && value.title.trim().length > 0
+    && !/[\r\n]/.test(value.title)
     && typeof value.body === "string"
     && value.body.trim().length > 0
     && FINDING_SEVERITIES.has(value.severity)

@@ -92,14 +92,14 @@ on:
       # --- prompt and injected knowledge ------------------------------------
       prompt_path:
         description: >-
-          Review instructions. Resolved from the reviewed repo's BASE commit first,
-          then from the central repo — never from the pull request's own tree.
+          Review instructions from the separately checked-out trusted central
+          ref, never from the repository under review.
         type: string
         default: review/prompt.md
       skills_path:
         description: >-
-          Comma-separated list of files appended to the system prompt. Each is
-          resolved base-then-central like prompt_path, and all are concatenated.
+          Comma-separated central-ref files appended to the system prompt. Each
+          is resolved only from the trusted support checkout and concatenated.
         type: string
         default: skills/infra-review/SKILL.md,skills/security-review/SKILL.md
       max_findings:
@@ -173,18 +173,16 @@ on:
       # vet. A caller-supplied `self-hosted` would therefore check out
       # attacker-authored PR content onto a persistent machine holding the
       # model key. Changing the runner is a fork, not an input.
-      # There is deliberately no `central_repo` input. It is derived from
-      # github.workflow_ref — the repository this very workflow file was loaded
-      # from — because a caller-supplied value was an execution hole: a same-repo
-      # pull request could edit its own caller to point at any repository, and
-      # the poster fetched from there runs with a token that can write to the
-      # pull request. Deriving it is also correct for forks, which was the only
-      # reason the input existed.
+      # There is deliberately no `central_repo` input. This base-controlled
+      # workflow names the central repository literally because a caller-supplied
+      # value would be an execution hole: support fetched from an attacker-chosen
+      # repository receives the model key and a token that can write to the pull
+      # request.
       central_ref:
         description: >-
-          Trusted central support ref. Accepts only literal main or central
-          release tags such as v1 and v1.2.3; pull refs, branches, SHAs, URLs,
-          and revision expressions are rejected before checkout.
+          Trusted central support ref. Accepts literal main, central release tags
+          such as v1 and v1.2.3, or an exact lowercase 40-hex commit SHA. Pull
+          refs, other branches, URLs, abbreviated SHAs, and expressions are rejected.
         type: string
         default: main
       timeout_minutes:
@@ -240,11 +238,11 @@ on:
         type: string
         required: true
 
-  # Not `pull_request_target`. That would run with a writable token against
-  # untrusted head code, which is the standard way this pattern becomes a
-  # repo-compromise. `pull_request` gets a read-only token on forks.
+  # `pull_request_target` loads this entry-point from the trusted base branch.
+  # The reviewed head is checked out only as data; executable support is fetched
+  # separately below from the selected central ref.
   #
-  # Types are listed explicitly because the DEFAULT for `pull_request` is
+  # Types are listed explicitly because the default pull-request action set is
   # [opened, synchronize, reopened] — and `synchronize` fires on every push to
   # an open PR. Left implicit, this agent would review on every push while
   # pr-agent (handle_push_trigger = false) reviews only on open, which is the
@@ -256,7 +254,7 @@ on:
   # one per commit.
   #
   # To mirror pr-agent exactly (review on open only), delete `synchronize`.
-  pull_request:
+  pull_request_target:
     types: [opened, reopened, ready_for_review, synchronize]
 
 permissions:
@@ -278,14 +276,14 @@ jobs:
     # ready_for_review rather than while a PR is still being iterated on.
     # A draft PR pushed ten times would otherwise cost ten reviews.
     #
-    # Fork pull requests are skipped rather than failed. GitHub does not pass
-    # repository secrets to them, so the model key is always empty and the run
-    # cannot succeed. Letting it start would put a red X on every outside
-    # contribution — a worse outcome than no review, and not something the
-    # contributor can fix. `pull_request_target` would make secrets available
-    # and is exactly the trade this project refuses to make.
+    # Fork pull requests are skipped rather than failed. The target event would
+    # make secrets available, but this project deliberately confines them to
+    # same-repository reviews rather than processing outside contributions with
+    # a write-capable token. Legacy callers still using `pull_request` are also
+    # skipped: their entry-point YAML is not base-controlled.
     if: >-
-      (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+      github.event_name != 'pull_request'
+      && (github.event_name != 'pull_request_target' || github.event.pull_request.draft == false)
       && github.event.pull_request.head.repo.fork != true
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.timeout_minutes || 20 }}
@@ -323,8 +321,9 @@ jobs:
           set -euo pipefail
 
           if [ -z "${IN_REPO:-}" ]; then
-            # pull_request mode: the event already carries everything, and the
-            # workflow token is scoped to this repository.
+            # pull_request_target mode: the trusted base workflow receives the
+            # event coordinates, then checks out the reviewed head strictly as
+            # data. Executable support comes from the separate central checkout.
             {
               echo "repo=${GITHUB_REPOSITORY}"
               echo "pr=${{ github.event.pull_request.number }}"
@@ -339,7 +338,7 @@ jobs:
             # "Input required and not supplied: token" at checkout, not as
             # anything mentioning secrets. Consumers fall back to github.token
             # directly when this output is absent.
-            echo "  pull_request mode: ${GITHUB_REPOSITORY}#${{ github.event.pull_request.number }}"
+            echo "  pull_request_target mode: ${GITHUB_REPOSITORY}#${{ github.event.pull_request.number }}"
             exit 0
           fi
 
@@ -410,7 +409,7 @@ jobs:
             echo "  app mode: ${IN_REPO}#${IN_PR} is a draft — skipped"
             exit 0
           fi
-          # Same stance as pull_request mode: forks are skipped, not failed.
+          # Same stance as pull_request_target mode: forks are skipped, not failed.
           # The head commit may not even exist in the base repo.
           if [ "$(gh_t '.head.repo.full_name == .base.repo.full_name')" != "true" ]; then
             echo "eligible=false" >> "$GITHUB_OUTPUT"
@@ -444,15 +443,13 @@ jobs:
           # nothing needs the credential to persist.
           persist-credentials: false
 
-      # The shared runner, data, and poster live in the central repo. External
-      # targets must use this checkout; a missing central checkout is therefore
-      # diagnosed by the trusted-support selection below rather than falling
-      # back to anything in the reviewed repository.
+      # The runner, data, stripper, and poster always come from a separate
+      # central checkout. This is required even when reviewing this repository:
+      # the target head is untrusted data and never supplies code that receives
+      # the model key or write-capable token.
       - name: resolve trusted central ref
         id: central-ref
-        if: >-
-          steps.target.outputs.eligible == 'true'
-          && steps.target.outputs.repo != 'atomikpanda/agentic-review'
+        if: steps.target.outputs.eligible == 'true'
         env:
           IN_CENTRAL_REF: ${{ inputs.central_ref }}
         run: |
@@ -460,19 +457,19 @@ jobs:
           CENTRAL_REF="${IN_CENTRAL_REF:-main}"
           if [ "$CENTRAL_REF" = "main" ]; then
             RESOLVED_REF="refs/heads/main"
+          elif [[ "$CENTRAL_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            RESOLVED_REF="$CENTRAL_REF"
           elif [[ "$CENTRAL_REF" =~ ^v(0|[1-9][0-9]*)$ ]] \
             || [[ "$CENTRAL_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
             RESOLVED_REF="refs/tags/$CENTRAL_REF"
           else
-            echo "::error::central_ref must be main or a central release tag (vN or vN.N.N): $CENTRAL_REF"
+            echo "::error::central_ref must be main, a central release tag (vN or vN.N.N), or an exact lowercase 40-hex SHA: $CENTRAL_REF"
             exit 1
           fi
           echo "ref=$RESOLVED_REF" >> "$GITHUB_OUTPUT"
 
       - name: prepare trusted support checkout
-        if: >-
-          steps.target.outputs.eligible == 'true'
-          && steps.target.outputs.repo != 'atomikpanda/agentic-review'
+        if: steps.target.outputs.eligible == 'true'
         run: |
           # The reviewed tree may contain this path or make it a symlink. Remove
           # it before checkout so a failed central fetch cannot leave a
@@ -480,9 +477,7 @@ jobs:
           rm -rf -- .central-skills
 
       - name: fetch shared prompt, skills and poster
-        if: >-
-          steps.target.outputs.eligible == 'true'
-          && steps.target.outputs.repo != 'atomikpanda/agentic-review'
+        if: steps.target.outputs.eligible == 'true'
         id: central
         continue-on-error: true
         uses: actions/checkout@v4
@@ -669,30 +664,20 @@ jobs:
       - name: select trusted support
         if: steps.target.outputs.eligible == 'true'
         env:
-          TARGET_REPO: ${{ steps.target.outputs.repo }}
           CENTRAL_REPO: atomikpanda/agentic-review
           CENTRAL_OUTCOME: ${{ steps.central.outcome }}
         run: |
           set -euo pipefail
-          WORKSPACE_ROOT="$(pwd -P)"
-          if [ "$TARGET_REPO" = "$CENTRAL_REPO" ]; then
-            # This branch already supplies the workflow shell that receives the
-            # model key, so using its runner/poster/data is the bounded
-            # self-review test path rather than a broader trust grant.
-            SUPPORT_ROOT="$WORKSPACE_ROOT"
-            echo "  support: this branch (self-review)"
-          else
-            [ "$CENTRAL_OUTCOME" = "success" ] || {
-              echo "::error::trusted support checkout from $CENTRAL_REPO failed"
-              exit 1
-            }
-            [ -d .central-skills ] || {
-              echo "::error::trusted support checkout from $CENTRAL_REPO is unavailable"
-              exit 1
-            }
-            SUPPORT_ROOT="$(cd -P .central-skills && pwd)"
-            echo "  support: $CENTRAL_REPO"
-          fi
+          [ "$CENTRAL_OUTCOME" = "success" ] || {
+            echo "::error::trusted support checkout from $CENTRAL_REPO failed"
+            exit 1
+          }
+          [ -d .central-skills ] || {
+            echo "::error::trusted support checkout from $CENTRAL_REPO is unavailable"
+            exit 1
+          }
+          SUPPORT_ROOT="$(cd -P .central-skills && pwd)"
+          echo "  support: $CENTRAL_REPO"
 
           REVIEW_RUNNER="$SUPPORT_ROOT/scripts/run-review.sh"
           REVIEW_POSTER="$SUPPORT_ROOT/scripts/post-review.mjs"
@@ -737,14 +722,11 @@ jobs:
 
       - name: resolve trusted prompt and skills
         if: steps.target.outputs.eligible == 'true'
-        env:
-          BASE: ${{ steps.target.outputs.base }}
         run: |
           set -euo pipefail
 
-          # Resolve instructions without trusting the pull request's tree.
-          # A repository may customize them in its merged base commit; otherwise
-          # the explicitly selected central/self-review data root owns them.
+          # Instructions are support data, so they follow the same trust
+          # boundary as the runner and poster rather than the reviewed tree.
           safe_path() {
             case "$1" in
               /*|*..*) echo "::error::path must be relative and must not contain '..': $1"; exit 1 ;;
@@ -752,11 +734,6 @@ jobs:
           }
           resolve() { # resolve <path> <destination>; 0 if found
             safe_path "$1"
-            if git cat-file -e "$BASE:$1" 2>/dev/null; then
-              git show "$BASE:$1" > "$2"
-              echo "    $1 (from base commit)" >&2
-              return 0
-            fi
             if [ -f "$TRUSTED_DATA_ROOT/$1" ]; then
               cp "$TRUSTED_DATA_ROOT/$1" "$2"
               echo "    $1 (from trusted support)" >&2

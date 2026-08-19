@@ -230,6 +230,7 @@ function sameSummaryFinding(left, right) {
 }
 
 export async function reconcileSummaryFindings({
+  analysisState,
   current,
   prior,
   priorHeadSha,
@@ -247,7 +248,7 @@ export async function reconcileSummaryFindings({
     } catch {
       reconciliationKnown = false;
     }
-    if (changeIsConfirmed(changed)) retired.push(previous);
+    if (analysisState === "complete" && changeIsConfirmed(changed)) retired.push(previous);
     else held.push(previous);
   }
   return { current, held, retired, reconciliationKnown };
@@ -1089,6 +1090,7 @@ export async function runSummaryMode({ metadata, findings, repo, pr, token, botL
 
   const reconciled = history.reconciliationKnown
     ? await reconcileSummaryFindings({
+      analysisState: metadata.analysis_state,
       current: findings,
       prior: history.findings,
       priorHeadSha: history.headSha,
@@ -1127,25 +1129,21 @@ export async function runSummaryMode({ metadata, findings, repo, pr, token, botL
   enforceGate(state);
 }
 
-async function runInlineMode({ metadata, findings, repo, pr, botLogin, identityKnown }) {
-  let prior = [];
-  let reconciliationKnown = identityKnown;
-  if (identityKnown) {
-    try {
-      const [owner, name] = repo.split("/");
-      prior = await fetchOurThreads({ owner, name, pr, botLogin });
-    } catch (error) {
-      reconciliationKnown = false;
-      console.log(`::warning::could not read existing review threads (${error.message}); posting without dedupe`);
-    }
-  }
-
-  const standing = prior.filter((thread) => !thread.isResolved && !thread.retired);
-  const dismissed = prior.filter((thread) => thread.isResolved);
+export async function reconcileInlineFindings({
+  metadata,
+  findings,
+  standing,
+  dismissed,
+  resolveStale,
+  writesEnabled,
+  changedSince = fileChangedSince,
+  retire = retireThread,
+}) {
   const current = [];
   const fresh = [];
   const stillLive = new Set();
   let suppressed = 0;
+  let reconciliationKnown = true;
 
   for (const finding of findings) {
     const match = findStandingMatch(finding, standing);
@@ -1161,19 +1159,15 @@ async function runInlineMode({ metadata, findings, repo, pr, botLogin, identityK
     current.push(finding);
     fresh.push(finding);
   }
-  if (suppressed) {
-    console.log(`  ${suppressed} finding(s) previously resolved and unchanged — not re-raised`);
-  }
 
   const unresolved = [];
-  const resolveStale = env("RESOLVE_STALE", "true") === "true";
   for (const thread of standing) {
     if (stillLive.has(thread.id)) continue;
-    const changed = fileChangedSince(thread, metadata.head_sha);
-    if (changeIsConfirmed(changed) && resolveStale) {
-      if (WRITES_ENABLED) {
+    const changed = changedSince(thread, metadata.head_sha);
+    if (metadata.analysis_state === "complete" && changeIsConfirmed(changed) && resolveStale) {
+      if (writesEnabled) {
         try {
-          await retireThread(thread, metadata.head_sha);
+          await retire(thread, metadata.head_sha);
           continue;
         } catch (error) {
           reconciliationKnown = false;
@@ -1189,24 +1183,59 @@ async function runInlineMode({ metadata, findings, repo, pr, botLogin, identityK
     else reconciliationKnown = false;
   }
 
+  return { current, fresh, unresolved, suppressed, reconciliationKnown };
+}
+
+export function buildInlineReviewPayload({ metadata, state, fresh, unresolved, comments }) {
+  return {
+    commit_id: metadata.head_sha,
+    event: "COMMENT",
+    body: buildReviewTopBody({
+      mode: REVIEW_MODE,
+      metadata,
+      state,
+      current: fresh,
+      unresolved,
+    }),
+    comments,
+  };
+}
+
+async function runInlineMode({ metadata, findings, repo, pr, botLogin, identityKnown }) {
+  let prior = [];
+  let reconciliationKnown = identityKnown;
+  if (identityKnown) {
+    try {
+      const [owner, name] = repo.split("/");
+      prior = await fetchOurThreads({ owner, name, pr, botLogin });
+    } catch (error) {
+      reconciliationKnown = false;
+      console.log(`::warning::could not read existing review threads (${error.message}); posting without dedupe`);
+    }
+  }
+
+  const standing = prior.filter((thread) => !thread.isResolved && !thread.retired);
+  const dismissed = prior.filter((thread) => thread.isResolved);
+  const reconciled = await reconcileInlineFindings({
+    metadata,
+    findings,
+    standing,
+    dismissed,
+    resolveStale: env("RESOLVE_STALE", "true") === "true",
+    writesEnabled: WRITES_ENABLED,
+  });
+  reconciliationKnown = reconciliationKnown && reconciled.reconciliationKnown;
+  const { current, fresh, unresolved, suppressed } = reconciled;
+  if (suppressed) {
+    console.log(`  ${suppressed} finding(s) previously resolved and unchanged — not re-raised`);
+  }
+
   const ranges = fresh.length > 0
     ? commentableRanges(metadata.base_sha, metadata.head_sha)
     : new Map();
   const { comments, unanchored } = buildReviewComments(fresh, ranges, { mode: REVIEW_MODE });
   const state = deriveState(metadata, current, unresolved, reconciliationKnown);
-  const body = buildReviewTopBody({
-    mode: REVIEW_MODE,
-    metadata,
-    state,
-    current,
-    unresolved,
-  });
-  const payload = {
-    commit_id: metadata.head_sha,
-    event: "COMMENT",
-    body,
-    comments,
-  };
+  const payload = buildInlineReviewPayload({ metadata, state, fresh, unresolved, comments });
 
   emitState(metadata, state);
   console.log(

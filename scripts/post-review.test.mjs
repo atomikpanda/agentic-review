@@ -289,6 +289,7 @@ test("current summary finding replaces a fuzzy prior duplicate", async () => {
   const prior = finding({ severity: "Medium" });
   const current = finding({ severity: "Critical", title: "Cache entry persists after invalidation" });
   const result = await reconcileSummaryFindings({
+    analysisState: "complete",
     current: [current],
     prior: [prior],
     priorHeadSha: PRIOR_HEAD_SHA,
@@ -304,6 +305,7 @@ for (const [label, changed] of [["unchanged", false], ["indeterminate", null]]) 
   test(`omitted ${label} summary finding is held`, async () => {
     const prior = finding({ severity: "Medium" });
     const result = await reconcileSummaryFindings({
+      analysisState: "complete",
       current: [], prior: [prior], priorHeadSha: PRIOR_HEAD_SHA, headSha: HEAD_SHA,
       spanChanged: async () => changed,
     });
@@ -315,6 +317,7 @@ for (const [label, changed] of [["unchanged", false], ["indeterminate", null]]) 
 test("omitted summary finding retires only after its original span changes", async () => {
   const prior = finding({ severity: "Medium" });
   const result = await reconcileSummaryFindings({
+    analysisState: "complete",
     current: [], prior: [prior], priorHeadSha: PRIOR_HEAD_SHA, headSha: HEAD_SHA,
     spanChanged: async (candidate, from, to) => {
       assert.equal(candidate, prior);
@@ -325,6 +328,100 @@ test("omitted summary finding retires only after its original span changes", asy
   });
   assert.deepEqual(result.held, []);
   assert.deepEqual(result.retired, [prior]);
+});
+
+test("inconclusive summary reconciliation holds omitted findings despite confirmed overlap", async () => {
+  const prior = finding({ severity: "High" });
+  const result = await reconcileSummaryFindings({
+    analysisState: "inconclusive",
+    current: [],
+    prior: [prior],
+    priorHeadSha: PRIOR_HEAD_SHA,
+    headSha: HEAD_SHA,
+    spanChanged: async () => true,
+  });
+  assert.deepEqual(result.held, [prior]);
+  assert.deepEqual(result.retired, []);
+  const heldState = deriveReviewState({
+    analysisState: "inconclusive",
+    current: [],
+    unresolved: result.held,
+    reconciliationKnown: true,
+    blockSeverities: ["Critical", "High"],
+  });
+  assert.equal(heldState.merge_state, "blocked");
+});
+
+test("inconclusive inline reconciliation holds omitted blockers and payload renders only fresh findings", async () => {
+  const recurring = finding();
+  const fresh = finding({
+    file: "src/queue.mjs",
+    start_line: 7,
+    end_line: 7,
+    severity: "Medium",
+    title: "Queue retry is dropped",
+    body: "The queued retry is discarded before it can run.",
+    suggestion: "retainRetry();\n",
+  });
+  const priorBody = poster.buildReviewComments(
+    [recurring],
+    new Map([[recurring.file, [[20, 22]]]]),
+    { mode: "suggest" },
+  ).comments[0].body;
+  const recurringThread = {
+    id: "recurring",
+    fp: priorBody.match(/agentic-review-fp:([0-9a-f]{16})/)?.[1],
+    path: recurring.file,
+    body: priorBody,
+    tokens: new Set(),
+    isResolved: false,
+    retired: false,
+  };
+  const omittedThread = {
+    id: "omitted",
+    fp: "f".repeat(16),
+    path: "src/standing.mjs",
+    body: "`P1` High — **Standing blocker**\n\nThe earlier blocker remains unresolved.",
+    tokens: new Set(["standing", "blocker", "earlier", "unresolved"]),
+    startLine: 4,
+    endLine: 4,
+    isResolved: false,
+    retired: false,
+  };
+  let retireCalls = 0;
+  const reconciled = await poster.reconcileInlineFindings({
+    metadata: metadata({ analysis_state: "inconclusive" }),
+    findings: [recurring, fresh],
+    standing: [recurringThread, omittedThread],
+    dismissed: [],
+    resolveStale: true,
+    writesEnabled: true,
+    changedSince: () => true,
+    retire: async () => { retireCalls += 1; },
+  });
+  assert.deepEqual(reconciled.current, [recurring, fresh]);
+  assert.deepEqual(reconciled.fresh, [fresh]);
+  assert.deepEqual(reconciled.unresolved.map(({ title }) => title), ["Standing blocker"]);
+  assert.equal(retireCalls, 0);
+
+  const payload = poster.buildInlineReviewPayload({
+    metadata: metadata({ analysis_state: "inconclusive" }),
+    state: state({
+      analysis_state: "inconclusive",
+      current_counts: { Critical: 0, High: 1, Medium: 1 },
+      unresolved_counts: { Critical: 0, High: 1, Medium: 0 },
+    }),
+    fresh: reconciled.fresh,
+    unresolved: reconciled.unresolved,
+    comments: [{ path: fresh.file, line: fresh.start_line, body: "fresh inline" }],
+  });
+  assert.doesNotMatch(payload.body, /Cache entry survives invalidation/);
+  assert.match(payload.body, /Queue retry is dropped/);
+  assert.doesNotMatch(JSON.stringify(payload), /replacement\(\)/);
+  assert.match(payload.body, /Standing blocker/);
+  assert.match(payload.body, /\| Current findings \| `Critical: 0 · High: 1 · Medium: 1` \|/);
+  assert.match(payload.body, /\| Held\/unresolved findings \| `Critical: 0 · High: 1 · Medium: 0` \|/);
+  assert.equal(payload.comments.length, 1);
 });
 
 test("state table renders the exact explicit contract", () => {
@@ -659,6 +756,7 @@ test("paginated inline history carries a page-two blocker and fails on any page 
       pullRequest: {
         reviewThreads: { nodes, pageInfo: { hasNextPage, endCursor } },
       },
+
     },
   });
   const threads = await fetchOurThreads({
@@ -694,6 +792,42 @@ test("paginated inline history carries a page-two blocker and fails on any page 
     }),
     /page two unavailable/,
   );
+});
+test("poster rejects a finding title containing CR or LF while preserving multiline bodies", () => {
+  const dir = mkdtempSync(join(tmpdir(), "post-review-title-boundary-"));
+  const findingsFile = join(dir, "findings.json");
+  const metadataFile = join(dir, "metadata.json");
+  writeFileSync(metadataFile, JSON.stringify(metadata()));
+  for (const title of ["Visible title\nInjected continuation", "Visible title\rInjected continuation"]) {
+    writeFileSync(findingsFile, JSON.stringify({ findings: [finding({ title })] }));
+    const rejected = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        FINDINGS_FILE: findingsFile,
+        REVIEW_METADATA_FILE: metadataFile,
+        RENDER: "1",
+        REVIEW_MODE: "inline",
+      },
+    });
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /findings artifact is not the requested structured JSON/);
+  }
+  writeFileSync(findingsFile, JSON.stringify({
+    findings: [finding({ body: "First body line.\nSecond body line." })],
+  }));
+  const accepted = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      FINDINGS_FILE: findingsFile,
+      REVIEW_METADATA_FILE: metadataFile,
+      RENDER: "1",
+      REVIEW_MODE: "inline",
+    },
+  });
+  assert.equal(accepted.status, 0, accepted.stderr);
+  assert.match(accepted.stdout, /First body line\.\nSecond body line\./);
 });
 
 test("machine outputs and matching job summary are emitted without a comment", () => {

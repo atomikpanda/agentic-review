@@ -80,6 +80,37 @@ function compareFindings(a, b) {
     || compareText(a.body, b.body);
 }
 
+function compareVariants(a, b) {
+  return compareText(String(a.file ?? "").replace(/^\.\//, ""), String(b.file ?? "").replace(/^\.\//, ""))
+    || compareText(a.title, b.title)
+    || compareText(a.body, b.body)
+    || (Number(a.start_line) || 0) - (Number(b.start_line) || 0)
+    || (Number(a.end_line) || 0) - (Number(b.end_line) || 0);
+}
+
+function mergeVariant(target, candidate) {
+  const votes = target.votes;
+  const severity = (SEVERITY_RANK[candidate.severity] ?? 9) < (SEVERITY_RANK[target.severity] ?? 9)
+    ? candidate.severity
+    : target.severity;
+  const fixSource = [target, candidate]
+    .filter((finding) => finding.suggestion)
+    .sort((left, right) =>
+      compareText(left.suggestion, right.suggestion)
+      || (Number(left.start_line) || 0) - (Number(right.start_line) || 0)
+      || (Number(left.end_line) || 0) - (Number(right.end_line) || 0))[0];
+  const fix = fixSource ? { ...fixSource } : null;
+  const representative = compareVariants(candidate, target) < 0 ? candidate : target;
+  Object.assign(target, representative);
+  if (votes !== undefined) target.votes = votes;
+  target.severity = severity;
+  if (fix) {
+    target.suggestion = fix.suggestion;
+    target.start_line = fix.start_line;
+    target.end_line = fix.end_line;
+  }
+}
+
 export function mergeFindingDocuments(documents, { minVotes = 1 } = {}) {
   const merged = [];
   const statuses = [];
@@ -96,24 +127,24 @@ export function mergeFindingDocuments(documents, { minVotes = 1 } = {}) {
 
     passes++;
     statuses.push({ status: "valid", finding_count: parsed.findings.length });
+    const uniqueFindings = [];
     for (const rawFinding of parsed.findings) {
       const finding = projectPublicFinding(rawFinding);
       if (!finding) continue;
+      const duplicate = uniqueFindings.find((candidate) =>
+        sameFinding(candidate, finding, SIMILARITY_DEFAULT));
+      if (duplicate) {
+        mergeVariant(duplicate, finding);
+      } else {
+        uniqueFindings.push(finding);
+      }
+    }
+    for (const finding of uniqueFindings) {
       const hit = merged.find((candidate) =>
         sameFinding(candidate, finding, SIMILARITY_DEFAULT));
       if (hit) {
         hit.votes++;
-        // Keep the variant that carries a concrete fix, and the more severe
-        // reading — a defect seen as Critical once and Medium twice is worth
-        // showing at Critical.
-        if ((SEVERITY_RANK[finding.severity] ?? 9) < (SEVERITY_RANK[hit.severity] ?? 9)) {
-          hit.severity = finding.severity;
-        }
-        if (!hit.suggestion && finding.suggestion) {
-          hit.suggestion = finding.suggestion;
-          hit.start_line = finding.start_line;
-          hit.end_line = finding.end_line;
-        }
+        mergeVariant(hit, finding);
       } else {
         merged.push({ ...finding, votes: 1 });
       }

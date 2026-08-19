@@ -12,7 +12,7 @@
 // across worktrees, and can never be committed by accident.
 //
 // Usage:
-//   local-state.mjs record <findings.json> <base> <head>   merge a run into state
+//   local-state.mjs record <findings.json> <base> <head> <complete|inconclusive>
 //   local-state.mjs list [open|all|dismissed]              print tracked findings
 //   local-state.mjs export-open                            print open findings JSON
 //   local-state.mjs dismiss <id>...                        stop reporting these
@@ -29,7 +29,7 @@ import {
   diffTouchesSpan,
   literalPathspec,
 } from "./thread-change.mjs";
-import { sameFinding } from "./lib-findings.mjs";
+import { projectPublicFinding, sameFinding } from "./lib-findings.mjs";
 
 const git = (args) => execFileSync("git", args, { encoding: "utf8" }).trim();
 const STATE_DIR = join(git(["rev-parse", "--git-common-dir"]), "agentic-review");
@@ -172,9 +172,17 @@ function extractJson(text) {
 const cmd = process.argv[2];
 
 if (cmd === "record") {
-  const [file, base, head] = process.argv.slice(3);
+  const [file, base, head, analysisState, ...extra] = process.argv.slice(3);
+  if (extra.length > 0 || !["complete", "inconclusive"].includes(analysisState)) {
+    throw new TypeError("record requires an explicit complete or inconclusive analysis state");
+  }
   const parsed = extractJson(readFileSync(file, "utf8"));
   if (!parsed) { console.error("unparseable findings"); process.exit(1); }
+  const findings = parsed.findings.map((finding, index) => {
+    const projected = projectPublicFinding(finding);
+    if (!projected) throw new TypeError(`findings[${index}] is not a valid public finding`);
+    return projected;
+  });
 
   const state = load();
   // new Date(undefined) is Invalid Date, not "now" — the || undefined idiom
@@ -184,7 +192,7 @@ if (cmd === "record") {
   const seen = new Set();
   let fresh = 0, again = 0, muted = 0;
 
-  for (const f of parsed.findings) {
+  for (const f of findings) {
     const known = state.findings.find((k) => sameFinding(k, f));
     if (known) {
       seen.add(known.id);
@@ -217,6 +225,7 @@ if (cmd === "record") {
   let retired = 0, unexplained = 0;
   for (const k of state.findings) {
     if (k.status !== "open" || seen.has(k.id)) continue;
+    if (analysisState !== "complete") { unexplained++; continue; }
     const changed = spanChangedSince(k, head);
     if (changeIsConfirmed(changed)) { k.status = "gone"; k.goneAt = now; retired++; }
     else unexplained++;
@@ -225,7 +234,7 @@ if (cmd === "record") {
   mkdirSync(RUNS_DIR, { recursive: true });
   const stamp = now.replace(/[:.]/g, "-");
   writeFileSync(join(RUNS_DIR, `${stamp}.json`), JSON.stringify(
-    { at: now, base, head, branch: git(["rev-parse", "--abbrev-ref", "HEAD"]), findings: parsed.findings }, null, 2));
+    { at: now, base, head, analysis_state: analysisState, branch: git(["rev-parse", "--abbrev-ref", "HEAD"]), findings }, null, 2));
   save(state);
 
   const bits = [`${fresh} new`, `${again} recurring`];
