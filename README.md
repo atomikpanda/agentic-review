@@ -82,12 +82,16 @@ preserves the first valid structured pass and marks the separate schema-v1
 metadata inconclusive rather than presenting the fallback as merged.
 `--metadata-out FILE` writes that bounded-run metadata: immutable base and head
 SHAs, the configuration fingerprint, diff and cap status, requested/completed
-pass identifiers, per-pass status, and `analysis_state`. The paths must resolve
-to different destinations. `--no-state` still reads existing history for the
+pass identifiers, per-pass status, and `analysis_state`. Both outputs reject a
+symlink destination before model work, and the paths must resolve to different
+destinations. `--no-state` still reads existing history for the
 rendered state and exit status but never mutates it. Advanced local experiments
 can change the ensemble with `--passes N`, `--lenses a,b,c`, and
 `--min-votes N`; pass/lens changes appear in the metadata identifiers, and all
-three change the configuration fingerprint.
+three change the configuration fingerprint. A vote threshold above one is
+experimental and always inconclusive. If it would hide any valid finding, the
+runner emits the complete union instead so state, history, and safety gating
+retain that evidence.
 
 **Works from any repository.** The prompt, output format and skill file are
 resolved relative to the script itself (symlinks followed), then overridden by
@@ -332,7 +336,7 @@ use their defaults:
 |---|---|---|
 | General passes | `1` | `--passes N` |
 | Additive lenses | `correctness,boundaries` | `--lenses a,b,c` |
-| Union vote threshold | `1` | `--min-votes N` |
+| Experimental vote threshold (always inconclusive) | `1` | `--min-votes N` |
 
 Those defaults produce the general/correctness/boundaries profile described
 above. `thinking` accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`,

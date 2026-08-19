@@ -148,6 +148,12 @@ test("an invalid finding makes the whole document malformed for imports and the 
     { ...valid, start_line: 2, end_line: 1 },
     { ...valid, suggestion: 42 },
     missingSuggestion,
+    { ...valid, file: "" },
+    { ...valid, file: " \t" },
+    { ...valid, title: "" },
+    { ...valid, title: "\n " },
+    { ...valid, body: "" },
+    { ...valid, body: " \n" },
   ];
 
   for (const invalid of invalidFindings) {

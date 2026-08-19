@@ -127,6 +127,14 @@ const fakeCodegraph = `#!/usr/bin/env node
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 const operation = process.argv[2];
+if (operation === "--version") {
+  const version = process.env.FAKE_CODEGRAPH_VERSION ?? "fake-codegraph 1.0.0";
+  appendFileSync(process.env.FAKE_CODEGRAPH_LOG, JSON.stringify({
+    operation: "version", version,
+  }) + "\\n");
+  process.stdout.write(version + "\\n");
+  process.exit(0);
+}
 if (operation === "init") {
   const project = process.cwd();
   const source = readFileSync(join(project, "alpha.txt"), "utf8").trim();
@@ -144,10 +152,16 @@ const pathIndex = process.argv.indexOf("--path");
 const project = pathIndex === -1 ? "" : process.argv[pathIndex + 1];
 let marker = "missing";
 try { marker = readFileSync(join(project, ".codegraph", "source-marker"), "utf8").trim(); } catch {}
+const countFile = join(process.env.FAKE_OMP_STATE, "codegraph-query-count");
+let query = 1;
+try { query = Number(readFileSync(countFile, "utf8")) + 1; } catch {}
+writeFileSync(countFile, String(query));
 appendFileSync(process.env.FAKE_CODEGRAPH_LOG, JSON.stringify({
-  operation: "query", project, marker,
+  operation: "query", project, marker, query,
 }) + "\\n");
-process.stdout.write("# Snapshot symbol index\\n\\n" + marker + "\\n");
+if (process.env.FAKE_CODEGRAPH_QUERY_MODE === "first-only" && query > 1) process.exit(8);
+const context = process.env.FAKE_CODEGRAPH_CONTEXT ?? marker;
+process.stdout.write("# Snapshot symbol index\\n\\n" + context + "\\n");
 `;
 
 function git(directory, ...args) {
@@ -1052,6 +1066,29 @@ test("malformed output receives one retry and records the successful second atte
   assert.deepEqual(run.findings.findings.map(({ title }) => title), [recovered.title]);
 });
 
+test("empty or whitespace finding identity fields exhaust the structured-output retry", (t) => {
+  for (const [field, value] of [["file", "  "], ["title", ""], ["body", "\n\t"]]) {
+    const invalid = finding(`Invalid ${field}`, { [field]: value });
+    const run = runReview(t, {
+      general: [{ findings: [invalid] }, { findings: [invalid] }],
+      correctness: [{ findings: [] }],
+      boundaries: [{ findings: [] }],
+    });
+
+    assert.equal(run.result.status, 0, `${field}: ${run.result.stderr}`);
+    assert.deepEqual(
+      run.metadata.passes.results.map(({ id, status, attempts }) => ({ id, status, attempts })),
+      [
+        { id: "general", status: "failed", attempts: 2 },
+        { id: "correctness", status: "valid", attempts: 1 },
+        { id: "boundaries", status: "valid", attempts: 1 },
+      ],
+    );
+    assert.equal(run.metadata.analysis_state, "inconclusive");
+    assert.deepEqual(run.findings.findings, []);
+  }
+});
+
 test("a permanently malformed pass is failed while valid pass findings survive the union", (t) => {
   const general = finding("General survives");
   const boundaries = finding("Boundaries survives");
@@ -1235,6 +1272,40 @@ test("findings and metadata destinations cannot resolve to the same file", (t) =
   assert.match(symlinkAlias.result.stderr, /--out.*--metadata-out|same destination/);
 });
 
+test("symlink artifact destinations are rejected before model work without replacing either output", (t) => {
+  const plan = {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  };
+  for (const selected of ["findings", "metadata"]) {
+    let staleTarget;
+    let otherOutput;
+    const stale = selected === "findings"
+      ? '{"findings":[{"title":"stale"}]}\n'
+      : '{"analysis_state":"stale"}\n';
+    const run = runReview(t, plan, {
+      outputPaths: ({ directory, findingsFile, metadataFile }) => {
+        staleTarget = join(directory, `${selected}-stale-target.json`);
+        writeFileSync(staleTarget, stale);
+        const symlink = join(directory, `${selected}-artifact.json`);
+        symlinkSync(staleTarget, symlink);
+        otherOutput = selected === "findings" ? metadataFile : findingsFile;
+        return selected === "findings"
+          ? { findingsFile: symlink, metadataFile }
+          : { findingsFile, metadataFile: symlink };
+      },
+    });
+
+    assert.notEqual(run.result.status, 0, `${selected}: ${run.result.stderr}`);
+    assert.equal(run.logs.length, 0, selected);
+    assert.equal(lstatSync(selected === "findings" ? run.findingsFile : run.metadataFile).isSymbolicLink(), true);
+    assert.equal(readFileSync(staleTarget, "utf8"), stale);
+    assert.equal(existsSync(otherOutput), false, `${selected}: other artifact was partially written`);
+    assert.match(run.result.stderr, /symlink.*(?:--out|--metadata-out)|(?:--out|--metadata-out).*symlink/i);
+  }
+});
+
 test("branch and staged reviews stay pinned when the source changes after worktree creation", (t) => {
   const plan = {
     general: [{ findings: [] }],
@@ -1314,6 +1385,60 @@ test("codegraph context comes only from the pinned review snapshot", (t) => {
     readFileSync(join(run.repository, ".codegraph", "source-marker"), "utf8"),
     "LIVE_INDEX_MUTATION\n",
   );
+});
+
+test("codegraph context is generated once and reused after the CLI changes between calls", (t) => {
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    fakeCodegraph: true,
+    untrackedCodegraph: true,
+    env: {
+      FAKE_CODEGRAPH_QUERY_MODE: "first-only",
+      FAKE_CODEGRAPH_VERSION: "fake-codegraph 7.1.0",
+    },
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.equal(run.codegraphLogs.filter(({ operation }) => operation === "version").length, 1);
+  assert.equal(run.codegraphLogs.filter(({ operation }) => operation === "query").length, 3);
+  const contexts = run.logs.map(({ prompt }) =>
+    prompt.match(/## Symbol and dependency index[\s\S]*?(?=\nReply with)/)?.[0] ?? null);
+  assert.ok(contexts.every(Boolean));
+  assert.equal(new Set(contexts).size, 1);
+});
+
+test("codegraph readiness, frozen context, and selected version affect the configuration fingerprint", (t) => {
+  const plan = {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  };
+  const run = (context, version, extraEnv = {}) => runReview(t, plan, {
+    fakeCodegraph: true,
+    untrackedCodegraph: true,
+    env: {
+      FAKE_CODEGRAPH_CONTEXT: context,
+      FAKE_CODEGRAPH_VERSION: version,
+      ...extraEnv,
+    },
+  });
+  const first = run("CONTEXT_ALPHA", "fake-codegraph 7.1.0");
+  const changedContext = run("CONTEXT_BETA", "fake-codegraph 7.1.0");
+  const changedVersion = run("CONTEXT_ALPHA", "fake-codegraph 7.2.0");
+  const unavailable = run("CONTEXT_ALPHA", "fake-codegraph 7.1.0", {
+    FAKE_CODEGRAPH_INIT_FAIL: "1",
+  });
+
+  for (const result of [first, changedContext, changedVersion, unavailable]) {
+    assert.equal(result.result.status, 0, result.result.stderr);
+  }
+  assert.notEqual(first.metadata.configuration_fingerprint, changedContext.metadata.configuration_fingerprint);
+  assert.notEqual(first.metadata.configuration_fingerprint, changedVersion.metadata.configuration_fingerprint);
+  assert.notEqual(first.metadata.configuration_fingerprint, unavailable.metadata.configuration_fingerprint);
+  assert.ok(unavailable.logs.every(({ prompt }) => !prompt.includes("CONTEXT_ALPHA")));
 });
 
 test("OMP sees the exact target codegraph config after base-trusted snapshot indexing", async (t) => {
@@ -1532,6 +1657,37 @@ test("advanced pass and lens overrides produce finite descriptors with stable un
   assert.notEqual(invalid.result.status, 0);
   assert.equal(invalid.logs.length, 0);
   assert.match(invalid.result.stderr, /--passes/);
+});
+
+test("min-votes filtering cannot hide one-pass blocking evidence or report convergence", (t) => {
+  const blocker = finding("Single-pass blocker", { severity: "High" });
+  const run = runReview(t, {
+    general: [{ findings: [blocker] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: ["--min-votes", "2", "--json"],
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.deepEqual(run.findings.findings.map(({ title }) => title), [blocker.title]);
+  assert.equal(run.metadata.analysis_state, "inconclusive");
+  const rendered = spawnSync(process.execPath, [poster], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      FINDINGS_FILE: run.findingsFile,
+      REVIEW_METADATA_FILE: run.metadataFile,
+      RENDER: "1",
+      REVIEW_MODE: "inline",
+      FAIL_ON_FINDINGS: "true",
+    },
+  });
+  assert.notEqual(rendered.status, 0);
+  assert.match(rendered.stdout, /\| Analysis \| `inconclusive` \|/);
+  assert.match(rendered.stdout, /\| Merge gate \| `blocked` \|/);
+  assert.match(rendered.stdout, /\| Bounded convergence \| `no` \|/);
+  assert.match(rendered.stdout, /Single-pass blocker/);
 });
 
 test("merge failure preserves a structured valid-pass artifact but is never complete", (t) => {

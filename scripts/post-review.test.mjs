@@ -25,6 +25,7 @@ import {
   shouldFailGate,
   upsertSummaryComment,
 } from "./post-review.mjs";
+import * as poster from "./post-review.mjs";
 import { deriveReviewState } from "./review-result.mjs";
 
 const BASE_SHA = "1".repeat(40);
@@ -118,6 +119,52 @@ test("summary marker round-trips only normalized carry-forward fields", () => {
   });
   assert.ok(!marker.includes("replacement"));
   assert.ok(!marker.includes("discard me"));
+});
+
+test("distinct held marker identities survive shared placeholder prose and keep the gate blocked", () => {
+  const held = [
+    finding({
+      severity: "Medium",
+      title: "Previously reported issue",
+      body: "Previously reported finding remains held from an earlier review sample.",
+      identity_tokens: ["cache", "eviction", "stale"],
+    }),
+    finding({
+      severity: "High",
+      title: "Previously reported issue",
+      body: "Previously reported finding remains held from an earlier review sample.",
+      identity_tokens: ["queue", "retry", "dropped"],
+    }),
+  ];
+  const reviewState = deriveReviewState({
+    analysisState: "complete",
+    current: [],
+    unresolved: held,
+    reconciliationKnown: true,
+    blockSeverities: ["Critical", "High"],
+  });
+
+  assert.deepEqual(reviewState.unresolved_counts, { Critical: 0, High: 1, Medium: 1 });
+  assert.equal(reviewState.merge_state, "blocked");
+  assert.equal(reviewState.sample_state, "findings");
+  const body = renderReviewBody({
+    mode: "summary",
+    metadata: metadata(),
+    state: reviewState,
+    current: [],
+    unresolved: held,
+  });
+  assert.equal(body.match(/Previously reported issue/g)?.length, 2);
+});
+
+test("malformed explicit marker identity tokens are rejected rather than weakened", () => {
+  assert.throws(
+    () => encodeSummaryMarker({
+      headSha: PRIOR_HEAD_SHA,
+      findings: [finding({ identity_tokens: ["valid", 42] })],
+    }),
+    /identity_tokens/,
+  );
 });
 
 test("decoder uses only the valid trailing standing marker", () => {
@@ -379,6 +426,105 @@ test("standing summary budgets visible prose without dropping safety state", () 
   assert.match(body, /<!-- agentic-review-summary:v1:/);
   assert.match(body, /display details truncated/i);
   assert.equal(decodeSummaryMarker(body).findings[0].severity, "High");
+});
+
+test("inline review top bodies budget oversized current and held prose with artifact references", () => {
+  const oversizedCurrent = finding({
+    title: "Oversized current detail",
+    body: incompressible(GITHUB_COMMENT_MAX_BYTES + 8_000),
+    suggestion: null,
+  });
+  const oversizedHeld = finding({
+    title: "Oversized held detail",
+    body: incompressible(GITHUB_COMMENT_MAX_BYTES + 9_000),
+    suggestion: null,
+  });
+  for (const [current, unresolved, expectedTitle] of [
+    [[oversizedCurrent], [], oversizedCurrent.title],
+    [[], [oversizedHeld], oversizedHeld.title],
+  ]) {
+    const body = poster.buildReviewTopBody({
+      mode: "inline",
+      metadata: metadata(),
+      state: state(),
+      current,
+      unresolved,
+    });
+    assert.ok(Buffer.byteLength(body) <= GITHUB_COMMENT_MAX_BYTES);
+    assert.match(body, /\| Merge gate \| `blocked` \|/);
+    assert.match(body, new RegExp(expectedTitle));
+    assert.match(body, /structured review artifact/i);
+  }
+});
+
+test("oversized inline prose is UTF-8 bounded while its identity stamp remains intact", () => {
+  const oversized = finding({
+    title: "Bounded inline comment",
+    body: `é${incompressible(GITHUB_COMMENT_MAX_BYTES + 8_000)}`,
+    suggestion: null,
+  });
+  const built = poster.buildReviewComments(
+    [oversized],
+    new Map([["src/cache.mjs", [[20, 22]]]]),
+    { mode: "inline" },
+  );
+  assert.equal(built.comments.length, 1);
+  assert.equal(built.unanchored.length, 0);
+  assert.ok(Buffer.byteLength(built.comments[0].body) <= GITHUB_COMMENT_MAX_BYTES);
+  assert.match(built.comments[0].body, /complete finding.*structured artifact/i);
+  assert.match(built.comments[0].body, /<!-- agentic-review-fp:[0-9a-f]{16} -->$/);
+});
+
+test("an oversized committable suggestion is omitted atomically and retained as a compact artifact note", () => {
+  const replacement = `replace_start();\n${incompressible(GITHUB_COMMENT_MAX_BYTES + 8_000)}\nreplace_end();`;
+  const oversized = finding({
+    title: "Atomic oversized suggestion",
+    body: "The complete replacement is too large for one GitHub review comment.",
+    suggestion: replacement,
+  });
+  const built = poster.buildReviewComments(
+    [oversized],
+    new Map([["src/cache.mjs", [[20, 22]]]]),
+    { mode: "suggest" },
+  );
+  assert.equal(built.comments.length, 0);
+  assert.equal(built.unanchored.length, 1);
+  assert.match(built.unanchored[0].reason, /suggestion.*limit/i);
+
+  const body = poster.buildReviewTopBody({
+    mode: "suggest",
+    metadata: metadata(),
+    state: state(),
+    current: [oversized],
+    unresolved: [],
+  });
+  assert.ok(Buffer.byteLength(body) <= GITHUB_COMMENT_MAX_BYTES);
+  assert.match(body, /Atomic oversized suggestion/);
+  assert.match(body, /structured review artifact/i);
+  assert.doesNotMatch(body, /replace_start|replace_end/);
+});
+
+test("review fallback keeps the already bounded body and cannot resend an oversized payload", () => {
+  const body = poster.buildReviewTopBody({
+    mode: "inline",
+    metadata: metadata(),
+    state: state(),
+    current: [finding({ body: incompressible(GITHUB_COMMENT_MAX_BYTES + 8_000), suggestion: null })],
+    unresolved: [],
+  });
+  const primary = {
+    commit_id: HEAD_SHA,
+    event: "COMMENT",
+    body,
+    comments: [{ path: "src/cache.mjs", side: "RIGHT", line: 22, body: "bounded" }],
+  };
+  const fallback = poster.reviewFallbackPayload(primary);
+  assert.deepEqual(fallback, { commit_id: HEAD_SHA, event: "COMMENT", body });
+  assert.ok(Buffer.byteLength(fallback.body) <= GITHUB_COMMENT_MAX_BYTES);
+  assert.throws(
+    () => poster.assertReviewPayloadBudget({ ...fallback, body: "x".repeat(GITHUB_COMMENT_MAX_BYTES + 1) }),
+    /body.*limit/i,
+  );
 });
 
 test("oversize safety markers and API bodies fail before POST or PATCH", async () => {

@@ -26,7 +26,7 @@
 #   --passes N          repeat the review N times and merge   $AGENTIC_REVIEW_PASSES
 #   --lenses a,b,c      one pass per concern, e.g. security,correctness,docs
 #                                                     $AGENTIC_REVIEW_LENSES
-#   --min-votes N       drop findings seen in fewer passes   $AGENTIC_REVIEW_MIN_VOTES
+#   --min-votes N       experimental threshold; always inconclusive, preserves unsafe drops
 #   --review-mode M     summary|inline|suggest        $AGENTIC_REVIEW_MODE
 #                       suggest prints the fixes it would offer on a PR
 #   --omp-version V     npm version or dist-tag       $AGENTIC_REVIEW_OMP_VERSION
@@ -257,6 +257,13 @@ destination_identity() {
     || die "output parent directory does not exist: $(dirname "$path")"
   printf '%s/%s' "$dir" "$(basename "$path")"
 }
+
+if [ -n "$OUT" ] && [ -L "$OUT" ]; then
+  die "--out cannot be a symlink destination"
+fi
+if [ -n "$METADATA_OUT" ] && [ -L "$METADATA_OUT" ]; then
+  die "--metadata-out cannot be a symlink destination"
+fi
 
 if [ -n "$OUT" ] && [ -n "$METADATA_OUT" ]; then
   OUT_IDENTITY="$(destination_identity "$OUT")"
@@ -492,9 +499,15 @@ command -v node >/dev/null 2>&1 || die "node is required for structured review r
 RUN_TMP="$(mktemp -d)"
 CODEGRAPH_READY=0
 CG=""
+CODEGRAPH_VERSION_FILE="$RUN_TMP/codegraph-version"
+CODEGRAPH_CONTEXT_FILE="$RUN_TMP/codegraph-context"
+: > "$CODEGRAPH_VERSION_FILE"
+: > "$CODEGRAPH_CONTEXT_FILE"
 if [ "$SOURCE_CODEGRAPH_OPT_IN" = 1 ] && [ "$SNAPSHOT_IMMUTABLE" = 1 ] \
    && command -v codegraph >/dev/null 2>&1 \
    && CG="$(support_exec scripts/codegraph.sh)"; then
+  codegraph --version > "$RUN_TMP/codegraph-version.tmp" 2>/dev/null || :
+  mv -f "$RUN_TMP/codegraph-version.tmp" "$CODEGRAPH_VERSION_FILE"
   # The live index only records local opt-in. Rebuild against the pinned tree so
   # stale symbols and concurrent checkout changes cannot enter any pass.
   _codegraph_prepared=1
@@ -517,6 +530,14 @@ if [ "$SOURCE_CODEGRAPH_OPT_IN" = 1 ] && [ "$SNAPSHOT_IMMUTABLE" = 1 ] \
   if git cat-file -e "$SOURCE_TARGET_SHA:codegraph.json" 2>/dev/null; then
     git -C "$REVIEW_ROOT" restore --source="$SOURCE_TARGET_SHA" --worktree -- codegraph.json \
       || die "could not restore codegraph.json in the review snapshot"
+  fi
+  if [ "$CODEGRAPH_READY" = 1 ]; then
+    if BASE_SHA="$SOURCE_BASE_SHA" HEAD_SHA="$SOURCE_TARGET_SHA" PROJECT="$REVIEW_ROOT" \
+      bash "$CG" > "$RUN_TMP/codegraph-context.tmp" 2>/dev/null; then
+      mv -f "$RUN_TMP/codegraph-context.tmp" "$CODEGRAPH_CONTEXT_FILE"
+    else
+      rm -f "$RUN_TMP/codegraph-context.tmp"
+    fi
   fi
 fi
 CHANGED_PATHS_FILE="$RUN_TMP/changed-paths"
@@ -658,9 +679,8 @@ build_prompt() {
       echo
       echo "Report at most $MAX_FINDINGS findings. If you have more, keep the most severe."
     fi
-    if [ "$CODEGRAPH_READY" = 1 ]; then
-      BASE_SHA="$SOURCE_BASE_SHA" HEAD_SHA="$SOURCE_TARGET_SHA" PROJECT="$REVIEW_ROOT" \
-        bash "$CG" 2>/dev/null || true
+    if [ "$CODEGRAPH_READY" = 1 ] && [ -s "$CODEGRAPH_CONTEXT_FILE" ]; then
+      cat "$CODEGRAPH_CONTEXT_FILE"
     fi
     echo
     echo "Reply with the single JSON object described above and nothing else — no prose, no code fence."
@@ -689,8 +709,8 @@ printf '%s\n' "${PASS_LENSES[@]}" > "$RUN_TMP/pass-lenses"
 CONFIG_FILE="$RUN_TMP/configuration.json"
 MODEL="$MODEL" THINKING="$THINKING" TOOLS="$TOOLS" MAX_TIME="$MAX_TIME" \
 OMP_VERSION="$OMP_VERSION" MAX_DIFF_BYTES="$MAX_DIFF_BYTES" MAX_FINDINGS="$MAX_FINDINGS" \
-MIN_VOTES="$MIN_VOTES" USE_CODEGRAPH="$USE_CODEGRAPH" PROMPT_FILE="$PROMPT_FILE" \
-FORMAT_FILE="$FORMAT_FILE" node -e '
+MIN_VOTES="$MIN_VOTES" USE_CODEGRAPH="$USE_CODEGRAPH" CODEGRAPH_READY="$CODEGRAPH_READY" \
+PROMPT_FILE="$PROMPT_FILE" FORMAT_FILE="$FORMAT_FILE" node -e '
   const fs = require("node:fs");
   const output = process.argv[1];
   const root = process.argv[2];
@@ -719,6 +739,9 @@ FORMAT_FILE="$FORMAT_FILE" node -e '
     finding_cap: Number(process.env.MAX_FINDINGS),
     min_votes: Number(process.env.MIN_VOTES),
     codegraph_enabled: process.env.USE_CODEGRAPH === "1",
+    codegraph_ready: process.env.CODEGRAPH_READY === "1",
+    codegraph_version: fs.readFileSync(`${root}/codegraph-version`, "utf8"),
+    codegraph_context: fs.readFileSync(`${root}/codegraph-context`, "utf8"),
     pass_descriptors,
     extra_omp_args: process.argv.slice(3),
   };
@@ -867,12 +890,27 @@ if [ ${#VALID_OUTS[@]} -eq 0 ]; then
 fi
 
 TMP_OUT="$RUN_TMP/merged.json"
+UNION_OUT="$RUN_TMP/union.json"
 MERGE_SUCCEEDED=true
-if ! node "$MERGE" --min-votes "$MIN_VOTES" "${VALID_OUTS[@]}" > "$TMP_OUT" \
-   || ! node "$MERGE" --check "$TMP_OUT" 2>/dev/null; then
+if ! node "$MERGE" --min-votes 1 "${VALID_OUTS[@]}" > "$UNION_OUT" \
+   || ! node "$MERGE" --check "$UNION_OUT" 2>/dev/null; then
   MERGE_SUCCEEDED=false
   say "merge failed — preserving the first valid structured pass as inconclusive"
   cp "${VALID_OUTS[0]}" "$TMP_OUT"
+elif [ "$MIN_VOTES" = 1 ]; then
+  mv "$UNION_OUT" "$TMP_OUT"
+else
+  MERGE_SUCCEEDED=false
+  if node "$MERGE" --min-votes "$MIN_VOTES" "${VALID_OUTS[@]}" > "$TMP_OUT" \
+     && node "$MERGE" --check "$TMP_OUT" 2>/dev/null; then
+    if ! cmp -s "$UNION_OUT" "$TMP_OUT"; then
+      say "min-votes $MIN_VOTES would hide valid evidence — preserving the union"
+      mv -f "$UNION_OUT" "$TMP_OUT"
+    fi
+  else
+    say "min-votes $MIN_VOTES merge failed — preserving the union"
+    mv -f "$UNION_OUT" "$TMP_OUT"
+  fi
 fi
 node "$MERGE" --check "$TMP_OUT" 2>/dev/null \
   || die "review result is not a structured findings document"

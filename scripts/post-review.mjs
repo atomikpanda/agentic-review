@@ -36,7 +36,14 @@ import { appendFileSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { deflateRawSync, inflateRawSync } from "node:zlib";
 
-import { sameFinding, tokenSet, similarity, SIMILARITY_DEFAULT } from "./lib-findings.mjs";
+import {
+  identityTokens,
+  isValidFinding,
+  sameFinding,
+  similarity,
+  SIMILARITY_DEFAULT,
+  tokenSet,
+} from "./lib-findings.mjs";
 import { deriveReviewState, validateRunMetadata } from "./review-result.mjs";
 import {
   GIT_DIFF_MAX_BUFFER_BYTES,
@@ -80,11 +87,17 @@ const HELD_FINDING_BODY = "Previously reported finding remains held from an earl
 const SHA_RE = /^[0-9a-f]{40}$/;
 
 function summaryIdentityTokens(value) {
-  const supplied = Array.isArray(value.identity_tokens)
-    ? value.identity_tokens
-    : [...tokenSet(`${value.title} ${value.body}`)];
-  return supplied
-    .filter((token) => typeof token === "string" && token.length > 0)
+  const explicit = value && typeof value === "object" && Object.hasOwn(value, "identity_tokens");
+  const tokens = identityTokens(value);
+  if (
+    !tokens
+    || tokens.length === 0
+    || (explicit && tokens.length > SUMMARY_IDENTITY_MAX_TOKENS)
+    || (explicit && tokens.some((token) => token.length > SUMMARY_IDENTITY_TOKEN_MAX_CHARS))
+  ) {
+    throw new TypeError("summary finding identity_tokens must be non-empty bounded strings");
+  }
+  return tokens
     .slice(0, SUMMARY_IDENTITY_MAX_TOKENS)
     .map((token) => token.slice(0, SUMMARY_IDENTITY_TOKEN_MAX_CHARS));
 }
@@ -291,7 +304,9 @@ function extractJson(text) {
   for (const c of candidates) {
     try {
       const parsed = JSON.parse(c);
-      if (parsed && Array.isArray(parsed.findings)) return parsed;
+      if (parsed && Array.isArray(parsed.findings) && parsed.findings.every(isValidFinding)) {
+        return parsed;
+      }
     } catch {
       /* try the next candidate */
     }
@@ -379,7 +394,7 @@ function commentBody(f, withSuggestion) {
 // ---------------------------------------------------------------------------
 const SEVERITY_ORDER = { Critical: 0, High: 1, Medium: 2 };
 
-function build(findings, ranges) {
+export function buildReviewComments(findings, ranges, { mode = REVIEW_MODE } = {}) {
   const comments = [];
   const unanchored = [];
 
@@ -411,9 +426,14 @@ function build(findings, ranges) {
       continue;
     }
 
+    const body = boundedCommentBody(f, mode === "suggest");
+    if (body === null) {
+      unanchored.push({ ...f, file, reason: "suggestion exceeds GitHub comment limit" });
+      continue;
+    }
     const comment = {
       path: file,
-      body: commentBody(f, REVIEW_MODE === "suggest"),
+      body,
       side: "RIGHT",
       line: end,
     };
@@ -486,6 +506,95 @@ export function renderReviewBody({ mode, metadata, state, current, unresolved })
 }
 
 export const GITHUB_COMMENT_MAX_BYTES = 65_536;
+
+function fitUtf8Bytes(value, maxBytes, suffix = "") {
+  const text = String(value ?? "");
+  if (Buffer.byteLength(text) <= maxBytes) return text;
+  const suffixBytes = Buffer.byteLength(suffix);
+  if (suffixBytes > maxBytes) throw new RangeError("UTF-8 suffix exceeds byte budget");
+  const available = maxBytes - suffixBytes;
+  let low = 0;
+  let high = text.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(text.slice(0, middle)) <= available) low = middle;
+    else high = middle - 1;
+  }
+  if (low > 0 && /[\uD800-\uDBFF]/.test(text[low - 1])) low -= 1;
+  return `${text.slice(0, low)}${suffix}`;
+}
+
+function boundedCommentBody(finding, withSuggestion) {
+  const full = commentBody(finding, withSuggestion);
+  if (Buffer.byteLength(full) <= GITHUB_COMMENT_MAX_BYTES) return full;
+  if (withSuggestion && typeof finding.suggestion === "string" && finding.suggestion.length > 0) {
+    return null;
+  }
+  const ending = "\n\n_Comment truncated; complete finding remains in the structured artifact._"
+    + stamp(fingerprint(finding));
+  const visible = `${badge(finding.severity)} — **${finding.title}**\n\n${finding.body}`;
+  return fitUtf8Bytes(visible, GITHUB_COMMENT_MAX_BYTES, ending);
+}
+
+function compactFindingLine(label, finding) {
+  const start = Number(finding.start_line);
+  const end = Number(finding.end_line ?? finding.start_line);
+  const span = Number.isInteger(start)
+    ? `:${start}${Number.isInteger(end) && end !== start ? `-${end}` : ""}`
+    : "";
+  const path = fitUtf8Bytes(String(finding.file ?? "").replace(/^\.\//, ""), 512, "…");
+  const title = fitUtf8Bytes(String(finding.title ?? "").trim(), 512, "…");
+  return `- ${label} ${badge(finding.severity)} — **${title}** (\`${path}${span}\`)`;
+}
+
+export function buildReviewTopBody({ mode, metadata, state, current, unresolved }) {
+  const full = renderReviewBody({ mode, metadata, state, current, unresolved });
+  if (Buffer.byteLength(full) <= GITHUB_COMMENT_MAX_BYTES) return full;
+
+  const out = ["### Agentic review", "", renderStateTable(metadata, state), ""];
+  let omitted = 0;
+  const footer = "_Finding prose was compacted for GitHub's request limit; complete findings and "
+    + "suggestions remain in the structured review artifact._";
+  for (const [label, findings] of [["Current:", current], ["Held:", unresolved]]) {
+    for (const finding of findings) {
+      const line = compactFindingLine(label, finding);
+      const candidate = [...out, line, "", footer].join("\n");
+      if (Buffer.byteLength(candidate) <= GITHUB_COMMENT_MAX_BYTES) out.push(line);
+      else omitted += 1;
+    }
+  }
+  if (omitted > 0) {
+    const note = `- ${omitted} additional finding(s) omitted from this body.`;
+    const candidate = [...out, note, "", footer].join("\n");
+    if (Buffer.byteLength(candidate) <= GITHUB_COMMENT_MAX_BYTES) out.push(note);
+  }
+  out.push("", footer);
+  const body = out.join("\n");
+  if (Buffer.byteLength(body) > GITHUB_COMMENT_MAX_BYTES) {
+    throw new RangeError("review body safety state exceeds GitHub comment limit");
+  }
+  return body;
+}
+
+export function assertReviewPayloadBudget(payload) {
+  if (typeof payload?.body !== "string" || Buffer.byteLength(payload.body) > GITHUB_COMMENT_MAX_BYTES) {
+    throw new RangeError("review body exceeds GitHub comment limit");
+  }
+  for (const [index, comment] of (payload.comments ?? []).entries()) {
+    if (typeof comment?.body !== "string" || Buffer.byteLength(comment.body) > GITHUB_COMMENT_MAX_BYTES) {
+      throw new RangeError(`review comment ${index} exceeds GitHub comment limit`);
+    }
+  }
+  return payload;
+}
+
+export function reviewFallbackPayload(payload) {
+  return assertReviewPayloadBudget({
+    commit_id: payload.commit_id,
+    event: payload.event,
+    body: payload.body,
+  });
+}
 
 export function buildStandingSummaryBody({ metadata, state, current, unresolved }) {
   const marker = encodeSummaryMarker({
@@ -846,6 +955,7 @@ async function retireThread(t, head) {
 }
 
 async function postReview(payload) {
+  assertReviewPayloadBudget(payload);
   if (DRY_RUN) {
     console.log("  [suppressed] would post a review with " + (payload.comments?.length ?? 0) + " inline comment(s)");
     return { ok: true, status: 0, text: "" };
@@ -1051,9 +1161,9 @@ async function runInlineMode({ metadata, findings, repo, pr, botLogin, identityK
   const ranges = fresh.length > 0
     ? commentableRanges(metadata.base_sha, metadata.head_sha)
     : new Map();
-  const { comments, unanchored } = build(fresh, ranges);
+  const { comments, unanchored } = buildReviewComments(fresh, ranges, { mode: REVIEW_MODE });
   const state = deriveState(metadata, current, unresolved, reconciliationKnown);
-  const body = renderReviewBody({
+  const body = buildReviewTopBody({
     mode: REVIEW_MODE,
     metadata,
     state,
@@ -1096,11 +1206,7 @@ async function runInlineMode({ metadata, findings, repo, pr, botLogin, identityK
   if (!response.ok) {
     console.log(`::warning::inline review rejected (${response.status}) — falling back to a non-inline review`);
     console.log(response.text.slice(0, 1000));
-    response = await postReview({
-      commit_id: payload.commit_id,
-      event: "COMMENT",
-      body,
-    });
+    response = await postReview(reviewFallbackPayload(payload));
     if (!response.ok) {
       throw new Error(`could not post the review (${response.status}): ${response.text.slice(0, 1000)}`);
     }

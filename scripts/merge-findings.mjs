@@ -22,24 +22,10 @@
 
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { sameFinding, SIMILARITY_DEFAULT } from "./lib-findings.mjs";
+import { isValidFinding, sameFinding, SIMILARITY_DEFAULT } from "./lib-findings.mjs";
 
 const SEVERITY_RANK = { Critical: 0, High: 1, Medium: 2 };
 
-function isValidFinding(value) {
-  return value !== null
-    && typeof value === "object"
-    && !Array.isArray(value)
-    && typeof value.file === "string"
-    && typeof value.title === "string"
-    && typeof value.body === "string"
-    && Object.hasOwn(SEVERITY_RANK, value.severity)
-    && Number.isInteger(value.start_line)
-    && value.start_line > 0
-    && Number.isInteger(value.end_line)
-    && value.end_line >= value.start_line
-    && (typeof value.suggestion === "string" || value.suggestion === null);
-}
 
 function isValidDocument(value) {
   return value !== null
