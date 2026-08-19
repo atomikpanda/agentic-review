@@ -229,6 +229,7 @@ function runReview(t, plan, {
   includeOutputs = true,
   metadataViaEnv = false,
   noState = true,
+  noFail = true,
   failMerge = false,
   failWorktree = false,
   fakeCodegraph: useFakeCodegraph = false,
@@ -267,7 +268,7 @@ function runReview(t, plan, {
     runner,
     ...(staged ? ["--staged"] : ["--base", "main"]),
     ...(useFakeCodegraph ? [] : ["--no-codegraph"]),
-    "--no-fail",
+    ...(noFail ? ["--no-fail"] : []),
     ...(noState ? ["--no-state"] : []),
     ...(includeOutputs
       ? [
@@ -870,9 +871,14 @@ test("local suggest rendering consumes generated metadata and keeps the replacem
   assert.doesNotMatch(run.result.stdout, /^\{\"findings\":/);
 });
 
-test("local rendering holds an omitted unchanged finding and retires it after its file changes", (t) => {
+test("local rendering holds a multi-line finding across unrelated hunks and retires it after overlap", (t) => {
+  const baseLines = Array.from({ length: 24 }, (_, index) => `base line ${index + 1}`);
+  const reportedLines = [...baseLines];
+  reportedLines[0] = "reported head";
   const prior = finding("Persistent local defect", {
     file: "alpha.txt",
+    start_line: 8,
+    end_line: 10,
     severity: "High",
   });
   const first = runReview(t, {
@@ -881,6 +887,8 @@ test("local rendering holds an omitted unchanged finding and retires it after it
     boundaries: [{ findings: [] }],
   }, {
     args: [],
+    baseFiles: { "alpha.txt": `${baseLines.join("\n")}\n` },
+    targetFiles: { "alpha.txt": `${reportedLines.join("\n")}\n` },
     noState: false,
   });
   assert.equal(first.result.status, 0, first.result.stderr);
@@ -892,32 +900,40 @@ test("local rendering holds an omitted unchanged finding and retires it after it
     correctness: [{ findings: [] }],
     boundaries: [{ findings: [] }],
   };
-  const unchanged = runReview(t, omitted, {
+  const unrelatedLines = [...reportedLines];
+  unrelatedLines[19] = "unrelated change";
+  writeFileSync(join(first.repository, "alpha.txt"), `${unrelatedLines.join("\n")}\n`);
+  git(first.repository, "commit", "-am", "change unrelated hunk");
+  const unrelated = runReview(t, omitted, {
     args: [],
     existingFixture: first,
     noState: false,
   });
-  assert.equal(unchanged.result.status, 0, unchanged.result.stderr);
-  assert.match(unchanged.result.stdout, /\| Sample \| `findings` \|/);
-  assert.match(unchanged.result.stdout, /\| Bounded convergence \| `no` \|/);
-  assert.match(unchanged.result.stdout, /\| Held\/unresolved findings \| `Critical: 0 · High: 1 · Medium: 0` \|/);
+  assert.equal(unrelated.result.status, 0, unrelated.result.stderr);
+  assert.match(unrelated.result.stdout, /\| Sample \| `findings` \|/);
+  assert.match(unrelated.result.stdout, /\| Bounded convergence \| `no` \|/);
+  assert.match(unrelated.result.stdout, /\| Held\/unresolved findings \| `Critical: 0 · High: 1 · Medium: 0` \|/);
 
-  writeFileSync(join(first.repository, "alpha.txt"), "alpha changed again\n");
-  git(first.repository, "add", "alpha.txt");
-  git(first.repository, "commit", "-m", "change reported file");
-  const changed = runReview(t, omitted, {
+  unrelatedLines[8] = "overlapping change";
+  writeFileSync(join(first.repository, "alpha.txt"), `${unrelatedLines.join("\n")}\n`);
+  git(first.repository, "commit", "-am", "change reported span");
+  const overlapping = runReview(t, omitted, {
     args: [],
     existingFixture: first,
     noState: false,
   });
-  assert.equal(changed.result.status, 0, changed.result.stderr);
-  assert.match(changed.result.stdout, /\| Sample \| `clean` \|/);
-  assert.match(changed.result.stdout, /\| Bounded convergence \| `yes` \|/);
+  assert.equal(overlapping.result.status, 0, overlapping.result.stderr);
+  assert.match(overlapping.result.stdout, /\| Sample \| `clean` \|/);
+  assert.match(overlapping.result.stdout, /\| Bounded convergence \| `yes` \|/);
 });
 
-test("local state record failure makes an empty rendered sample unknown", (t) => {
+test("malformed readable local state is not overwritten and makes rendering unknown", (t) => {
   const fixture = createFixture(t);
-  mkdirSync(join(fixture.repository, ".git", "agentic-review", "state.json"), { recursive: true });
+  const stateDirectory = join(fixture.repository, ".git", "agentic-review");
+  const statePath = join(stateDirectory, "state.json");
+  const malformed = "{\"findings\":";
+  mkdirSync(stateDirectory, { recursive: true });
+  writeFileSync(statePath, malformed);
   const run = runReview(t, {
     general: [{ findings: [] }],
     correctness: [{ findings: [] }],
@@ -931,6 +947,41 @@ test("local state record failure makes an empty rendered sample unknown", (t) =>
   assert.equal(run.result.status, 0, run.result.stderr);
   assert.match(run.result.stdout, /\| Sample \| `unknown` \|/);
   assert.match(run.result.stdout, /\| Bounded convergence \| `no` \|/);
+  assert.equal(readFileSync(statePath, "utf8"), malformed);
+});
+
+test("--no-state reads held findings for state and default exit without mutating history", (t) => {
+  const high = finding("Held local blocker", { file: "alpha.txt", severity: "High" });
+  const medium = finding("Held local advisory", { file: "beta.txt", severity: "Medium" });
+  const first = runReview(t, {
+    general: [{ findings: [high, medium] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    noState: false,
+  });
+  assert.equal(first.result.status, 0, first.result.stderr);
+  const statePath = join(first.repository, ".git", "agentic-review", "state.json");
+  const stateBefore = readFileSync(statePath);
+
+  const held = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    existingFixture: first,
+    noFail: false,
+    noState: true,
+  });
+
+  assert.equal(held.result.status, 1, held.result.stderr);
+  assert.match(held.result.stdout, /\| Merge gate \| `blocked` \|/);
+  assert.match(held.result.stdout, /\| Sample \| `findings` \|/);
+  assert.match(held.result.stdout, /\| Bounded convergence \| `no` \|/);
+  assert.match(held.result.stdout, /\| Held\/unresolved findings \| `Critical: 0 · High: 1 · Medium: 1` \|/);
+  assert.deepEqual(readFileSync(statePath), stateBefore);
 });
 
 function diffFileOrder(prompt) {

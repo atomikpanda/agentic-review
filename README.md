@@ -39,10 +39,10 @@ review --history             # past runs
 
 State lives in the repository's git common directory — per-repo, shared across
 worktrees, never committable. Each run reports `N new, N recurring` rather than
-re-listing everything, and a finding is only marked **gone** when the file it
-pointed at actually changed. If the file is unchanged or its change cannot be
-determined, the finding stays open: a later sample failing to mention it is
-not the same as it being fixed.
+re-listing everything. A finding is marked **gone** only when a changed hunk
+overlaps its latest confirmed inclusive line span. An unrelated change in the
+same file, an invalid old span, or an indeterminate Git result keeps it open: a
+later sample failing to mention it is not the same as it being fixed.
 
 [`skills/review-loop/SKILL.md`](skills/review-loop/SKILL.md) describes the
 bounded review/fix workflow, including its three-round stop.
@@ -83,8 +83,8 @@ metadata inconclusive rather than presenting the fallback as merged.
 `--metadata-out FILE` writes that bounded-run metadata: immutable base and head
 SHAs, the configuration fingerprint, diff and cap status, requested/completed
 pass identifiers, per-pass status, and `analysis_state`. The paths must resolve
-to different destinations. `--no-state` leaves the git-common-directory history
-untouched. Advanced local experiments
+to different destinations. `--no-state` still reads existing history for the
+rendered state and exit status but never mutates it. Advanced local experiments
 can change the ensemble with `--passes N`, `--lenses a,b,c`, and
 `--min-votes N`; pass/lens changes appear in the metadata identifiers, and all
 three change the configuration fingerprint.

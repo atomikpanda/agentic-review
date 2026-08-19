@@ -49,9 +49,10 @@ identical in the output:
 2. The reviewer did not mention it this time.
 
 The second happens often — identical configurations have produced 5, 6, 7, 8 and
-9 findings out of the same 11 on unchanged input. So `review --open` reports a
-finding as gone only when the **file it pointed at actually changed**. If the
-file is untouched, it stays open and the run says `unreported but unchanged`.
+9 findings out of the same 11 on unchanged input. `review --open` reports a
+finding as gone only after a changed hunk overlaps its latest confirmed line
+span. Unrelated same-file changes and indeterminate comparisons leave it open,
+and the run says `unreported without confirmed overlap`.
 
 Treat that phrase as a warning, not as progress.
 

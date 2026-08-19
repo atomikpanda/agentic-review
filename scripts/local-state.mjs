@@ -14,7 +14,7 @@
 // Usage:
 //   local-state.mjs record <findings.json> <base> <head>   merge a run into state
 //   local-state.mjs list [open|all|dismissed]              print tracked findings
-//   local-state.mjs export-open                           print open findings JSON
+//   local-state.mjs export-open                            print open findings JSON
 //   local-state.mjs dismiss <id>...                        stop reporting these
 //   local-state.mjs reopen <id>...
 //   local-state.mjs runs                                   past runs, newest first
@@ -23,15 +23,33 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import {
+  GIT_DIFF_MAX_BUFFER_BYTES,
+  changeIsConfirmed,
+  diffTouchesSpan,
+  literalPathspec,
+} from "./thread-change.mjs";
 import { sameFinding } from "./lib-findings.mjs";
 
 const git = (args) => execFileSync("git", args, { encoding: "utf8" }).trim();
 const STATE_DIR = join(git(["rev-parse", "--git-common-dir"]), "agentic-review");
 const RUNS_DIR = join(STATE_DIR, "runs");
 const STATE_FILE = join(STATE_DIR, "state.json");
-
 const load = () => {
-  try { return JSON.parse(readFileSync(STATE_FILE, "utf8")); } catch { return { findings: [] }; }
+  try {
+    const state = JSON.parse(readFileSync(STATE_FILE, "utf8"));
+    if (!state || typeof state !== "object" || !Array.isArray(state.findings)) {
+      throw new TypeError("local review state must contain a findings array");
+    }
+    for (const finding of state.findings) {
+      if (finding.endLine === undefined) finding.endLine = finding.line;
+      if (finding.lastCommit === undefined) finding.lastCommit = finding.firstCommit;
+    }
+    return state;
+  } catch (error) {
+    if (error?.code === "ENOENT") return { findings: [] };
+    throw error;
+  }
 };
 const save = (s) => {
   mkdirSync(STATE_DIR, { recursive: true });
@@ -45,13 +63,35 @@ const idFor = (f) =>
     .digest("hex")
     .slice(0, 6);
 
-function fileChangedSince(path, sinceCommit, head) {
-  if (!path || !sinceCommit) return null;
+function spanChangedSince(finding, head) {
+  if (
+    !finding.file
+    || !finding.lastCommit
+    || !head
+    || !Number.isInteger(finding.line)
+    || !Number.isInteger(finding.endLine)
+  ) return null;
   try {
-    execFileSync("git", ["diff", "--quiet", sinceCommit, head, "--", path], { stdio: "ignore" });
-    return false;
-  } catch (e) {
-    return e.status === 1 ? true : null;
+    const diff = execFileSync(
+      "git",
+      [
+        "diff",
+        "--unified=0",
+        "--no-ext-diff",
+        finding.lastCommit,
+        head,
+        "--",
+        literalPathspec(finding.file),
+      ],
+      {
+        encoding: "utf8",
+        maxBuffer: GIT_DIFF_MAX_BUFFER_BYTES,
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
+    return diffTouchesSpan(diff, finding.line, finding.endLine);
+  } catch {
+    return null;
   }
 }
 
@@ -93,6 +133,8 @@ if (cmd === "record") {
       known.count = (known.count ?? 1) + 1;
       known.severity = f.severity ?? known.severity;
       known.line = f.start_line ?? known.line;
+      known.endLine = f.end_line ?? f.start_line ?? known.endLine;
+      known.lastCommit = head;
       if (known.status === "dismissed") { muted++; continue; }
       // Reported again after being marked gone: the defect returned, so the
       // record has to return with it rather than staying closed forever.
@@ -103,21 +145,21 @@ if (cmd === "record") {
       seen.add(id);
       state.findings.push({
         id, file: f.file, title: f.title, body: f.body, severity: f.severity,
-        line: f.start_line, status: "open", firstSeen: now, lastSeen: now,
-        firstCommit: head, count: 1,
+        line: f.start_line, endLine: f.end_line ?? f.start_line, status: "open",
+        firstSeen: now, lastSeen: now, firstCommit: head, lastCommit: head,
+        count: 1,
       });
       fresh++;
     }
   }
-
-  // Anything previously open and not reported now: retired, but only when the
-  // file it pointed at has changed. If nothing changed under it, the reviewer
-  // just failed to mention it this time, which is not the same as fixed.
+  // Anything previously open and not reported now retires only after a changed
+  // hunk overlaps its latest confirmed span. Unrelated changes, invalid spans,
+  // and indeterminate Git results retain the finding.
   let retired = 0, unexplained = 0;
   for (const k of state.findings) {
     if (k.status !== "open" || seen.has(k.id)) continue;
-    const changed = fileChangedSince(k.file, k.firstCommit, head);
-    if (changed === true) { k.status = "gone"; k.goneAt = now; retired++; }
+    const changed = spanChangedSince(k, head);
+    if (changeIsConfirmed(changed)) { k.status = "gone"; k.goneAt = now; retired++; }
     else unexplained++;
   }
 
@@ -130,7 +172,7 @@ if (cmd === "record") {
   const bits = [`${fresh} new`, `${again} recurring`];
   if (muted) bits.push(`${muted} dismissed`);
   if (retired) bits.push(`${retired} gone`);
-  if (unexplained) bits.push(`${unexplained} unreported but unchanged`);
+  if (unexplained) bits.push(`${unexplained} unreported without confirmed overlap`);
   console.log(bits.join(", "));
   process.exit(0);
 }
@@ -145,7 +187,7 @@ if (cmd === "export-open") {
       body: finding.body,
       severity: finding.severity,
       start_line: finding.line,
-      end_line: finding.line,
+      end_line: finding.endLine,
       suggestion: null,
     }));
   process.stdout.write(`${JSON.stringify({ findings })}\n`);

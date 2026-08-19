@@ -891,21 +891,27 @@ write_metadata "$MERGE_SUCCEEDED"
 
 LOCAL_UNRESOLVED_FILE="$RUN_TMP/local-unresolved.json"
 printf '%s\n' '{"findings":[]}' > "$LOCAL_UNRESOLVED_FILE"
-LOCAL_RECONCILIATION_KNOWN=true
-if [ "$RECORD_STATE" = 1 ]; then
-  LOCAL_RECONCILIATION_KNOWN=false
-  local_unresolved_tmp="$LOCAL_UNRESOLVED_FILE.tmp"
-  if ST="$(support_exec scripts/local-state.mjs)" \
-    && _delta="$(node "$ST" record "$TMP_OUT" "$BASE_SHA" "$HEAD_SHA" 2>/dev/null)" \
+LOCAL_RECONCILIATION_KNOWN=false
+local_unresolved_tmp="$LOCAL_UNRESOLVED_FILE.tmp"
+if ST="$(support_exec scripts/local-state.mjs)"; then
+  state_ready=1
+  if [ "$RECORD_STATE" = 1 ]; then
+    if _delta="$(node "$ST" record "$TMP_OUT" "$BASE_SHA" "$HEAD_SHA" 2>/dev/null)"; then
+      say "state: $_delta"
+    else
+      state_ready=0
+    fi
+  fi
+  if [ "$state_ready" = 1 ] \
     && node "$ST" export-open > "$local_unresolved_tmp" 2>/dev/null \
     && node "$MERGE" --check "$local_unresolved_tmp" 2>/dev/null; then
     mv -f "$local_unresolved_tmp" "$LOCAL_UNRESOLVED_FILE"
     LOCAL_RECONCILIATION_KNOWN=true
-    say "state: $_delta"
-  else
-    rm -f "$local_unresolved_tmp"
-    say "state reconciliation unavailable"
   fi
+fi
+if [ "$LOCAL_RECONCILIATION_KNOWN" != true ]; then
+  rm -f "$local_unresolved_tmp"
+  say "state reconciliation unavailable"
 fi
 
 CLEAN=0
