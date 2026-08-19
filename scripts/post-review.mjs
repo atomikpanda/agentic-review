@@ -34,7 +34,7 @@ import { appendFileSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { deflateRawSync, inflateRawSync } from "node:zlib";
 
-import { sameFinding, tokenSet, similarity, SIMILARITY_DEFAULT } from "./lib-findings.mjs";
+import { tokenSet, similarity, SIMILARITY_DEFAULT } from "./lib-findings.mjs";
 import { deriveReviewState, validateRunMetadata } from "./review-result.mjs";
 import {
   GIT_DIFF_MAX_BUFFER_BYTES,
@@ -67,10 +67,25 @@ const stamp = (fp) => `\n\n<!-- ${MARKER}:${fp} -->`;
 const SUMMARY_MARKER = "agentic-review-summary";
 const SUMMARY_MARKER_VERSION = 1;
 const SUMMARY_STATE_MAX_BYTES = 1024 * 1024;
-const SUMMARY_MARKER_RE = /<!-- agentic-review-summary:v1:([A-Za-z0-9_-]+) -->/;
-const SUMMARY_MARKER_PRESENT_RE = /<!-- agentic-review-summary:v\d+:[^>]*-->/;
-const SUMMARY_SEVERITIES = new Set(["Critical", "High", "Medium"]);
+const SUMMARY_MARKER_RE = /<!-- agentic-review-summary:v1:([A-Za-z0-9_-]+) -->\s*$/;
+const SUMMARY_MARKER_PRESENT_RE = /<!-- agentic-review-summary:v\d+:[^>]*-->\s*$/;
+const SUMMARY_SEVERITIES = ["Critical", "High", "Medium"];
+const SUMMARY_SEVERITY_SET = new Set(SUMMARY_SEVERITIES);
+const SUMMARY_TITLE_MAX_CHARS = 240;
+const SUMMARY_IDENTITY_MAX_TOKENS = 32;
+const SUMMARY_IDENTITY_TOKEN_MAX_CHARS = 64;
+const HELD_FINDING_BODY = "Previously reported finding remains held from an earlier review sample.";
 const SHA_RE = /^[0-9a-f]{40}$/;
+
+function summaryIdentityTokens(value) {
+  const supplied = Array.isArray(value.identity_tokens)
+    ? value.identity_tokens
+    : [...tokenSet(`${value.title} ${value.body}`)];
+  return supplied
+    .filter((token) => typeof token === "string" && token.length > 0)
+    .slice(0, SUMMARY_IDENTITY_MAX_TOKENS)
+    .map((token) => token.slice(0, SUMMARY_IDENTITY_TOKEN_MAX_CHARS));
+}
 
 function normalizeSummaryFinding(value, index) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -82,7 +97,7 @@ function normalizeSummaryFinding(value, index) {
   if (!file || !Number.isInteger(startLine) || startLine < 1 || !Number.isInteger(endLine) || endLine < startLine) {
     throw new TypeError(`summary findings[${index}] must have a path and valid inclusive line span`);
   }
-  if (!SUMMARY_SEVERITIES.has(value.severity)) {
+  if (!SUMMARY_SEVERITY_SET.has(value.severity)) {
     throw new TypeError(`summary findings[${index}].severity is invalid`);
   }
   if (typeof value.title !== "string" || !value.title || typeof value.body !== "string" || !value.body) {
@@ -93,17 +108,46 @@ function normalizeSummaryFinding(value, index) {
     start_line: startLine,
     end_line: endLine,
     severity: value.severity,
-    title: value.title,
-    body: value.body,
+    title: value.title.slice(0, SUMMARY_TITLE_MAX_CHARS),
+    body: HELD_FINDING_BODY,
+    identity_tokens: summaryIdentityTokens(value),
   };
+}
+
+function encodeSummaryFinding(value, index) {
+  const finding = normalizeSummaryFinding(value, index);
+  return [
+    finding.file,
+    finding.start_line,
+    finding.end_line,
+    SUMMARY_SEVERITIES.indexOf(finding.severity),
+    finding.title,
+    finding.identity_tokens,
+  ];
+}
+
+function decodeSummaryFinding(value, index) {
+  if (!Array.isArray(value) || value.length !== 6 || !Array.isArray(value[5])) {
+    throw new TypeError(`summary findings[${index}] has an invalid compact shape`);
+  }
+  const severity = SUMMARY_SEVERITIES[value[3]];
+  return normalizeSummaryFinding({
+    file: value[0],
+    start_line: value[1],
+    end_line: value[2],
+    severity,
+    title: value[4],
+    body: HELD_FINDING_BODY,
+    identity_tokens: value[5],
+  }, index);
 }
 
 export function encodeSummaryMarker({ headSha, findings }) {
   if (!SHA_RE.test(headSha)) throw new TypeError("summary headSha must be a lowercase 40-character SHA");
   if (!Array.isArray(findings)) throw new TypeError("summary findings must be an array");
   const state = {
-    head_sha: headSha,
-    findings: findings.map(normalizeSummaryFinding),
+    h: headSha,
+    f: findings.map(encodeSummaryFinding),
   };
   const encoded = deflateRawSync(Buffer.from(JSON.stringify(state))).toString("base64url");
   return `<!-- ${SUMMARY_MARKER}:v${SUMMARY_MARKER_VERSION}:${encoded} -->`;
@@ -117,13 +161,13 @@ export function decodeSummaryMarker(body) {
       maxOutputLength: SUMMARY_STATE_MAX_BYTES,
     }).toString("utf8");
     const parsed = JSON.parse(text);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !SHA_RE.test(parsed.head_sha)) {
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !SHA_RE.test(parsed.h)) {
       return null;
     }
-    if (!Array.isArray(parsed.findings)) return null;
+    if (!Array.isArray(parsed.f)) return null;
     return {
-      head_sha: parsed.head_sha,
-      findings: parsed.findings.map(normalizeSummaryFinding),
+      head_sha: parsed.h,
+      findings: parsed.f.map(decodeSummaryFinding),
     };
   } catch {
     return null;
@@ -131,12 +175,12 @@ export function decodeSummaryMarker(body) {
 }
 
 function isBotComment(comment, botLogin) {
-  const login = comment?.user?.login ?? "";
   return comment?.user?.type === "Bot"
-    && (/^github-actions(?:\[bot\])?$/.test(login) || (botLogin && login === botLogin));
+    && typeof botLogin === "string"
+    && comment?.user?.login === botLogin;
 }
 
-export function selectSummaryHistory(comments, { botLogin = "github-actions[bot]" } = {}) {
+export function selectSummaryHistory(comments, { botLogin } = {}) {
   const candidates = (Array.isArray(comments) ? comments : [])
     .filter((comment) => isBotComment(comment, botLogin) && SUMMARY_MARKER_PRESENT_RE.test(String(comment.body ?? "")))
     .sort((left, right) => {
@@ -159,6 +203,16 @@ export function selectSummaryHistory(comments, { botLogin = "github-actions[bot]
   };
 }
 
+function sameSummaryFinding(left, right) {
+  const leftFile = String(left.file ?? "").replace(/^\.\//, "");
+  const rightFile = String(right.file ?? "").replace(/^\.\//, "");
+  if (leftFile !== rightFile) return false;
+  return similarity(
+    new Set(summaryIdentityTokens(left)),
+    new Set(summaryIdentityTokens(right)),
+  ) >= SIMILARITY;
+}
+
 export async function reconcileSummaryFindings({
   current,
   prior,
@@ -170,7 +224,7 @@ export async function reconcileSummaryFindings({
   const retired = [];
   let reconciliationKnown = true;
   for (const previous of prior) {
-    if (current.some((candidate) => sameFinding(candidate, previous))) continue;
+    if (current.some((candidate) => sameSummaryFinding(candidate, previous))) continue;
     let changed = null;
     try {
       changed = await spanChanged(previous, priorHeadSha, headSha);
@@ -395,7 +449,7 @@ export function renderStateTable(metadata, state) {
   ].join("\n");
 }
 
-function appendFindings(out, heading, findings) {
+function appendFindings(out, heading, findings, mode) {
   if (findings.length === 0) return;
   out.push("", `#### ${heading}`, "");
   for (const finding of findings) {
@@ -408,8 +462,13 @@ function appendFindings(out, heading, findings) {
       `\`${String(finding.file).replace(/^\.\//, "")}${span}\``,
       "",
       finding.body,
-      "",
     );
+    if (mode === "suggest" && typeof finding.suggestion === "string" && finding.suggestion.length > 0) {
+      const replacement = finding.suggestion.replace(/\n+$/, "");
+      const fence = fenceFor(replacement);
+      out.push("", `${fence}suggestion`, replacement, fence);
+    }
+    out.push("");
   }
   if (out.at(-1) === "") out.pop();
 }
@@ -419,9 +478,38 @@ export function renderReviewBody({ mode, metadata, state, current, unresolved })
     throw new TypeError("review mode must be summary, inline, or suggest");
   }
   const out = ["### Agentic review", "", renderStateTable(metadata, state)];
-  appendFindings(out, "Current findings", current);
-  appendFindings(out, "Held findings", unresolved);
+  appendFindings(out, "Current findings", current, mode);
+  appendFindings(out, "Held findings", unresolved, mode);
   return out.join("\n");
+}
+
+export const GITHUB_COMMENT_MAX_BYTES = 65_536;
+
+export function buildStandingSummaryBody({ metadata, state, current, unresolved }) {
+  const marker = encodeSummaryMarker({
+    headSha: metadata.head_sha,
+    findings: [...current, ...unresolved],
+  });
+  const full = `${renderReviewBody({
+    mode: "summary",
+    metadata,
+    state,
+    current,
+    unresolved,
+  })}\n\n${marker}`;
+  if (Buffer.byteLength(full) <= GITHUB_COMMENT_MAX_BYTES) return full;
+
+  const safetyOnly = `${renderReviewBody({
+    mode: "summary",
+    metadata,
+    state,
+    current: [],
+    unresolved: [],
+  })}\n\n_Display details truncated to retain the complete standing review state._\n\n${marker}`;
+  if (Buffer.byteLength(safetyOnly) > GITHUB_COMMENT_MAX_BYTES) {
+    throw new RangeError("standing summary safety marker exceeds GitHub comment limit");
+  }
+  return safetyOnly;
 }
 
 export function emitWorkflowResult({ metadata, state, outputFile, summaryFile }) {
@@ -470,6 +558,28 @@ async function graphql(query, variables) {
   return json.data;
 }
 
+export async function fetchViewerLogin({ token, fetchImpl = fetch }) {
+  const res = await fetchImpl("https://api.github.com/graphql", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ query: "query { viewer { login } }" }),
+  });
+  const json = await res.json().catch(() => null);
+  const login = json?.data?.viewer?.login;
+  if (
+    !res.ok
+    || json?.errors
+    || typeof login !== "string"
+    || (!login.endsWith("[bot]") && login !== "github-actions")
+  ) {
+    throw new Error(`could not establish authenticated bot identity (${res.status})`);
+  }
+  return login;
+}
+
 export async function fetchSummaryComments({ repo, pr, token, fetchImpl = fetch }) {
   const comments = [];
   for (let page = 1; ; page += 1) {
@@ -503,6 +613,9 @@ export async function upsertSummaryComment({
 }) {
   if (!existingComment && !hasFindings) return "skipped";
   if (!writesEnabled) return "suppressed";
+  if (Buffer.byteLength(body) > GITHUB_COMMENT_MAX_BYTES) {
+    throw new RangeError("summary comment exceeds GitHub comment limit");
+  }
   const updating = Boolean(existingComment);
   const url = updating
     ? `https://api.github.com/repos/${repo}/issues/comments/${existingComment.id}`
@@ -523,46 +636,57 @@ export async function upsertSummaryComment({
   return updating ? "updated" : "created";
 }
 
-// Only threads this reviewer started are ever touched. A human's thread has no
-// marker, so it cannot match — resolving someone else's review comment would be
-// a far worse failure than leaving a stale one.
-async function ourThreads() {
-  const [owner, name] = required("GITHUB_REPO").split("/");
-  const data = await graphql(
-    `query($owner:String!,$name:String!,$pr:Int!){
-       repository(owner:$owner,name:$name){
-         pullRequest(number:$pr){
-           reviewThreads(first:100){
-             nodes{ id isResolved isOutdated path originalStartLine originalLine
-                    comments(first:1){ nodes{ databaseId body author{login}
-                                              originalCommit{ oid } } } } } } } }`,
-    { owner, name, pr: Number(required("PR_NUMBER")) },
-  );
-  const nodes = data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
+// Only threads authored by the authenticated token identity are ever touched.
+export async function fetchOurThreads({
+  owner,
+  name,
+  pr,
+  botLogin,
+  graphqlImpl = graphql,
+}) {
   const out = [];
-  for (const t of nodes) {
-    const c = t.comments?.nodes?.[0];
-    const startLine = Number(t.originalStartLine ?? t.originalLine);
-    const endLine = Number(t.originalLine);
-    // Author check, not just the marker. Anyone can paste
-    // `<!-- agentic-review-fp:... -->` into a comment; without this a pull
-    // request could forge a thread that we then resolve or edit, or claim a
-    // finding as "already reported" to suppress a real one.
-    const login = c?.author?.login ?? "";
-    const isOurs = /^github-actions(\[bot\])?$/.test(login) || login === env("BOT_LOGIN", "github-actions[bot]");
-    const fp = isOurs ? readStamp(c?.body) : null;
-    if (fp)
-      out.push({
-        id: t.id, fp, isResolved: t.isResolved,
-        commentId: c?.databaseId, body: c?.body ?? "",
-        path: t.path, origOid: c?.originalCommit?.oid ?? null,
-        startLine: Number.isInteger(startLine) && startLine > 0 ? startLine : null,
-        endLine: Number.isInteger(endLine) && endLine > 0 ? endLine : null,
-        retired: RETIRED_RE.test(c?.body ?? ""),
-        tokens: tokenSet(c?.body ?? ""),
-      });
+  let cursor = null;
+  for (;;) {
+    const data = await graphqlImpl(
+      `query($owner:String!,$name:String!,$pr:Int!,$cursor:String){
+         repository(owner:$owner,name:$name){
+           pullRequest(number:$pr){
+             reviewThreads(first:100,after:$cursor){
+               nodes{ id isResolved isOutdated path originalStartLine originalLine
+                      comments(first:1){ nodes{ databaseId body author{login}
+                                                originalCommit{ oid } } } }
+               pageInfo{ hasNextPage endCursor } } } } }`,
+      { owner, name, pr: Number(pr), cursor },
+    );
+    const connection = data?.repository?.pullRequest?.reviewThreads;
+    if (!connection || !Array.isArray(connection.nodes) || !connection.pageInfo) {
+      throw new Error("review thread query returned an invalid connection");
+    }
+    for (const thread of connection.nodes) {
+      const comment = thread.comments?.nodes?.[0];
+      const startLine = Number(thread.originalStartLine ?? thread.originalLine);
+      const endLine = Number(thread.originalLine);
+      const fp = comment?.author?.login === botLogin ? readStamp(comment?.body) : null;
+      if (fp) {
+        out.push({
+          id: thread.id,
+          fp,
+          isResolved: thread.isResolved,
+          commentId: comment?.databaseId,
+          body: comment?.body ?? "",
+          path: thread.path,
+          origOid: comment?.originalCommit?.oid ?? null,
+          startLine: Number.isInteger(startLine) && startLine > 0 ? startLine : null,
+          endLine: Number.isInteger(endLine) && endLine > 0 ? endLine : null,
+          retired: RETIRED_RE.test(comment?.body ?? ""),
+          tokens: tokenSet(comment?.body ?? ""),
+        });
+      }
+    }
+    if (!connection.pageInfo.hasNextPage) return out;
+    if (!connection.pageInfo.endCursor) throw new Error("review thread query omitted its next cursor");
+    cursor = connection.pageInfo.endCursor;
   }
-  return out;
 }
 
 const RETIRED_RE = /^(?:✅|⚠️) \*\*No longer reported\*\*/;
@@ -613,7 +737,7 @@ function summarySpanChanged(finding, fromHead, toHead) {
   }, toHead);
 }
 
-function threadAsFinding(thread) {
+export function findingFromThread(thread) {
   const firstLine = String(thread.body ?? "").split("\n", 1)[0];
   const match = firstLine.match(/^`P[012]` (Critical|High|Medium) — \*\*(.+?)\*\*/);
   if (!thread.path || !match) return null;
@@ -808,14 +932,16 @@ function matchesUnchangedResolvedThread(finding, threads, headSha) {
   ));
 }
 
-async function runSummaryMode({ metadata, findings, repo, pr, token }) {
-  let history = { comment: null, findings: [], headSha: null, reconciliationKnown: true };
-  try {
-    const comments = await fetchSummaryComments({ repo, pr, token });
-    history = selectSummaryHistory(comments, { botLogin: env("BOT_LOGIN", "github-actions[bot]") });
-  } catch (error) {
-    history = { comment: null, findings: [], headSha: null, reconciliationKnown: false };
-    console.log(`::warning::could not read standing summary comment (${error.message})`);
+export async function runSummaryMode({ metadata, findings, repo, pr, token, botLogin, identityKnown }) {
+  let history = { comment: null, findings: [], headSha: null, reconciliationKnown: identityKnown };
+  if (identityKnown) {
+    try {
+      const comments = await fetchSummaryComments({ repo, pr, token });
+      history = selectSummaryHistory(comments, { botLogin });
+    } catch (error) {
+      history = { comment: null, findings: [], headSha: null, reconciliationKnown: false };
+      console.log(`::warning::could not read standing summary comment (${error.message})`);
+    }
   }
 
   const reconciled = history.reconciliationKnown
@@ -830,13 +956,12 @@ async function runSummaryMode({ metadata, findings, repo, pr, token }) {
   const reconciliationKnown = history.reconciliationKnown && reconciled.reconciliationKnown;
   const state = deriveState(metadata, reconciled.current, reconciled.held, reconciliationKnown);
   const carried = [...reconciled.current, ...reconciled.held];
-  const body = `${renderReviewBody({
-    mode: "summary",
+  const body = buildStandingSummaryBody({
     metadata,
     state,
     current: reconciled.current,
     unresolved: reconciled.held,
-  })}\n\n${encodeSummaryMarker({ headSha: metadata.head_sha, findings: carried })}`;
+  });
 
   emitState(metadata, state);
   if (reconciliationKnown) {
@@ -859,14 +984,17 @@ async function runSummaryMode({ metadata, findings, repo, pr, token }) {
   enforceGate(state);
 }
 
-async function runInlineMode({ metadata, findings }) {
+async function runInlineMode({ metadata, findings, repo, pr, botLogin, identityKnown }) {
   let prior = [];
-  let reconciliationKnown = true;
-  try {
-    prior = await ourThreads();
-  } catch (error) {
-    reconciliationKnown = false;
-    console.log(`::warning::could not read existing review threads (${error.message}); posting without dedupe`);
+  let reconciliationKnown = identityKnown;
+  if (identityKnown) {
+    try {
+      const [owner, name] = repo.split("/");
+      prior = await fetchOurThreads({ owner, name, pr, botLogin });
+    } catch (error) {
+      reconciliationKnown = false;
+      console.log(`::warning::could not read existing review threads (${error.message}); posting without dedupe`);
+    }
   }
 
   const standing = prior.filter((thread) => !thread.isResolved && !thread.retired);
@@ -913,7 +1041,7 @@ async function runInlineMode({ metadata, findings }) {
         continue;
       }
     }
-    const carried = threadAsFinding(thread);
+    const carried = findingFromThread(thread);
     if (carried) unresolved.push(carried);
     else reconciliationKnown = false;
   }
@@ -943,6 +1071,11 @@ async function runInlineMode({ metadata, findings }) {
       + `${unanchored.length} summary-only, ${findings.length - fresh.length - suppressed} already open`,
   );
 
+  if (!identityKnown) {
+    console.log("::warning::authenticated bot identity is unknown; review writes were suppressed");
+    enforceGate(state);
+    return;
+  }
   if (DRY_RUN) {
     if (env("SUPPRESS_WRITES", "") !== "true" && env("POST_COMMENT", "true") !== "false") {
       console.log(JSON.stringify(payload, null, 2));
@@ -989,30 +1122,31 @@ async function main() {
   if (env("RENDER", "") === "1") {
     const state = deriveState(metadata, findings, [], true);
     emitState(metadata, state);
-    process.stdout.write(`${renderReviewBody({
-      mode,
-      metadata,
-      state,
-      current: findings,
-      unresolved: [],
-    })}${mode === "summary"
-      ? `\n\n${encodeSummaryMarker({ headSha: metadata.head_sha, findings })}`
-      : ""}\n`);
+    const body = mode === "summary"
+      ? buildStandingSummaryBody({ metadata, state, current: findings, unresolved: [] })
+      : renderReviewBody({ mode, metadata, state, current: findings, unresolved: [] });
+    process.stdout.write(`${body}\n`);
     enforceGate(state);
     return;
   }
 
+  const repo = required("GITHUB_REPO");
+  const pr = Number(required("PR_NUMBER"));
+  const token = required("GH_TOKEN");
+  let botLogin = null;
+  let identityKnown = true;
+  try {
+    botLogin = await fetchViewerLogin({ token });
+  } catch (error) {
+    identityKnown = false;
+    console.log(`::warning::${error.message}; reconciliation and review writes are suppressed`);
+  }
+
   if (mode === "summary") {
-    await runSummaryMode({
-      metadata,
-      findings,
-      repo: required("GITHUB_REPO"),
-      pr: Number(required("PR_NUMBER")),
-      token: required("GH_TOKEN"),
-    });
+    await runSummaryMode({ metadata, findings, repo, pr, token, botLogin, identityKnown });
     return;
   }
-  await runInlineMode({ metadata, findings });
+  await runInlineMode({ metadata, findings, repo, pr, botLogin, identityKnown });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,17 +8,24 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
+  GITHUB_COMMENT_MAX_BYTES,
+  buildStandingSummaryBody,
   decodeSummaryMarker,
   emitWorkflowResult,
   encodeSummaryMarker,
+  fetchOurThreads,
   fetchSummaryComments,
+  fetchViewerLogin,
+  findingFromThread,
   reconcileSummaryFindings,
   renderReviewBody,
   renderStateTable,
+  runSummaryMode,
   selectSummaryHistory,
   shouldFailGate,
   upsertSummaryComment,
 } from "./post-review.mjs";
+import { deriveReviewState } from "./review-result.mjs";
 
 const BASE_SHA = "1".repeat(40);
 const HEAD_SHA = "2".repeat(40);
@@ -84,6 +92,14 @@ function botComment(id, body, createdAt = `2026-08-19T00:00:0${id}Z`) {
   return { id, body, created_at: createdAt, user: { login: "github-actions[bot]", type: "Bot" } };
 }
 
+function incompressible(length) {
+  let value = "";
+  for (let index = 0; value.length < length; index += 1) {
+    value += createHash("sha256").update(String(index)).digest("base64url");
+  }
+  return value.slice(0, length);
+}
+
 test("summary marker round-trips only normalized carry-forward fields", () => {
   const original = finding({ file: "./src/cache.mjs", extra: "discard me" });
   const marker = encodeSummaryMarker({ headSha: PRIOR_HEAD_SHA, findings: [original] });
@@ -96,11 +112,23 @@ test("summary marker round-trips only normalized carry-forward fields", () => {
       end_line: 22,
       severity: "High",
       title: "Cache entry survives invalidation",
-      body: "The stale entry is returned after invalidation.",
+      body: "Previously reported finding remains held from an earlier review sample.",
+      identity_tokens: ["cache", "entry", "survives", "invalidation", "stale", "returned"],
     }],
   });
   assert.ok(!marker.includes("replacement"));
   assert.ok(!marker.includes("discard me"));
+});
+
+test("decoder uses only the valid trailing standing marker", () => {
+  const earlier = encodeSummaryMarker({ headSha: PRIOR_HEAD_SHA, findings: [finding()] });
+  const trailing = encodeSummaryMarker({
+    headSha: HEAD_SHA,
+    findings: [finding({ title: "Trailing state", body: "Trailing state remains broken." })],
+  });
+  const decoded = decodeSummaryMarker(`${earlier}\n\nFinding prose may quote marker-like text.\n\n${trailing}\n`);
+  assert.equal(decoded.head_sha, HEAD_SHA);
+  assert.equal(decoded.findings[0].title, "Trailing state");
 });
 
 test("newest trusted summary marker wins while untrusted markers are ignored", () => {
@@ -110,24 +138,99 @@ test("newest trusted summary marker wins while untrusted markers are ignored", (
     findings: [finding({ title: "New state", body: "New state remains broken." })],
   });
   const forged = { id: 99, body: newer, created_at: "2026-08-19T00:01:00Z", user: { login: "dependabot[bot]", type: "Bot" } };
-  const selected = selectSummaryHistory([botComment(1, older), forged, botComment(2, newer)]);
+  const selected = selectSummaryHistory(
+    [botComment(1, older), forged, botComment(2, newer)],
+    { botLogin: "github-actions[bot]" },
+  );
   assert.equal(selected.reconciliationKnown, true);
   assert.equal(selected.comment.id, 2);
   assert.equal(selected.findings[0].title, "New state");
   assert.equal(selected.headSha, HEAD_SHA);
 });
 
+test("authenticated App bot identity owns and updates its standing history", async () => {
+  const login = await fetchViewerLogin({
+    token: "token",
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ data: { viewer: { login: "review-app[bot]" } } }),
+      text: async () => "",
+    }),
+  });
+  const marker = encodeSummaryMarker({ headSha: PRIOR_HEAD_SHA, findings: [finding()] });
+  const history = selectSummaryHistory([{
+    id: 41,
+    body: marker,
+    created_at: "2026-08-19T00:00:00Z",
+    user: { login, type: "Bot" },
+  }], { botLogin: login });
+  assert.equal(history.comment.id, 41);
+
+  const calls = [];
+  await upsertSummaryComment({
+    repo: "o/r",
+    pr: 7,
+    token: "token",
+    existingComment: history.comment,
+    body: `updated\n\n${marker}`,
+    hasFindings: true,
+    writesEnabled: true,
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return { ok: true, status: 200, text: async () => "{}" };
+    },
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.method, "PATCH");
+  assert.match(calls[0].url, /issues\/comments\/41$/);
+});
+
+test("unknown authenticated identity prevents a clean state and every standing write", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "post-review-identity-"));
+  const output = join(dir, "output");
+  const originalOutput = process.env.GITHUB_OUTPUT;
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  process.env.GITHUB_OUTPUT = output;
+  globalThis.fetch = async () => {
+    calls += 1;
+    throw new Error("unexpected API call");
+  };
+  try {
+    await runSummaryMode({
+      metadata: metadata(),
+      findings: [],
+      repo: "o/r",
+      pr: 7,
+      token: "token",
+      botLogin: null,
+      identityKnown: false,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalOutput === undefined) delete process.env.GITHUB_OUTPUT;
+    else process.env.GITHUB_OUTPUT = originalOutput;
+  }
+  assert.equal(calls, 0);
+  assert.match(readFileSync(output, "utf8"), /sample_state=unknown/);
+  assert.match(readFileSync(output, "utf8"), /bounded_converged=false/);
+});
+
 test("malformed selected bot marker makes reconciliation unknown without trusting older state", () => {
   const older = encodeSummaryMarker({ headSha: PRIOR_HEAD_SHA, findings: [finding()] });
   const malformed = "<!-- agentic-review-summary:v1:not-valid-compressed-state -->";
-  const selected = selectSummaryHistory([botComment(1, older), botComment(2, malformed)]);
+  const selected = selectSummaryHistory(
+    [botComment(1, older), botComment(2, malformed)],
+    { botLogin: "github-actions[bot]" },
+  );
   assert.equal(selected.reconciliationKnown, false);
   assert.equal(selected.comment.id, 2);
   assert.deepEqual(selected.findings, []);
 });
 
 test("deleting the standing summary comment resets summary history only", () => {
-  assert.deepEqual(selectSummaryHistory([]), {
+  assert.deepEqual(selectSummaryHistory([], { botLogin: "github-actions[bot]" }), {
     comment: null,
     findings: [],
     headSha: null,
@@ -206,6 +309,17 @@ test("all modes render one current artifact before mode-specific history", () =>
   }
 });
 
+test("local suggest rendering keeps the complete replacement and fences", () => {
+  const current = [finding({ suggestion: "first();\nsecond();\n" })];
+  const bodies = Object.fromEntries(["summary", "inline", "suggest"].map((mode) => [
+    mode,
+    renderReviewBody({ mode, metadata: metadata(), state: state(), current, unresolved: [] }),
+  ]));
+  assert.doesNotMatch(bodies.summary, /```suggestion|first\(\);/);
+  assert.doesNotMatch(bodies.inline, /```suggestion|first\(\);/);
+  assert.match(bodies.suggest, /```suggestion\nfirst\(\);\nsecond\(\);\n```/);
+});
+
 test("rendered bodies remove confidence heuristics and exhaustive or safety wording", () => {
   const body = renderReviewBody({
     mode: "summary", metadata: metadata(), state: state(), current: [finding()], unresolved: [],
@@ -252,6 +366,58 @@ test("summary lifecycle creates no clean comment and suppresses every write", as
   assert.equal(calls, 0);
 });
 
+test("standing summary budgets visible prose without dropping safety state", () => {
+  const current = [finding({ body: incompressible(GITHUB_COMMENT_MAX_BYTES + 8_000) })];
+  const body = buildStandingSummaryBody({
+    metadata: metadata(),
+    state: state({ unresolved_counts: EMPTY_COUNTS }),
+    current,
+    unresolved: [],
+  });
+  assert.ok(Buffer.byteLength(body) <= GITHUB_COMMENT_MAX_BYTES);
+  assert.match(body, /\| Merge gate \| `blocked` \|/);
+  assert.match(body, /<!-- agentic-review-summary:v1:/);
+  assert.match(body, /display details truncated/i);
+  assert.equal(decodeSummaryMarker(body).findings[0].severity, "High");
+});
+
+test("oversize safety markers and API bodies fail before POST or PATCH", async () => {
+  const random = incompressible(500 * 300);
+  const tooMany = Array.from({ length: 500 }, (_, index) => finding({
+    file: `src/${index}-${random.slice(index * 20, index * 20 + 20)}.mjs`,
+    title: random.slice(index * 240, index * 240 + 240),
+    body: random.slice(index * 40, index * 40 + 40),
+  }));
+  assert.throws(
+    () => buildStandingSummaryBody({
+      metadata: metadata(),
+      state: state(),
+      current: tooMany,
+      unresolved: [],
+    }),
+    /safety marker exceeds GitHub comment limit/,
+  );
+
+  let writes = 0;
+  await assert.rejects(
+    upsertSummaryComment({
+      repo: "o/r",
+      pr: 7,
+      token: "token",
+      existingComment: { id: 41 },
+      body: "x".repeat(GITHUB_COMMENT_MAX_BYTES + 1),
+      hasFindings: true,
+      writesEnabled: true,
+      fetchImpl: async () => {
+        writes += 1;
+        return { ok: true, status: 200, text: async () => "{}" };
+      },
+    }),
+    /exceeds GitHub comment limit/,
+  );
+  assert.equal(writes, 0);
+});
+
 test("summary history reads every issue-comment page and fails loud on query uncertainty", async () => {
   const urls = [];
   const pageOne = Array.from({ length: 100 }, (_, id) => ({ id }));
@@ -276,6 +442,65 @@ test("summary history reads every issue-comment page and fails loud on query unc
       fetchImpl: async () => ({ ok: false, status: 503, text: async () => "unavailable" }),
     }),
     /GET issue comments 503/,
+  );
+});
+
+test("paginated inline history carries a page-two blocker and fails on any page error", async () => {
+  const pageTwoNode = {
+    id: "thread-101",
+    isResolved: false,
+    isOutdated: false,
+    path: "src/cache.mjs",
+    originalStartLine: 20,
+    originalLine: 22,
+    comments: {
+      nodes: [{
+        databaseId: 91,
+        body: "`P1` High — **Prior blocker**\n\nThe blocker remains.\n\n<!-- agentic-review-fp:aaaaaaaaaaaaaaaa -->",
+        author: { login: "review-app[bot]" },
+        originalCommit: { oid: PRIOR_HEAD_SHA },
+      }],
+    },
+  };
+  const page = (nodes, hasNextPage, endCursor) => ({
+    repository: {
+      pullRequest: {
+        reviewThreads: { nodes, pageInfo: { hasNextPage, endCursor } },
+      },
+    },
+  });
+  const threads = await fetchOurThreads({
+    owner: "o",
+    name: "r",
+    pr: 7,
+    botLogin: "review-app[bot]",
+    graphqlImpl: async (_query, variables) => (
+      variables.cursor === null ? page([], true, "cursor-1") : page([pageTwoNode], false, null)
+    ),
+  });
+  const unresolved = threads.map(findingFromThread);
+  const reviewState = deriveReviewState({
+    analysisState: "complete",
+    current: [],
+    unresolved,
+    reconciliationKnown: true,
+    blockSeverities: ["Critical", "High"],
+  });
+  assert.equal(reviewState.merge_state, "blocked");
+  assert.deepEqual(reviewState.unresolved_counts, { Critical: 0, High: 1, Medium: 0 });
+
+  await assert.rejects(
+    fetchOurThreads({
+      owner: "o",
+      name: "r",
+      pr: 7,
+      botLogin: "review-app[bot]",
+      graphqlImpl: async (_query, variables) => {
+        if (variables.cursor === null) return page([], true, "cursor-1");
+        throw new Error("page two unavailable");
+      },
+    }),
+    /page two unavailable/,
   );
 });
 

@@ -381,6 +381,29 @@ test("the default profile runs general, correctness, and boundaries into one val
   assert.deepEqual(JSON.parse(validation.stdout), run.metadata);
 });
 
+test("local suggest rendering consumes generated metadata and keeps the replacement", (t) => {
+  const rendered = finding("Rendered fix", {
+    file: "alpha.txt",
+    start_line: 1,
+    end_line: 1,
+    severity: "High",
+    suggestion: "alpha replacement\n",
+  });
+  const run = runReview(t, {
+    general: [{ findings: [rendered] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    env: { AGENTIC_REVIEW_MODE: "suggest" },
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.match(run.result.stdout, /\| Analysis \| `complete` \|/);
+  assert.match(run.result.stdout, /```suggestion\nalpha replacement\n```/);
+  assert.doesNotMatch(run.result.stdout, /^\{\"findings\":/);
+});
+
 function diffFileOrder(prompt) {
   const diff = prompt.match(/## The diff\n\n```diff\n([\s\S]*?)\n```/);
   assert.ok(diff, "prompt must contain a diff block");

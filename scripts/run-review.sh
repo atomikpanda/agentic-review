@@ -895,7 +895,8 @@ fi
 if [ "$AS_JSON" = 1 ]; then
   cat "$TMP_OUT"
 elif RENDERER="$(support_exec scripts/post-review.mjs)"; then
-  FINDINGS_FILE="$TMP_OUT" REVIEW_MODE="$REVIEW_MODE" RENDER=1 node "$RENDERER" || cat "$TMP_OUT"
+  FINDINGS_FILE="$TMP_OUT" REVIEW_METADATA_FILE="$RUN_TMP/metadata.json" \
+    REVIEW_MODE="$REVIEW_MODE" RENDER=1 node "$RENDERER" || cat "$TMP_OUT"
 else
   cat "$TMP_OUT"
 fi
