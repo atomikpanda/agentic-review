@@ -31,6 +31,8 @@
 #                       suggest prints the fixes it would offer on a PR
 #   --omp-version V     npm version or dist-tag       $AGENTIC_REVIEW_OMP_VERSION
 #   --out FILE          write the review here
+#   --metadata-out FILE write bounded-run metadata here $AGENTIC_REVIEW_METADATA_OUT
+#   --no-state          do not update local review history
 #   --open              list findings still open from previous runs
 #   --all               list every tracked finding, including dismissed
 #   --history           list past runs
@@ -91,13 +93,12 @@ REVIEW_MODE="${AGENTIC_REVIEW_MODE:-suggest}"
 OMP_VERSION="${AGENTIC_REVIEW_OMP_VERSION:-latest}"
 MAX_DIFF_BYTES="${AGENTIC_REVIEW_MAX_DIFF_BYTES:-400000}"
 PASSES="${AGENTIC_REVIEW_PASSES:-1}"
-# Separate passes per concern. Macroscope runs security / correctness / docs as
-# distinct passes, and AgenticSCR measured that MIXING knowledge sources hurt
-# (13.0% -> 12.6%, "semantic noise or conflicting signals"). Splitting also cuts
-# rules-per-prompt, which is what predicts whether injected knowledge is used.
-LENSES="${AGENTIC_REVIEW_LENSES:-}"
+# The bounded default is one general review plus two additive specialist passes.
+LENSES="${AGENTIC_REVIEW_LENSES:-correctness,boundaries}"
 MIN_VOTES="${AGENTIC_REVIEW_MIN_VOTES:-1}"
-STAGED=0; OUT=""; FAIL_ON_FINDINGS=1; AS_JSON=0; USE_CODEGRAPH=1; VIEW=""; TRUST_REPO="${TRUST_REPO:-0}"
+METADATA_OUT="${AGENTIC_REVIEW_METADATA_OUT:-}"
+TRUSTED_DATA_ROOT="${AGENTIC_REVIEW_TRUSTED_DATA_ROOT:-}"
+STAGED=0; OUT=""; FAIL_ON_FINDINGS=1; AS_JSON=0; USE_CODEGRAPH=1; VIEW=""; TRUST_REPO="${TRUST_REPO:-0}"; RECORD_STATE=1
 PASSTHRU=()
 
 while [ $# -gt 0 ]; do
@@ -116,15 +117,17 @@ while [ $# -gt 0 ]; do
     --min-votes)    MIN_VOTES="${2:-}"; shift 2 ;;
     --omp-version)  OMP_VERSION="${2:-}"; shift 2 ;;
     --out)          OUT="${2:-}"; shift 2 ;;
+    --metadata-out) METADATA_OUT="${2:-}"; shift 2 ;;
     --staged)       STAGED=1; shift ;;
     --no-fail)      FAIL_ON_FINDINGS=0; shift ;;
     --no-codegraph) USE_CODEGRAPH=0; shift ;;
     --trust-repo)   TRUST_REPO=1; shift ;;
+    --no-state)     RECORD_STATE=0; shift ;;
     --open)         VIEW=open; shift ;;
     --history)      VIEW=runs; shift ;;
     --all)          VIEW=all; shift ;;
     --dismiss)      VIEW=dismiss; shift; DISMISS_IDS="$*"; break ;;
-    --json)         AS_JSON=1; REVIEW_MODE="${REVIEW_MODE/#summary/suggest}"; shift ;;
+    --json)         AS_JSON=1; shift ;;
     --)             shift; PASSTHRU=("$@"); break ;;
     # Print the header comment, stopping at the first line that isn't one.
     # A line range would silently start leaking code every time the header grows.
@@ -132,6 +135,19 @@ while [ $# -gt 0 ]; do
     *) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
+
+case "$PASSES" in
+  ''|*[!0-9]*|0) printf '%s\n' "--passes must be a positive integer (got '$PASSES')" >&2; exit 2 ;;
+esac
+case "$MAX_FINDINGS" in
+  ''|*[!0-9]*) printf '%s\n' "--max-findings must be a non-negative integer (got '$MAX_FINDINGS')" >&2; exit 2 ;;
+esac
+case "$MAX_DIFF_BYTES" in
+  ''|*[!0-9]*) printf '%s\n' "AGENTIC_REVIEW_MAX_DIFF_BYTES must be a non-negative integer (got '$MAX_DIFF_BYTES')" >&2; exit 2 ;;
+esac
+case "$MIN_VOTES" in
+  ''|*[!0-9]*|0) printf '%s\n' "--min-votes must be a positive integer (got '$MIN_VOTES')" >&2; exit 2 ;;
+esac
 
 # All progress goes to stderr, so stdout carries nothing but the review. That
 # is what makes `--json | jq` and `--review-mode suggest > out.md` work.
@@ -156,22 +172,41 @@ SELF_ROOT="$(cd -P "$(dirname "$_self")/.." && pwd)"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not in a git repository"
 cd "$REPO_ROOT"
 
-# Two lookups, because the two kinds of file have opposite trust requirements.
-#
-# DATA — prompts, skills, output formats — may be overridden by the repository,
-# because a project shipping its own review conventions is the feature.
-#
-# CODE — anything this script then executes — must come from where this script
-# lives and nowhere else. Preferring the repository's copy meant that running
-# `review` inside someone else's checkout ran their scripts/post-review.mjs and
-# scripts/codegraph.sh on your machine. Reviewing a branch is not consenting to
-# execute it.
-support() { # support <relative-path> -> data file, repo first
-  if [ -f "$1" ]; then printf '%s' "$1"; return 0; fi
-  if [ -f "$SELF_ROOT/$1" ]; then printf '%s' "$SELF_ROOT/$1"; return 0; fi
+# Data and executable support have opposite trust requirements. Executable
+# helpers always come from SELF_ROOT. Data keeps the local repository-first
+# behavior unless a hosted caller supplies a trusted root.
+canonical_file() {
+  local path="$1" target dir
+  [ -f "$path" ] || return 1
+  while [ -L "$path" ]; do
+    dir="$(cd -P "$(dirname "$path")" && pwd)" || return 1
+    target="$(readlink "$path")" || return 1
+    case "$target" in /*) path="$target" ;; *) path="$dir/$target" ;; esac
+  done
+  dir="$(cd -P "$(dirname "$path")" && pwd)" || return 1
+  printf '%s/%s' "$dir" "$(basename "$path")"
+}
+
+if [ -n "$TRUSTED_DATA_ROOT" ]; then
+  [ -d "$TRUSTED_DATA_ROOT" ] || die "trusted data root is not a directory: $TRUSTED_DATA_ROOT"
+  TRUSTED_DATA_ROOT="$(cd -P "$TRUSTED_DATA_ROOT" && pwd)"
+fi
+
+support() {
+  local requested="$1" resolved
+  case "$requested" in
+    /*) canonical_file "$requested"; return $? ;;
+  esac
+  if [ -n "$TRUSTED_DATA_ROOT" ]; then
+    resolved="$(canonical_file "$TRUSTED_DATA_ROOT/$requested")" || return 1
+    case "$resolved" in "$TRUSTED_DATA_ROOT"/*) printf '%s' "$resolved" ;; *) return 1 ;; esac
+    return
+  fi
+  if [ -f "$requested" ]; then printf '%s' "$requested"; return 0; fi
+  if [ -f "$SELF_ROOT/$requested" ]; then printf '%s' "$SELF_ROOT/$requested"; return 0; fi
   return 1
 }
-support_exec() { # support_exec <relative-path> -> executable, installed copy only
+support_exec() {
   if [ -f "$SELF_ROOT/$1" ]; then printf '%s' "$SELF_ROOT/$1"; return 0; fi
   return 1
 }
@@ -298,10 +333,13 @@ fi
 # range resolution, the codegraph index and local state all belong to it.
 REVIEW_ROOT="$REPO_ROOT"
 WORKTREE=""
+RUN_TMP=""
 cleanup_worktree() {
-  [ -n "$WORKTREE" ] || return 0
-  git worktree remove --force "$WORKTREE" 2>/dev/null || rm -rf -- "$WORKTREE"
-  WORKTREE=""
+  if [ -n "$WORKTREE" ]; then
+    git worktree remove --force "$WORKTREE" 2>/dev/null || rm -rf -- "$WORKTREE"
+    WORKTREE=""
+  fi
+  if [ -n "$RUN_TMP" ]; then rm -rf -- "$RUN_TMP"; RUN_TMP=""; fi
 }
 trap cleanup_worktree EXIT
 
@@ -408,352 +446,417 @@ ordered_diff() { # ordered_diff <pass-index>
 }
 
 step "Building prompt"
-PROMPT_FILE="$(support "$PROMPT_FILE")" \
-  || die "no review instructions at $PROMPT_FILE (looked in this repo and in $SELF_ROOT)"
-
-# Same split as CI: review instructions and output format are separate files,
-# so asking for suggested fixes does not fork the "what to look for" half.
 case "$REVIEW_MODE" in
-  summary) FORMAT_FILE="review/format-markdown.md" ;;
-  suggest|inline) FORMAT_FILE="review/format-json.md" ;;
+  summary|inline|suggest) ;;
   *) die "--review-mode must be summary, inline or suggest (got '$REVIEW_MODE')" ;;
 esac
-FORMAT_FILE="$(support "$FORMAT_FILE")" \
-  || die "no output format at $FORMAT_FILE (looked in this repo and in $SELF_ROOT)"
 
-TMP_PROMPT="$(mktemp)"
-# Per-lens focus text and the skill files that lens wants. A lens with an empty
-# skills list gets none — the docs lens works from its own instructions, and
-# giving it the infra catalogue would be the heterogeneous-knowledge mistake.
-lens_focus() { # lens_focus <name>; prints the focus block, or nothing
-  local f; f="$(support "review/lenses/$1.md" 2>/dev/null)" || return 1
-  grep -v '^<!-- skills:' "$f"
-}
-lens_skills() { # lens_skills <name>; prints space-separated skill paths
-  local f; f="$(support "review/lenses/$1.md" 2>/dev/null)" || return 1
-  grep -oE '<!-- skills: [^>]*-->' "$f" | sed 's/<!-- skills: //; s/ *-->//'
-}
+_prompt_requested="$PROMPT_FILE"
+PROMPT_FILE="$(support "$PROMPT_FILE")" \
+  || die "no review instructions at $_prompt_requested"
+FORMAT_FILE="$(support "review/format-json.md")" \
+  || die "no output format at review/format-json.md"
+RESULT_HELPER="$(support_exec scripts/review-result.mjs)" \
+  || die "scripts/review-result.mjs is missing from $SELF_ROOT"
+MERGE="$(support_exec scripts/merge-findings.mjs)" \
+  || die "scripts/merge-findings.mjs is missing from $SELF_ROOT"
+command -v node >/dev/null 2>&1 || die "node is required for structured review results"
 
-build_prompt() { # build_prompt <pass-index> <destination> [lens]
-# The diff goes in verbatim. It used to say only "The diff is: git diff A B",
-# but the tool allowlist has no shell and no git, so the agent could never run
-# that — it was reviewing the working tree while guessing from filenames what
-# had changed.
-# Decided once, before any pass. This used to be recomputed inside prompt
-# building: the first pass truncated DIFFTEXT in place, so the second measured
-# the already-shortened value, concluded it was within the cap, and rebuilt the
-# diff per file at full length. The cap applied to pass one only.
-DIFF_BYTES=${#DIFFTEXT}
+RUN_TMP="$(mktemp -d)"
+printf '%s' "$DIFFTEXT" > "$RUN_TMP/diff.full"
+DIFF_BYTES="$(wc -c < "$RUN_TMP/diff.full" | tr -d ' ')"
 TRUNCATED=0
 if [ "$MAX_DIFF_BYTES" != "0" ] && [ "$DIFF_BYTES" -gt "$MAX_DIFF_BYTES" ]; then
-  DIFFTEXT="${DIFFTEXT:0:$MAX_DIFF_BYTES}"
+  node -e '
+    const fs = require("node:fs");
+    fs.writeFileSync(process.argv[2], fs.readFileSync(process.argv[1]).subarray(0, Number(process.argv[3])));
+  ' "$RUN_TMP/diff.full" "$RUN_TMP/diff.included" "$MAX_DIFF_BYTES"
+  DIFFTEXT="$(cat "$RUN_TMP/diff.included"; printf x)"
+  DIFFTEXT="${DIFFTEXT%x}"
   TRUNCATED=1
 fi
-# Deliberately NOT readonly. Marking it so turns any later assignment into a
-# fatal shell error mid-run, which trades a wrong number for a dead review — and
-# the recomputation this guarded against is now structurally impossible anyway,
-# since the value is computed once before the first prompt is built.
-{
-  cat "$PROMPT_FILE"
-  echo
-  if [ -n "${3:-}" ]; then echo; lens_focus "$3"; echo; fi
-  # WHAT THE CHANGE IS FOR. Several defects are only visible against intent —
-  # a documented token scope that cannot work, a CIDR that cannot route. With
-  # no statement of intent there is nothing to contradict, and those were
-  # exactly the findings this reviewer never produced. Locally the commit
-  # messages are the closest thing to a PR description.
-  if [ -n "${INTENT:-}" ]; then
-    echo "## What this change is meant to do"
-    echo
-    printf '%s\n' "$INTENT"
-    echo
-    echo "Check the change against this. An instruction or setting that cannot"
-    echo "achieve what is stated here is a defect, even if the code is valid."
-    echo
-  fi
-  # Output contract before the diff — see the workflow for why.
-  cat "$FORMAT_FILE"
-  echo
-  echo "## Changed files"
-  echo
-  echo '```'
-  printf '%s\n' "$DIFFSTAT"
-  echo '```'
-  echo
-  echo "## The diff"
-  echo
-  if [ "$TRUNCATED" = 1 ]; then
-    echo "NOTE: this diff was truncated at $MAX_DIFF_BYTES of $DIFF_BYTES bytes."
-    echo "Files after the cut-off are missing. Say so if it limits the review."
-    echo
-  fi
-  echo '```diff'
-  ordered_diff "${1:-1}"
-  echo '```'
-  echo
-  echo "The working tree is checked out at the post-change state, so you can read any"
-  echo "file as it will be after this branch lands. Use that to check what the diff depends on."
-  if [ "${MAX_FINDINGS:-0}" != "0" ]; then
-    echo
-    echo "Report at most $MAX_FINDINGS findings. If you have more, keep the most severe."
-  fi
-  # Symbol/dependency index, when the project is already indexed. Deliberately
-  # NOT auto-initialised: `codegraph init` writes a .codegraph/ directory into
-  # the repository, and a review tool should not leave artefacts in someone's
-  # working tree without being asked. Run `codegraph init` yourself to enable it.
-  if [ "$USE_CODEGRAPH" = 1 ] && CG="$(support_exec scripts/codegraph.sh)" && [ -d "$REPO_ROOT/.codegraph" ]; then
-    if [ "$STAGED" = 1 ]; then
-      STAGED=1 PROJECT="$REPO_ROOT" bash "$CG" 2>/dev/null || true
-    else
-      BASE_SHA="$MERGE_BASE" HEAD_SHA="HEAD" PROJECT="$REPO_ROOT" bash "$CG" 2>/dev/null || true
-    fi
-  fi
-  echo
-  if [ "$REVIEW_MODE" = "summary" ]; then
-    echo "Reply with the markdown described above, or exactly \"No findings.\""
-  else
-    echo "Reply with the single JSON object described above and nothing else — no prose, no code fence."
-  fi
-} > "$2"
-}
-build_prompt 1 "$TMP_PROMPT"
-ok "$(wc -c < "$TMP_PROMPT" | tr -d ' ') bytes (diff ${DIFF_BYTES}B, truncated=$TRUNCATED)"
+printf '%s' "$DIFFTEXT" > "$RUN_TMP/diff.included"
+INCLUDED_DIFF_BYTES="$(wc -c < "$RUN_TMP/diff.included" | tr -d ' ')"
 
-ARGS=()
-[ -n "$SKILL" ] || SKILL="$SKILL_DEFAULT"
-# --skill takes a comma-separated list; they are concatenated.
-TMP_SKILL="$(mktemp)"; : > "$TMP_SKILL"; skill_names=""
-IFS=',' read -ra _skills <<< "$SKILL"
-for sk in "${_skills[@]}"; do
-  sk="$(printf '%s' "$sk" | tr -d '[:space:]')"
-  [ -n "$sk" ] || continue
-  if resolved="$(support "$sk")"; then
-    cat "$resolved" >> "$TMP_SKILL"; printf '\n\n' >> "$TMP_SKILL"
-    skill_names="$skill_names $sk"
+if [ "$STAGED" = 1 ]; then
+  BASE_SHA="$(git rev-parse HEAD)"
+  HEAD_SHA="$(git rev-parse "$_commit")"
+else
+  BASE_SHA="$(git rev-parse "$MERGE_BASE")"
+  HEAD_SHA="$(git rev-parse HEAD)"
+fi
+
+PASS_IDS=()
+PASS_LENSES=()
+PASS_LENS_FILES=()
+unique_pass_id() {
+  local base="$1" candidate="$1" suffix=2 existing
+  while :; do
+    existing=0
+    for id in "${PASS_IDS[@]+"${PASS_IDS[@]}"}"; do
+      if [ "$id" = "$candidate" ]; then existing=1; break; fi
+    done
+    if [ "$existing" = 0 ]; then UNIQUE_PASS_ID="$candidate"; return; fi
+    candidate="${base}-${suffix}"
+    suffix=$((suffix + 1))
+  done
+}
+add_pass_descriptor() {
+  local requested_id="$1" lens="$2" lens_file="${3:-}"
+  unique_pass_id "$requested_id"
+  PASS_IDS+=("$UNIQUE_PASS_ID")
+  PASS_LENSES+=("$lens")
+  PASS_LENS_FILES+=("$lens_file")
+}
+
+for ((i = 1; i <= PASSES; i++)); do
+  if [ "$i" = 1 ]; then add_pass_descriptor general "" ""
+  else add_pass_descriptor "general-$i" "" ""
   fi
 done
-# Keep only the sections that apply to what changed. Rule count is the thing
-# that predicts whether injected knowledge is used at all, so this matters more
-# than how the rules are worded.
-if SEL="$(support_exec scripts/select-skills.mjs)" && command -v node >/dev/null 2>&1 && [ -s "$TMP_SKILL" ]; then
-  if [ "$STAGED" = 1 ]; then _cf="$(git diff --cached --name-only --diff-filter=d)"
-  else _cf="$(git diff --name-only --diff-filter=d "$MERGE_BASE" HEAD)"; fi
-  TMP_SEL="$(mktemp)"
-  if CHANGED_FILES="$_cf" SKILL_FILES="$TMP_SKILL" node "$SEL" > "$TMP_SEL" 2>>"$TMP_SKILL.log" && [ -s "$TMP_SEL" ]; then
-    mv "$TMP_SEL" "$TMP_SKILL"
-    [ -f "$TMP_SKILL.log" ] && sed 's/^/ /' "$TMP_SKILL.log" >&2 && rm -f "$TMP_SKILL.log"
-  else
-    rm -f "$TMP_SEL"
-  fi
-fi
+IFS=',' read -ra _lenses <<< "$LENSES"
+for lens in "${_lenses[@]}"; do
+  lens="$(printf '%s' "$lens" | tr -d '[:space:]')"
+  [ -n "$lens" ] || continue
+  case "$lens" in *[!A-Za-z0-9._-]*) die "invalid lens name: $lens" ;; esac
+  lens_file="$(support "review/lenses/$lens.md")" || die "no such lens: $lens"
+  add_pass_descriptor "$lens" "$lens" "$lens_file"
+done
 
-if [ -s "$TMP_SKILL" ]; then
-  ARGS+=(--append-system-prompt="$TMP_SKILL"); ok "knowledge base:$skill_names"
-else
-  say "no skill file — running without injected knowledge"
-fi
-if [ -n "$THINKING" ]; then ARGS+=(--thinking="$THINKING"); fi
-if [ -n "$MAX_TIME" ]; then ARGS+=(--max-time="$MAX_TIME"); fi
-if [ ${#PASSTHRU[@]} -gt 0 ]; then ARGS+=("${PASSTHRU[@]}"); fi
+lens_focus_file() {
+  grep -v '^<!-- skills:' "$1"
+}
+lens_skills_file() {
+  grep -oE '<!-- skills: [^>]*-->' "$1" | sed 's/<!-- skills: //; s/ *-->//'
+}
+
+prepare_skill() {
+  local spec="$1" destination="$2" select="$3" sk resolved selected changed
+  : > "$destination"
+  spec="${spec// /,}"
+  IFS=',' read -ra _skills <<< "$spec"
+  for sk in "${_skills[@]}"; do
+    sk="$(printf '%s' "$sk" | tr -d '[:space:]')"
+    [ -n "$sk" ] || continue
+    if resolved="$(support "$sk")"; then
+      cat "$resolved" >> "$destination"
+      printf '\n\n' >> "$destination"
+    fi
+  done
+  if [ "$select" = 1 ] && [ -s "$destination" ] \
+     && SEL="$(support_exec scripts/select-skills.mjs)"; then
+    if [ "$STAGED" = 1 ]; then changed="$(git diff --cached --name-only --diff-filter=d)"
+    else changed="$(git diff --name-only --diff-filter=d "$MERGE_BASE" HEAD)"; fi
+    selected="${destination}.selected"
+    if CHANGED_FILES="$changed" SKILL_FILES="$destination" node "$SEL" > "$selected" 2>"${destination}.log" \
+       && [ -s "$selected" ]; then
+      mv "$selected" "$destination"
+      if [ -s "${destination}.log" ]; then sed 's/^/ /' "${destination}.log" >&2; fi
+    else
+      rm -f "$selected"
+    fi
+    rm -f "${destination}.log"
+  fi
+}
+
+build_prompt() {
+  local pass_index="$1" destination="$2" lens_file="$3"
+  {
+    cat "$PROMPT_FILE"
+    echo
+    if [ -n "$lens_file" ]; then echo; lens_focus_file "$lens_file"; echo; fi
+    if [ -n "${INTENT:-}" ]; then
+      echo "## What this change is meant to do"
+      echo
+      printf '%s\n' "$INTENT"
+      echo
+      echo "Check the change against this. An instruction or setting that cannot"
+      echo "achieve what is stated here is a defect, even if the code is valid."
+      echo
+    fi
+    cat "$FORMAT_FILE"
+    echo
+    echo "## Changed files"
+    echo
+    echo '```'
+    printf '%s\n' "$DIFFSTAT"
+    echo '```'
+    echo
+    echo "## The diff"
+    echo
+    if [ "$TRUNCATED" = 1 ]; then
+      echo "NOTE: this diff was truncated at $MAX_DIFF_BYTES of $DIFF_BYTES bytes."
+      echo "Files after the cut-off are missing. Say so if it limits the review."
+      echo
+    fi
+    echo '```diff'
+    ordered_diff "$pass_index"
+    echo '```'
+    echo
+    echo "The working tree is checked out at the post-change state, so you can read any"
+    echo "file as it will be after this branch lands. Use that to check what the diff depends on."
+    if [ "$MAX_FINDINGS" != "0" ]; then
+      echo
+      echo "Report at most $MAX_FINDINGS findings. If you have more, keep the most severe."
+    fi
+    if [ "$USE_CODEGRAPH" = 1 ] && CG="$(support_exec scripts/codegraph.sh)" \
+       && [ -d "$REPO_ROOT/.codegraph" ]; then
+      if [ "$STAGED" = 1 ]; then
+        STAGED=1 PROJECT="$REPO_ROOT" bash "$CG" 2>/dev/null || true
+      else
+        BASE_SHA="$MERGE_BASE" HEAD_SHA="HEAD" PROJECT="$REPO_ROOT" bash "$CG" 2>/dev/null || true
+      fi
+    fi
+    echo
+    echo "Reply with the single JSON object described above and nothing else — no prose, no code fence."
+  } > "$destination"
+}
+
+[ -n "$SKILL" ] || SKILL="$SKILL_DEFAULT"
+for ((i = 0; i < ${#PASS_IDS[@]}; i++)); do
+  prompt="$RUN_TMP/prompt.$i"
+  skill="$RUN_TMP/skill.$i"
+  lens_copy="$RUN_TMP/lens.$i"
+  if [ -n "${PASS_LENS_FILES[i]}" ]; then
+    cp "${PASS_LENS_FILES[i]}" "$lens_copy"
+    lens_skill_spec="$(lens_skills_file "${PASS_LENS_FILES[i]}")"
+    prepare_skill "$lens_skill_spec" "$skill" 0
+  else
+    : > "$lens_copy"
+    prepare_skill "$SKILL" "$skill" 1
+  fi
+  build_prompt $((i + 1)) "$prompt" "${PASS_LENS_FILES[i]}"
+done
+ok "$(wc -c < "$RUN_TMP/prompt.0" | tr -d ' ') bytes (diff ${DIFF_BYTES}B, truncated=$TRUNCATED)"
+
+printf '%s\n' "${PASS_IDS[@]}" > "$RUN_TMP/pass-ids"
+printf '%s\n' "${PASS_LENSES[@]}" > "$RUN_TMP/pass-lenses"
+CONFIG_FILE="$RUN_TMP/configuration.json"
+MODEL="$MODEL" THINKING="$THINKING" TOOLS="$TOOLS" MAX_TIME="$MAX_TIME" \
+OMP_VERSION="$OMP_VERSION" MAX_DIFF_BYTES="$MAX_DIFF_BYTES" MAX_FINDINGS="$MAX_FINDINGS" \
+MIN_VOTES="$MIN_VOTES" USE_CODEGRAPH="$USE_CODEGRAPH" PROMPT_FILE="$PROMPT_FILE" \
+FORMAT_FILE="$FORMAT_FILE" node -e '
+  const fs = require("node:fs");
+  const output = process.argv[1];
+  const root = process.argv[2];
+  const lines = (name) => {
+    const values = fs.readFileSync(`${root}/${name}`, "utf8").split("\n");
+    if (values.at(-1) === "") values.pop();
+    return values;
+  };
+  const ids = lines("pass-ids");
+  const lenses = lines("pass-lenses");
+  const pass_descriptors = ids.map((id, index) => ({
+    id,
+    lens: lenses[index] || null,
+    lens_content: fs.readFileSync(`${root}/lens.${index}`, "utf8"),
+    skill_content: fs.readFileSync(`${root}/skill.${index}`, "utf8"),
+  }));
+  const config = {
+    model: process.env.MODEL,
+    reasoning: process.env.THINKING,
+    tools: process.env.TOOLS.split(",").map((value) => value.trim()).filter(Boolean),
+    max_time: process.env.MAX_TIME,
+    omp_version: process.env.OMP_VERSION,
+    prompt_content: fs.readFileSync(process.env.PROMPT_FILE, "utf8"),
+    format_content: fs.readFileSync(process.env.FORMAT_FILE, "utf8"),
+    diff_cap: Number(process.env.MAX_DIFF_BYTES),
+    finding_cap: Number(process.env.MAX_FINDINGS),
+    min_votes: Number(process.env.MIN_VOTES),
+    codegraph_enabled: process.env.USE_CODEGRAPH === "1",
+    pass_descriptors,
+    extra_omp_args: process.argv.slice(3),
+  };
+  fs.writeFileSync(output, JSON.stringify(config));
+' "$CONFIG_FILE" "$RUN_TMP" "${PASSTHRU[@]+"${PASSTHRU[@]}"}"
+CONFIGURATION_FINGERPRINT="$(node "$RESULT_HELPER" fingerprint "$CONFIG_FILE")" \
+  || die "could not fingerprint review configuration"
 
 step "Reviewing with $MODEL"
-say "read-only tools: $TOOLS${THINKING:+ | thinking: $THINKING}${PASSES:+ | passes: $PASSES}"
-TMP_OUT="$(mktemp)"
+say "read-only tools: $TOOLS${THINKING:+ | thinking: $THINKING} | passes: ${#PASS_IDS[@]}"
 
-# One omp invocation. Same allowlist as CI, --tools emitted last so nothing
-# passed after -- can be the winning value, and the prompt supplied as @file.
-# A pass whose output cannot be parsed is wasted compute, and roughly one in
-# three came back that way. omp cannot enforce a JSON schema — it has no
-# structured-output mode — so the only lever is to check afterwards and retry.
-# One retry, because a second failure usually means the prompt, not the dice.
-run_pass_checked() { # run_pass_checked <prompt-file> <out-file>
-  local attempt
+run_pass() {
+  local prompt_file="$1" out_file="$2" skill_file="$3"
+  local -a args=()
+  if [ -s "$skill_file" ]; then args+=(--append-system-prompt="$skill_file"); fi
+  if [ -n "$THINKING" ]; then args+=(--thinking="$THINKING"); fi
+  if [ -n "$MAX_TIME" ]; then args+=(--max-time="$MAX_TIME"); fi
+  if [ ${#PASSTHRU[@]} -gt 0 ]; then args+=("${PASSTHRU[@]}"); fi
+  "${OMP[@]}" -p \
+    --model="$MODEL" \
+    --no-session \
+    "${args[@]+"${args[@]}"}" \
+    --tools="$TOOLS" \
+    --approval-mode=always-ask \
+    --cwd="$REVIEW_ROOT" \
+    "@$prompt_file" \
+    < /dev/null > "$out_file" 2>"$out_file.err"
+}
+
+run_pass_checked() {
+  local prompt_file="$1" out_file="$2" skill_file="$3" attempt
+  LAST_ATTEMPTS=0
   for attempt in 1 2; do
-    if run_pass "$1" "$2" && [ -s "$2" ]; then
-      # Only structured modes owe a findings object. summary mode answers in
-      # markdown, and checking it against the JSON contract failed every time —
-      # which retried, failed again, and killed the default local mode outright.
-      if [ "$REVIEW_MODE" = "summary" ] || [ -z "${CHECKER:-}" ] \
-         || node "$CHECKER" --check "$2" 2>/dev/null; then return 0; fi
-      say "  output unparseable (attempt $attempt)"
+    LAST_ATTEMPTS="$attempt"
+    if run_pass "$prompt_file" "$out_file" "$skill_file" && [ -s "$out_file" ] \
+       && node "$MERGE" --check "$out_file" 2>/dev/null; then
+      return 0
     fi
+    say "output unparseable (attempt $attempt)"
   done
   return 1
 }
 
-run_pass() { # run_pass <prompt-file> <out-file>
-  "${OMP[@]}" -p \
-    --model="$MODEL" \
-    --no-session \
-    "${ARGS[@]+"${ARGS[@]}"}" \
-    --tools="$TOOLS" \
-    --approval-mode=always-ask \
-    --cwd="$REVIEW_ROOT" \
-    "@$1" \
-    < /dev/null > "$2" 2>"$2.err"
+PASS_STATUSES=()
+PASS_ATTEMPTS=()
+PASS_COUNTS=()
+PASS_CAPPED=()
+PASS_OUTS=()
+VALID_OUTS=()
+for ((i = 0; i < ${#PASS_IDS[@]}; i++)); do
+  out="$RUN_TMP/out.$i"
+  PASS_OUTS+=("$out")
+  if run_pass_checked "$RUN_TMP/prompt.$i" "$out" "$RUN_TMP/skill.$i"; then
+    count="$(node -e 'const fs=require("node:fs"); process.stdout.write(String(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).findings.length))' "$out")"
+    capped=false
+    if [ "$MAX_FINDINGS" != "0" ] && [ "$count" -ge "$MAX_FINDINGS" ]; then capped=true; fi
+    PASS_STATUSES+=("valid")
+    PASS_ATTEMPTS+=("$LAST_ATTEMPTS")
+    PASS_COUNTS+=("$count")
+    PASS_CAPPED+=("$capped")
+    VALID_OUTS+=("$out")
+    say "pass ${PASS_IDS[i]} valid (${count} finding(s), attempt $LAST_ATTEMPTS)"
+  else
+    PASS_STATUSES+=("failed")
+    PASS_ATTEMPTS+=("$LAST_ATTEMPTS")
+    PASS_COUNTS+=("0")
+    PASS_CAPPED+=("false")
+    say "pass ${PASS_IDS[i]} failed after $LAST_ATTEMPTS attempts"
+  fi
+done
+
+write_metadata() {
+  local merge_succeeded="$1" records="$RUN_TMP/pass-records" raw="$RUN_TMP/metadata.raw.json"
+  : > "$records"
+  for ((j = 0; j < ${#PASS_IDS[@]}; j++)); do
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "${PASS_IDS[j]}" "${PASS_STATUSES[j]}" "${PASS_ATTEMPTS[j]}" \
+      "${PASS_COUNTS[j]}" "${PASS_CAPPED[j]}" >> "$records"
+  done
+  BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" CONFIGURATION_FINGERPRINT="$CONFIGURATION_FINGERPRINT" \
+  DIFF_BYTES="$DIFF_BYTES" INCLUDED_DIFF_BYTES="$INCLUDED_DIFF_BYTES" TRUNCATED="$TRUNCATED" \
+  MAX_FINDINGS="$MAX_FINDINGS" MERGE_SUCCEEDED="$merge_succeeded" node -e '
+    const fs = require("node:fs");
+    const results = fs.readFileSync(process.argv[1], "utf8").trimEnd().split("\n").filter(Boolean)
+      .map((line) => {
+        const [id, status, attempts, finding_count, capped] = line.split("\t");
+        return {
+          id,
+          status,
+          attempts: Number(attempts),
+          finding_count: Number(finding_count),
+          capped: capped === "true",
+          base_sha: process.env.BASE_SHA,
+          head_sha: process.env.HEAD_SHA,
+          configuration_fingerprint: process.env.CONFIGURATION_FINGERPRINT,
+        };
+      });
+    const metadata = {
+      schema_version: 1,
+      base_sha: process.env.BASE_SHA,
+      head_sha: process.env.HEAD_SHA,
+      configuration_fingerprint: process.env.CONFIGURATION_FINGERPRINT,
+      analysis_state: "inconclusive",
+      diff: {
+        bytes: Number(process.env.DIFF_BYTES),
+        included_bytes: Number(process.env.INCLUDED_DIFF_BYTES),
+        truncated: process.env.TRUNCATED === "1",
+      },
+      finding_cap: Number(process.env.MAX_FINDINGS),
+      passes: {
+        requested: results.map(({ id }) => id),
+        completed: results.filter(({ status }) => status === "valid").map(({ id }) => id),
+        results,
+      },
+    };
+    if (process.env.MERGE_SUCCEEDED === "false") metadata.merge_succeeded = false;
+    fs.writeFileSync(process.argv[2], JSON.stringify(metadata));
+  ' "$records" "$raw"
+  ANALYSIS_STATE="$(node "$RESULT_HELPER" analysis "$raw")" \
+    || die "could not derive review analysis state"
+  ANALYSIS_STATE="$ANALYSIS_STATE" node -e '
+    const fs = require("node:fs");
+    const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    value.analysis_state = process.env.ANALYSIS_STATE;
+    fs.writeFileSync(process.argv[2], JSON.stringify(value, null, 2));
+  ' "$raw" "$RUN_TMP/metadata.json"
+  node "$RESULT_HELPER" validate "$RUN_TMP/metadata.json" >/dev/null \
+    || die "generated review metadata failed validation"
+  if [ -n "$METADATA_OUT" ]; then
+    metadata_tmp="${METADATA_OUT}.tmp.$$"
+    cp "$RUN_TMP/metadata.json" "$metadata_tmp" || die "could not write metadata beside $METADATA_OUT"
+    if ! node "$RESULT_HELPER" validate "$metadata_tmp" >/dev/null; then
+      rm -f "$metadata_tmp"
+      die "metadata at $metadata_tmp failed validation"
+    fi
+    mv -f "$metadata_tmp" "$METADATA_OUT"
+    ok "metadata written to $METADATA_OUT"
+  fi
 }
 
-CHECKER="$(support_exec scripts/merge-findings.mjs 2>/dev/null || true)"
-
-if [ -n "$LENSES" ]; then
-  # Lenses are ADDITIVE, not a partition. Replacing the general review with
-  # narrow passes lost coverage — the security lens never saw the Caddy entry
-  # that its own text calls an auth bypass. Run the general review first, then
-  # each lens as a specialist on top, and merge.
-  #
-  # Measured: general alone 8/11, docs lens alone 5/11, the two merged 9/11 with
-  # the docs pass contributing 8 findings the general pass did not make.
-  PASS_OUTS=""; ok_passes=0; li=0
-
-  GP="$(mktemp)"; GO="$(mktemp)"
-  build_prompt 1 "$GP"
-  if run_pass_checked "$GP" "$GO"; then
-    PASS_OUTS="$PASS_OUTS $GO"; ok_passes=$((ok_passes + 1)); say "general pass ok"
-  else
-    say "general pass failed — continuing with lenses only"; rm -f "$GO" "$GO.err"
-  fi
-  rm -f "$GP"
-
-  IFS=',' read -ra _lenses <<< "$LENSES"
-  for lens in "${_lenses[@]}"; do
-    lens="$(printf '%s' "$lens" | tr -d '[:space:]')"; [ -n "$lens" ] || continue
-    li=$((li + 1))
-    if ! lens_focus "$lens" >/dev/null 2>&1; then say "no such lens: $lens — skipping"; continue; fi
-
-    # Swap the skill file set for this lens.
-    LENS_SKILLS="$(lens_skills "$lens")"
-    : > "$TMP_SKILL"
-    for sk in $LENS_SKILLS; do
-      if r="$(support "$sk")"; then cat "$r" >> "$TMP_SKILL"; printf '\n\n' >> "$TMP_SKILL"; fi
-    done
-    ARGS=()
-    if [ -s "$TMP_SKILL" ]; then ARGS+=(--append-system-prompt="$TMP_SKILL"); fi
-    if [ -n "$THINKING" ]; then ARGS+=(--thinking="$THINKING"); fi
-    if [ -n "$MAX_TIME" ]; then ARGS+=(--max-time="$MAX_TIME"); fi
-    if [ ${#PASSTHRU[@]} -gt 0 ]; then ARGS+=("${PASSTHRU[@]}"); fi
-
-    P="$(mktemp)"; O="$(mktemp)"
-    build_prompt "$li" "$P" "$lens"
-    if run_pass_checked "$P" "$O"; then
-      PASS_OUTS="$PASS_OUTS $O"; ok_passes=$((ok_passes + 1))
-      say "lens $lens ok ($(grep -cE '^\s*[-*] ' "$TMP_SKILL" 2>/dev/null || echo 0) skill rules)"
-    else
-      say "lens $lens failed — continuing"; rm -f "$O" "$O.err"
-    fi
-    rm -f "$P"
-  done
-  [ "$ok_passes" -gt 0 ] || { rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_SKILL"; die "every lens failed"; }
-  merged=0
-  if MERGE="$(support_exec scripts/merge-findings.mjs)" && command -v node >/dev/null 2>&1; then
-    # shellcheck disable=SC2086
-    if node "$MERGE" --min-votes "$MIN_VOTES" $PASS_OUTS > "$TMP_OUT"; then merged=1; fi
-  fi
-  if [ "$merged" = 0 ]; then cat "${PASS_OUTS%% *}" > "$TMP_OUT" 2>/dev/null || true; fi
-  # shellcheck disable=SC2086
-  rm -f $PASS_OUTS
-elif [ "${PASSES:-1}" -le 1 ]; then
-  # Checked here too. The retry originally covered only the multi-pass paths,
-  # so a single pass could still return output the poster could not use — and
-  # did: one benchmark run came back with zero findings and no error.
-  if ! run_pass_checked "$TMP_PROMPT" "$TMP_OUT"; then
-    printf '\n' >&2; sed 's/^/    /' "$TMP_OUT.err" | tail -20 >&2
-    rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err" "$TMP_SKILL"
-    die "review failed"
-  fi
-else
-  # Repeated sampling. The same model over identical input agreed with itself
-  # on only 5 of 9 findings across two runs, so a single pass systematically
-  # under-reports; three passes took measured recall from 5/11 to 7/11.
-  PASS_OUTS=""
-  ok_passes=0
-  for i in $(seq 1 "$PASSES"); do
-    P="$(mktemp)"; O="$(mktemp)"
-    build_prompt "$i" "$P"
-    if run_pass_checked "$P" "$O"; then
-      PASS_OUTS="$PASS_OUTS $O"; ok_passes=$((ok_passes + 1)); say "pass $i/$PASSES ok"
-    else
-      say "pass $i/$PASSES failed — continuing"
-      rm -f "$O" "$O.err"
-    fi
-    rm -f "$P"
-  done
-  [ "$ok_passes" -gt 0 ] || { rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_SKILL"; die "every pass failed"; }
-  # `if` not `A && B || C`: with the && form a merge that fails would fall
-  # through to C, and a merge that succeeds but exits non-zero would too.
-  merged=0
-  # summary passes are markdown, and the merger parses findings objects: it
-  # would read every pass as unparseable and emit an empty result, silently
-  # discarding the whole review. There is nothing to merge in that mode.
-  if [ "$REVIEW_MODE" != "summary" ] \
-     && MERGE="$(support_exec scripts/merge-findings.mjs)" && command -v node >/dev/null 2>&1; then
-    # shellcheck disable=SC2086  # deliberate word splitting over the pass list
-    if node "$MERGE" --min-votes "$MIN_VOTES" $PASS_OUTS > "$TMP_OUT"; then merged=1; fi
-  fi
-  if [ "$merged" = 0 ]; then
-    say "merge unavailable — using the first successful pass"
-    cat "${PASS_OUTS%% *}" > "$TMP_OUT" 2>/dev/null || true
-  fi
-  # shellcheck disable=SC2086  # deliberate word splitting over the pass list
-  rm -f $PASS_OUTS
+if [ ${#VALID_OUTS[@]} -eq 0 ]; then
+  write_metadata not-run
+  die "every configured pass failed"
 fi
 
-# Remember what was said. Without this a local run has no memory: it re-reports
-# everything every time and there is no way to say "seen it, it's fine". The
-# pull-request side gets that from the threads; locally it has to be stored.
-# Every mode records. The default local mode is `summary`, so gating this on
-# non-summary meant the documented plain `review` never stored anything — the
-# state feature was off by default in the only path most people use.
-# summary mode answers in markdown, which has no findings to track. Say so
-# rather than appearing to record and silently not.
-if [ "$REVIEW_MODE" = "summary" ]; then
-  say "state: not tracked in summary mode — use suggest or inline"
-elif ST="$(support_exec scripts/local-state.mjs)" && command -v node >/dev/null 2>&1 \
-   && grep -q '"findings"' "$TMP_OUT" 2>/dev/null; then
-  _head="$(git rev-parse HEAD 2>/dev/null || echo)"
-  _base="${MERGE_BASE:-${BASE:-}}"
-  if _delta="$(node "$ST" record "$TMP_OUT" "$_base" "$_head" 2>/dev/null)"; then
+TMP_OUT="$RUN_TMP/merged.json"
+MERGE_SUCCEEDED=true
+if ! node "$MERGE" --min-votes "$MIN_VOTES" "${VALID_OUTS[@]}" > "$TMP_OUT" \
+   || ! node "$MERGE" --check "$TMP_OUT" 2>/dev/null; then
+  MERGE_SUCCEEDED=false
+  say "merge failed — preserving the first valid structured pass as inconclusive"
+  cp "${VALID_OUTS[0]}" "$TMP_OUT"
+fi
+node "$MERGE" --check "$TMP_OUT" 2>/dev/null \
+  || die "merged review is not a structured findings document"
+
+if [ -n "$OUT" ]; then
+  out_tmp="${OUT}.tmp.$$"
+  cp "$TMP_OUT" "$out_tmp" || die "could not write review beside $OUT"
+  if ! node "$MERGE" --check "$out_tmp" 2>/dev/null; then
+    rm -f "$out_tmp"
+    die "structured review at $out_tmp failed validation"
+  fi
+  mv -f "$out_tmp" "$OUT"
+  ok "written to $OUT"
+fi
+write_metadata "$MERGE_SUCCEEDED"
+
+if [ "$RECORD_STATE" = 1 ] && ST="$(support_exec scripts/local-state.mjs)"; then
+  if _delta="$(node "$ST" record "$TMP_OUT" "$BASE_SHA" "$HEAD_SHA" 2>/dev/null)"; then
     say "state: $_delta"
   fi
 fi
 
-# Read the verdict BEFORE cleanup: $OUT is empty when printing to stdout and
-# the temp file is gone by then, so a check placed afterwards can never fire.
-# (`if` rather than `grep … && CLEAN=1` purely for clarity — a failing
-# non-final command in a && list is exempt from set -e, so both are correct.)
 CLEAN=0
-if [ "$REVIEW_MODE" = "summary" ]; then
-  if grep -qx "No findings." "$TMP_OUT"; then CLEAN=1; fi
-elif grep -q '"findings"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]' "$TMP_OUT"; then
+if node -e 'const fs=require("node:fs"); process.exit(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).findings.length === 0 ? 0 : 1)' "$TMP_OUT"; then
   CLEAN=1
 fi
 
-printf '\n'
-if [ -n "$OUT" ]; then
-  # --out gets the raw agent output, so a JSON review stays machine-readable.
-  cp "$TMP_OUT" "$OUT"; ok "written to $OUT"
-elif [ "$AS_JSON" = 1 ]; then
-  # Raw model output, so the findings stay machine-readable for a pipeline.
-  # Progress goes to stderr throughout, so stdout is only ever the result.
+if [ "$AS_JSON" = 1 ]; then
   cat "$TMP_OUT"
-elif [ "$REVIEW_MODE" = "summary" ]; then
-  cat "$TMP_OUT"
+elif RENDERER="$(support_exec scripts/post-review.mjs)"; then
+  FINDINGS_FILE="$TMP_OUT" REVIEW_MODE="$REVIEW_MODE" RENDER=1 node "$RENDERER" || cat "$TMP_OUT"
 else
-  # Render the structured findings, including the fixes that would appear as
-  # committable suggestions on a pull request. Shares post-review.mjs's parser
-  # so the terminal and the PR cannot disagree about what the agent said.
-  if command -v node >/dev/null 2>&1 && RENDERER="$(support_exec scripts/post-review.mjs)"; then
-    FINDINGS_FILE="$TMP_OUT" RENDER=1 node "$RENDERER" || cat "$TMP_OUT"
-  else
-    cat "$TMP_OUT"
-  fi
+  cat "$TMP_OUT"
 fi
-rm -f "$TMP_PROMPT" "$TMP_OUT" "$TMP_OUT.err"
 
 printf '\n' >&2
-if [ "$CLEAN" = 1 ]; then
+if [ "$CLEAN" = 1 ] && [ "$ANALYSIS_STATE" = "complete" ]; then
   ok "no findings"
+elif [ "$CLEAN" = 1 ]; then
+  say "no findings in available passes; analysis inconclusive"
 elif [ "$FAIL_ON_FINDINGS" = 1 ]; then
-  # Non-zero exit so this is usable as a pre-push hook or in a pipeline.
   _c "0;33"; printf '  ! findings above — review before pushing\n' >&2; _c "0"
   exit 1
 else
