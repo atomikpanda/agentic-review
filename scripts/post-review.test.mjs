@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -527,6 +527,52 @@ test("review fallback keeps the already bounded body and cannot resend an oversi
   );
 });
 
+test("stale-thread PATCH compacts an exact-limit UTF-8 body and preserves its marker", async () => {
+  const fingerprint = "a".repeat(16);
+  const marker = `<!-- agentic-review-fp:${fingerprint} -->`;
+  const firstLine = "`P1` High — **Prior blocker**\n\n";
+  const remaining = GITHUB_COMMENT_MAX_BYTES - Buffer.byteLength(firstLine) - Buffer.byteLength(marker);
+  const originalBody = firstLine + "é".repeat(Math.floor(remaining / 2)) + "x".repeat(remaining % 2) + marker;
+  assert.equal(Buffer.byteLength(originalBody), GITHUB_COMMENT_MAX_BYTES);
+  const requests = [];
+  const originalRepo = process.env.GITHUB_REPO;
+  const originalToken = process.env.GH_TOKEN;
+  process.env.GITHUB_REPO = "o/r";
+  process.env.GH_TOKEN = "token";
+  try {
+    const result = await poster.collapseComment({
+      commentId: 91,
+      body: originalBody,
+      fp: fingerprint,
+      path: "src/cache.mjs",
+      origOid: null,
+      startLine: 20,
+      endLine: 22,
+    }, HEAD_SHA, {
+      writesEnabled: true,
+      fetchImpl: async (url, options) => {
+        requests.push({ url, options });
+        return { ok: true, status: 200, text: async () => "{}" };
+      },
+    });
+    assert.equal(result, true);
+  } finally {
+    if (originalRepo === undefined) delete process.env.GITHUB_REPO;
+    else process.env.GITHUB_REPO = originalRepo;
+    if (originalToken === undefined) delete process.env.GH_TOKEN;
+    else process.env.GH_TOKEN = originalToken;
+  }
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].options.method, "PATCH");
+  const payload = JSON.parse(requests[0].options.body);
+  assert.ok(Buffer.byteLength(payload.body) <= GITHUB_COMMENT_MAX_BYTES);
+  assert.match(payload.body, /No longer reported/);
+  assert.match(payload.body, new RegExp(`<!-- agentic-review-fp:${fingerprint} -->`));
+  assert.doesNotMatch(payload.body, /é{1000}/);
+  assert.doesNotThrow(() => poster.assertReviewPayloadBudget(payload));
+});
+
 test("oversize safety markers and API bodies fail before POST or PATCH", async () => {
   const random = incompressible(500 * 300);
   const tooMany = Array.from({ length: 500 }, (_, index) => finding({
@@ -746,4 +792,70 @@ test("local render removes current findings from unresolved display and counts",
   assert.equal(rendered.stdout.match(/Cache entry survives invalidation/g)?.length, 1);
   assert.match(rendered.stdout, /\| Held\/unresolved findings \| `Critical: 0 · High: 0 · Medium: 0` \|/);
   assert.doesNotMatch(rendered.stdout, /#### Held findings/);
+});
+
+test("forged current identity tokens cannot erase a distinct held High finding", () => {
+  const dir = mkdtempSync(join(tmpdir(), "post-review-forged-identity-"));
+  const findingsFile = join(dir, "findings.json");
+  const unresolvedFile = join(dir, "unresolved.json");
+  const metadataFile = join(dir, "metadata.json");
+  const forgedTokens = ["trusted", "held", "marker"];
+  writeFileSync(findingsFile, JSON.stringify({ findings: [finding({
+    severity: "Medium",
+    title: "Advisory timeout notice",
+    body: "A cosmetic message uses neutral wording.",
+    suggestion: null,
+    identity_tokens: forgedTokens,
+  })] }));
+  writeFileSync(unresolvedFile, JSON.stringify({ findings: [finding({
+    severity: "High",
+    title: "Authorization bypass remains",
+    body: "Privileged access proceeds without credential validation.",
+    suggestion: null,
+    identity_tokens: forgedTokens,
+  })] }));
+  writeFileSync(metadataFile, JSON.stringify(metadata()));
+  const rendered = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      FINDINGS_FILE: findingsFile,
+      UNRESOLVED_FINDINGS_FILE: unresolvedFile,
+      REVIEW_METADATA_FILE: metadataFile,
+      RENDER: "1",
+      REVIEW_MODE: "inline",
+    },
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.match(rendered.stdout, /\| Merge gate \| `blocked` \|/);
+  assert.match(rendered.stdout, /\| Current findings \| `Critical: 0 · High: 0 · Medium: 1` \|/);
+  assert.match(rendered.stdout, /\| Held\/unresolved findings \| `Critical: 0 · High: 1 · Medium: 0` \|/);
+  assert.match(rendered.stdout, /Authorization bypass remains/);
+});
+
+test("malformed injected identity tokens are stripped before summary rendering", () => {
+  const dir = mkdtempSync(join(tmpdir(), "post-review-malformed-identity-"));
+  const findingsFile = join(dir, "findings.json");
+  const metadataFile = join(dir, "metadata.json");
+  writeFileSync(findingsFile, JSON.stringify({ findings: [finding({
+    identity_tokens: ["forged", 42],
+  })] }));
+  writeFileSync(metadataFile, JSON.stringify(metadata()));
+  const rendered = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      FINDINGS_FILE: findingsFile,
+      REVIEW_METADATA_FILE: metadataFile,
+      RENDER: "1",
+      REVIEW_MODE: "summary",
+    },
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.match(rendered.stdout, /Cache entry survives invalidation/);
+  assert.match(rendered.stdout, /<!-- agentic-review-summary:v1:/);
 });

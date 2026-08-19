@@ -177,6 +177,19 @@ test("an invalid finding makes the whole document malformed for imports and the 
   assert.notEqual(checked.status, 0);
 });
 
+test("external findings cannot carry trusted summary identity tokens through the merger", () => {
+  const injected = finding("Injected identity", {
+    identity_tokens: ["held", "blocker", "identity"],
+    extra_internal_state: "discard",
+  });
+  const result = mergeFindingDocuments([{ findings: [injected] }], { minVotes: 1 });
+
+  assert.equal(result.statuses[0].status, "valid");
+  assert.deepEqual(result.findings, [{ ...finding("Injected identity"), votes: 1 }]);
+  assert.equal(Object.hasOwn(result.findings[0], "identity_tokens"), false);
+  assert.equal(Object.hasOwn(result.findings[0], "extra_internal_state"), false);
+});
+
 test("importing the module has no stdout, stderr, or exit side effects", () => {
   const imported = spawnSync(
     process.execPath,

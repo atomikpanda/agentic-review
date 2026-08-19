@@ -39,6 +39,7 @@ import { deflateRawSync, inflateRawSync } from "node:zlib";
 import {
   identityTokens,
   isValidFinding,
+  projectPublicFinding,
   sameFinding,
   similarity,
   SIMILARITY_DEFAULT,
@@ -305,7 +306,10 @@ function extractJson(text) {
     try {
       const parsed = JSON.parse(c);
       if (parsed && Array.isArray(parsed.findings) && parsed.findings.every(isValidFinding)) {
-        return parsed;
+        return {
+          ...parsed,
+          findings: parsed.findings.map(projectPublicFinding),
+        };
       }
     } catch {
       /* try the next candidate */
@@ -506,6 +510,7 @@ export function renderReviewBody({ mode, metadata, state, current, unresolved })
 }
 
 export const GITHUB_COMMENT_MAX_BYTES = 65_536;
+const COLLAPSED_ORIGINAL_LINE_MAX_BYTES = 2_048;
 
 function fitUtf8Bytes(value, maxBytes, suffix = "") {
   const text = String(value ?? "");
@@ -912,16 +917,42 @@ async function resolveThread(id) {
 // Editing our own review comment IS permitted, so a stale finding is marked and
 // folded away instead. Less tidy than a resolved thread, same practical effect:
 // the reader can see at a glance that the reviewer withdrew it.
-async function collapseComment(t, head) {
-  if (!t.commentId) return false;
-  if (DRY_RUN) { console.log(`  [suppressed] would mark comment ${t.commentId} as no longer reported`); return true; }
-  if (RETIRED_RE.test(t.body)) return false; // already done
+function collapsedCommentBody(thread, head) {
+  const note = retirementNote(thread, head);
+  const full =
+    `${note}\n\n` +
+    `<details><summary>Original finding</summary>\n\n${thread.body}\n\n</details>`;
+  if (Buffer.byteLength(full) <= GITHUB_COMMENT_MAX_BYTES) return full;
+
+  const fp = readStamp(thread.body) ?? (/^[0-9a-f]{16}$/.test(thread.fp ?? "") ? thread.fp : null);
+  if (!fp) throw new RangeError("oversized stale comment has no authoritative identity marker");
+  const firstLine = String(thread.body ?? "").split("\n", 1)[0];
+  const original = fitUtf8Bytes(firstLine, COLLAPSED_ORIGINAL_LINE_MAX_BYTES, "…");
+  const details =
+    `<details><summary>Original finding</summary>\n\n${original}\n\n` +
+    `_Original finding prose omitted to satisfy GitHub's PATCH byte limit._\n\n</details>` +
+    stamp(fp);
+  const noteBudget = GITHUB_COMMENT_MAX_BYTES - Buffer.byteLength(details) - 2;
+  if (noteBudget < 1) throw new RangeError("stale comment identity history exceeds GitHub comment limit");
+  return `${fitUtf8Bytes(note, noteBudget, "…")}\n\n${details}`;
+}
+
+export async function collapseComment(
+  thread,
+  head,
+  { writesEnabled = !DRY_RUN, fetchImpl = fetch } = {},
+) {
+  if (!thread.commentId) return false;
+  if (!writesEnabled) {
+    console.log(`  [suppressed] would mark comment ${thread.commentId} as no longer reported`);
+    return true;
+  }
+  if (RETIRED_RE.test(thread.body)) return false; // already done
   const repo = required("GITHUB_REPO");
-  const body =
-    `${retirementNote(t, head)}\n\n` +
-    `<details><summary>Original finding</summary>\n\n${t.body}\n\n</details>`;
-  const res = await fetch(
-    `https://api.github.com/repos/${repo}/pulls/comments/${t.commentId}`,
+  const payload = { body: collapsedCommentBody(thread, head) };
+  assertReviewPayloadBudget(payload);
+  const res = await fetchImpl(
+    `https://api.github.com/repos/${repo}/pulls/comments/${thread.commentId}`,
     {
       method: "PATCH",
       headers: {
@@ -929,7 +960,7 @@ async function collapseComment(t, head) {
         accept: "application/vnd.github+json",
         "content-type": "application/json",
       },
-      body: JSON.stringify({ body }),
+      body: JSON.stringify(payload),
     },
   );
   if (!res.ok) throw new Error(`PATCH comment ${res.status}: ${(await res.text()).slice(0, 200)}`);

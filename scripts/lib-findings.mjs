@@ -43,6 +43,19 @@ export function isValidFinding(value) {
     && (typeof value.suggestion === "string" || value.suggestion === null);
 }
 
+export function projectPublicFinding(value) {
+  if (!isValidFinding(value)) return null;
+  return {
+    title: value.title,
+    body: value.body,
+    severity: value.severity,
+    file: value.file,
+    start_line: value.start_line,
+    end_line: value.end_line,
+    suggestion: value.suggestion,
+  };
+}
+
 const STOPWORDS = new Set(
   ("this that with from have when then than been they them there which while would could" +
     " should must into over under only also more most much some such very each other same" +

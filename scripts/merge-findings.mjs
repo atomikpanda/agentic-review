@@ -22,7 +22,12 @@
 
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { isValidFinding, sameFinding, SIMILARITY_DEFAULT } from "./lib-findings.mjs";
+import {
+  isValidFinding,
+  projectPublicFinding,
+  sameFinding,
+  SIMILARITY_DEFAULT,
+} from "./lib-findings.mjs";
 
 const SEVERITY_RANK = { Critical: 0, High: 1, Medium: 2 };
 
@@ -91,8 +96,9 @@ export function mergeFindingDocuments(documents, { minVotes = 1 } = {}) {
 
     passes++;
     statuses.push({ status: "valid", finding_count: parsed.findings.length });
-    for (const finding of parsed.findings) {
-      if (!finding || typeof finding.file !== "string") continue;
+    for (const rawFinding of parsed.findings) {
+      const finding = projectPublicFinding(rawFinding);
+      if (!finding) continue;
       const hit = merged.find((candidate) =>
         sameFinding(candidate, finding, SIMILARITY_DEFAULT));
       if (hit) {
