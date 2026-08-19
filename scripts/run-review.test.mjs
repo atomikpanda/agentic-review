@@ -19,7 +19,31 @@ import test from "node:test";
 
 const runner = fileURLToPath(new URL("./run-review.sh", import.meta.url));
 const resultCli = fileURLToPath(new URL("./review-result.mjs", import.meta.url));
+const poster = fileURLToPath(new URL("./post-review.mjs", import.meta.url));
+const workflow = fileURLToPath(new URL("../.github/workflows/agentic-review.yml", import.meta.url));
 const trustedRoot = dirname(dirname(runner));
+
+function workflowRunStep(name) {
+  const lines = readFileSync(workflow, "utf8").split("\n");
+  const stepStart = lines.findIndex((line) => line === `      - name: ${name}`);
+  if (stepStart === -1) throw new Error(`workflow step not found: ${name}`);
+  const runStart = lines.findIndex((line, index) => index > stepStart && line === "        run: |");
+  if (runStart === -1) throw new Error(`workflow run body not found: ${name}`);
+  const body = [];
+  for (let index = runStart + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line.length > 0 && !line.startsWith("          ")) break;
+    body.push(line.startsWith("          ") ? line.slice(10) : "");
+  }
+  return `${body.join("\n")}\n`;
+}
+
+function envFileValues(path) {
+  return Object.fromEntries(readFileSync(path, "utf8").trim().split("\n").map((line) => {
+    const separator = line.indexOf("=");
+    return [line.slice(0, separator), line.slice(separator + 1)];
+  }));
+}
 
 function finding(title, overrides = {}) {
   return {
@@ -46,6 +70,8 @@ const promptArgument = process.argv.slice(2).find((argument) => argument.startsW
 if (!promptArgument) process.exit(2);
 const promptPath = promptArgument.slice(1);
 const prompt = readFileSync(promptPath, "utf8");
+const skillArgument = process.argv.slice(2).find((argument) => argument.startsWith("--append-system-prompt="));
+const skill = skillArgument ? readFileSync(skillArgument.slice("--append-system-prompt=".length), "utf8") : "";
 const instructions = prompt.split("## Changed files", 1)[0];
 const id = instructions.includes("# This pass: correctness")
   ? "correctness"
@@ -81,6 +107,7 @@ appendFileSync(process.env.FAKE_OMP_LOG, JSON.stringify({
   attempt,
   promptPath,
   prompt,
+  skill,
   cwd: reviewCwd,
   reviewedAlpha,
   reviewedCodegraph,
@@ -379,6 +406,250 @@ test("the default profile runs general, correctness, and boundaries into one val
   const validation = validateMetadata(run.metadataFile);
   assert.equal(validation.status, 0, validation.stderr);
   assert.deepEqual(JSON.parse(validation.stdout), run.metadata);
+});
+
+test("hosted contract runs one trusted ensemble and one suppressed poster gate", (t) => {
+  const maliciousExecutableMarker = join(tmpdir(), `hosted-target-executed-${process.pid}-${Date.now()}`);
+  const targetDataMarker = "UNTRUSTED_TARGET_SUPPORT";
+  const shared = finding("Shared hosted defect", {
+    file: "alpha.txt",
+    severity: "High",
+  });
+  const medium = finding("Correctness hosted defect", {
+    file: "beta.txt",
+    severity: "Medium",
+  });
+  const fixture = createFixture(t, {
+    targetFiles: {
+      "review/prompt.md": `${targetDataMarker}_PROMPT\n`,
+      "review/format-json.md": `${targetDataMarker}_FORMAT\n`,
+      "review/lenses/correctness.md": `# This pass: correctness\n${targetDataMarker}_CORRECTNESS\n`,
+      "review/lenses/boundaries.md": `# This pass: boundaries\n${targetDataMarker}_BOUNDARIES\n`,
+      "skills/infra-review/SKILL.md": `${targetDataMarker}_SKILL\n`,
+      "scripts/review-result.mjs": `import { writeFileSync } from "node:fs"; writeFileSync(process.env.MALICIOUS_EXEC_MARKER, "review-result");\n`,
+      "scripts/merge-findings.mjs": `import { writeFileSync } from "node:fs"; writeFileSync(process.env.MALICIOUS_EXEC_MARKER, "merge-findings");\n`,
+      "scripts/run-review.sh": `#!/usr/bin/env bash\nprintf target > "$MALICIOUS_EXEC_MARKER"\n`,
+      "scripts/post-review.mjs": `import { writeFileSync } from "node:fs"; writeFileSync(process.env.MALICIOUS_EXEC_MARKER, "poster");\n`,
+      "scripts/strip-agent-config.sh": `#!/usr/bin/env bash\nprintf target > "$MALICIOUS_EXEC_MARKER"\n`,
+    },
+  });
+  t.after(() => rmSync(maliciousExecutableMarker, { force: true }));
+  symlinkSync(trustedRoot, join(fixture.repository, ".central-skills"), "dir");
+
+  const planFile = join(fixture.directory, "plan.json");
+  const logFile = join(fixture.directory, "omp.log");
+  writeFileSync(planFile, JSON.stringify({
+    general: [{ findings: [shared] }],
+    correctness: [{ findings: [medium] }],
+    boundaries: [{ findings: [shared] }],
+  }));
+
+  const failedSupportSelection = spawnSync("bash", ["-c", workflowRunStep("select trusted support")], {
+    cwd: fixture.repository,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      TARGET_REPO: "outside/target",
+      CENTRAL_OUTCOME: "failure",
+      CENTRAL_REPO: "atomikpanda/agentic-review",
+      GITHUB_ENV: join(fixture.directory, "failed-support.env"),
+    },
+  });
+  assert.notEqual(failedSupportSelection.status, 0);
+  assert.match(`${failedSupportSelection.stdout}${failedSupportSelection.stderr}`, /trusted support checkout .* failed/);
+
+  const supportEnvFile = join(fixture.directory, "support.env");
+  const selectionResult = spawnSync("bash", ["-c", workflowRunStep("select trusted support")], {
+    cwd: fixture.repository,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      TARGET_REPO: "outside/target",
+      CENTRAL_OUTCOME: "success",
+      CENTRAL_REPO: "atomikpanda/agentic-review",
+      GITHUB_ENV: supportEnvFile,
+    },
+  });
+  assert.equal(selectionResult.status, 0, selectionResult.stderr);
+  const support = envFileValues(supportEnvFile);
+  assert.equal(support.REVIEW_RUNNER, runner);
+  assert.equal(support.REVIEW_POSTER, poster);
+  assert.equal(support.TRUSTED_DATA_ROOT, trustedRoot);
+
+  const selfSupportEnvFile = join(fixture.directory, "self-support.env");
+  const selfSelection = spawnSync("bash", ["-c", workflowRunStep("select trusted support")], {
+    cwd: fixture.repository,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      TARGET_REPO: "atomikpanda/agentic-review",
+      CENTRAL_REPO: "atomikpanda/agentic-review",
+      CENTRAL_OUTCOME: "failure",
+      GITHUB_ENV: selfSupportEnvFile,
+    },
+  });
+  assert.equal(selfSelection.status, 0, selfSelection.stderr);
+  const selfSupport = envFileValues(selfSupportEnvFile);
+  assert.equal(selfSupport.TRUSTED_DATA_ROOT, fixture.repository);
+  assert.equal(selfSupport.REVIEW_RUNNER, join(fixture.repository, "scripts/run-review.sh"));
+  assert.equal(selfSupport.REVIEW_POSTER, join(fixture.repository, "scripts/post-review.mjs"));
+
+  for (const path of ["/tmp/prompt-body.md", "/tmp/skill.md", "/tmp/one-skill.md"]) {
+    rmSync(path, { force: true });
+    t.after(() => rmSync(path, { force: true }));
+  }
+  const promptEnvFile = join(fixture.directory, "prompt.env");
+  const promptResolution = spawnSync("bash", ["-c", workflowRunStep("resolve trusted prompt and skills")], {
+    cwd: fixture.repository,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ...support,
+      BASE: fixture.baseSha,
+      PROMPT_PATH: "review/prompt.md",
+      SKILLS_PATH: "skills/infra-review/SKILL.md,skills/security-review/SKILL.md",
+      GITHUB_ENV: promptEnvFile,
+    },
+  });
+  assert.equal(promptResolution.status, 0, promptResolution.stderr);
+  const promptSupport = envFileValues(promptEnvFile);
+  assert.equal(promptSupport.PROMPT_FILE, "/tmp/prompt-body.md");
+  assert.equal(promptSupport.SKILL_FILE, "/tmp/skill.md");
+  assert.equal(readFileSync(promptSupport.PROMPT_FILE, "utf8").includes(targetDataMarker), false);
+  assert.equal(readFileSync(promptSupport.SKILL_FILE, "utf8").includes(targetDataMarker), false);
+
+  const findingsFile = "/tmp/review.md";
+  const metadataFile = "/tmp/review-meta.json";
+  const runnerOutFile = "/tmp/review-runner.out";
+  const runnerErrFile = "/tmp/review-runner.err";
+  for (const path of [findingsFile, metadataFile, runnerOutFile, runnerErrFile]) {
+    rmSync(path, { force: true });
+    t.after(() => rmSync(path, { force: true }));
+  }
+  const reviewResult = spawnSync("bash", ["-c", workflowRunStep("run agentic review (read-only)")], {
+    cwd: fixture.repository,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ...support,
+      ...promptSupport,
+      PATH: `${fixture.bin}:${process.env.PATH}`,
+      OPENROUTER_API_KEY: "sk-or-hosted-test",
+      FAKE_OMP_PLAN: planFile,
+      FAKE_OMP_LOG: logFile,
+      FAKE_OMP_STATE: fixture.state,
+      MALICIOUS_EXEC_MARKER: maliciousExecutableMarker,
+      BASE: fixture.baseSha,
+      HEAD: fixture.headSha,
+      MODEL: "openrouter/test/hosted",
+      THINKING: "low",
+      TOOLS: "read,grep,glob",
+      MAX_TIME: "7m",
+      MAX_FINDINGS: "5",
+      MAX_DIFF_BYTES: "400000",
+      REVIEW_MODE: "summary",
+      OMP_VERSION: "latest",
+      EXTRA_ARGS: "--print-thoughts",
+      CODEGRAPH: "false",
+    },
+  });
+  assert.equal(reviewResult.status, 0, reviewResult.stderr);
+
+  const logs = readFileSync(logFile, "utf8").trim().split("\n").map(JSON.parse);
+  const findings = JSON.parse(readFileSync(findingsFile, "utf8"));
+  const metadata = JSON.parse(readFileSync(metadataFile, "utf8"));
+  assert.equal(logs.length, 3);
+  assert.deepEqual(logs.map(({ id }) => id), ["general", "correctness", "boundaries"]);
+  assert.ok(logs.every(({ attempt }) => attempt === 1));
+  assert.ok(logs.every(({ argv }) => argv.includes("--print-thoughts")));
+  assert.ok(logs.every(({ prompt }) => prompt.includes("Output a single JSON object and nothing else")));
+  assert.ok(logs.every(({ prompt }) => !prompt.split("## Changed files", 1)[0].includes(targetDataMarker)));
+  assert.ok(logs.every(({ skill }) => !skill.includes(targetDataMarker)));
+  assert.equal(existsSync(maliciousExecutableMarker), false);
+  assert.equal(existsSync(findingsFile), true);
+  assert.equal(existsSync(metadataFile), true);
+  assert.deepEqual(metadata.passes.requested, ["general", "correctness", "boundaries"]);
+  assert.deepEqual(metadata.passes.completed, ["general", "correctness", "boundaries"]);
+  assert.equal(metadata.analysis_state, "complete");
+  assert.deepEqual(
+    findings.findings.map(({ title }) => title).sort(),
+    ["Correctness hosted defect", "Shared hosted defect"],
+  );
+  assert.equal(findings.findings.find(({ title }) => title === shared.title).votes, 2);
+
+  const githubLogFile = join(fixture.directory, "github.log");
+  const posterCallsFile = join(fixture.directory, "poster-calls.log");
+  const outputFile = join(fixture.directory, "poster-output");
+  const summaryFile = join(fixture.directory, "poster-summary");
+  const preloadFile = join(fixture.directory, "fake-github.mjs");
+  writeFileSync(preloadFile, `
+import { appendFileSync } from "node:fs";
+appendFileSync(process.env.FAKE_POSTER_CALLS, "poster\\n");
+globalThis.fetch = async (url, options = {}) => {
+  const method = options.method ?? "GET";
+  const body = String(options.body ?? "");
+  appendFileSync(process.env.FAKE_GITHUB_LOG, JSON.stringify({ url: String(url), method, body }) + "\\n");
+  if (String(url).endsWith("/graphql") && body.includes("viewer")) {
+    return { ok: true, status: 200, json: async () => ({ data: { viewer: { login: "review-app[bot]" } } }), text: async () => "" };
+  }
+  if (String(url).includes("/issues/17/comments") && method === "GET") {
+    return { ok: true, status: 200, json: async () => [], text: async () => "" };
+  }
+  throw new Error("unexpected GitHub request: " + method + " " + url);
+};
+`);
+  const posterResult = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: fixture.repository,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ...support,
+      NODE_OPTIONS: `--import=${preloadFile}`,
+      FAKE_GITHUB_LOG: githubLogFile,
+      FAKE_POSTER_CALLS: posterCallsFile,
+      GH_TOKEN: "installation-token",
+      FINDINGS_FILE: findingsFile,
+      REVIEW_METADATA_FILE: metadataFile,
+      GITHUB_REPO: "outside/target",
+      PR_NUMBER: "17",
+      HEAD_SHA: fixture.headSha,
+      BASE_SHA: fixture.baseSha,
+      TARGET_REPO: "outside/target",
+      PR: "17",
+      BASE: fixture.baseSha,
+      HEAD: fixture.headSha,
+      REVIEW_MODE: "summary",
+      POST_COMMENT: "true",
+      SUPPRESS_WRITES: "true",
+      RESOLVE_STALE: "true",
+      MAX_FINDINGS: "5",
+      FAIL_ON_FINDINGS: "true",
+      BLOCK_SEVERITIES: "Critical,High",
+      GITHUB_OUTPUT: outputFile,
+      GITHUB_STEP_SUMMARY: summaryFile,
+    },
+  });
+  assert.equal(posterResult.status, 1, posterResult.stderr);
+  assert.match(posterResult.stderr, /1 blocking finding/);
+  assert.equal(readFileSync(posterCallsFile, "utf8"), "poster\n");
+  const outputs = envFileValues(outputFile);
+  assert.equal(outputs.analysis_state, "complete");
+  assert.equal(outputs.merge_state, "blocked");
+  assert.equal(outputs.sample_state, "findings");
+  assert.equal(outputs.bounded_converged, "false");
+  assert.equal(outputs.passes_requested, "3");
+  assert.equal(outputs.passes_completed, "3");
+  assert.deepEqual(JSON.parse(outputs.current_counts), { Critical: 0, High: 1, Medium: 1 });
+  assert.deepEqual(JSON.parse(outputs.unresolved_counts), { Critical: 0, High: 0, Medium: 0 });
+  assert.match(readFileSync(summaryFile, "utf8"), /\| Passes \| `3 requested \/ 3 completed` \|/);
+  const githubRequests = readFileSync(githubLogFile, "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(githubRequests.length, 2);
+  assert.equal(
+    githubRequests.some(({ url, method }) => url.includes("/comments") && method !== "GET"),
+    false,
+  );
+  assert.equal(githubRequests.some(({ body }) => body.includes("mutation")), false);
+  assert.equal(existsSync(maliciousExecutableMarker), false);
 });
 
 test("local suggest rendering consumes generated metadata and keeps the replacement", (t) => {
