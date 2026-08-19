@@ -37,7 +37,7 @@ const RUNS_DIR = join(STATE_DIR, "runs");
 const STATE_FILE = join(STATE_DIR, "state.json");
 const STORED_STATUSES = new Set(["open", "dismissed", "gone"]);
 const STORED_SEVERITIES = new Set(["Critical", "High", "Medium"]);
-const COMMIT_SHA = /^[0-9a-f]{40}$/;
+const NON_LOWERCASE_HEX = /[^0-9a-f]/;
 
 function isTimestamp(value) {
   if (typeof value !== "string") return false;
@@ -87,7 +87,8 @@ function migrateAndValidateStoredFinding(finding, index) {
     throw new TypeError(`${label} has an invalid inclusive line span`);
   }
   for (const field of ["firstCommit", "lastCommit"]) {
-    if (typeof finding[field] !== "string" || !COMMIT_SHA.test(finding[field])) {
+    const commit = finding[field];
+    if (typeof commit !== "string" || commit.length !== 40 || NON_LOWERCASE_HEX.test(commit)) {
       throw new TypeError(`${label}.${field} must be a lowercase 40-hex commit SHA`);
     }
   }

@@ -153,6 +153,13 @@ test("structurally invalid stored findings fail every reader and preserve bytes"
     JSON.stringify({ findings: [{ ...valid, status: "open", goneAt: validTimestamp }] }),
     JSON.stringify({ findings: [{ ...valid, status: "dismissed", goneAt: validTimestamp }] }),
   ];
+  for (const field of ["firstCommit", "lastCommit"]) {
+    for (const terminator of ["\n", "\r", "\u2028", "\u2029"]) {
+      invalidStates.push(JSON.stringify({
+        findings: [{ ...valid, [field]: `${validCommit}${terminator}` }],
+      }));
+    }
+  }
   mkdirSync(stateDirectory, { recursive: true });
   const findingsFile = join(repository, "findings.json");
   writeFileSync(findingsFile, JSON.stringify({ findings: [] }));
