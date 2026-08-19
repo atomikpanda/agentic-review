@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -57,12 +58,17 @@ const attemptFile = join(process.env.FAKE_OMP_STATE, id);
 let attempt = 1;
 try { attempt = Number(readFileSync(attemptFile, "utf8")) + 1; } catch {}
 writeFileSync(attemptFile, String(attempt));
+const reviewCwd = process.argv.slice(2).find((argument) => argument.startsWith("--cwd="))?.slice(6)
+  ?? process.cwd();
+let reviewedAlpha = null;
+try { reviewedAlpha = readFileSync(join(reviewCwd, "alpha.txt"), "utf8"); } catch {}
 appendFileSync(process.env.FAKE_OMP_LOG, JSON.stringify({
   id,
   attempt,
   promptPath,
   prompt,
-  cwd: process.cwd(),
+  cwd: reviewCwd,
+  reviewedAlpha,
   argv: process.argv.slice(2),
 }) + "\\n");
 const plan = JSON.parse(readFileSync(process.env.FAKE_OMP_PLAN, "utf8"));
@@ -79,7 +85,12 @@ function git(directory, ...args) {
   return execFileSync("git", args, { cwd: directory, encoding: "utf8" }).trim();
 }
 
-function createFixture(t, { targetFiles = {} } = {}) {
+function createFixture(t, {
+  targetFiles = {},
+  baseFiles = {},
+  deleteFiles = [],
+  staged = false,
+} = {}) {
   const directory = mkdtempSync(join(tmpdir(), "run-review-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const repository = join(directory, "repository");
@@ -95,11 +106,16 @@ function createFixture(t, { targetFiles = {} } = {}) {
   writeFileSync(join(repository, "alpha.txt"), "alpha base\n");
   writeFileSync(join(repository, "beta.txt"), "beta base\n");
   writeFileSync(join(repository, "gamma.txt"), "gamma base\n");
+  for (const [path, contents] of Object.entries(baseFiles)) {
+    const destination = join(repository, path);
+    mkdirSync(dirname(destination), { recursive: true });
+    writeFileSync(destination, contents);
+  }
   git(repository, "add", ".");
   git(repository, "commit", "-m", "base");
   const baseSha = git(repository, "rev-parse", "HEAD");
 
-  git(repository, "checkout", "-b", "feature");
+  if (!staged) git(repository, "checkout", "-b", "feature");
   writeFileSync(join(repository, "alpha.txt"), "alpha head\n");
   writeFileSync(join(repository, "beta.txt"), "beta head\n");
   writeFileSync(join(repository, "gamma.txt"), "gamma head\n");
@@ -108,9 +124,13 @@ function createFixture(t, { targetFiles = {} } = {}) {
     mkdirSync(dirname(destination), { recursive: true });
     writeFileSync(destination, contents);
   }
+  for (const path of deleteFiles) rmSync(join(repository, path));
   git(repository, "add", ".");
-  git(repository, "commit", "-m", "change three files");
-  const headSha = git(repository, "rev-parse", "HEAD");
+  let headSha = null;
+  if (!staged) {
+    git(repository, "commit", "-m", "change three files");
+    headSha = git(repository, "rev-parse", "HEAD");
+  }
 
   const omp = join(bin, "omp");
   writeFileSync(omp, fakeOmp);
@@ -123,20 +143,32 @@ function runReview(t, plan, {
   args = ["--json"],
   env = {},
   targetFiles = {},
+  baseFiles = {},
+  deleteFiles = [],
+  staged = false,
   includeOutputs = true,
   metadataViaEnv = false,
   noState = true,
   failMerge = false,
+  mutateAfterWorktree = null,
+  outputPaths = null,
 } = {}) {
-  const fixture = createFixture(t, { targetFiles });
+  const fixture = createFixture(t, { targetFiles, baseFiles, deleteFiles, staged });
   const planFile = join(fixture.directory, "plan.json");
   const logFile = join(fixture.directory, "omp.log");
-  const findingsFile = join(fixture.directory, "findings.json");
-  const metadataFile = join(fixture.directory, "metadata.json");
+  let findingsFile = join(fixture.directory, "findings.json");
+  let metadataFile = join(fixture.directory, "metadata.json");
+  if (outputPaths) {
+    ({ findingsFile, metadataFile } = outputPaths({
+      ...fixture,
+      findingsFile,
+      metadataFile,
+    }));
+  }
   writeFileSync(planFile, JSON.stringify(plan));
   const runnerArgs = [
     runner,
-    "--base", "main",
+    ...(staged ? ["--staged"] : ["--base", "main"]),
     "--no-codegraph",
     "--no-fail",
     ...(noState ? ["--no-state"] : []),
@@ -157,6 +189,30 @@ fi
 exec "\${REAL_NODE}" "$@"
 `);
     chmodSync(node, 0o755);
+  }
+  if (mutateAfterWorktree) {
+    const gitWrapper = join(fixture.bin, "git");
+    const mutationMarker = join(fixture.directory, "git-mutated");
+    writeFileSync(gitWrapper, `#!/usr/bin/env bash
+real_path="\${PATH#*:}"
+PATH="$real_path" git "$@"
+status=$?
+if [ "$status" = 0 ] && [ "\${1:-}" = "worktree" ] && [ "\${2:-}" = "add" ] && [ ! -e "\${FAKE_GIT_MUTATION_MARKER}" ]; then
+  touch "\${FAKE_GIT_MUTATION_MARKER}"
+  printf 'late head\\n' > alpha.txt
+  PATH="$real_path" git add alpha.txt
+  if [ "\${FAKE_GIT_MUTATION_MODE}" = "branch" ]; then
+    PATH="$real_path" git commit -m 'late concurrent head' >/dev/null
+  fi
+fi
+exit "$status"
+`);
+    chmodSync(gitWrapper, 0o755);
+    env = {
+      FAKE_GIT_MUTATION_MARKER: mutationMarker,
+      FAKE_GIT_MUTATION_MODE: mutateAfterWorktree,
+      ...env,
+    };
   }
   const result = spawnSync("bash", runnerArgs, {
     cwd: fixture.repository,
@@ -394,6 +450,89 @@ test("each pass receives the complete available diff in deterministic rotated fi
     ["beta.txt", "gamma.txt", "alpha.txt"],
     ["gamma.txt", "alpha.txt", "beta.txt"],
   ]);
+});
+
+test("every rotated pass includes deletions and unusual filenames", (t) => {
+  const unusualPath = "odd name\nline.txt";
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    baseFiles: {
+      "deleted file.txt": "DELETE_ME\n",
+      [unusualPath]: "unusual base\n",
+    },
+    targetFiles: { [unusualPath]: "unusual head\n" },
+    deleteFiles: ["deleted file.txt"],
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.equal(run.logs.length, 3);
+  for (const { prompt } of run.logs) {
+    assert.match(prompt, /-DELETE_ME/);
+    assert.match(prompt, /\+unusual head/);
+  }
+});
+
+test("findings and metadata destinations cannot resolve to the same file", (t) => {
+  const plan = {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  };
+  const dotAlias = runReview(t, plan, {
+    outputPaths: ({ directory }) => ({
+      findingsFile: join(directory, "same.json"),
+      metadataFile: `${directory}/./same.json`,
+    }),
+  });
+  assert.notEqual(dotAlias.result.status, 0);
+  assert.equal(dotAlias.logs.length, 0);
+  assert.match(dotAlias.result.stderr, /--out.*--metadata-out|same destination/);
+
+  const symlinkAlias = runReview(t, plan, {
+    outputPaths: ({ directory }) => {
+      const realDirectory = join(directory, "real-output");
+      const aliasDirectory = join(directory, "alias-output");
+      mkdirSync(realDirectory);
+      symlinkSync(realDirectory, aliasDirectory, "dir");
+      return {
+        findingsFile: join(realDirectory, "result.json"),
+        metadataFile: join(aliasDirectory, "result.json"),
+      };
+    },
+  });
+  assert.notEqual(symlinkAlias.result.status, 0);
+  assert.equal(symlinkAlias.logs.length, 0);
+  assert.match(symlinkAlias.result.stderr, /--out.*--metadata-out|same destination/);
+});
+
+test("branch and staged reviews stay pinned when the source changes after worktree creation", (t) => {
+  const plan = {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  };
+  for (const mode of ["branch", "staged"]) {
+    const run = runReview(t, plan, {
+      staged: mode === "staged",
+      mutateAfterWorktree: mode,
+    });
+
+    assert.equal(run.result.status, 0, `${mode}: ${run.result.stderr}`);
+    assert.ok(run.logs.every(({ reviewedAlpha }) => reviewedAlpha === "alpha head\n"));
+    assert.ok(run.logs.every(({ prompt }) => prompt.includes("+alpha head")));
+    assert.ok(run.logs.every(({ prompt }) => !prompt.includes("late head")));
+    assert.ok(run.logs.every(({ prompt }) => !prompt.includes("late concurrent head")));
+    if (mode === "branch") {
+      assert.equal(run.metadata.head_sha, run.headSha);
+      assert.notEqual(git(run.repository, "rev-parse", "HEAD"), run.headSha);
+    } else {
+      assert.equal(git(run.repository, "show", `${run.metadata.head_sha}:alpha.txt`), "alpha head");
+      assert.equal(git(run.repository, "show", ":alpha.txt"), "late head");
+    }
+  }
 });
 
 test("summary, inline, and suggest all ask OMP for the structured JSON contract", (t) => {

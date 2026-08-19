@@ -225,6 +225,28 @@ if [ -n "$VIEW" ]; then
   exit $?
 fi
 
+destination_identity() {
+  local path="$1" target dir
+  case "$path" in /*) ;; *) path="$REPO_ROOT/$path" ;; esac
+  while [ -L "$path" ]; do
+    dir="$(cd -P "$(dirname "$path")" && pwd)" \
+      || die "output parent directory does not exist: $(dirname "$path")"
+    target="$(readlink "$path")" || die "could not resolve output path: $path"
+    case "$target" in /*) path="$target" ;; *) path="$dir/$target" ;; esac
+  done
+  dir="$(cd -P "$(dirname "$path")" && pwd)" \
+    || die "output parent directory does not exist: $(dirname "$path")"
+  printf '%s/%s' "$dir" "$(basename "$path")"
+}
+
+if [ -n "$OUT" ] && [ -n "$METADATA_OUT" ]; then
+  OUT_IDENTITY="$(destination_identity "$OUT")"
+  METADATA_IDENTITY="$(destination_identity "$METADATA_OUT")"
+  if [ "$OUT_IDENTITY" = "$METADATA_IDENTITY" ]; then
+    die "--out and --metadata-out resolve to the same destination"
+  fi
+fi
+
 step "Checking prerequisites"
 
 # A key passed inline lands in shell history and in anything capturing the
@@ -343,20 +365,46 @@ cleanup_worktree() {
 }
 trap cleanup_worktree EXIT
 
+step "Working out what changed"
+if [ "$STAGED" = 1 ]; then
+  # Capture the parent and index tree once, then represent that exact pair as a
+  # dangling commit. Later restaging cannot change the review target.
+  SOURCE_BASE_SHA="$(git rev-parse --verify 'HEAD^{commit}')"
+  SOURCE_INDEX_TREE="$(git write-tree)"
+  SOURCE_TARGET_SHA="$(git commit-tree "$SOURCE_INDEX_TREE" -p "$SOURCE_BASE_SHA" -m 'agentic-review: staged state')"
+  RANGE="--staged"
+  INTENT=""
+else
+  if [ -z "$BASE" ]; then
+    BASE="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    [ -n "$BASE" ] || for c in origin/main origin/master main master; do
+      git rev-parse --verify --quiet "$c" >/dev/null && { BASE="$c"; break; }
+    done
+    [ -n "$BASE" ] || die "could not determine a base branch — pass --base"
+  fi
+  SOURCE_TARGET_SHA="$(git rev-parse --verify 'HEAD^{commit}')" \
+    || die "could not resolve HEAD"
+  SOURCE_BASE_TIP="$(git rev-parse --verify "$BASE^{commit}")" \
+    || die "unknown base ref: $BASE"
+  SOURCE_BASE_SHA="$(git merge-base "$SOURCE_TARGET_SHA" "$SOURCE_BASE_TIP")"
+  INTENT="$(git log --reverse -n 40 --format='- %s' "$SOURCE_BASE_SHA..$SOURCE_TARGET_SHA")"
+  RANGE="$BASE"
+fi
+
+git diff --quiet "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" \
+  && die "$([ "$STAGED" = 1 ] && printf 'nothing staged' || printf 'no changes vs %s' "$BASE")"
+DIFFSTAT="$(git diff --stat "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA")"
+DIFFTEXT="$(git diff --no-color "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA")"
+ok "reviewing against $RANGE"
+printf '%s\n' "$DIFFSTAT" | sed 's/^/    /' >&2
+
 # support_exec, not support: this deletes files, so it must come from the
 # installed copy and never from the repository under review.
 _strip=""
 if _strip="$(support_exec scripts/strip-agent-config.sh)" && [ -n "$_strip" ]; then
-  if [ "$STAGED" = 1 ]; then
-    # The index is not a commit and `git worktree add` needs one. commit-tree
-    # makes a dangling commit that no ref points at; gc collects it.
-    _commit="$(git commit-tree "$(git write-tree)" -p HEAD -m 'agentic-review: staged state')"
-  else
-    _commit="HEAD"
-  fi
   _wt="$(mktemp -d)"
-  rm -rf -- "$_wt"   # worktree add requires the path NOT to exist
-  if git worktree add --detach "$_wt" "$_commit" >/dev/null 2>&1; then
+  rm -rf -- "$_wt"
+  if git worktree add --detach "$_wt" "$SOURCE_TARGET_SHA" >/dev/null 2>&1; then
     WORKTREE="$_wt"; REVIEW_ROOT="$_wt"
     _removed="$(bash "$_strip" --strip "$REVIEW_ROOT")"
     if [ -n "$_removed" ]; then ok "throwaway worktree — $_removed"; else ok "reviewing a throwaway worktree"; fi
@@ -365,14 +413,9 @@ if _strip="$(support_exec scripts/strip-agent-config.sh)" && [ -n "$_strip" ]; t
   fi
 fi
 
-# Fallback only: a worktree could not be created (older git, unusual layout), so
-# the review runs in your actual tree and nothing can be safely deleted. Back to
-# refusing, which is the honest response when the guard is unavailable.
+# Fallback only: a worktree could not be created, so the actual checkout cannot
+# be stripped. Refuse executable agent configuration unless the owner opts in.
 if [ -z "$WORKTREE" ]; then
-  # `if`, not `[ test ] && assign`. When the test fails it is the last command
-  # in that list, so under `set -e` the script exits — silently, with no message
-  # and a zero-length output file. Same trap documented in the workflow's
-  # argument assembly.
   [ -n "$_strip" ] || die "scripts/strip-agent-config.sh is missing from $SELF_ROOT — refusing to run an unguarded review"
   _agent_cfg=""
   if _found="$(bash "$_strip" --check "$REPO_ROOT")"; then :; else _agent_cfg="$_found"; fi
@@ -387,61 +430,32 @@ if [ -z "$WORKTREE" ]; then
   fi
 fi
 
-step "Working out what changed"
-if [ "$STAGED" = 1 ]; then
-  RANGE="--staged"
-  git diff --cached --quiet && die "nothing staged"
-  DIFFSTAT="$(git diff --cached --stat)"
-  DIFFTEXT="$(git diff --cached --no-color)"
-  INTENT=""
-else
-  if [ -z "$BASE" ]; then
-    # origin/HEAD is the reliable default-branch pointer; fall back sensibly.
-    BASE="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
-    [ -n "$BASE" ] || for c in origin/main origin/master main master; do
-      git rev-parse --verify --quiet "$c" >/dev/null && { BASE="$c"; break; }
-    done
-    [ -n "$BASE" ] || die "could not determine a base branch — pass --base"
+# Emit the immutable diff with a pass-dependent file rotation. Paths stay
+# NUL-delimited until each literal pathspec reaches git, so deletions, newlines,
+# and pathspec metacharacters cannot disappear or select another file.
+ordered_diff() {
+  local pass="$1" rotation
+  if [ "$pass" -le 1 ] || [ "$TRUNCATED" = 1 ] || [ "$CHANGED_PATH_COUNT" -le 1 ]; then
+    printf '%s\n' "$DIFFTEXT"
+    return 0
   fi
-  git rev-parse --verify --quiet "$BASE" >/dev/null || die "unknown base ref: $BASE"
-  MERGE_BASE="$(git merge-base HEAD "$BASE")"
-  # Two-dot from the merge base = only this branch's work, excluding changes
-  # that landed on the base since. Same range CI reviews.
-  git diff --quiet "$MERGE_BASE" HEAD && die "no changes vs $BASE"
-  DIFFSTAT="$(git diff --stat "$MERGE_BASE" HEAD)"
-  DIFFTEXT="$(git diff --no-color "$MERGE_BASE" HEAD)"
-  # -n rather than `| head`: head closes the pipe, git takes SIGPIPE, and with
-  # `set -o pipefail` the whole assignment fails and `set -e` exits the script
-  # with no message at all. It only showed up once this branch had enough
-  # commits to fill sixty lines — which is to say, once the tool was used on a
-  # real branch. Subjects only; the bodies here run to hundreds of lines.
-  INTENT="$(git log --reverse -n 40 --format='- %s' "$MERGE_BASE"..HEAD)"
-  RANGE="$BASE"
-fi
-ok "reviewing against $RANGE"
-printf '%s\n' "$DIFFSTAT" | sed 's/^/    /' >&2
-
-# Emit the diff with files in a pass-dependent order. Bugbot randomises diff
-# order across its eight passes because it "nudged the model toward different
-# lines of reasoning" — with a U-shaped attention bias, what sits in the middle
-# changes with the order, and so does what gets noticed. Rotation rather than
-# RNG so a given pass is reproducible.
-ordered_diff() { # ordered_diff <pass-index>
-  local pass="$1"
-  # Later passes rebuild the diff per file, which bypasses the truncation the
-  # first pass applied — a capped diff would silently become uncapped.
-  if [ "$pass" -le 1 ] || [ "$TRUNCATED" = 1 ]; then printf '%s\n' "$DIFFTEXT"; return 0; fi
-  local files n i
-  if [ "$STAGED" = 1 ]; then files="$(git diff --cached --name-only --diff-filter=d)"
-  else files="$(git diff --name-only --diff-filter=d "$MERGE_BASE" HEAD)"; fi
-  n="$(printf '%s\n' "$files" | grep -c . || true)"
-  [ "$n" -gt 1 ] || { printf '%s\n' "$DIFFTEXT"; return 0; }
-  i=$(( (pass - 1) % n ))
-  { printf '%s\n' "$files" | tail -n +$((i + 1)); printf '%s\n' "$files" | head -n "$i"; } \
-  | while IFS= read -r f; do
-      [ -n "$f" ] || continue
-      if [ "$STAGED" = 1 ]; then git diff --cached --no-color -- "$f"
-      else git diff --no-color "$MERGE_BASE" HEAD -- "$f"; fi
+  rotation=$(( (pass - 1) % CHANGED_PATH_COUNT ))
+  node -e '
+    const fs = require("node:fs");
+    const bytes = fs.readFileSync(process.argv[1]);
+    const paths = [];
+    let start = 0;
+    for (let index = 0; index < bytes.length; index += 1) {
+      if (bytes[index] !== 0) continue;
+      paths.push(bytes.subarray(start, index));
+      start = index + 1;
+    }
+    const offset = Number(process.argv[2]);
+    const rotated = [...paths.slice(offset), ...paths.slice(0, offset)];
+    process.stdout.write(Buffer.concat(rotated.flatMap((path) => [path, Buffer.from([0])])));
+  ' "$CHANGED_PATHS_FILE" "$rotation" \
+  | while IFS= read -r -d '' path; do
+      git --literal-pathspecs diff --no-color "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" -- "$path"
     done
 }
 
@@ -463,6 +477,15 @@ MERGE="$(support_exec scripts/merge-findings.mjs)" \
 command -v node >/dev/null 2>&1 || die "node is required for structured review results"
 
 RUN_TMP="$(mktemp -d)"
+CHANGED_PATHS_FILE="$RUN_TMP/changed-paths"
+git diff --name-only -z "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" > "$CHANGED_PATHS_FILE"
+CHANGED_PATH_COUNT="$(node -e '
+  const fs = require("node:fs");
+  const bytes = fs.readFileSync(process.argv[1]);
+  let count = 0;
+  for (const byte of bytes) if (byte === 0) count += 1;
+  process.stdout.write(String(count));
+' "$CHANGED_PATHS_FILE")"
 printf '%s' "$DIFFTEXT" > "$RUN_TMP/diff.full"
 DIFF_BYTES="$(wc -c < "$RUN_TMP/diff.full" | tr -d ' ')"
 TRUNCATED=0
@@ -478,13 +501,8 @@ fi
 printf '%s' "$DIFFTEXT" > "$RUN_TMP/diff.included"
 INCLUDED_DIFF_BYTES="$(wc -c < "$RUN_TMP/diff.included" | tr -d ' ')"
 
-if [ "$STAGED" = 1 ]; then
-  BASE_SHA="$(git rev-parse HEAD)"
-  HEAD_SHA="$(git rev-parse "$_commit")"
-else
-  BASE_SHA="$(git rev-parse "$MERGE_BASE")"
-  HEAD_SHA="$(git rev-parse HEAD)"
-fi
+BASE_SHA="$SOURCE_BASE_SHA"
+HEAD_SHA="$SOURCE_TARGET_SHA"
 
 PASS_IDS=()
 PASS_LENSES=()
@@ -545,8 +563,7 @@ prepare_skill() {
   done
   if [ "$select" = 1 ] && [ -s "$destination" ] \
      && SEL="$(support_exec scripts/select-skills.mjs)"; then
-    if [ "$STAGED" = 1 ]; then changed="$(git diff --cached --name-only --diff-filter=d)"
-    else changed="$(git diff --name-only --diff-filter=d "$MERGE_BASE" HEAD)"; fi
+    changed="$(git diff --name-only "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA")"
     selected="${destination}.selected"
     if CHANGED_FILES="$changed" SKILL_FILES="$destination" node "$SEL" > "$selected" 2>"${destination}.log" \
        && [ -s "$selected" ]; then
@@ -601,11 +618,8 @@ build_prompt() {
     fi
     if [ "$USE_CODEGRAPH" = 1 ] && CG="$(support_exec scripts/codegraph.sh)" \
        && [ -d "$REPO_ROOT/.codegraph" ]; then
-      if [ "$STAGED" = 1 ]; then
-        STAGED=1 PROJECT="$REPO_ROOT" bash "$CG" 2>/dev/null || true
-      else
-        BASE_SHA="$MERGE_BASE" HEAD_SHA="HEAD" PROJECT="$REPO_ROOT" bash "$CG" 2>/dev/null || true
-      fi
+      BASE_SHA="$SOURCE_BASE_SHA" HEAD_SHA="$SOURCE_TARGET_SHA" PROJECT="$REPO_ROOT" \
+        bash "$CG" 2>/dev/null || true
     fi
     echo
     echo "Reply with the single JSON object described above and nothing else — no prose, no code fence."
