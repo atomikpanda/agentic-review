@@ -237,6 +237,11 @@ test("configuration fingerprints reject credentials and unsupported JSON values"
     "oauth_credentials",
     "app_private_key",
     "provider_api_key",
+    "githubtoken",
+    "clientsecret",
+    "accesstoken",
+    "authtoken",
+    "secretaccesskey",
   ]) {
     assert.throws(
       () => configurationFingerprint({ model: "example", [key]: "do-not-hash" }),

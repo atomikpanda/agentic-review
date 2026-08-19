@@ -26,6 +26,13 @@ const CREDENTIAL_FIELD_NAMES = new Set([
   "secret",
   "token",
 ]);
+const COMPACT_CREDENTIAL_SUFFIXES = [
+  "githubtoken",
+  "clientsecret",
+  "accesstoken",
+  "authtoken",
+  "secretaccesskey",
+];
 
 function isPlainObject(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
@@ -41,11 +48,13 @@ function isCredentialField(key) {
   const last = segments.at(-1);
   const pair = segments.slice(-2).join("_");
   const triple = segments.slice(-3).join("_");
+  const compact = segments.join("");
   return CREDENTIAL_FIELD_NAMES.has(last)
     || last === "apikey"
     || pair === "api_key"
     || pair === "private_key"
-    || triple === "secret_access_key";
+    || triple === "secret_access_key"
+    || COMPACT_CREDENTIAL_SUFFIXES.some((suffix) => compact.endsWith(suffix));
 }
 
 function canonicalize(value, path = "configuration") {
