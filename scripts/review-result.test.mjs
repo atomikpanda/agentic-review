@@ -228,6 +228,31 @@ test("configuration fingerprints reject credentials and unsupported JSON values"
     () => configurationFingerprint({ model: "example", provider: { token: "do-not-hash" } }),
     /credential field.*token/i,
   );
+
+  for (const key of [
+    "gh_token",
+    "bearer_token",
+    "client_password",
+    "service_secret",
+    "oauth_credentials",
+    "app_private_key",
+    "provider_api_key",
+  ]) {
+    assert.throws(
+      () => configurationFingerprint({ model: "example", [key]: "do-not-hash" }),
+      new RegExp(`credential field.*${key}`, "i"),
+    );
+  }
+  for (const key of [
+    "tokenizer",
+    "passwordless_mode",
+    "secretary",
+    "credentialing",
+    "private_key_format",
+    "api_key_header",
+  ]) {
+    assert.match(configurationFingerprint({ model: "example", [key]: "setting" }), /^[a-f0-9]{64}$/);
+  }
   assert.throws(() => configurationFingerprint({ model: "example", optional: undefined }), /plain JSON/i);
   assert.throws(() => configurationFingerprint({ model: "example", temperature: Number.NaN }), /plain JSON/i);
   assert.throws(() => configurationFingerprint(new Date()), /plain JSON/i);
@@ -284,6 +309,7 @@ test("run metadata validation rejects malformed values instead of coercing them"
     [(value) => { value.diff.truncated = "false"; }, /diff\.truncated/],
     [(value) => { value.finding_cap = -1; }, /finding_cap/],
     [(value) => { value.passes.results[0].attempts = "1"; }, /attempts.*general/i],
+    [(value) => { value.passes.results[0].attempts = 3; }, /attempts.*general/i],
     [(value) => { value.passes.results[0].finding_count = 20; }, /capped.*general/i],
   ]) {
     const malformed = structuredClone(metadata);

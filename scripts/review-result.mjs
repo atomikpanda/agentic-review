@@ -26,15 +26,6 @@ const CREDENTIAL_FIELD_NAMES = new Set([
   "secret",
   "token",
 ]);
-const CREDENTIAL_FIELD_SUFFIXES = [
-  "apikey",
-  "accesstoken",
-  "authtoken",
-  "clientsecret",
-  "githubtoken",
-  "secretaccesskey",
-  "secretkey",
-];
 
 function isPlainObject(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
@@ -42,9 +33,19 @@ function isPlainObject(value) {
 }
 
 function isCredentialField(key) {
-  const compact = key.toLowerCase().replace(/[^a-z0-9]/g, "");
-  return CREDENTIAL_FIELD_NAMES.has(compact)
-    || CREDENTIAL_FIELD_SUFFIXES.some((suffix) => compact.endsWith(suffix));
+  const segments = key
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  const last = segments.at(-1);
+  const pair = segments.slice(-2).join("_");
+  const triple = segments.slice(-3).join("_");
+  return CREDENTIAL_FIELD_NAMES.has(last)
+    || last === "apikey"
+    || pair === "api_key"
+    || pair === "private_key"
+    || triple === "secret_access_key";
 }
 
 function canonicalize(value, path = "configuration") {
@@ -143,7 +144,9 @@ function validatePassResult(result, index) {
   if (!PASS_STATUSES.has(result.status)) {
     throw new TypeError(`${prefix}.status for ${result.id} must be valid or failed`);
   }
-  requireInteger(result.attempts, `${prefix}.attempts for ${result.id}`, 1);
+  if (!Number.isInteger(result.attempts) || result.attempts < 1 || result.attempts > 2) {
+    throw new TypeError(`${prefix}.attempts for ${result.id} must be an integer from 1 through 2`);
+  }
   requireInteger(result.finding_count, `${prefix}.finding_count for ${result.id}`);
   requireBoolean(result.capped, `${prefix}.capped for ${result.id}`);
   requireSha(result.base_sha, `${prefix}.base_sha for ${result.id}`);
