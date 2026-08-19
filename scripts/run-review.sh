@@ -351,11 +351,12 @@ fi
 # describes rather than the working tree's uncommitted drift — which is also
 # more correct, since the diff it is given is committed-only.
 #
-# REVIEW_ROOT is what omp sees. REPO_ROOT stays the real repository, because git
-# range resolution, the codegraph index and local state all belong to it.
+# REVIEW_ROOT is what omp and optional symbol tools see. REPO_ROOT stays the
+# real repository because git range resolution and local state belong to it.
 REVIEW_ROOT="$REPO_ROOT"
 WORKTREE=""
 RUN_TMP=""
+SNAPSHOT_IMMUTABLE=0
 cleanup_worktree() {
   if [ -n "$WORKTREE" ]; then
     git worktree remove --force "$WORKTREE" 2>/dev/null || rm -rf -- "$WORKTREE"
@@ -405,7 +406,7 @@ if _strip="$(support_exec scripts/strip-agent-config.sh)" && [ -n "$_strip" ]; t
   _wt="$(mktemp -d)"
   rm -rf -- "$_wt"
   if git worktree add --detach "$_wt" "$SOURCE_TARGET_SHA" >/dev/null 2>&1; then
-    WORKTREE="$_wt"; REVIEW_ROOT="$_wt"
+    WORKTREE="$_wt"; REVIEW_ROOT="$_wt"; SNAPSHOT_IMMUTABLE=1
     _removed="$(bash "$_strip" --strip "$REVIEW_ROOT")"
     if [ -n "$_removed" ]; then ok "throwaway worktree — $_removed"; else ok "reviewing a throwaway worktree"; fi
   else
@@ -616,9 +617,9 @@ build_prompt() {
       echo
       echo "Report at most $MAX_FINDINGS findings. If you have more, keep the most severe."
     fi
-    if [ "$USE_CODEGRAPH" = 1 ] && CG="$(support_exec scripts/codegraph.sh)" \
-       && [ -d "$REPO_ROOT/.codegraph" ]; then
-      BASE_SHA="$SOURCE_BASE_SHA" HEAD_SHA="$SOURCE_TARGET_SHA" PROJECT="$REPO_ROOT" \
+    if [ "$USE_CODEGRAPH" = 1 ] && [ "$SNAPSHOT_IMMUTABLE" = 1 ] \
+       && CG="$(support_exec scripts/codegraph.sh)" && [ -d "$REVIEW_ROOT/.codegraph" ]; then
+      BASE_SHA="$SOURCE_BASE_SHA" HEAD_SHA="$SOURCE_TARGET_SHA" PROJECT="$REVIEW_ROOT" \
         bash "$CG" 2>/dev/null || true
     fi
     echo
@@ -758,7 +759,8 @@ write_metadata() {
       "${PASS_COUNTS[j]}" "${PASS_CAPPED[j]}" >> "$records"
   done
   BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" CONFIGURATION_FINGERPRINT="$CONFIGURATION_FINGERPRINT" \
-  DIFF_BYTES="$DIFF_BYTES" INCLUDED_DIFF_BYTES="$INCLUDED_DIFF_BYTES" TRUNCATED="$TRUNCATED" \
+  SNAPSHOT_IMMUTABLE="$SNAPSHOT_IMMUTABLE" DIFF_BYTES="$DIFF_BYTES" \
+  INCLUDED_DIFF_BYTES="$INCLUDED_DIFF_BYTES" TRUNCATED="$TRUNCATED" \
   MAX_FINDINGS="$MAX_FINDINGS" MERGE_SUCCEEDED="$merge_succeeded" node -e '
     const fs = require("node:fs");
     const results = fs.readFileSync(process.argv[1], "utf8").trimEnd().split("\n").filter(Boolean)
@@ -780,6 +782,7 @@ write_metadata() {
       base_sha: process.env.BASE_SHA,
       head_sha: process.env.HEAD_SHA,
       configuration_fingerprint: process.env.CONFIGURATION_FINGERPRINT,
+      snapshot_immutable: process.env.SNAPSHOT_IMMUTABLE === "1",
       analysis_state: "inconclusive",
       diff: {
         bytes: Number(process.env.DIFF_BYTES),

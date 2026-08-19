@@ -39,6 +39,7 @@ function completeRun(overrides = {}) {
     base_sha: BASE_SHA,
     head_sha: HEAD_SHA,
     configuration_fingerprint: FINGERPRINT,
+    snapshot_immutable: true,
     diff: { bytes: 100, included_bytes: 100, truncated: false },
     finding_cap: 20,
     merge_succeeded: true,
@@ -165,6 +166,7 @@ test("bounded convergence is derived exactly from complete plus clean", () => {
 
 test("analysis is complete only for successful uncapped passes on one target and fingerprint", () => {
   assert.equal(deriveAnalysisState(completeRun()), "complete");
+  assert.equal(deriveAnalysisState(completeRun({ snapshot_immutable: false })), "inconclusive");
 
   const failed = completeRun();
   failed.passes.completed = PASS_IDS.filter((id) => id !== "correctness");
@@ -296,6 +298,15 @@ test("run metadata validation rejects target, fingerprint, pass, and derived-sta
   wrongAnalysis.analysis_state = "inconclusive";
   assert.throws(() => validateRunMetadata(wrongAnalysis), /analysis_state/i);
 
+  const mutableSnapshot = structuredClone(metadata);
+  mutableSnapshot.snapshot_immutable = false;
+  mutableSnapshot.analysis_state = "complete";
+  assert.throws(() => validateRunMetadata(mutableSnapshot), /analysis_state/i);
+
+  const missingSnapshotState = structuredClone(metadata);
+  delete missingSnapshotState.snapshot_immutable;
+  assert.throws(() => validateRunMetadata(missingSnapshotState), /snapshot_immutable/i);
+
   const duplicatePass = structuredClone(metadata);
   duplicatePass.passes.requested = ["general", "general", "boundaries"];
   assert.throws(() => validateRunMetadata(duplicatePass), /passes\.requested/i);
@@ -312,6 +323,7 @@ test("run metadata validation rejects malformed values instead of coercing them"
     [(value) => { value.schema_version = "1"; }, /schema_version/],
     [(value) => { value.base_sha = "not-a-sha"; }, /base_sha/],
     [(value) => { value.diff.truncated = "false"; }, /diff\.truncated/],
+    [(value) => { value.snapshot_immutable = "true"; }, /snapshot_immutable/],
     [(value) => { value.finding_cap = -1; }, /finding_cap/],
     [(value) => { value.passes.results[0].attempts = "1"; }, /attempts.*general/i],
     [(value) => { value.passes.results[0].attempts = 3; }, /attempts.*general/i],

@@ -171,6 +171,7 @@ function inspectRun(run) {
   requireSha(run.base_sha, "base_sha");
   requireSha(run.head_sha, "head_sha");
   requireFingerprint(run.configuration_fingerprint, "configuration_fingerprint");
+  requireBoolean(run.snapshot_immutable, "snapshot_immutable");
   validateDiff(run.diff);
   requireInteger(run.finding_cap, "finding_cap");
   if (run.merge_succeeded !== undefined) requireBoolean(run.merge_succeeded, "merge_succeeded");
@@ -214,6 +215,7 @@ export function deriveAnalysisState(run) {
   ));
 
   const complete = requested.length > 0
+    && run.snapshot_immutable === true
     && run.merge_succeeded !== false
     && run.diff.truncated === false
     && run.diff.included_bytes === run.diff.bytes

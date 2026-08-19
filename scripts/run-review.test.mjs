@@ -81,6 +81,17 @@ if (choice && typeof choice === "object" && Object.hasOwn(choice, "__exit")) {
 process.stdout.write(typeof choice === "string" ? choice : JSON.stringify(choice));
 `;
 
+const fakeCodegraph = `#!/usr/bin/env node
+import { appendFileSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+const pathIndex = process.argv.indexOf("--path");
+const project = pathIndex === -1 ? "" : process.argv[pathIndex + 1];
+let marker = "missing";
+try { marker = readFileSync(join(project, ".codegraph", "source-marker"), "utf8").trim(); } catch {}
+appendFileSync(process.env.FAKE_CODEGRAPH_LOG, JSON.stringify({ project, marker }) + "\\n");
+process.stdout.write("# Snapshot symbol index\\n\\n" + marker + "\\n");
+`;
+
 function git(directory, ...args) {
   return execFileSync("git", args, { cwd: directory, encoding: "utf8" }).trim();
 }
@@ -112,6 +123,7 @@ function createFixture(t, {
     writeFileSync(destination, contents);
   }
   git(repository, "add", ".");
+  for (const path of Object.keys(baseFiles)) git(repository, "add", "-f", "--", path);
   git(repository, "commit", "-m", "base");
   const baseSha = git(repository, "rev-parse", "HEAD");
 
@@ -126,6 +138,7 @@ function createFixture(t, {
   }
   for (const path of deleteFiles) rmSync(join(repository, path));
   git(repository, "add", ".");
+  for (const path of Object.keys(targetFiles)) git(repository, "add", "-f", "--", path);
   let headSha = null;
   if (!staged) {
     git(repository, "commit", "-m", "change three files");
@@ -150,12 +163,15 @@ function runReview(t, plan, {
   metadataViaEnv = false,
   noState = true,
   failMerge = false,
+  failWorktree = false,
+  fakeCodegraph: useFakeCodegraph = false,
   mutateAfterWorktree = null,
   outputPaths = null,
 } = {}) {
   const fixture = createFixture(t, { targetFiles, baseFiles, deleteFiles, staged });
   const planFile = join(fixture.directory, "plan.json");
   const logFile = join(fixture.directory, "omp.log");
+  const codegraphLogFile = join(fixture.directory, "codegraph.log");
   let findingsFile = join(fixture.directory, "findings.json");
   let metadataFile = join(fixture.directory, "metadata.json");
   if (outputPaths) {
@@ -169,7 +185,7 @@ function runReview(t, plan, {
   const runnerArgs = [
     runner,
     ...(staged ? ["--staged"] : ["--base", "main"]),
-    "--no-codegraph",
+    ...(useFakeCodegraph ? [] : ["--no-codegraph"]),
     "--no-fail",
     ...(noState ? ["--no-state"] : []),
     ...(includeOutputs
@@ -190,29 +206,41 @@ exec "\${REAL_NODE}" "$@"
 `);
     chmodSync(node, 0o755);
   }
-  if (mutateAfterWorktree) {
+  if (mutateAfterWorktree || failWorktree) {
     const gitWrapper = join(fixture.bin, "git");
     const mutationMarker = join(fixture.directory, "git-mutated");
     writeFileSync(gitWrapper, `#!/usr/bin/env bash
 real_path="\${PATH#*:}"
+if [ "\${FAKE_GIT_FAIL_WORKTREE:-0}" = 1 ] && [ "\${1:-}" = "worktree" ] && [ "\${2:-}" = "add" ]; then
+  exit 1
+fi
 PATH="$real_path" git "$@"
 status=$?
-if [ "$status" = 0 ] && [ "\${1:-}" = "worktree" ] && [ "\${2:-}" = "add" ] && [ ! -e "\${FAKE_GIT_MUTATION_MARKER}" ]; then
+if [ "$status" = 0 ] && [ "\${1:-}" = "worktree" ] && [ "\${2:-}" = "add" ] && [ -n "\${FAKE_GIT_MUTATION_MODE:-}" ] && [ ! -e "\${FAKE_GIT_MUTATION_MARKER}" ]; then
   touch "\${FAKE_GIT_MUTATION_MARKER}"
   printf 'late head\\n' > alpha.txt
-  PATH="$real_path" git add alpha.txt
-  if [ "\${FAKE_GIT_MUTATION_MODE}" = "branch" ]; then
-    PATH="$real_path" git commit -m 'late concurrent head' >/dev/null
+  if [ "\${FAKE_GIT_MUTATION_MODE}" = "branch-codegraph" ]; then
+    printf 'LIVE_INDEX_MUTATION\\n' > .codegraph/source-marker
   fi
+  PATH="$real_path" git add alpha.txt .codegraph/source-marker 2>/dev/null || PATH="$real_path" git add alpha.txt
+  case "\${FAKE_GIT_MUTATION_MODE}" in
+    branch|branch-codegraph) PATH="$real_path" git commit -m 'late concurrent head' >/dev/null ;;
+  esac
 fi
 exit "$status"
 `);
     chmodSync(gitWrapper, 0o755);
     env = {
+      FAKE_GIT_FAIL_WORKTREE: failWorktree ? "1" : "0",
       FAKE_GIT_MUTATION_MARKER: mutationMarker,
-      FAKE_GIT_MUTATION_MODE: mutateAfterWorktree,
+      FAKE_GIT_MUTATION_MODE: mutateAfterWorktree ?? "",
       ...env,
     };
+  }
+  if (useFakeCodegraph) {
+    const codegraph = join(fixture.bin, "codegraph");
+    writeFileSync(codegraph, fakeCodegraph);
+    chmodSync(codegraph, 0o755);
   }
   const result = spawnSync("bash", runnerArgs, {
     cwd: fixture.repository,
@@ -233,6 +261,7 @@ exit "$status"
       FAKE_OMP_PLAN: planFile,
       FAKE_OMP_LOG: logFile,
       FAKE_OMP_STATE: fixture.state,
+      FAKE_CODEGRAPH_LOG: codegraphLogFile,
       REAL_NODE: process.execPath,
       ...(metadataViaEnv ? { AGENTIC_REVIEW_METADATA_OUT: metadataFile } : {}),
       ...env,
@@ -241,10 +270,14 @@ exit "$status"
   const logs = existsSync(logFile)
     ? readFileSync(logFile, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse)
     : [];
+  const codegraphLogs = existsSync(codegraphLogFile)
+    ? readFileSync(codegraphLogFile, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse)
+    : [];
   return {
     ...fixture,
     result,
     logs,
+    codegraphLogs,
     findingsFile,
     metadataFile,
     findings: existsSync(findingsFile) ? JSON.parse(readFileSync(findingsFile, "utf8")) : null,
@@ -282,6 +315,7 @@ test("the default profile runs general, correctness, and boundaries into one val
   assert.equal(run.metadata.base_sha, run.baseSha);
   assert.equal(run.metadata.head_sha, run.headSha);
   assert.equal(run.metadata.analysis_state, "complete");
+  assert.equal(run.metadata.snapshot_immutable, true);
   assert.equal(new Set(run.metadata.passes.results.map((pass) => pass.configuration_fingerprint)).size, 1);
   for (const pass of run.metadata.passes.results) {
     assert.equal(pass.base_sha, run.baseSha);
@@ -533,6 +567,42 @@ test("branch and staged reviews stay pinned when the source changes after worktr
       assert.equal(git(run.repository, "show", ":alpha.txt"), "late head");
     }
   }
+});
+
+test("legacy live-checkout fallback is explicitly mutable and inconclusive", (t) => {
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    failWorktree: true,
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.ok(run.logs.every(({ cwd }) => cwd === run.repository));
+  assert.equal(run.metadata.snapshot_immutable, false);
+  assert.equal(run.metadata.analysis_state, "inconclusive");
+  assert.equal(validateMetadata(run.metadataFile).status, 0);
+});
+
+test("codegraph context comes only from the pinned review snapshot", (t) => {
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    targetFiles: { ".codegraph/source-marker": "SNAPSHOT_INDEX\n" },
+    fakeCodegraph: true,
+    mutateAfterWorktree: "branch-codegraph",
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.ok(run.codegraphLogs.length > 0);
+  assert.ok(run.codegraphLogs.every(({ project }) => project === run.logs[0].cwd));
+  assert.ok(run.codegraphLogs.every(({ project }) => project !== run.repository));
+  assert.ok(run.codegraphLogs.every(({ marker }) => marker === "SNAPSHOT_INDEX"));
+  assert.ok(run.logs.every(({ prompt }) => prompt.includes("SNAPSHOT_INDEX")));
+  assert.ok(run.logs.every(({ prompt }) => !prompt.includes("LIVE_INDEX_MUTATION")));
 });
 
 test("summary, inline, and suggest all ask OMP for the structured JSON contract", (t) => {
