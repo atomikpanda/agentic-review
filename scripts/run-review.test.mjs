@@ -236,8 +236,9 @@ function runReview(t, plan, {
   untrackedCodegraph = false,
   mutateAfterWorktree = null,
   outputPaths = null,
+  existingFixture = null,
 } = {}) {
-  const fixture = createFixture(t, {
+  const fixture = existingFixture ?? createFixture(t, {
     targetFiles,
     baseFiles,
     deleteFiles,
@@ -867,6 +868,69 @@ test("local suggest rendering consumes generated metadata and keeps the replacem
   assert.match(run.result.stdout, /\| Analysis \| `complete` \|/);
   assert.match(run.result.stdout, /```suggestion\nalpha replacement\n```/);
   assert.doesNotMatch(run.result.stdout, /^\{\"findings\":/);
+});
+
+test("local rendering holds an omitted unchanged finding and retires it after its file changes", (t) => {
+  const prior = finding("Persistent local defect", {
+    file: "alpha.txt",
+    severity: "High",
+  });
+  const first = runReview(t, {
+    general: [{ findings: [prior] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    noState: false,
+  });
+  assert.equal(first.result.status, 0, first.result.stderr);
+  assert.match(first.result.stdout, /\| Sample \| `findings` \|/);
+  assert.match(first.result.stdout, /\| Held\/unresolved findings \| `Critical: 0 · High: 0 · Medium: 0` \|/);
+
+  const omitted = {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  };
+  const unchanged = runReview(t, omitted, {
+    args: [],
+    existingFixture: first,
+    noState: false,
+  });
+  assert.equal(unchanged.result.status, 0, unchanged.result.stderr);
+  assert.match(unchanged.result.stdout, /\| Sample \| `findings` \|/);
+  assert.match(unchanged.result.stdout, /\| Bounded convergence \| `no` \|/);
+  assert.match(unchanged.result.stdout, /\| Held\/unresolved findings \| `Critical: 0 · High: 1 · Medium: 0` \|/);
+
+  writeFileSync(join(first.repository, "alpha.txt"), "alpha changed again\n");
+  git(first.repository, "add", "alpha.txt");
+  git(first.repository, "commit", "-m", "change reported file");
+  const changed = runReview(t, omitted, {
+    args: [],
+    existingFixture: first,
+    noState: false,
+  });
+  assert.equal(changed.result.status, 0, changed.result.stderr);
+  assert.match(changed.result.stdout, /\| Sample \| `clean` \|/);
+  assert.match(changed.result.stdout, /\| Bounded convergence \| `yes` \|/);
+});
+
+test("local state record failure makes an empty rendered sample unknown", (t) => {
+  const fixture = createFixture(t);
+  mkdirSync(join(fixture.repository, ".git", "agentic-review", "state.json"), { recursive: true });
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    existingFixture: fixture,
+    noState: false,
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.match(run.result.stdout, /\| Sample \| `unknown` \|/);
+  assert.match(run.result.stdout, /\| Bounded convergence \| `no` \|/);
 });
 
 function diffFileOrder(prompt) {

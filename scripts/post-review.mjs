@@ -27,6 +27,8 @@
 //   DRY_RUN               "1" reads and reconciles but does not write
 //   SUPPRESS_WRITES       "true" reads and reconciles but does not write
 //   POST_COMMENT          "false" reads and reconciles but does not write
+//   UNRESOLVED_FINDINGS_FILE prior local findings for RENDER only
+//   RECONCILIATION_KNOWN    "false" prevents a clean RENDER result
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -1120,11 +1122,23 @@ async function main() {
   }
 
   if (env("RENDER", "") === "1") {
-    const state = deriveState(metadata, findings, [], true);
+    let unresolved = [];
+    let reconciliationKnown = env("RECONCILIATION_KNOWN", "true") === "true";
+    const unresolvedPath = env("UNRESOLVED_FINDINGS_FILE", "");
+    if (unresolvedPath) {
+      try {
+        const prior = extractJson(readFileSync(unresolvedPath, "utf8"));
+        if (!prior) throw new TypeError("unresolved findings are not structured JSON");
+        unresolved = prior.findings;
+      } catch {
+        reconciliationKnown = false;
+      }
+    }
+    const state = deriveState(metadata, findings, unresolved, reconciliationKnown);
     emitState(metadata, state);
     const body = mode === "summary"
-      ? buildStandingSummaryBody({ metadata, state, current: findings, unresolved: [] })
-      : renderReviewBody({ mode, metadata, state, current: findings, unresolved: [] });
+      ? buildStandingSummaryBody({ metadata, state, current: findings, unresolved })
+      : renderReviewBody({ mode, metadata, state, current: findings, unresolved });
     process.stdout.write(`${body}\n`);
     enforceGate(state);
     return;

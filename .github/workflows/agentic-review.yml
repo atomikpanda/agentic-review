@@ -135,8 +135,9 @@ on:
         default: suggest
       resolve_stale:
         description: >-
-          On each run, resolve the review threads this reviewer opened earlier
-          and no longer reports, and stay silent about findings whose thread is
+          On each run, retire an earlier thread omitted by this reviewer only
+          after a confirmed change to its original span. Hold unchanged or
+          indeterminate spans, and stay silent about findings whose thread is
           still open instead of posting them again.
         type: boolean
         default: true
@@ -897,7 +898,7 @@ jobs:
             exit 1
           fi
           cat /tmp/review-runner.err >&2
-          echo "  merged review: $(wc -c < /tmp/review.md) bytes"
+          echo "  review result: $(wc -c < /tmp/review.md) bytes"
           echo "  metadata: $(wc -c < /tmp/review-meta.json) bytes"
 
       - name: post review

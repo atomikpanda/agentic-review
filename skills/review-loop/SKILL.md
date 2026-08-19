@@ -76,12 +76,15 @@ rounds**. Each round consumes one merged batch, applies and verifies the
 integrated repair, makes one consolidated push, and reviews the new immutable
 head.
 
-Stop earlier when every finding is fixed or dismissed with a stated reason and
-no earlier valid finding remains held. A bounded clean result means this sample
-found nothing actionable; it does not prove the repository defect-free.
+Stop earlier only when the latest immutable head has
+`analysis_state=complete`, `sample_state=clean`, and no held earlier finding.
+Every reported finding must already be fixed or dismissed with a stated reason.
+A bounded clean result means this sample found nothing actionable; it does not
+prove the repository defect-free.
 
-If the result after round three is still non-clean, stop the loop. Report the
-unresolved findings, their shared invariants or callsites, and the verification
-that still fails; do **not** launch a fourth broad pass or restart per-comment
+If the result after round three does not meet that stop condition, stop the
+loop. Report the unresolved findings and/or why analysis is inconclusive, their
+shared invariants or callsites, and the actual verification outcome; do **not**
+assume verification failed, launch a fourth broad pass, or restart per-comment
 patching. The cap constrains fixer churn, not the reviewer's obligation to
 preserve and report valid evidence.

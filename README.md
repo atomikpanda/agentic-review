@@ -63,7 +63,7 @@ review writes; `suppress_writes` is the explicit choice for trial runs.
 ## Run it locally (details)
 
 No GitHub is involved. The default terminal output is a structured rendering of
-the merged findings and result metadata; `--json` emits only the merged findings
+the findings result and metadata; `--json` emits only the structured findings
 document.
 
 ```bash
@@ -76,12 +76,15 @@ export OPENROUTER_API_KEY=sk-or-v1-yourkeyhere   # or see OPENROUTER_API_KEY_FIL
 ./scripts/run-review.sh --no-state               # leave local history unchanged
 ```
 
-`--out FILE` atomically writes the validated merged structured findings
-document. `--metadata-out FILE` separately writes schema-v1 bounded-run
-metadata: immutable base and head SHAs, the configuration fingerprint, diff and
-cap status, requested/completed pass identifiers, per-pass status, and
-`analysis_state`. The paths must resolve to different destinations. `--no-state`
-leaves the git-common-directory history untouched. Advanced local experiments
+`--out FILE` atomically writes the validated structured findings result.
+Normally it is the union of every valid pass. If union fails, the runner
+preserves the first valid structured pass and marks the separate schema-v1
+metadata inconclusive rather than presenting the fallback as merged.
+`--metadata-out FILE` writes that bounded-run metadata: immutable base and head
+SHAs, the configuration fingerprint, diff and cap status, requested/completed
+pass identifiers, per-pass status, and `analysis_state`. The paths must resolve
+to different destinations. `--no-state` leaves the git-common-directory history
+untouched. Advanced local experiments
 can change the ensemble with `--passes N`, `--lenses a,b,c`, and
 `--min-votes N`; pass/lens changes appear in the metadata identifiers, and all
 three change the configuration fingerprint.
@@ -118,7 +121,7 @@ human reviewer, not a wall of prose at the bottom of the PR.
 |---|---|
 | `suggest` (default) | Inline comments anchored to the offending lines, each with a ready-to-commit fix where the agent could produce a complete one |
 | `inline` | The same inline comments, explanation only, no fixes |
-| `summary` | One standing issue comment rendered from the merged structured findings and result metadata — no line anchoring |
+| `summary` | One standing issue comment rendered from the structured findings result and metadata — no line anchoring |
 
 This is a different mechanism, not a different format. A suggestion has to be
 an inline review comment attached to a line range **inside the pull request's
@@ -149,7 +152,8 @@ The default local and hosted profile runs three sequential passes — **general*
 and configuration fingerprint. It performs approximately three times the model
 work of one general pass. Each pass gets one retry if its output is malformed.
 Every valid pass contributes to one union with `min_votes=1`, so a finding seen
-by only one pass survives; only the merged review is rendered or posted.
+by only one pass survives. One result is rendered or posted: the union, or an
+explicitly inconclusive first-valid structured fallback if union fails.
 
 The result separates four operator-visible values:
 
@@ -191,16 +195,16 @@ The reusable workflow exposes these exact outputs:
 | `current_counts`, `unresolved_counts` | JSON severity maps for current and held findings |
 
 The same values appear in the review body and GitHub job summary. The hosted
-`agentic-review` artifact retains the merged structured findings
-(`review.md`), bounded-run metadata (`review-meta.json`), and runner stdout and
-stderr for seven days. Locally, `--out` and `--metadata-out` write the first two
-artifacts directly.
+`agentic-review` artifact retains the structured findings result (`review.md`),
+bounded-run metadata (`review-meta.json`), and runner stdout and stderr for
+seven days. Locally, `--out` and `--metadata-out` write the first two artifacts
+directly.
 
 ### Standing summaries and finding history
 
 Summary mode does not ask the model for Markdown. It deterministically renders
-the same merged structured findings and result metadata used by inline and
-suggest modes.
+the same structured findings result and metadata used by inline and suggest
+modes.
 
 When findings exist, summary mode maintains one bot-authored standing issue
 comment with an embedded state marker and edits it on later runs instead of
@@ -218,11 +222,10 @@ Suppressed-write runs read and reconcile the standing state for outputs and
 gating but do not edit it. If identity lookup or reconciliation fails, the
 comment is left untouched and the result cannot be clean or converged.
 
-Only a marked comment authored by the currently authenticated **Bot** identity
-is trusted as standing state. A human user's manual PAT therefore cannot make a
-user-authored comment into bot history: the poster will not reuse or edit it,
-and repeated findings runs may create separate comments. This fails safe rather
-than accepting a marker in a human or attacker-authored comment.
+Only the currently authenticated **Bot** identity can own standing state. A
+human user's manual PAT or an unrecognized viewer makes identity unknown; the
+poster emits conservative outputs and gate state but suppresses every PR write.
+It neither trusts nor edits a marker in a human or attacker-authored comment.
 
 Inline and suggest modes use bot-authored fingerprinted threads. A recurring
 finding stays silent while its thread is open. An omitted open finding stays

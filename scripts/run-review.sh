@@ -45,9 +45,9 @@
 #   -- ARGS...          display-only omp flags: --print-thoughts,
 #                       --hide-thinking, --no-title
 #
-# Identical prompt, tools and skill injection to .github/workflows/
-# agentic-review.yml — both read review/prompt.md, so local results and CI
-# results cannot drift. The flag names match the workflow's inputs one-for-one.
+# Uses the same trusted prompt, tools, skill injection, and execution owner as
+# .github/workflows/agentic-review.yml. Local-only state and ensemble overrides
+# are listed above; hosted-only presentation controls remain workflow inputs.
 #
 # Needs: OPENROUTER_API_KEY in the environment (or OPENROUTER_API_KEY_FILE
 # pointing at a file holding it), and bun (omp is bun-only).
@@ -875,7 +875,7 @@ if ! node "$MERGE" --min-votes "$MIN_VOTES" "${VALID_OUTS[@]}" > "$TMP_OUT" \
   cp "${VALID_OUTS[0]}" "$TMP_OUT"
 fi
 node "$MERGE" --check "$TMP_OUT" 2>/dev/null \
-  || die "merged review is not a structured findings document"
+  || die "review result is not a structured findings document"
 
 if [ -n "$OUT" ]; then
   out_tmp="${OUT}.tmp.$$"
@@ -889,14 +889,32 @@ if [ -n "$OUT" ]; then
 fi
 write_metadata "$MERGE_SUCCEEDED"
 
-if [ "$RECORD_STATE" = 1 ] && ST="$(support_exec scripts/local-state.mjs)"; then
-  if _delta="$(node "$ST" record "$TMP_OUT" "$BASE_SHA" "$HEAD_SHA" 2>/dev/null)"; then
+LOCAL_UNRESOLVED_FILE="$RUN_TMP/local-unresolved.json"
+printf '%s\n' '{"findings":[]}' > "$LOCAL_UNRESOLVED_FILE"
+LOCAL_RECONCILIATION_KNOWN=true
+if [ "$RECORD_STATE" = 1 ]; then
+  LOCAL_RECONCILIATION_KNOWN=false
+  local_unresolved_tmp="$LOCAL_UNRESOLVED_FILE.tmp"
+  if ST="$(support_exec scripts/local-state.mjs)" \
+    && _delta="$(node "$ST" record "$TMP_OUT" "$BASE_SHA" "$HEAD_SHA" 2>/dev/null)" \
+    && node "$ST" export-open > "$local_unresolved_tmp" 2>/dev/null \
+    && node "$MERGE" --check "$local_unresolved_tmp" 2>/dev/null; then
+    mv -f "$local_unresolved_tmp" "$LOCAL_UNRESOLVED_FILE"
+    LOCAL_RECONCILIATION_KNOWN=true
     say "state: $_delta"
+  else
+    rm -f "$local_unresolved_tmp"
+    say "state reconciliation unavailable"
   fi
 fi
 
 CLEAN=0
-if node -e 'const fs=require("node:fs"); process.exit(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).findings.length === 0 ? 0 : 1)' "$TMP_OUT"; then
+if [ "$LOCAL_RECONCILIATION_KNOWN" = true ] && node -e '
+  const fs = require("node:fs");
+  const current = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).findings;
+  const unresolved = JSON.parse(fs.readFileSync(process.argv[2], "utf8")).findings;
+  process.exit(current.length === 0 && unresolved.length === 0 ? 0 : 1);
+' "$TMP_OUT" "$LOCAL_UNRESOLVED_FILE"; then
   CLEAN=1
 fi
 
@@ -904,6 +922,8 @@ if [ "$AS_JSON" = 1 ]; then
   cat "$TMP_OUT"
 elif RENDERER="$(support_exec scripts/post-review.mjs)"; then
   FINDINGS_FILE="$TMP_OUT" REVIEW_METADATA_FILE="$RUN_TMP/metadata.json" \
+    UNRESOLVED_FINDINGS_FILE="$LOCAL_UNRESOLVED_FILE" \
+    RECONCILIATION_KNOWN="$LOCAL_RECONCILIATION_KNOWN" \
     REVIEW_MODE="$REVIEW_MODE" RENDER=1 node "$RENDERER" || cat "$TMP_OUT"
 else
   cat "$TMP_OUT"
@@ -915,8 +935,8 @@ if [ "$CLEAN" = 1 ] && [ "$ANALYSIS_STATE" = "complete" ]; then
 elif [ "$CLEAN" = 1 ]; then
   say "no findings in available passes; analysis inconclusive"
 elif [ "$FAIL_ON_FINDINGS" = 1 ]; then
-  _c "0;33"; printf '  ! findings above — review before pushing\n' >&2; _c "0"
+  _c "0;33"; printf '  ! review above is not clean — review before pushing\n' >&2; _c "0"
   exit 1
 else
-  _c "0;33"; printf '  ! findings above (--no-fail set)\n' >&2; _c "0"
+  _c "0;33"; printf '  ! review above is not clean (--no-fail set)\n' >&2; _c "0"
 fi

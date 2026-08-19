@@ -14,6 +14,7 @@
 // Usage:
 //   local-state.mjs record <findings.json> <base> <head>   merge a run into state
 //   local-state.mjs list [open|all|dismissed]              print tracked findings
+//   local-state.mjs export-open                           print open findings JSON
 //   local-state.mjs dismiss <id>...                        stop reporting these
 //   local-state.mjs reopen <id>...
 //   local-state.mjs runs                                   past runs, newest first
@@ -134,6 +135,23 @@ if (cmd === "record") {
   process.exit(0);
 }
 
+if (cmd === "export-open") {
+  const state = load();
+  const findings = state.findings
+    .filter((finding) => finding.status === "open")
+    .map((finding) => ({
+      file: finding.file,
+      title: finding.title,
+      body: finding.body,
+      severity: finding.severity,
+      start_line: finding.line,
+      end_line: finding.line,
+      suggestion: null,
+    }));
+  process.stdout.write(`${JSON.stringify({ findings })}\n`);
+  process.exit(0);
+}
+
 if (cmd === "list") {
   const which = process.argv[3] ?? "open";
   const state = load();
@@ -176,5 +194,5 @@ if (cmd === "runs") {
   process.exit(0);
 }
 
-console.error("usage: local-state.mjs record|list|dismiss|reopen|runs");
+console.error("usage: local-state.mjs record|export-open|list|dismiss|reopen|runs");
 process.exit(2);
