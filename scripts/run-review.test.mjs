@@ -3,9 +3,11 @@ import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -33,7 +35,7 @@ function finding(title, overrides = {}) {
 }
 
 const fakeOmp = `#!/usr/bin/env node
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, lstatSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 if (process.argv.includes("--version")) {
@@ -62,6 +64,18 @@ const reviewCwd = process.argv.slice(2).find((argument) => argument.startsWith("
   ?? process.cwd();
 let reviewedAlpha = null;
 try { reviewedAlpha = readFileSync(join(reviewCwd, "alpha.txt"), "utf8"); } catch {}
+const codegraphPath = join(reviewCwd, "codegraph.json");
+let reviewedCodegraph = { type: "absent" };
+try {
+  const status = lstatSync(codegraphPath);
+  reviewedCodegraph = status.isSymbolicLink()
+    ? { type: "symlink", target: readlinkSync(codegraphPath), contents: readFileSync(codegraphPath, "utf8") }
+    : status.isFile()
+      ? { type: "file", contents: readFileSync(codegraphPath, "utf8") }
+      : { type: "other" };
+} catch (error) {
+  if (error.code !== "ENOENT") throw error;
+}
 appendFileSync(process.env.FAKE_OMP_LOG, JSON.stringify({
   id,
   attempt,
@@ -69,6 +83,7 @@ appendFileSync(process.env.FAKE_OMP_LOG, JSON.stringify({
   prompt,
   cwd: reviewCwd,
   reviewedAlpha,
+  reviewedCodegraph,
   argv: process.argv.slice(2),
 }) + "\\n");
 const plan = JSON.parse(readFileSync(process.env.FAKE_OMP_PLAN, "utf8"));
@@ -116,6 +131,7 @@ function createFixture(t, {
   targetFiles = {},
   baseFiles = {},
   deleteFiles = [],
+  targetSymlinks = {},
   staged = false,
 } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "run-review-"));
@@ -152,9 +168,16 @@ function createFixture(t, {
     mkdirSync(dirname(destination), { recursive: true });
     writeFileSync(destination, contents);
   }
+  for (const [path, target] of Object.entries(targetSymlinks)) {
+    const destination = join(repository, path);
+    mkdirSync(dirname(destination), { recursive: true });
+    rmSync(destination, { recursive: true, force: true });
+    symlinkSync(target, destination);
+  }
   for (const path of deleteFiles) rmSync(join(repository, path));
   git(repository, "add", ".");
   for (const path of Object.keys(targetFiles)) git(repository, "add", "-f", "--", path);
+  for (const path of Object.keys(targetSymlinks)) git(repository, "add", "-f", "--", path);
   let headSha = null;
   if (!staged) {
     git(repository, "commit", "-m", "change three files");
@@ -174,6 +197,7 @@ function runReview(t, plan, {
   targetFiles = {},
   baseFiles = {},
   deleteFiles = [],
+  targetSymlinks = {},
   staged = false,
   includeOutputs = true,
   metadataViaEnv = false,
@@ -185,7 +209,13 @@ function runReview(t, plan, {
   mutateAfterWorktree = null,
   outputPaths = null,
 } = {}) {
-  const fixture = createFixture(t, { targetFiles, baseFiles, deleteFiles, staged });
+  const fixture = createFixture(t, {
+    targetFiles,
+    baseFiles,
+    deleteFiles,
+    staged,
+    targetSymlinks,
+  });
   if (untrackedCodegraph) {
     mkdirSync(join(fixture.repository, ".codegraph"), { recursive: true });
     writeFileSync(join(fixture.repository, ".codegraph", "source-marker"), "SOURCE_INDEX_BEFORE\\n");
@@ -627,6 +657,12 @@ test("codegraph context comes only from the pinned review snapshot", (t) => {
   assert.notEqual(initializations[0].project, run.repository);
   assert.equal(initializations[0].source, "alpha head");
   assert.equal(initializations[0].config, "{\"trusted\":\"base\"}");
+  for (const { reviewedCodegraph } of run.logs) {
+    assert.deepEqual(
+      reviewedCodegraph,
+      { type: "file", contents: "{\"untrusted\":\"target\"}\n" },
+    );
+  }
   assert.ok(queries.length > 0);
   assert.ok(queries.every(({ project }) => project === run.logs[0].cwd));
   assert.ok(queries.every(({ marker }) => marker === "INDEX:alpha head"));
@@ -638,12 +674,70 @@ test("codegraph context comes only from the pinned review snapshot", (t) => {
   );
 });
 
+test("OMP sees the exact target codegraph config after base-trusted snapshot indexing", async (t) => {
+  const plan = {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  };
+  const scenarios = [
+    {
+      name: "target addition",
+      targetFiles: { "codegraph.json": "{\"target\":\"added\"}\n" },
+      expectedInit: null,
+      expectedTarget: { type: "file", contents: "{\"target\":\"added\"}\n" },
+    },
+    {
+      name: "target deletion",
+      baseFiles: { "codegraph.json": "{\"trusted\":\"base\"}\n" },
+      deleteFiles: ["codegraph.json"],
+      expectedInit: "{\"trusted\":\"base\"}",
+      expectedTarget: { type: "absent" },
+    },
+    {
+      name: "target symlink",
+      baseFiles: { "codegraph.json": "{\"trusted\":\"base\"}\n" },
+      targetFiles: { "target-codegraph.json": "{\"target\":\"linked\"}\n" },
+      targetSymlinks: { "codegraph.json": "target-codegraph.json" },
+      expectedInit: "{\"trusted\":\"base\"}",
+      expectedTarget: {
+        type: "symlink",
+        target: "target-codegraph.json",
+        contents: "{\"target\":\"linked\"}\n",
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, (t) => {
+      const run = runReview(t, plan, {
+        baseFiles: scenario.baseFiles,
+        targetFiles: scenario.targetFiles,
+        deleteFiles: scenario.deleteFiles,
+        targetSymlinks: scenario.targetSymlinks,
+        fakeCodegraph: true,
+        untrackedCodegraph: true,
+      });
+
+      assert.equal(run.result.status, 0, run.result.stderr);
+      const initializations = run.codegraphLogs.filter(({ operation }) => operation === "init");
+      assert.equal(initializations.length, 1);
+      assert.equal(initializations[0].config, scenario.expectedInit);
+      for (const { reviewedCodegraph } of run.logs) {
+        assert.deepEqual(reviewedCodegraph, scenario.expectedTarget);
+      }
+    });
+  }
+});
+
 test("codegraph snapshot initialization failure omits optional context without failing review", (t) => {
   const run = runReview(t, {
     general: [{ findings: [] }],
     correctness: [{ findings: [] }],
     boundaries: [{ findings: [] }],
   }, {
+    baseFiles: { "codegraph.json": "{\"trusted\":\"base\"}\n" },
+    targetFiles: { "codegraph.json": "{\"target\":\"after-failure\"}\n" },
     fakeCodegraph: true,
     untrackedCodegraph: true,
     env: { FAKE_CODEGRAPH_INIT_FAIL: "1" },
@@ -651,9 +745,17 @@ test("codegraph snapshot initialization failure omits optional context without f
 
   assert.equal(run.result.status, 0, run.result.stderr);
   assert.equal(run.metadata.analysis_state, "complete");
-  assert.equal(run.codegraphLogs.filter(({ operation }) => operation === "init").length, 1);
+  const initializations = run.codegraphLogs.filter(({ operation }) => operation === "init");
+  assert.equal(initializations.length, 1);
+  assert.equal(initializations[0].config, "{\"trusted\":\"base\"}");
   assert.equal(run.codegraphLogs.filter(({ operation }) => operation === "query").length, 0);
   assert.ok(run.logs.every(({ prompt }) => !prompt.includes("# Snapshot symbol index")));
+  for (const { reviewedCodegraph } of run.logs) {
+    assert.deepEqual(
+      reviewedCodegraph,
+      { type: "file", contents: "{\"target\":\"after-failure\"}\n" },
+    );
+  }
 });
 
 test("summary, inline, and suggest all ask OMP for the structured JSON contract", (t) => {

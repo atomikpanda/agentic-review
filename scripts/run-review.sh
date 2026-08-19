@@ -491,7 +491,7 @@ if [ "$SOURCE_CODEGRAPH_OPT_IN" = 1 ] && [ "$SNAPSHOT_IMMUTABLE" = 1 ] \
   # stale symbols and concurrent checkout changes cannot enter any pass.
   _codegraph_prepared=1
   rm -rf -- "$REVIEW_ROOT/.codegraph" 2>/dev/null || _codegraph_prepared=0
-  rm -f -- "$REVIEW_ROOT/codegraph.json" 2>/dev/null || _codegraph_prepared=0
+  rm -rf -- "$REVIEW_ROOT/codegraph.json" 2>/dev/null || _codegraph_prepared=0
   if [ "$_codegraph_prepared" = 1 ] \
      && git cat-file -e "$SOURCE_BASE_SHA:codegraph.json" 2>/dev/null; then
     git show "$SOURCE_BASE_SHA:codegraph.json" > "$REVIEW_ROOT/codegraph.json" \
@@ -501,6 +501,14 @@ if [ "$SOURCE_CODEGRAPH_OPT_IN" = 1 ] && [ "$SNAPSHOT_IMMUTABLE" = 1 ] \
      && (cd "$REVIEW_ROOT" && CODEGRAPH_TELEMETRY=0 codegraph init . >/dev/null 2>&1) \
      && [ -d "$REVIEW_ROOT/.codegraph" ]; then
     CODEGRAPH_READY=1
+  fi
+  # The base config is trusted indexing input, not part of the reviewed target.
+  # Remove it before restoring so a target symlink can never redirect the write.
+  rm -rf -- "$REVIEW_ROOT/codegraph.json" \
+    || die "could not restore codegraph.json in the review snapshot"
+  if git cat-file -e "$SOURCE_TARGET_SHA:codegraph.json" 2>/dev/null; then
+    git -C "$REVIEW_ROOT" restore --source="$SOURCE_TARGET_SHA" --worktree -- codegraph.json \
+      || die "could not restore codegraph.json in the review snapshot"
   fi
 fi
 CHANGED_PATHS_FILE="$RUN_TMP/changed-paths"
