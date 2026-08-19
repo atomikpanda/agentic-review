@@ -26,19 +26,37 @@ import { sameFinding, SIMILARITY_DEFAULT } from "./lib-findings.mjs";
 
 const SEVERITY_RANK = { Critical: 0, High: 1, Medium: 2 };
 
+function isValidFinding(value) {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && typeof value.file === "string"
+    && typeof value.title === "string"
+    && typeof value.body === "string"
+    && Object.hasOwn(SEVERITY_RANK, value.severity)
+    && Number.isInteger(value.start_line)
+    && value.start_line > 0
+    && Number.isInteger(value.end_line)
+    && value.end_line >= value.start_line
+    && (typeof value.suggestion === "string" || value.suggestion === null);
+}
+
+function isValidDocument(value) {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Array.isArray(value.findings)
+    && value.findings.every(isValidFinding);
+}
+
 function extractJson(text, { strict = false } = {}) {
   const trimmed = String(text ?? "").trim();
   if (!trimmed) return null;
 
-  const candidates = [];
-  const fencePattern = strict
-    ? /^```(?:json)?\s*\n([\s\S]*?)\n```$/
-    : /```(?:json)?\s*\n([\s\S]*?)\n```/;
-  const fence = trimmed.match(fencePattern);
-  if (fence) candidates.push(fence[1]);
-  candidates.push(trimmed);
-
+  const candidates = [trimmed];
   if (!strict) {
+    const fence = trimmed.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
+    if (fence) candidates.unshift(fence[1]);
     const first = trimmed.indexOf("{");
     const last = trimmed.lastIndexOf("}");
     if (first !== -1 && last > first) candidates.push(trimmed.slice(first, last + 1));
@@ -47,7 +65,7 @@ function extractJson(text, { strict = false } = {}) {
   for (const candidate of candidates) {
     try {
       const parsed = JSON.parse(candidate);
-      if (parsed && Array.isArray(parsed.findings)) return parsed;
+      if (isValidDocument(parsed)) return parsed;
     } catch {
       /* try the next candidate */
     }
@@ -77,8 +95,8 @@ export function mergeFindingDocuments(documents, { minVotes = 1 } = {}) {
   let passes = 0;
 
   for (const document of documents) {
-    const parsed = document && typeof document === "object" && Array.isArray(document.findings)
-      ? document
+    const parsed = document && typeof document === "object"
+      ? (isValidDocument(document) ? document : null)
       : extractJson(document);
     if (!parsed) {
       statuses.push({ status: "malformed", finding_count: 0 });

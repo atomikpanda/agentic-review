@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { mergeFindingDocuments } from "./merge-findings.mjs";
+
 const script = new URL("./merge-findings.mjs", import.meta.url);
 
 function finding(title, overrides = {}) {
@@ -15,6 +17,7 @@ function finding(title, overrides = {}) {
     file: `src/${title.toLowerCase().replaceAll(" ", "-")}.js`,
     start_line: 1,
     end_line: 1,
+    suggestion: null,
     ...overrides,
   };
 }
@@ -129,6 +132,45 @@ test("malformed documents report status to importers and diagnostics to the CLI"
   assert.equal(JSON.parse(cli.stdout).passes, 1);
 });
 
+test("an invalid finding makes the whole document malformed for imports and the CLI", () => {
+  const valid = finding("Valid finding");
+  const missingSuggestion = { ...valid };
+  delete missingSuggestion.suggestion;
+  const invalidFindings = [
+    null,
+    {},
+    { ...valid, file: null },
+    { ...valid, title: 42 },
+    { ...valid, body: null },
+    { ...valid, severity: "Low" },
+    { ...valid, start_line: 0 },
+    { ...valid, start_line: 1.5 },
+    { ...valid, start_line: 2, end_line: 1 },
+    { ...valid, suggestion: 42 },
+    missingSuggestion,
+  ];
+
+  for (const invalid of invalidFindings) {
+    for (const document of [
+      { findings: [valid, invalid] },
+      JSON.stringify({ findings: [valid, invalid] }),
+    ]) {
+      const result = mergeFindingDocuments([document], { minVotes: 1 });
+      assert.deepEqual(result.statuses, [{ status: "malformed", finding_count: 0 }]);
+      assert.equal(result.passes, 0);
+      assert.deepEqual(result.findings, []);
+    }
+  }
+
+  const document = { findings: [valid, {}] };
+  const merged = runCli([document]);
+  const checked = runCli([document], ["--check"]);
+  assert.equal(merged.status, 0, merged.stderr);
+  assert.match(merged.stderr, /unparseable, skipped/);
+  assert.deepEqual(JSON.parse(merged.stdout), { findings: [], passes: 0 });
+  assert.notEqual(checked.status, 0);
+});
+
 test("importing the module has no stdout, stderr, or exit side effects", () => {
   const imported = spawnSync(
     process.execPath,
@@ -141,14 +183,16 @@ test("importing the module has no stdout, stderr, or exit side effects", () => {
   assert.equal(imported.stderr, "");
 });
 
-test("--check accepts bare findings JSON and rejects prose-wrapped or empty output", () => {
+test("--check accepts only a bare valid findings object", () => {
   const json = JSON.stringify({ findings: [] });
   const bare = runCli([json], ["--check"]);
   const prose = runCli([`Review complete. ${json}`], ["--check"]);
+  const fenced = runCli(["```json\n" + json + "\n```"], ["--check"]);
   const empty = runCli([""], ["--check"]);
 
   assert.equal(bare.status, 0, bare.stderr);
   assert.notEqual(prose.status, 0);
+  assert.notEqual(fenced.status, 0);
   assert.notEqual(empty.status, 0);
 });
 
