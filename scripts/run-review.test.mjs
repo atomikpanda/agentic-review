@@ -346,6 +346,11 @@ shift 2
 exec "\$(dirname "$0")/omp" "$@"
 `);
     chmodSync(bunx, 0o755);
+    const bun = join(fixture.bin, "bun");
+    writeFileSync(bun, `#!/usr/bin/env bash
+printf '%s\\n' '1.3.14'
+`);
+    chmodSync(bun, 0o755);
   }
   const result = spawnSync("bash", runnerArgs, {
     cwd: fixture.repository,
