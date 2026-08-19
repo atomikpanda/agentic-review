@@ -33,4 +33,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: verify review-thread hunk matching
-        run: node --test scripts/thread-change.test.mjs scripts/review-result.test.mjs
+        run: node --test scripts/thread-change.test.mjs scripts/review-result.test.mjs scripts/merge-findings.test.mjs
