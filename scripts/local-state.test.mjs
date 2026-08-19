@@ -100,8 +100,55 @@ test("malformed readable state fails without overwriting its bytes", (t) => {
   writeFileSync(findingsFile, JSON.stringify({ findings: [] }));
 
   assert.equal(run(repository, "export-open").status, 1);
+  assert.equal(run(repository, "list", "open").status, 1);
   assert.equal(run(repository, "record", findingsFile, head, head).status, 1);
   assert.equal(readFileSync(stateFile, "utf8"), malformed);
+});
+
+test("structurally invalid stored findings fail every reader and preserve bytes", (t) => {
+  const repository = createRepository(t, "local-state-invalid-entry-");
+  writeFileSync(join(repository, "alpha.txt"), "base\n");
+  git(repository, "add", "alpha.txt");
+  git(repository, "commit", "-m", "base");
+  const head = git(repository, "rev-parse", "HEAD");
+  const stateDirectory = join(repository, ".git", "agentic-review");
+  const stateFile = join(stateDirectory, "state.json");
+  const valid = {
+    id: "stored",
+    file: "alpha.txt",
+    title: "Stored finding",
+    body: "Stored body.",
+    severity: "High",
+    line: 1,
+    endLine: 1,
+    status: "open",
+    firstSeen: "2026-08-19T00:00:00.000Z",
+    lastSeen: "2026-08-19T00:00:00.000Z",
+    firstCommit: head,
+    lastCommit: head,
+    count: 1,
+  };
+  const invalidStates = [
+    JSON.stringify({ findings: [{}] }),
+    JSON.stringify({ findings: [{ ...valid, status: "waiting" }] }),
+    JSON.stringify({ findings: [{ ...valid, endLine: 0 }] }),
+    JSON.stringify({ findings: [{ ...valid, firstCommit: "not-a-commit", lastCommit: undefined }] }),
+  ];
+  mkdirSync(stateDirectory, { recursive: true });
+  const findingsFile = join(repository, "findings.json");
+  writeFileSync(findingsFile, JSON.stringify({ findings: [] }));
+
+  for (const invalid of invalidStates) {
+    for (const args of [
+      ["export-open"],
+      ["list", "open"],
+      ["record", findingsFile, head, head],
+    ]) {
+      writeFileSync(stateFile, invalid);
+      assert.equal(run(repository, ...args).status, 1, args.join(" "));
+      assert.equal(readFileSync(stateFile, "utf8"), invalid);
+    }
+  }
 });
 
 test("legacy state defaults the end span and latest commit without mutating on export", (t) => {
@@ -123,6 +170,9 @@ test("legacy state defaults the end span and latest commit without mutating on e
       line: 1,
       status: "open",
       firstCommit: head,
+      firstSeen: "2026-08-19T00:00:00.000Z",
+      lastSeen: "2026-08-19T00:00:00.000Z",
+      count: 1,
     }],
   });
   writeFileSync(stateFile, legacy);

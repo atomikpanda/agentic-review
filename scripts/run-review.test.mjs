@@ -950,6 +950,29 @@ test("malformed readable local state is not overwritten and makes rendering unkn
   assert.equal(readFileSync(statePath, "utf8"), malformed);
 });
 
+test("structurally invalid local entry makes rendering unknown and is not overwritten", (t) => {
+  const fixture = createFixture(t);
+  const stateDirectory = join(fixture.repository, ".git", "agentic-review");
+  const statePath = join(stateDirectory, "state.json");
+  const invalid = JSON.stringify({ findings: [{}] });
+  mkdirSync(stateDirectory, { recursive: true });
+  writeFileSync(statePath, invalid);
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    existingFixture: fixture,
+    noState: false,
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.match(run.result.stdout, /\| Sample \| `unknown` \|/);
+  assert.match(run.result.stdout, /\| Bounded convergence \| `no` \|/);
+  assert.equal(readFileSync(statePath, "utf8"), invalid);
+});
+
 test("--no-state reads held findings for state and default exit without mutating history", (t) => {
   const high = finding("Held local blocker", { file: "alpha.txt", severity: "High" });
   const medium = finding("Held local advisory", { file: "beta.txt", severity: "Medium" });
@@ -982,7 +1005,23 @@ test("--no-state reads held findings for state and default exit without mutating
   assert.match(held.result.stdout, /\| Bounded convergence \| `no` \|/);
   assert.match(held.result.stdout, /\| Held\/unresolved findings \| `Critical: 0 · High: 1 · Medium: 1` \|/);
   assert.deepEqual(readFileSync(statePath), stateBefore);
+  const recurring = runReview(t, {
+    general: [{ findings: [high, medium] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    existingFixture: first,
+    noState: true,
+  });
+  assert.equal(recurring.result.status, 0, recurring.result.stderr);
+  assert.equal(recurring.result.stdout.match(/\*\*Held local blocker\*\*/g)?.length, 1);
+  assert.equal(recurring.result.stdout.match(/\*\*Held local advisory\*\*/g)?.length, 1);
+  assert.match(recurring.result.stdout, /\| Held\/unresolved findings \| `Critical: 0 · High: 0 · Medium: 0` \|/);
+  assert.doesNotMatch(recurring.result.stdout, /#### Held findings/);
+  assert.deepEqual(readFileSync(statePath), stateBefore);
 });
+
 
 function diffFileOrder(prompt) {
   const diff = prompt.match(/## The diff\n\n```diff\n([\s\S]*?)\n```/);

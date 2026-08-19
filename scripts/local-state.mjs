@@ -35,16 +35,54 @@ const git = (args) => execFileSync("git", args, { encoding: "utf8" }).trim();
 const STATE_DIR = join(git(["rev-parse", "--git-common-dir"]), "agentic-review");
 const RUNS_DIR = join(STATE_DIR, "runs");
 const STATE_FILE = join(STATE_DIR, "state.json");
+const STORED_STATUSES = new Set(["open", "dismissed", "gone"]);
+const STORED_SEVERITIES = new Set(["Critical", "High", "Medium"]);
+const COMMIT_SHA = /^[0-9a-f]{40}$/i;
+
+function migrateAndValidateStoredFinding(finding, index) {
+  const label = `local review state findings[${index}]`;
+  if (!finding || typeof finding !== "object" || Array.isArray(finding)) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  if (finding.endLine === undefined) finding.endLine = finding.line;
+  if (finding.lastCommit === undefined) finding.lastCommit = finding.firstCommit;
+  for (const field of ["id", "file", "title", "firstSeen", "lastSeen"]) {
+    if (typeof finding[field] !== "string" || finding[field].length === 0) {
+      throw new TypeError(`${label}.${field} must be a non-empty string`);
+    }
+  }
+  if (typeof finding.body !== "string") {
+    throw new TypeError(`${label}.body must be a string`);
+  }
+  if (!STORED_SEVERITIES.has(finding.severity)) {
+    throw new TypeError(`${label}.severity is invalid`);
+  }
+  if (!STORED_STATUSES.has(finding.status)) {
+    throw new TypeError(`${label}.status is invalid`);
+  }
+  if (
+    !Number.isInteger(finding.line)
+    || finding.line < 1
+    || !Number.isInteger(finding.endLine)
+    || finding.endLine < finding.line
+  ) {
+    throw new TypeError(`${label} has an invalid inclusive line span`);
+  }
+  if (!COMMIT_SHA.test(finding.firstCommit) || !COMMIT_SHA.test(finding.lastCommit)) {
+    throw new TypeError(`${label} has an invalid commit SHA`);
+  }
+  if (!Number.isInteger(finding.count) || finding.count < 1) {
+    throw new TypeError(`${label}.count must be a positive integer`);
+  }
+}
+
 const load = () => {
   try {
     const state = JSON.parse(readFileSync(STATE_FILE, "utf8"));
     if (!state || typeof state !== "object" || !Array.isArray(state.findings)) {
       throw new TypeError("local review state must contain a findings array");
     }
-    for (const finding of state.findings) {
-      if (finding.endLine === undefined) finding.endLine = finding.line;
-      if (finding.lastCommit === undefined) finding.lastCommit = finding.firstCommit;
-    }
+    state.findings.forEach(migrateAndValidateStoredFinding);
     return state;
   } catch (error) {
     if (error?.code === "ENOENT") return { findings: [] };

@@ -574,3 +574,30 @@ test("summary render smoke uses explicit findings and metadata and emits no heur
   assert.match(rendered.stdout, /Cache entry survives invalidation/);
   assert.equal(/whole diff reviewed|Production ready|Review confidence/.test(rendered.stdout), false);
 });
+
+test("local render removes current findings from unresolved display and counts", () => {
+  const dir = mkdtempSync(join(tmpdir(), "post-review-render-dedup-"));
+  const findingsFile = join(dir, "findings.json");
+  const unresolvedFile = join(dir, "unresolved.json");
+  const metadataFile = join(dir, "metadata.json");
+  const current = finding();
+  writeFileSync(findingsFile, JSON.stringify({ findings: [current] }));
+  writeFileSync(unresolvedFile, JSON.stringify({ findings: [current] }));
+  writeFileSync(metadataFile, JSON.stringify(metadata()));
+  const rendered = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      FINDINGS_FILE: findingsFile,
+      UNRESOLVED_FINDINGS_FILE: unresolvedFile,
+      REVIEW_METADATA_FILE: metadataFile,
+      RENDER: "1",
+      REVIEW_MODE: "inline",
+    },
+  });
+
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.equal(rendered.stdout.match(/Cache entry survives invalidation/g)?.length, 1);
+  assert.match(rendered.stdout, /\| Held\/unresolved findings \| `Critical: 0 · High: 0 · Medium: 0` \|/);
+  assert.doesNotMatch(rendered.stdout, /#### Held findings/);
+});

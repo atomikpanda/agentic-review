@@ -36,7 +36,7 @@ import { appendFileSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { deflateRawSync, inflateRawSync } from "node:zlib";
 
-import { tokenSet, similarity, SIMILARITY_DEFAULT } from "./lib-findings.mjs";
+import { sameFinding, tokenSet, similarity, SIMILARITY_DEFAULT } from "./lib-findings.mjs";
 import { deriveReviewState, validateRunMetadata } from "./review-result.mjs";
 import {
   GIT_DIFF_MAX_BUFFER_BYTES,
@@ -1129,7 +1129,8 @@ async function main() {
       try {
         const prior = extractJson(readFileSync(unresolvedPath, "utf8"));
         if (!prior) throw new TypeError("unresolved findings are not structured JSON");
-        unresolved = prior.findings;
+        unresolved = prior.findings.filter((priorFinding) =>
+          !findings.some((currentFinding) => sameFinding(currentFinding, priorFinding)));
       } catch {
         reconciliationKnown = false;
       }
