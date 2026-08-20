@@ -2857,6 +2857,74 @@ test("branch and staged reviews stay pinned when the source changes after worktr
   }
 });
 
+test("staged review uses an internal synthetic commit without configured Git identity", (t) => {
+  const fixture = createFixture(t, { staged: true });
+  git(fixture.repository, "config", "--local", "--unset-all", "user.name");
+  git(fixture.repository, "config", "--local", "--unset-all", "user.email");
+  const gitConfigHome = join(fixture.directory, "git-config-home");
+  const xdgConfigHome = join(gitConfigHome, "xdg");
+  mkdirSync(xdgConfigHome, { recursive: true });
+  const identitylessEnv = {
+    HOME: gitConfigHome,
+    XDG_CONFIG_HOME: xdgConfigHome,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: join(gitConfigHome, "global-config"),
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "user.useConfigOnly",
+    GIT_CONFIG_VALUE_0: "true",
+    GIT_AUTHOR_NAME: "",
+    GIT_AUTHOR_EMAIL: "",
+    GIT_COMMITTER_NAME: "",
+    GIT_COMMITTER_EMAIL: "",
+  };
+  for (const key of ["user.name", "user.email"]) {
+    const configured = spawnSync("git", ["config", "--get", key], {
+      cwd: fixture.repository,
+      encoding: "utf8",
+      env: { ...process.env, ...identitylessEnv },
+    });
+    assert.equal(configured.status, 1, `${key} unexpectedly configured: ${configured.stdout}`);
+  }
+  const localConfigBefore = git(fixture.repository, "config", "--local", "--list");
+  const refsBefore = git(
+    fixture.repository,
+    "for-each-ref",
+    "--format=%(refname) %(objectname)",
+  );
+
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    env: identitylessEnv,
+    existingFixture: fixture,
+    staged: true,
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.equal(run.logs.length, 3);
+  assert.equal(git(run.repository, "rev-parse", "HEAD"), fixture.baseSha);
+  assert.equal(
+    git(run.repository, "show", "-s", "--format=%an|%ae|%cn|%ce", run.metadata.head_sha),
+    "agentic-review|agentic-review@localhost|agentic-review|agentic-review@localhost",
+  );
+  assert.equal(
+    git(run.repository, "for-each-ref", "--format=%(refname)", "--contains", run.metadata.head_sha),
+    "",
+    "synthetic staged commit must not be published through a Git ref",
+  );
+  assert.equal(
+    git(run.repository, "for-each-ref", "--format=%(refname) %(objectname)"),
+    refsBefore,
+  );
+  assert.equal(
+    git(run.repository, "config", "--local", "--list"),
+    localConfigBefore,
+    "staged review must not persist synthetic commit identity",
+  );
+});
+
 test("staged review state keeps its synthetic target reachable for later reconciliation", (t) => {
   const reported = finding("Fixed staged defect", {
     file: "alpha.txt",

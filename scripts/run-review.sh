@@ -393,7 +393,7 @@ if [ "$STAGED" = 1 ]; then
   # dangling commit. Later restaging cannot change the review target.
   SOURCE_BASE_SHA="$(git rev-parse --verify 'HEAD^{commit}')"
   SOURCE_INDEX_TREE="$(git write-tree)"
-  SOURCE_TARGET_SHA="$(git commit-tree "$SOURCE_INDEX_TREE" -p "$SOURCE_BASE_SHA" -m 'agentic-review: staged state')"
+  SOURCE_TARGET_SHA="$(GIT_AUTHOR_NAME=agentic-review GIT_AUTHOR_EMAIL=agentic-review@localhost GIT_COMMITTER_NAME=agentic-review GIT_COMMITTER_EMAIL=agentic-review@localhost git commit-tree "$SOURCE_INDEX_TREE" -p "$SOURCE_BASE_SHA" -m 'agentic-review: staged state')"
   STAGED_TARGET_SHA="$SOURCE_TARGET_SHA"
   RANGE="--staged"
   INTENT=""
