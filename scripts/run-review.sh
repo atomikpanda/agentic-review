@@ -73,8 +73,8 @@ READ_ONLY_TOOLS="read grep glob"
 BUN_MIN="1.3.14"
 
 BASE="${AGENTIC_REVIEW_BASE:-}"
-MODEL="${AGENTIC_REVIEW_MODEL:-openrouter/deepseek/deepseek-v4-flash-0731:nitro}"
-# Default high. Historical testing on the previous default improved tool use
+MODEL="${AGENTIC_REVIEW_MODEL:-openrouter/openai/gpt-5.6-luna}"
+# Default high. Historical testing with the default model improved tool use
 # from 2 to 25 calls and measured recall from 5/11 to 8/11. Lower it only when
 # the wall-clock and cost trade-off matters more than recall.
 THINKING="${AGENTIC_REVIEW_THINKING:-high}"

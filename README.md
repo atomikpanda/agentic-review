@@ -329,9 +329,9 @@ runs each, and found a consistent same-author penalty on high-severity bugs:
 | Claude | 53.7% | **60.0%** |
 | GPT | **62.0%** | 50.5% |
 
-The default is DeepSeek V4 Flash 0731 through OpenRouter's Nitro
-fastest-provider route, keeping the reviewer in a different model family from
-both Claude and Codex-authored changes. Explicit `model` overrides still win.
+The default is `openrouter/openai/gpt-5.6-luna`, which has completed hosted
+three-pass reviews within the default 20-minute job cap. Explicit `model`
+overrides still win when reviewer-family diversity is more important.
 
 ## Symbol index
 
@@ -368,7 +368,7 @@ cell means that surface does not expose the setting.
 
 | Setting | Workflow default | Workflow `with:` | `install-review.sh` | `run-review.sh` |
 |---|---|---|---|---|
-| Model slug | `openrouter/deepseek/deepseek-v4-flash-0731:nitro` | `model` | `--model` | `--model` |
+| Model slug | `openrouter/openai/gpt-5.6-luna` | `model` | `--model` | `--model` |
 | Reasoning effort | `high` | `thinking` | `--thinking` | `--thinking` |
 | Tool allowlist | `read,grep,glob` | `tools` | `--tools` | `--tools` |
 | Wall-clock cap | none | `max_time` | `--max-time` | `--max-time` |
@@ -575,10 +575,8 @@ overlapping sets of inline comments.
 ## Cost
 
 The default ensemble performs approximately three times the model work of one
-general pass. DeepSeek V4 Flash 0731 advertises $0.065/M input and $0.14/M
-output on OpenRouter; Nitro routing chooses the fastest provider, so actual
-price can vary. Historical `gpt-5.6-luna` runs cost roughly $0.10–0.30 per
-pass. Actual cost still scales with how much each pass explores and is less
+general pass. Historical `gpt-5.6-luna` runs cost roughly $0.10–0.30 per pass.
+Actual cost still scales with how much each pass explores and is less
 predictable than a single-shot reviewer.
 
 `max_time` bounds each model invocation and `timeout_minutes` bounds the hosted

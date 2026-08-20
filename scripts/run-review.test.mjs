@@ -578,8 +578,8 @@ function runWorkflowConfig(t, overrides = {}) {
   };
 }
 
-test("hosted and local entrypoints share the DeepSeek Nitro default", (t) => {
-  const expected = "openrouter/deepseek/deepseek-v4-flash-0731:nitro";
+test("hosted and local entrypoints share the proven Luna default", (t) => {
+  const expected = "openrouter/openai/gpt-5.6-luna";
   const hosted = runWorkflowConfig(t);
   assert.equal(hosted.result.status, 0, hosted.result.stderr);
   assert.equal(hosted.values.MODEL, expected);
