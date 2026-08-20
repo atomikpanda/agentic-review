@@ -20,9 +20,19 @@
 //   local-state.mjs runs                                   past runs, newest first
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   GIT_DIFF_MAX_BUFFER_BYTES,
   changeIsConfirmed,
@@ -39,6 +49,137 @@ const STORED_STATUSES = new Set(["open", "dismissed", "gone"]);
 const STORED_SEVERITIES = new Set(["Critical", "High", "Medium"]);
 const NON_LOWERCASE_HEX = /[^0-9a-f]/;
 const STAGED_TARGET_REF_PREFIX = "refs/agentic-review/staged-targets/";
+// A fully populated directory is atomically published to serialize the state/ref
+// transaction. The owner lets a later CLI reclaim a lock abandoned by a crash.
+const STATE_LOCK_DIR = join(STATE_DIR, "state.lock");
+const STATE_LOCK_OWNER = join(STATE_LOCK_DIR, "owner.json");
+const STATE_LOCK_REAPER = join(STATE_LOCK_DIR, "reaper");
+const LOCK_RETRY_MS = 25;
+const OWNERLESS_LOCK_STALE_MS = 5_000;
+const LOCK_WAIT_TIMEOUT_MS = 30_000;
+
+function readStateLockOwner() {
+  try {
+    const owner = JSON.parse(readFileSync(STATE_LOCK_OWNER, "utf8"));
+    return Number.isInteger(owner?.pid) && owner.pid > 0 && typeof owner.token === "string"
+      ? owner
+      : null;
+  } catch (error) {
+    if (error?.code === "ENOENT" || error instanceof SyntaxError) return null;
+    throw error;
+  }
+}
+
+function readStateLockReaper() {
+  try {
+    return readFileSync(STATE_LOCK_REAPER, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function removeStateLockReaper(token) {
+  if (readStateLockReaper() !== token) return false;
+  try {
+    unlinkSync(STATE_LOCK_REAPER);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+
+function processIsRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    if (error?.code === "EPERM") return true;
+    throw error;
+  }
+}
+
+function reapStaleStateLock(token) {
+  const observedOwner = readStateLockOwner();
+  let ownerlessLockIsStale = false;
+  if (observedOwner) {
+    if (processIsRunning(observedOwner.pid)) return false;
+  } else {
+    try {
+      ownerlessLockIsStale = Date.now() - statSync(STATE_LOCK_DIR).mtimeMs >= OWNERLESS_LOCK_STALE_MS;
+    } catch (error) {
+      if (error?.code === "ENOENT") return true;
+      throw error;
+    }
+    if (!ownerlessLockIsStale) return false;
+  }
+
+  try {
+    writeFileSync(STATE_LOCK_REAPER, token, { flag: "wx" });
+  } catch (error) {
+    if (error?.code === "EEXIST" || error?.code === "ENOENT") return false;
+    throw error;
+  }
+
+  const currentOwner = readStateLockOwner();
+  if (
+    (currentOwner && processIsRunning(currentOwner.pid))
+    || (observedOwner && currentOwner?.token !== observedOwner.token)
+  ) {
+    removeStateLockReaper(token);
+    return false;
+  }
+  rmSync(STATE_LOCK_DIR, { recursive: true, force: true });
+  return true;
+}
+
+function acquireStateLock() {
+  mkdirSync(STATE_DIR, { recursive: true });
+  const token = randomUUID();
+  const pendingLockDir = `${STATE_LOCK_DIR}.pending-${token}`;
+  const pendingOwner = join(pendingLockDir, "owner.json");
+  const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS;
+  try {
+    mkdirSync(pendingLockDir);
+    writeFileSync(pendingOwner, JSON.stringify({
+      pid: process.pid,
+      token,
+      acquiredAt: new Date().toISOString(),
+    }), { flag: "wx" });
+
+    while (true) {
+      if (existsSync(STATE_LOCK_DIR)) {
+        if (reapStaleStateLock(token)) continue;
+      } else {
+        try {
+          renameSync(pendingLockDir, STATE_LOCK_DIR);
+          return token;
+        } catch (error) {
+          if (error?.code !== "EEXIST" && error?.code !== "ENOTEMPTY") throw error;
+        }
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`timed out waiting for local review state lock at ${STATE_LOCK_DIR}`);
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LOCK_RETRY_MS);
+    }
+  } finally {
+    rmSync(pendingLockDir, { recursive: true, force: true });
+  }
+}
+
+function withStateMutation(action) {
+  const token = acquireStateLock();
+  try {
+    return action();
+  } finally {
+    const owner = readStateLockOwner();
+    if (owner?.token === token) rmSync(STATE_LOCK_DIR, { recursive: true, force: true });
+  }
+}
 
 const findingOwnsStagedTarget = (finding) => finding.stagedTarget === true && finding.status !== "gone";
 
@@ -217,69 +358,72 @@ if (cmd === "record") {
     return projected;
   });
 
-  const state = load();
-  // new Date(undefined) is Invalid Date, not "now" — the || undefined idiom
-  // that works for numbers does not work for this constructor.
-  const epoch = Number(process.env.RUN_EPOCH);
-  const now = (Number.isFinite(epoch) && epoch > 0 ? new Date(epoch) : new Date()).toISOString();
-  const seen = new Set();
-  let fresh = 0, again = 0, muted = 0;
+  const summary = withStateMutation(() => {
+    const state = load();
+    // new Date(undefined) is Invalid Date, not "now" — the || undefined idiom
+    // that works for numbers does not work for this constructor.
+    const epoch = Number(process.env.RUN_EPOCH);
+    const now = (Number.isFinite(epoch) && epoch > 0 ? new Date(epoch) : new Date()).toISOString();
+    const seen = new Set();
+    let fresh = 0, again = 0, muted = 0;
 
-  for (const f of findings) {
-    const known = state.findings.find((k) => sameFinding(k, f));
-    if (known) {
-      seen.add(known.id);
-      known.lastSeen = now;
-      known.count = (known.count ?? 1) + 1;
-      known.severity = f.severity ?? known.severity;
-      known.line = f.start_line ?? known.line;
-      known.endLine = f.end_line ?? f.start_line ?? known.endLine;
-      known.lastCommit = head;
-      known.stagedTarget = Boolean(stagedTarget);
-      if (known.status === "dismissed") { muted++; continue; }
-      // Reported again after being marked gone: the defect returned, so the
-      // record has to return with it rather than staying closed forever.
-      if (known.status === "gone") { known.status = "open"; delete known.goneAt; }
-      again++;
-    } else {
-      const id = idFor(f);
-      seen.add(id);
-      state.findings.push({
-        id, file: f.file, title: f.title, body: f.body, severity: f.severity,
-        line: f.start_line, endLine: f.end_line ?? f.start_line, status: "open",
-        firstSeen: now, lastSeen: now, firstCommit: head, lastCommit: head,
-        stagedTarget: Boolean(stagedTarget), count: 1,
-      });
-      fresh++;
+    for (const f of findings) {
+      const known = state.findings.find((k) => sameFinding(k, f));
+      if (known) {
+        seen.add(known.id);
+        known.lastSeen = now;
+        known.count = (known.count ?? 1) + 1;
+        known.severity = f.severity ?? known.severity;
+        known.line = f.start_line ?? known.line;
+        known.endLine = f.end_line ?? f.start_line ?? known.endLine;
+        known.lastCommit = head;
+        known.stagedTarget = Boolean(stagedTarget);
+        if (known.status === "dismissed") { muted++; continue; }
+        // Reported again after being marked gone: the defect returned, so the
+        // record has to return with it rather than staying closed forever.
+        if (known.status === "gone") { known.status = "open"; delete known.goneAt; }
+        again++;
+      } else {
+        const id = idFor(f);
+        seen.add(id);
+        state.findings.push({
+          id, file: f.file, title: f.title, body: f.body, severity: f.severity,
+          line: f.start_line, endLine: f.end_line ?? f.start_line, status: "open",
+          firstSeen: now, lastSeen: now, firstCommit: head, lastCommit: head,
+          stagedTarget: Boolean(stagedTarget), count: 1,
+        });
+        fresh++;
+      }
     }
-  }
-  // Anything previously open and not reported now retires only after a changed
-  // hunk overlaps its latest confirmed span. Unrelated changes, invalid spans,
-  // and indeterminate Git results retain the finding.
-  let retired = 0, unexplained = 0;
-  for (const k of state.findings) {
-    if (k.status !== "open" || seen.has(k.id)) continue;
-    if (analysisState !== "complete") { unexplained++; continue; }
-    const changed = spanChangedSince(k, head);
-    if (changeIsConfirmed(changed)) { k.status = "gone"; k.goneAt = now; retired++; }
-    else unexplained++;
-  }
+    // Anything previously open and not reported now retires only after a changed
+    // hunk overlaps its latest confirmed span. Unrelated changes, invalid spans,
+    // and indeterminate Git results retain the finding.
+    let retired = 0, unexplained = 0;
+    for (const k of state.findings) {
+      if (k.status !== "open" || seen.has(k.id)) continue;
+      if (analysisState !== "complete") { unexplained++; continue; }
+      const changed = spanChangedSince(k, head);
+      if (changeIsConfirmed(changed)) { k.status = "gone"; k.goneAt = now; retired++; }
+      else unexplained++;
+    }
 
-  mkdirSync(RUNS_DIR, { recursive: true });
-  const stamp = now.replace(/[:.]/g, "-");
-  writeFileSync(join(RUNS_DIR, `${stamp}.json`), JSON.stringify(
-    { at: now, base, head, analysis_state: analysisState, branch: git(["rev-parse", "--abbrev-ref", "HEAD"]), findings }, null, 2));
-  // A staged worktree may be the target's only other reachability. Add its ref
-  // before persisting ownership, then prune only after the new state is durable.
-  retainStagedTarget(state, stagedTarget);
-  save(state);
-  pruneUnownedStagedTargets(state);
+    mkdirSync(RUNS_DIR, { recursive: true });
+    const stamp = now.replace(/[:.]/g, "-");
+    writeFileSync(join(RUNS_DIR, `${stamp}.json`), JSON.stringify(
+      { at: now, base, head, analysis_state: analysisState, branch: git(["rev-parse", "--abbrev-ref", "HEAD"]), findings }, null, 2));
+    // A staged worktree may be the target's only other reachability. Add its ref
+    // before persisting ownership, then prune only after the new state is durable.
+    retainStagedTarget(state, stagedTarget);
+    save(state);
+    pruneUnownedStagedTargets(state);
 
-  const bits = [`${fresh} new`, `${again} recurring`];
-  if (muted) bits.push(`${muted} dismissed`);
-  if (retired) bits.push(`${retired} gone`);
-  if (unexplained) bits.push(`${unexplained} unreported without confirmed overlap`);
-  console.log(bits.join(", "));
+    const bits = [`${fresh} new`, `${again} recurring`];
+    if (muted) bits.push(`${muted} dismissed`);
+    if (retired) bits.push(`${retired} gone`);
+    if (unexplained) bits.push(`${unexplained} unreported without confirmed overlap`);
+    return bits.join(", ");
+  });
+  console.log(summary);
   process.exit(0);
 }
 
@@ -318,29 +462,32 @@ if (cmd === "list") {
 
 if (cmd === "dismiss" || cmd === "reopen") {
   const ids = process.argv.slice(3);
-  const state = load();
-  const stagedTargetsToRestore = new Set();
-  if (cmd === "reopen") {
-    for (const f of state.findings) {
-      if (ids.includes(f.id) && f.status !== "open" && f.stagedTarget === true) {
-        stagedTargetsToRestore.add(f.lastCommit);
+  const n = withStateMutation(() => {
+    const state = load();
+    const stagedTargetsToRestore = new Set();
+    if (cmd === "reopen") {
+      for (const f of state.findings) {
+        if (ids.includes(f.id) && f.status !== "open" && f.stagedTarget === true) {
+          stagedTargetsToRestore.add(f.lastCommit);
+        }
+      }
+      for (const target of stagedTargetsToRestore) {
+        git(["cat-file", "-e", `${target}^{commit}`]);
       }
     }
-    for (const target of stagedTargetsToRestore) {
-      git(["cat-file", "-e", `${target}^{commit}`]);
-    }
-  }
 
-  let n = 0;
-  for (const f of state.findings) {
-    if (!ids.includes(f.id)) continue;
-    f.status = cmd === "dismiss" ? "dismissed" : "open";
-    delete f.goneAt;
-    n++;
-  }
-  for (const target of stagedTargetsToRestore) retainStagedTarget(state, target);
-  save(state);
-  pruneUnownedStagedTargets(state);
+    let updated = 0;
+    for (const f of state.findings) {
+      if (!ids.includes(f.id)) continue;
+      f.status = cmd === "dismiss" ? "dismissed" : "open";
+      delete f.goneAt;
+      updated++;
+    }
+    for (const target of stagedTargetsToRestore) retainStagedTarget(state, target);
+    save(state);
+    pruneUnownedStagedTargets(state);
+    return updated;
+  });
   console.log(`${cmd === "dismiss" ? "dismissed" : "reopened"} ${n}`);
   process.exit(0);
 }

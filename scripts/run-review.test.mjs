@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -10,12 +10,15 @@ import {
   readlinkSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
+import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 const runner = fileURLToPath(new URL("./run-review.sh", import.meta.url));
 const resultCli = fileURLToPath(new URL("./review-result.mjs", import.meta.url));
@@ -69,6 +72,27 @@ function assertFinalResultSummary(summary, result) {
   ]) {
     assert.ok(summary.includes(row), row);
   }
+}
+
+function expectedExecutionFailureResult(baseSha, headSha) {
+  return {
+    analysis_state: "inconclusive",
+    merge_state: "ready",
+    sample_state: "unknown",
+    bounded_converged: false,
+    base_sha: baseSha,
+    head_sha: headSha,
+    configuration_fingerprint: "",
+    passes_requested: 0,
+    passes_completed: 0,
+    current_counts: { Critical: 0, High: 0, Medium: 0 },
+    unresolved_counts: { Critical: 0, High: 0, Medium: 0 },
+    reviewed_head: headSha,
+    scope_hash: "",
+    coverage: "unknown",
+    remaining_analysis: ["execution_failed"],
+    converged: false,
+  };
 }
 
 function finding(title, overrides = {}) {
@@ -827,6 +851,7 @@ writeFileSync(process.env.UNTRUSTED_POSTER_MARKER, "executed");
   assert.equal(existsSync(untrustedPosterMarker), false);
   const outputs = envFileValues(outputFile);
   const result = JSON.parse(readFileSync(resultFile, "utf8"));
+  assert.deepEqual(result, expectedExecutionFailureResult(env.BASE_SHA, env.HEAD_SHA));
   assert.equal(outputs.analysis_state, "inconclusive");
   assert.equal(outputs.sample_state, "unknown");
   assert.equal(outputs.bounded_converged, "false");
@@ -846,6 +871,101 @@ writeFileSync(process.env.UNTRUSTED_POSTER_MARKER, "executed");
     assert.match(source, new RegExp(`^        value: \\$\\{\\{ jobs\\.review\\.outputs\\.${field} \\}\\}`, "m"));
     assert.match(source, new RegExp(`^      ${field}: \\$\\{\\{ steps\\.poster\\.outputs\\.${field} \\}\\}`, "m"));
   }
+});
+
+test("workflow boundary finalizes poster module-load failure without replacing poster-owned results", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hosted-poster-load-failure-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const trustedPoster = join(directory, "scripts", "post-review.mjs");
+  mkdirSync(dirname(trustedPoster), { recursive: true });
+  writeFileSync(trustedPoster, 'import "./missing-trusted-dependency.mjs";\n');
+
+  const baseSha = "1111111111111111111111111111111111111111";
+  const headSha = "2222222222222222222222222222222222222222";
+  const env = {
+    ...process.env,
+    TARGET_ELIGIBLE: "true",
+    PR_NUMBER: "7",
+    GITHUB_REPO: "example/repository",
+    HEAD_SHA: headSha,
+    BASE_SHA: baseSha,
+    TRUSTED_DATA_ROOT: directory,
+    REVIEW_POSTER: trustedPoster,
+    REVIEW_MODE: "summary",
+    POST_COMMENT: "false",
+    SUPPRESS_WRITES: "true",
+    RESOLVE_STALE: "false",
+    MAX_FINDINGS: "20",
+    FAIL_ON_FINDINGS: "false",
+    BLOCK_SEVERITIES: "Critical,High",
+  };
+  const outputFile = join(directory, "failure-output");
+  const resultFile = join(directory, "failure-result.json");
+  const summaryFile = join(directory, "failure-summary");
+  const failedLoad = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...env,
+      GITHUB_OUTPUT: outputFile,
+      REVIEW_RESULT_FILE: resultFile,
+      GITHUB_STEP_SUMMARY: summaryFile,
+    },
+  });
+
+  assert.notEqual(failedLoad.status, 0);
+  assert.match(failedLoad.stderr, /ERR_MODULE_NOT_FOUND|Cannot find module/);
+  const expectedResult = expectedExecutionFailureResult(baseSha, headSha);
+  assert.deepEqual(JSON.parse(readFileSync(resultFile, "utf8")), expectedResult);
+  assert.deepEqual(
+    envFileValues(outputFile),
+    Object.fromEntries(Object.entries(expectedResult).map(([name, value]) => [
+      name,
+      typeof value === "object" ? JSON.stringify(value) : String(value),
+    ])),
+  );
+  assertFinalResultSummary(readFileSync(summaryFile, "utf8"), expectedResult);
+
+  const emittedResult = {
+    ...expectedResult,
+    analysis_state: "complete",
+    sample_state: "no_findings",
+    bounded_converged: true,
+    coverage: "bounded",
+    remaining_analysis: [],
+    converged: true,
+  };
+  const emittedResultText = `${JSON.stringify(emittedResult, null, 2)}\n`;
+  const emittedOutput = "analysis_state=complete\n";
+  const emittedSummary = "poster-owned summary\n";
+  writeFileSync(trustedPoster, `
+import { appendFileSync, writeFileSync } from "node:fs";
+writeFileSync(process.env.REVIEW_RESULT_FILE, process.env.EMITTED_RESULT);
+appendFileSync(process.env.GITHUB_OUTPUT, process.env.EMITTED_OUTPUT);
+appendFileSync(process.env.GITHUB_STEP_SUMMARY, process.env.EMITTED_SUMMARY);
+process.exit(23);
+`);
+  const preservedOutput = join(directory, "preserved-output");
+  const preservedResult = join(directory, "preserved-result.json");
+  const preservedSummary = join(directory, "preserved-summary");
+  const failedAfterResult = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...env,
+      GITHUB_OUTPUT: preservedOutput,
+      REVIEW_RESULT_FILE: preservedResult,
+      GITHUB_STEP_SUMMARY: preservedSummary,
+      EMITTED_RESULT: emittedResultText,
+      EMITTED_OUTPUT: emittedOutput,
+      EMITTED_SUMMARY: emittedSummary,
+    },
+  });
+
+  assert.equal(failedAfterResult.status, 23, failedAfterResult.stderr);
+  assert.equal(readFileSync(preservedResult, "utf8"), emittedResultText);
+  assert.equal(readFileSync(preservedOutput, "utf8"), emittedOutput);
+  assert.equal(readFileSync(preservedSummary, "utf8"), emittedSummary);
 });
 
 test("target resolution failure finalizes conservatively while explicit ineligibility remains skipped", (t) => {
@@ -892,24 +1012,7 @@ writeFileSync(process.env.TARGET_POSTER_MARKER, "executed");
 
   assert.equal(failedResolution.status, 1, failedResolution.stderr);
   assert.equal(existsSync(markerFile), false);
-  const expectedResult = {
-    analysis_state: "inconclusive",
-    merge_state: "ready",
-    sample_state: "unknown",
-    bounded_converged: false,
-    base_sha: "",
-    head_sha: "",
-    configuration_fingerprint: "",
-    passes_requested: 0,
-    passes_completed: 0,
-    current_counts: { Critical: 0, High: 0, Medium: 0 },
-    unresolved_counts: { Critical: 0, High: 0, Medium: 0 },
-    reviewed_head: "",
-    scope_hash: "",
-    coverage: "unknown",
-    remaining_analysis: ["execution_failed"],
-    converged: false,
-  };
+  const expectedResult = expectedExecutionFailureResult("", "");
   assert.deepEqual(JSON.parse(readFileSync(failureResult, "utf8")), expectedResult);
   assert.deepEqual(
     envFileValues(failureOutput),
@@ -1817,6 +1920,395 @@ test("staged review state keeps its synthetic target reachable for later reconci
   assert.equal(retired.stagedTarget, true);
 });
 
+test("concurrent local-state updates cannot prune a staged ref owned by final state", async (t) => {
+  const fixture = createFixture(t);
+  const head = git(fixture.repository, "rev-parse", "HEAD");
+  const stagedTarget = git(
+    fixture.repository,
+    "commit-tree",
+    `${head}^{tree}`,
+    "-p",
+    head,
+    "-m",
+    "synthetic staged target",
+  );
+  const ordinaryFinding = finding("Concurrent ordinary finding", { file: "beta.txt" });
+  const stagedFinding = finding("Concurrent staged finding", { file: "alpha.txt" });
+  const ordinaryFile = join(fixture.directory, "ordinary-findings.json");
+  const stagedFile = join(fixture.directory, "staged-findings.json");
+  writeFileSync(ordinaryFile, JSON.stringify({ findings: [ordinaryFinding] }));
+  writeFileSync(stagedFile, JSON.stringify({ findings: [stagedFinding] }));
+
+  const wrapper = join(fixture.bin, "git");
+  const firstPruneReady = join(fixture.directory, "first-prune-ready");
+  const releaseFirstPrune = join(fixture.directory, "release-first-prune");
+  const secondStarted = join(fixture.directory, "second-started");
+  const secondPruneReady = join(fixture.directory, "second-prune-ready");
+  writeFileSync(wrapper, `#!/usr/bin/env node
+import { existsSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+const args = process.argv.slice(2);
+if (
+  process.env.PROCESS_READY
+  && args[0] === "rev-parse"
+  && args[1] === "--git-common-dir"
+) writeFileSync(process.env.PROCESS_READY, "ready");
+if (
+  process.env.PRUNE_READY
+  && args[0] === "for-each-ref"
+  && args.at(-1) === "${stagedTargetRefPrefix}"
+) {
+  writeFileSync(process.env.PRUNE_READY, "ready");
+  while (process.env.RELEASE_PRUNE && !existsSync(process.env.RELEASE_PRUNE)) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+}
+const result = spawnSync("git", args, {
+  encoding: "utf8",
+  env: { ...process.env, PATH: process.env.REAL_GIT_PATH },
+});
+if (result.stdout) process.stdout.write(result.stdout);
+if (result.stderr) process.stderr.write(result.stderr);
+process.exit(result.status ?? 1);
+`);
+  chmodSync(wrapper, 0o755);
+
+  const commonEnv = {
+    ...process.env,
+    PATH: `${fixture.bin}:${process.env.PATH}`,
+    REAL_GIT_PATH: process.env.PATH,
+  };
+  const firstProcess = spawn(
+    process.execPath,
+    [localState, "record", ordinaryFile, fixture.baseSha, head, "inconclusive"],
+    {
+      cwd: fixture.repository,
+      env: {
+        ...commonEnv,
+        PRUNE_READY: firstPruneReady,
+        RELEASE_PRUNE: releaseFirstPrune,
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    },
+  );
+  const firstDone = once(firstProcess, "close");
+  let firstError = "";
+  firstProcess.stderr.setEncoding("utf8");
+  firstProcess.stderr.on("data", (chunk) => { firstError += chunk; });
+  t.after(() => { if (firstProcess.exitCode === null) firstProcess.kill("SIGKILL"); });
+
+  const firstDeadline = Date.now() + 5_000;
+  while (!existsSync(firstPruneReady)) {
+    assert.equal(firstProcess.exitCode, null, firstError);
+    assert.ok(Date.now() < firstDeadline, "first process did not reach staged-ref pruning");
+    await delay(10);
+  }
+  const readWhileLocked = spawnSync(process.execPath, [localState, "export-open"], {
+    cwd: fixture.repository,
+    encoding: "utf8",
+  });
+  assert.equal(readWhileLocked.status, 0, readWhileLocked.stderr);
+  assert.deepEqual(
+    JSON.parse(readWhileLocked.stdout).findings.map(({ title }) => title),
+    [ordinaryFinding.title],
+    "read-only commands remain available while a mutation owns the lock",
+  );
+
+  const secondProcess = spawn(
+    process.execPath,
+    [localState, "record", stagedFile, fixture.baseSha, stagedTarget, "inconclusive"],
+    {
+      cwd: fixture.repository,
+      env: {
+        ...commonEnv,
+        AGENTIC_REVIEW_STAGED_TARGET: stagedTarget,
+        PROCESS_READY: secondStarted,
+        PRUNE_READY: secondPruneReady,
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    },
+  );
+  const secondDone = once(secondProcess, "close");
+  let secondError = "";
+  secondProcess.stderr.setEncoding("utf8");
+  secondProcess.stderr.on("data", (chunk) => { secondError += chunk; });
+  t.after(() => { if (secondProcess.exitCode === null) secondProcess.kill("SIGKILL"); });
+
+  const secondDeadline = Date.now() + 5_000;
+  while (!existsSync(secondStarted)) {
+    assert.equal(secondProcess.exitCode, null, secondError);
+    assert.ok(Date.now() < secondDeadline, "second process did not start its state update");
+    await delay(10);
+  }
+  const lockPath = join(fixture.repository, ".git", "agentic-review", "state.lock");
+  if (existsSync(lockPath)) {
+    await delay(50);
+  } else {
+    while (!existsSync(secondPruneReady)) {
+      assert.equal(secondProcess.exitCode, null, secondError);
+      assert.ok(Date.now() < secondDeadline, "second process did not reach staged-ref pruning");
+      await delay(10);
+    }
+  }
+  writeFileSync(releaseFirstPrune, "release");
+
+  const [[firstStatus], [secondStatus]] = await Promise.all([firstDone, secondDone]);
+  assert.equal(firstStatus, 0, firstError);
+  assert.equal(secondStatus, 0, secondError);
+  const state = JSON.parse(readFileSync(
+    join(fixture.repository, ".git", "agentic-review", "state.json"),
+    "utf8",
+  ));
+  const stored = state.findings.find(({ title }) => title === stagedFinding.title);
+  assert.ok(stored, "the final state must retain the staged finding");
+  assert.equal(stored.status, "open");
+  assert.equal(stored.stagedTarget, true);
+  assert.equal(stored.lastCommit, stagedTarget);
+  assert.equal(
+    git(fixture.repository, "rev-parse", `${stagedTargetRefPrefix}${stagedTarget}`),
+    stagedTarget,
+  );
+  assert.equal(existsSync(lockPath), false, "successful mutations must release the state lock");
+});
+
+test("a creator cannot mutate after an ownerless lock is reaped during publication", async (t) => {
+  const fixture = createFixture(t);
+  const head = git(fixture.repository, "rev-parse", "HEAD");
+  const creatorFile = join(fixture.directory, "creator-findings.json");
+  const reaperFile = join(fixture.directory, "reaper-findings.json");
+  const creatorFinding = finding("Creator publication finding", { file: "alpha.txt" });
+  const reaperFinding = finding("Reaper replacement finding", { file: "beta.txt" });
+  writeFileSync(creatorFile, JSON.stringify({ findings: [creatorFinding] }));
+  writeFileSync(reaperFile, JSON.stringify({ findings: [reaperFinding] }));
+
+  const lockPath = join(fixture.repository, ".git", "agentic-review", "state.lock");
+  const ownerPath = join(lockPath, "owner.json");
+  const runsPath = join(fixture.repository, ".git", "agentic-review", "runs");
+  const creatorReady = join(fixture.directory, "creator-ready");
+  const reaperReady = join(fixture.directory, "reaper-ready");
+  const creatorOwnerPublished = join(fixture.directory, "creator-owner-published");
+  const creatorRetried = join(fixture.directory, "creator-retried");
+  const creatorActionStarted = join(fixture.directory, "creator-action-started");
+  const replacementOwnerPublished = join(fixture.directory, "replacement-owner-published");
+  const releaseReplacement = join(fixture.directory, "release-replacement");
+  const creatorPreload = join(fixture.directory, "creator-lock-race.cjs");
+  const reaperPreload = join(fixture.directory, "reaper-lock-race.cjs");
+
+  writeFileSync(creatorPreload, `
+const fs = require("node:fs");
+const { syncBuiltinESMExports } = require("node:module");
+const { resolve } = require("node:path");
+const originalExistsSync = fs.existsSync;
+const originalMkdirSync = fs.mkdirSync;
+const originalRenameSync = fs.renameSync;
+const originalWriteFileSync = fs.writeFileSync;
+const sleeper = new Int32Array(new SharedArrayBuffer(4));
+const samePath = (left, right) => typeof left === "string" && resolve(left) === resolve(right);
+const pendingLockPrefix = resolve(process.env.LOCK_PATH) + ".pending-";
+const isCreatedLock = (path) => (
+  samePath(path, process.env.LOCK_PATH)
+  || (typeof path === "string" && resolve(path).startsWith(pendingLockPrefix))
+);
+const isOwner = (path) => (
+  samePath(path, process.env.OWNER_PATH)
+  || (
+    typeof path === "string"
+    && resolve(path).startsWith(pendingLockPrefix)
+    && resolve(path).endsWith("/owner.json")
+  )
+);
+const waitFor = (path) => {
+  while (!originalExistsSync(path)) Atomics.wait(sleeper, 0, 0, 10);
+};
+let lockMkdirAttempts = 0;
+fs.mkdirSync = (path, ...args) => {
+  if (isCreatedLock(path)) {
+    lockMkdirAttempts += 1;
+    if (lockMkdirAttempts > 1) originalWriteFileSync(process.env.CREATOR_RETRIED, "retried");
+  }
+  const result = originalMkdirSync(path, ...args);
+  if (isCreatedLock(path) && lockMkdirAttempts === 1) {
+    originalWriteFileSync(process.env.CREATOR_READY, "ready");
+    waitFor(process.env.REAPER_READY);
+  }
+  return result;
+};
+fs.existsSync = (path) => {
+  const result = originalExistsSync(path);
+  if (
+    result
+    && samePath(path, process.env.LOCK_PATH)
+    && originalExistsSync(process.env.REPLACEMENT_OWNER_PUBLISHED)
+  ) originalWriteFileSync(process.env.CREATOR_RETRIED, "retried");
+  return result;
+};
+fs.renameSync = (from, to) => {
+  if (
+    samePath(to, process.env.LOCK_PATH)
+    && originalExistsSync(process.env.REPLACEMENT_OWNER_PUBLISHED)
+  ) originalWriteFileSync(process.env.CREATOR_RETRIED, "retried");
+  return originalRenameSync(from, to);
+};
+fs.writeFileSync = (path, ...args) => {
+  const result = originalWriteFileSync(path, ...args);
+  if (isOwner(path) && !originalExistsSync(process.env.CREATOR_OWNER_PUBLISHED)) {
+    originalWriteFileSync(process.env.CREATOR_OWNER_PUBLISHED, "published");
+    waitFor(process.env.REPLACEMENT_OWNER_PUBLISHED);
+  }
+  if (
+    typeof path === "string"
+    && resolve(path).startsWith(resolve(process.env.RUNS_PATH) + "/")
+    && !originalExistsSync(process.env.CREATOR_ACTION_STARTED)
+  ) originalWriteFileSync(process.env.CREATOR_ACTION_STARTED, "started");
+  return result;
+};
+syncBuiltinESMExports();
+`);
+  writeFileSync(reaperPreload, `
+const fs = require("node:fs");
+const { syncBuiltinESMExports } = require("node:module");
+const { resolve } = require("node:path");
+const originalExistsSync = fs.existsSync;
+const originalRenameSync = fs.renameSync;
+const originalRmSync = fs.rmSync;
+const originalWriteFileSync = fs.writeFileSync;
+const sleeper = new Int32Array(new SharedArrayBuffer(4));
+const samePath = (left, right) => typeof left === "string" && resolve(left) === resolve(right);
+const contenderAdvanced = () => (
+  originalExistsSync(process.env.CREATOR_OWNER_PUBLISHED)
+  || originalExistsSync(process.env.CREATOR_RETRIED)
+);
+const holdReplacement = () => {
+  originalWriteFileSync(process.env.REPLACEMENT_OWNER_PUBLISHED, "published");
+  while (!originalExistsSync(process.env.RELEASE_REPLACEMENT)) {
+    Atomics.wait(sleeper, 0, 0, 10);
+  }
+};
+fs.renameSync = (from, to) => {
+  const result = originalRenameSync(from, to);
+  if (
+    samePath(to, process.env.LOCK_PATH)
+    && !originalExistsSync(process.env.REPLACEMENT_OWNER_PUBLISHED)
+  ) {
+    originalWriteFileSync(process.env.REAPER_READY, "ready");
+    holdReplacement();
+  }
+  return result;
+};
+fs.rmSync = (path, ...args) => {
+  if (samePath(path, process.env.LOCK_PATH) && !originalExistsSync(process.env.REAPER_READY)) {
+    originalWriteFileSync(process.env.REAPER_READY, "ready");
+    while (!contenderAdvanced()) Atomics.wait(sleeper, 0, 0, 10);
+  }
+  return originalRmSync(path, ...args);
+};
+fs.writeFileSync = (path, ...args) => {
+  const result = originalWriteFileSync(path, ...args);
+  if (
+    samePath(path, process.env.OWNER_PATH)
+    && originalExistsSync(process.env.REAPER_READY)
+    && !originalExistsSync(process.env.REPLACEMENT_OWNER_PUBLISHED)
+  ) holdReplacement();
+  return result;
+};
+syncBuiltinESMExports();
+`);
+
+  const raceEnv = {
+    ...process.env,
+    LOCK_PATH: lockPath,
+    OWNER_PATH: ownerPath,
+    RUNS_PATH: runsPath,
+    CREATOR_READY: creatorReady,
+    REAPER_READY: reaperReady,
+    CREATOR_OWNER_PUBLISHED: creatorOwnerPublished,
+    CREATOR_RETRIED: creatorRetried,
+    CREATOR_ACTION_STARTED: creatorActionStarted,
+    REPLACEMENT_OWNER_PUBLISHED: replacementOwnerPublished,
+    RELEASE_REPLACEMENT: releaseReplacement,
+  };
+  const creator = spawn(
+    process.execPath,
+    [localState, "record", creatorFile, fixture.baseSha, head, "inconclusive"],
+    {
+      cwd: fixture.repository,
+      env: {
+        ...raceEnv,
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${creatorPreload}`.trim(),
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    },
+  );
+  const creatorDone = once(creator, "close");
+  let creatorError = "";
+  creator.stderr.setEncoding("utf8");
+  creator.stderr.on("data", (chunk) => { creatorError += chunk; });
+  t.after(() => { if (creator.exitCode === null) creator.kill("SIGKILL"); });
+
+  const creatorReadyDeadline = Date.now() + 5_000;
+  while (!existsSync(creatorReady)) {
+    assert.equal(creator.exitCode, null, creatorError);
+    assert.ok(Date.now() < creatorReadyDeadline, "creator did not pause after creating the lock directory");
+    await delay(10);
+  }
+  if (existsSync(lockPath)) utimesSync(lockPath, new Date(0), new Date(0));
+
+  const reaper = spawn(
+    process.execPath,
+    [localState, "record", reaperFile, fixture.baseSha, head, "inconclusive"],
+    {
+      cwd: fixture.repository,
+      env: {
+        ...raceEnv,
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${reaperPreload}`.trim(),
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    },
+  );
+  const reaperDone = once(reaper, "close");
+  let reaperError = "";
+  reaper.stderr.setEncoding("utf8");
+  reaper.stderr.on("data", (chunk) => { reaperError += chunk; });
+  t.after(() => { if (reaper.exitCode === null) reaper.kill("SIGKILL"); });
+
+  const replacementDeadline = Date.now() + 5_000;
+  while (!existsSync(replacementOwnerPublished)) {
+    assert.equal(creator.exitCode, null, creatorError);
+    assert.equal(reaper.exitCode, null, reaperError);
+    assert.ok(Date.now() < replacementDeadline, "reaper did not publish its replacement lock owner");
+    await delay(10);
+  }
+  while (!existsSync(creatorRetried) && !existsSync(creatorActionStarted)) {
+    assert.equal(creator.exitCode, null, creatorError);
+    assert.ok(Date.now() < replacementDeadline, "creator neither retried acquisition nor entered mutation");
+    await delay(10);
+  }
+
+  assert.equal(
+    existsSync(creatorActionStarted),
+    false,
+    "creator must not enter mutation after its lock directory was replaced",
+  );
+  assert.equal(existsSync(creatorRetried), true, "creator must retry acquisition after losing publication");
+  assert.equal(
+    JSON.parse(readFileSync(ownerPath, "utf8")).pid,
+    reaper.pid,
+    "losing creator must not remove the replacement owner's lock",
+  );
+  writeFileSync(releaseReplacement, "release");
+
+  const [[creatorStatus], [reaperStatus]] = await Promise.all([creatorDone, reaperDone]);
+  assert.equal(creatorStatus, 0, creatorError);
+  assert.equal(reaperStatus, 0, reaperError);
+  assert.equal(existsSync(creatorActionStarted), true, "creator must mutate after acquiring a later lock");
+  assert.equal(existsSync(lockPath), false, "both serialized mutations must release the state lock");
+  const titles = JSON.parse(readFileSync(
+    join(fixture.repository, ".git", "agentic-review", "state.json"),
+    "utf8",
+  )).findings.map(({ title }) => title).sort();
+  assert.deepEqual(titles, [creatorFinding.title, reaperFinding.title].sort());
+});
+
 test("ordinary gone findings can reopen after their historical commit is pruned", (t) => {
   const reported = finding("Reopened branch defect", {
     file: "alpha.txt",
@@ -2007,12 +2499,22 @@ test("unavailable staged targets block reopen atomically but not dismissal", (t)
   });
   assert.notEqual(reopened.status, 0, "reopen must fail when its target cannot be retained");
   assert.equal(readFileSync(statePath, "utf8"), goneState);
+  const lockPath = join(first.repository, ".git", "agentic-review", "state.lock");
+  assert.equal(existsSync(lockPath), false, "failed mutations must release the state lock");
+  const exitedOwner = spawnSync(process.execPath, ["-e", ""]);
+  assert.equal(exitedOwner.status, 0);
+  mkdirSync(lockPath);
+  writeFileSync(
+    join(lockPath, "owner.json"),
+    JSON.stringify({ pid: exitedOwner.pid, token: "exited-test-owner" }),
+  );
 
   const dismissed = spawnSync(process.execPath, [localState, "dismiss", stored.id], {
     cwd: first.repository,
     encoding: "utf8",
   });
   assert.equal(dismissed.status, 0, dismissed.stderr);
+  assert.equal(existsSync(lockPath), false, "the next mutation must reclaim the stale state lock");
   assert.equal(JSON.parse(readFileSync(statePath, "utf8")).findings[0].status, "dismissed");
   const retained = spawnSync(
     "git",

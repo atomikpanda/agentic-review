@@ -900,8 +900,8 @@ jobs:
 
       - name: post review
         id: poster
-        # Run even after runner failure so the poster can emit a conservative
-        # result; it never posts missing/invalid artifacts and preserves failure.
+        # Run after runner failure so the poster or this boundary can emit a
+        # conservative result without posting missing or invalid artifacts.
         if: ${{ !cancelled() }}
         env:
           # The write-capable credential is confined to this presentation step.
@@ -920,28 +920,11 @@ jobs:
           fi
           set -euo pipefail
 
-          poster_configured=true
-          for name in REVIEW_MODE POST_COMMENT SUPPRESS_WRITES RESOLVE_STALE \
-                      MAX_FINDINGS FAIL_ON_FINDINGS BLOCK_SEVERITIES; do
-            if [ -z "${!name+x}" ]; then
-              poster_configured=false
-              break
+          finalize_missing_result() {
+            local result_file="${REVIEW_RESULT_FILE:-/tmp/review-result.json}"
+            if [ -s "$result_file" ]; then
+              return
             fi
-          done
-          if [ "${TARGET_ELIGIBLE:-}" != "true" ] \
-            || [ -z "${GITHUB_REPO:-}" ] \
-            || [ -z "${PR_NUMBER:-}" ] \
-            || [ -z "${HEAD_SHA:-}" ] \
-            || [ -z "${BASE_SHA:-}" ] \
-            || [ "$poster_configured" != "true" ] \
-            || [ -z "${TRUSTED_DATA_ROOT:-}" ] \
-            || [ -z "${REVIEW_POSTER:-}" ] \
-            || [[ "${TRUSTED_DATA_ROOT:-}" != /* ]] \
-            || [ "${REVIEW_POSTER:-}" != "${TRUSTED_DATA_ROOT:-}/scripts/post-review.mjs" ] \
-            || [ ! -f "${REVIEW_POSTER:-}" ]; then
-            echo "::warning::review setup is incomplete; emitting a conservative result"
-            # Target resolution and the support checkout are both upstream of
-            # this always() step, so the fallback cannot import either one.
             node <<'NODE'
           const { appendFileSync, writeFileSync } = require("node:fs");
 
@@ -1015,9 +998,35 @@ jobs:
             ].join("\n"));
           }
           NODE
+          }
+
+          poster_configured=true
+          for name in REVIEW_MODE POST_COMMENT SUPPRESS_WRITES RESOLVE_STALE \
+                      MAX_FINDINGS FAIL_ON_FINDINGS BLOCK_SEVERITIES; do
+            if [ -z "${!name+x}" ]; then
+              poster_configured=false
+              break
+            fi
+          done
+          if [ "${TARGET_ELIGIBLE:-}" != "true" ] \
+            || [ -z "${GITHUB_REPO:-}" ] \
+            || [ -z "${PR_NUMBER:-}" ] \
+            || [ -z "${HEAD_SHA:-}" ] \
+            || [ -z "${BASE_SHA:-}" ] \
+            || [ "$poster_configured" != "true" ] \
+            || [ -z "${TRUSTED_DATA_ROOT:-}" ] \
+            || [ -z "${REVIEW_POSTER:-}" ] \
+            || [[ "${TRUSTED_DATA_ROOT:-}" != /* ]] \
+            || [ "${REVIEW_POSTER:-}" != "${TRUSTED_DATA_ROOT:-}/scripts/post-review.mjs" ] \
+            || [ ! -f "${REVIEW_POSTER:-}" ]; then
+            echo "::warning::review setup is incomplete; emitting a conservative result"
+            # Target resolution and the support checkout are both upstream of
+            # this always() step, so the fallback cannot import either one.
+            finalize_missing_result
             exit 1
           fi
 
+          poster_status=0
           REVIEW_MODE="$REVIEW_MODE" \
           POST_COMMENT="$POST_COMMENT" \
           SUPPRESS_WRITES="$SUPPRESS_WRITES" \
@@ -1025,7 +1034,14 @@ jobs:
           MAX_FINDINGS="$MAX_FINDINGS" \
           FAIL_ON_FINDINGS="$FAIL_ON_FINDINGS" \
           BLOCK_SEVERITIES="$BLOCK_SEVERITIES" \
-            node "$REVIEW_POSTER"
+            node "$REVIEW_POSTER" || poster_status=$?
+          if [ "$poster_status" -ne 0 ]; then
+            if [ ! -s "${REVIEW_RESULT_FILE:-/tmp/review-result.json}" ]; then
+              echo "::warning::review poster failed before emitting a final result; emitting a conservative result"
+            fi
+            finalize_missing_result
+            exit "$poster_status"
+          fi
 
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() && steps.target.outputs.eligible != 'false' }}

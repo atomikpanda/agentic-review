@@ -163,13 +163,18 @@ function runPosterWithHistory({
   writesEnabled = false,
   suppressWrites = false,
   changedOpenFinding = null,
+  gitFinding = null,
 }) {
   const dir = mkdtempSync(join(tmpdir(), "post-review-history-"));
   let runtimeMetadata = metadata();
   let runtimeThreads = threads;
-  if (changedOpenFinding) {
-    const { originalSha, headSha } = commitChangedFindingSpan(dir, changedOpenFinding);
+  const changedSpan = changedOpenFinding ?? gitFinding;
+  if (changedSpan) {
+    const { originalSha, headSha } = commitChangedFindingSpan(dir, changedSpan);
     runtimeMetadata = metadata({ base_sha: originalSha, head_sha: headSha });
+  }
+  if (changedOpenFinding) {
+    const originalSha = runtimeMetadata.base_sha;
     const body = poster.buildReviewComments(
       [changedOpenFinding],
       new Map([[changedOpenFinding.file, [[changedOpenFinding.start_line, changedOpenFinding.end_line]]]]),
@@ -246,7 +251,7 @@ globalThis.fetch = async (url, options = {}) => {
     [fileURLToPath(new URL("./post-review.mjs", import.meta.url))],
     {
       encoding: "utf8",
-      cwd: changedOpenFinding ? dir : undefined,
+      cwd: changedSpan ? dir : undefined,
       env: {
         ...process.env,
         NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${preloadFile}`.trim(),
@@ -900,6 +905,79 @@ test("summary mode keeps an unchanged dismissed inline finding suppressed", () =
   assert.deepEqual(decodeSummaryMarker(result.stdout).findings, []);
 });
 
+test("summary mode re-raises a High finding after its matching Medium thread was dismissed", () => {
+  const dismissed = finding({ severity: "Medium", suggestion: null });
+  const escalated = finding({ severity: "High", suggestion: null });
+  const inlineBody = poster.buildReviewComments(
+    [dismissed],
+    new Map([[dismissed.file, [[dismissed.start_line, dismissed.end_line]]]]),
+    { mode: "inline" },
+  ).comments[0].body;
+  const result = runPosterWithHistory({
+    mode: "summary",
+    currentFindings: [escalated],
+    threads: [{
+      id: "dismissed-medium-thread",
+      isResolved: true,
+      isOutdated: false,
+      path: dismissed.file,
+      originalStartLine: dismissed.start_line,
+      originalLine: dismissed.end_line,
+      comments: {
+        nodes: [{
+          databaseId: 24,
+          body: inlineBody,
+          author: { login: "github-actions[bot]" },
+          originalCommit: { oid: HEAD_SHA },
+        }],
+      },
+    }],
+  });
+
+  assert.equal(result.status, 1, `${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
+  assert.match(result.workflowOutput, /merge_state=blocked/);
+  assert.match(result.workflowOutput, /current_counts=\{"Critical":0,"High":1,"Medium":0\}/);
+  assert.match(result.stdout, /Cache entry survives invalidation/);
+  assert.equal(decodeSummaryMarker(result.stdout).findings[0].severity, "High");
+});
+
+test("inline mode re-raises a Critical finding after its matching Medium thread was dismissed", () => {
+  const dismissed = finding({ severity: "Medium", suggestion: null });
+  const escalated = finding({ severity: "Critical", suggestion: null });
+  const inlineBody = poster.buildReviewComments(
+    [dismissed],
+    new Map([[dismissed.file, [[dismissed.start_line, dismissed.end_line]]]]),
+    { mode: "inline" },
+  ).comments[0].body;
+  const result = runPosterWithHistory({
+    mode: "inline",
+    currentFindings: [escalated],
+    gitFinding: escalated,
+    threads: [{
+      id: "dismissed-medium-inline-thread",
+      isResolved: true,
+      isOutdated: false,
+      path: dismissed.file,
+      originalStartLine: dismissed.start_line,
+      originalLine: dismissed.end_line,
+      comments: {
+        nodes: [{
+          databaseId: 25,
+          body: inlineBody,
+          author: { login: "github-actions[bot]" },
+          originalCommit: { oid: HEAD_SHA },
+        }],
+      },
+    }],
+  });
+
+  assert.equal(result.status, 1, `${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
+  assert.match(result.workflowOutput, /merge_state=blocked/, `${result.stderr}\n${result.stdout}`);
+  assert.match(result.workflowOutput, /current_counts=\{"Critical":1,"High":0,"Medium":0\}/);
+  assert.match(result.workflowOutput, /unresolved_counts=\{"Critical":0,"High":0,"Medium":0\}/);
+  assert.match(result.stdout, /Cache entry survives invalidation/);
+});
+
 test("summary mode suppresses a dismissed summary duplicate without consuming a distinct fuzzy neighbor", () => {
   const dismissed = finding({ suggestion: null });
   const unrelated = finding({
@@ -950,8 +1028,9 @@ test("summary mode suppresses a dismissed summary duplicate without consuming a 
   );
 });
 
-test("inline summary-history dismissal does not produce a negative already-open count", () => {
-  const dismissed = finding({ suggestion: null });
+test("inline mode keeps downgraded held summary evidence dismissed without a negative already-open count", () => {
+  const dismissed = finding({ severity: "High", suggestion: null });
+  const held = finding({ severity: "Medium", suggestion: null });
   const inlineBody = poster.buildReviewComments(
     [dismissed],
     new Map([[dismissed.file, [[dismissed.start_line, dismissed.end_line]]]]),
@@ -960,7 +1039,7 @@ test("inline summary-history dismissal does not produce a negative already-open 
   const result = runPosterWithHistory({
     mode: "inline",
     summaryComments: [
-      botComment(1, encodeSummaryMarker({ headSha: HEAD_SHA, findings: [dismissed] })),
+      botComment(1, encodeSummaryMarker({ headSha: HEAD_SHA, findings: [held] })),
     ],
     threads: [{
       id: "dismissed-summary-only",
@@ -981,6 +1060,8 @@ test("inline summary-history dismissal does not produce a negative already-open 
   });
 
   assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
+  assert.match(result.workflowOutput, /merge_state=ready/);
+  assert.match(result.workflowOutput, /unresolved_counts=\{"Critical":0,"High":0,"Medium":0\}/);
   assert.match(result.stdout, /0 finding\(s\): 0 anchored, 0 summary-only, 0 already open/);
   assert.doesNotMatch(result.stdout, /-1 already open/);
 });

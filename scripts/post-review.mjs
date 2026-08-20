@@ -1312,8 +1312,12 @@ export async function reconcileHostedFindings({ metadata, findings, history, wri
   let suppressed = inlineReconciled.suppressed;
   for (const finding of summaryReconciled.held) {
     const match = findStandingMatch(finding, dismissed, matchedDismissed, metadata.head_sha);
-    if (match) {
-      matchedDismissed.add(match);
+    const historical = match ? findingFromThread(match) : null;
+    if (match) matchedDismissed.add(match);
+    if (
+      historical
+      && SEVERITY_ORDER[historical.severity] <= SEVERITY_ORDER[finding.severity]
+    ) {
       suppressed += 1;
     } else {
       summaryHeld.push(finding);
@@ -1413,8 +1417,14 @@ export async function reconcileInlineFindings({
     );
     if (dismissedMatch) {
       matchedDismissed.add(dismissedMatch);
-      suppressed += 1;
-      continue;
+      const historical = findingFromThread(dismissedMatch);
+      if (
+        historical
+        && SEVERITY_ORDER[historical.severity] <= SEVERITY_ORDER[finding.severity]
+      ) {
+        suppressed += 1;
+        continue;
+      }
     }
     current.push(finding);
     fresh.push(finding);
