@@ -259,7 +259,7 @@ YAML
 # it isn't there). Keys you leave out keep tracking the central repo, so they
 # improve as it does rather than being frozen at install time.
 #
-#   model:            openrouter/openai/gpt-5.6-luna
+#   model:            openrouter/deepseek/deepseek-v4-flash-0731:nitro
 #   thinking:         ''            # off|minimal|low|medium|high|xhigh|max|auto
 #   tools:            read,grep,glob
 #                                   # lsp is NOT available: omp loads language

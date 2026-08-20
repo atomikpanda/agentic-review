@@ -578,6 +578,23 @@ function runWorkflowConfig(t, overrides = {}) {
   };
 }
 
+test("hosted and local entrypoints share the DeepSeek Nitro default", (t) => {
+  const expected = "openrouter/deepseek/deepseek-v4-flash-0731:nitro";
+  const hosted = runWorkflowConfig(t);
+  assert.equal(hosted.result.status, 0, hosted.result.stderr);
+  assert.equal(hosted.values.MODEL, expected);
+
+  const local = runReview(t, { default: [{ findings: [] }] }, {
+    args: ["--json", "--passes", "1"],
+    env: { AGENTIC_REVIEW_MODEL: "" },
+  });
+  assert.equal(local.result.status, 0, local.result.stderr);
+  assert.ok(local.logs.every(({ argv }) => argv.includes(`--model=${expected}`)));
+
+  const workflowSource = readFileSync(workflow, "utf8");
+  assert.match(workflowSource, new RegExp(`default: ${expected.replaceAll(".", "\\.")}`));
+});
+
 test("hosted central refs resolve literal main, release tags, and exact immutable SHAs", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "central-ref-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
