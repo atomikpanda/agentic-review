@@ -24,6 +24,7 @@ const poster = fileURLToPath(new URL("./post-review.mjs", import.meta.url));
 const workflow = fileURLToPath(new URL("../.github/workflows/agentic-review.yml", import.meta.url));
 const installer = fileURLToPath(new URL("./install-review.sh", import.meta.url));
 const trustedRoot = dirname(dirname(runner));
+const stagedTargetRefPrefix = "refs/agentic-review/staged-targets/";
 
 function workflowRunStep(name) {
   const lines = readFileSync(workflow, "utf8").split("\n");
@@ -784,6 +785,94 @@ writeFileSync(process.env.UNTRUSTED_POSTER_MARKER, "executed");
     assert.match(source, new RegExp(`^        value: \\$\\{\\{ jobs\\.review\\.outputs\\.${field} \\}\\}`, "m"));
     assert.match(source, new RegExp(`^      ${field}: \\$\\{\\{ steps\\.poster\\.outputs\\.${field} \\}\\}`, "m"));
   }
+});
+
+test("target resolution failure finalizes conservatively while explicit ineligibility remains skipped", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hosted-target-failure-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const markerFile = join(directory, "target-poster-ran");
+  const targetPoster = join(directory, "scripts", "post-review.mjs");
+  mkdirSync(dirname(targetPoster), { recursive: true });
+  writeFileSync(targetPoster, `
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.TARGET_POSTER_MARKER, "executed");
+`);
+
+  const env = {
+    ...process.env,
+    TRUSTED_DATA_ROOT: directory,
+    REVIEW_POSTER: targetPoster,
+    REVIEW_MODE: "summary",
+    POST_COMMENT: "false",
+    SUPPRESS_WRITES: "true",
+    RESOLVE_STALE: "false",
+    MAX_FINDINGS: "20",
+    FAIL_ON_FINDINGS: "false",
+    BLOCK_SEVERITIES: "Critical,High",
+    TARGET_POSTER_MARKER: markerFile,
+  };
+  for (const name of ["TARGET_ELIGIBLE", "PR_NUMBER", "GITHUB_REPO", "HEAD_SHA", "BASE_SHA"]) {
+    delete env[name];
+  }
+
+  const failureOutput = join(directory, "failure-output");
+  const failureResult = join(directory, "failure-result.json");
+  const failedResolution = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...env,
+      GITHUB_OUTPUT: failureOutput,
+      REVIEW_RESULT_FILE: failureResult,
+    },
+  });
+
+  assert.equal(failedResolution.status, 0, failedResolution.stderr);
+  assert.equal(existsSync(markerFile), false);
+  const expectedResult = {
+    analysis_state: "inconclusive",
+    merge_state: "ready",
+    sample_state: "unknown",
+    bounded_converged: false,
+    base_sha: "",
+    head_sha: "",
+    configuration_fingerprint: "",
+    passes_requested: 0,
+    passes_completed: 0,
+    current_counts: { Critical: 0, High: 0, Medium: 0 },
+    unresolved_counts: { Critical: 0, High: 0, Medium: 0 },
+    reviewed_head: "",
+    scope_hash: "",
+    coverage: "unknown",
+    remaining_analysis: ["execution_failed"],
+    converged: false,
+  };
+  assert.deepEqual(JSON.parse(readFileSync(failureResult, "utf8")), expectedResult);
+  assert.deepEqual(
+    envFileValues(failureOutput),
+    Object.fromEntries(Object.entries(expectedResult).map(([name, value]) => [
+      name,
+      typeof value === "object" ? JSON.stringify(value) : String(value),
+    ])),
+  );
+
+  const skippedOutput = join(directory, "skipped-output");
+  const skippedResult = join(directory, "skipped-result.json");
+  const skipped = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...env,
+      TARGET_ELIGIBLE: "false",
+      GITHUB_OUTPUT: skippedOutput,
+      REVIEW_RESULT_FILE: skippedResult,
+    },
+  });
+
+  assert.equal(skipped.status, 0, skipped.stderr);
+  assert.equal(existsSync(skippedOutput), false);
+  assert.equal(existsSync(skippedResult), false);
+  assert.equal(existsSync(markerFile), false);
 });
 
 test("hosted contract runs one trusted ensemble and one suppressed poster gate", (t) => {
@@ -1662,7 +1751,7 @@ test("staged review state keeps its synthetic target reachable for later reconci
   assert.equal(retired.status, "gone");
 });
 
-test("reopened staged findings retain their synthetic target through pruning", (t) => {
+test("reopening a gone staged finding restores ownership before later pruning", (t) => {
   const reported = finding("Reopened staged defect", {
     file: "alpha.txt",
     start_line: 1,
@@ -1681,33 +1770,11 @@ test("reopened staged findings retain their synthetic target through pruning", (
 
   const statePath = join(first.repository, ".git", "agentic-review", "state.json");
   const [stored] = JSON.parse(readFileSync(statePath, "utf8")).findings;
-  for (const command of ["dismiss", "reopen"]) {
-    const result = spawnSync(process.execPath, [localState, command, stored.id], {
-      cwd: first.repository,
-      encoding: "utf8",
-    });
-    assert.equal(result.status, 0, result.stderr);
-  }
+  const stagedTargetRef = `${stagedTargetRefPrefix}${stored.lastCommit}`;
+  const temporaryRef = "refs/agentic-review/test-reopen-target";
+  git(first.repository, "update-ref", temporaryRef, stored.lastCommit);
 
-  const retainingRefs = git(
-    first.repository,
-    "for-each-ref",
-    "--format=%(refname)",
-    "--contains",
-    stored.lastCommit,
-  ).split("\n").filter(Boolean);
-  assert.ok(retainingRefs.length > 0, "reopened staged target must regain a durable Git ref");
-
-  git(first.repository, "reflog", "expire", "--expire=now", "--all");
-  git(first.repository, "prune", "--expire=now");
-  const retainedTarget = spawnSync(
-    "git",
-    ["cat-file", "-e", `${stored.lastCommit}^{commit}`],
-    { cwd: first.repository, encoding: "utf8" },
-  );
-  assert.equal(retainedTarget.status, 0, "reopened staged target must survive Git pruning");
-
-  writeFileSync(join(first.repository, "alpha.txt"), "alpha fixed after reopening\n");
+  writeFileSync(join(first.repository, "alpha.txt"), "alpha fixed\n");
   git(first.repository, "add", "alpha.txt");
   const fixed = runReview(t, {
     general: [{ findings: [] }],
@@ -1719,10 +1786,95 @@ test("reopened staged findings retain their synthetic target through pruning", (
     staged: true,
     noState: false,
   });
-
   assert.equal(fixed.result.status, 0, fixed.result.stderr);
-  const [retired] = JSON.parse(readFileSync(statePath, "utf8")).findings;
-  assert.equal(retired.status, "gone");
+
+  const [gone] = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  assert.equal(gone.status, "gone");
+  assert.equal(git(first.repository, "rev-parse", temporaryRef), stored.lastCommit);
+  const released = spawnSync(
+    "git",
+    ["show-ref", "--verify", "--quiet", stagedTargetRef],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.notEqual(released.status, 0, "gone staged finding must release its private ref");
+
+  const reopened = spawnSync(process.execPath, [localState, "reopen", stored.id], {
+    cwd: first.repository,
+    encoding: "utf8",
+  });
+  assert.equal(reopened.status, 0, reopened.stderr);
+  assert.equal(JSON.parse(readFileSync(statePath, "utf8")).findings[0].status, "open");
+  assert.equal(git(first.repository, "rev-parse", stagedTargetRef), stored.lastCommit);
+
+  git(first.repository, "update-ref", "-d", temporaryRef);
+  git(first.repository, "reflog", "expire", "--expire=now", "--all");
+  git(first.repository, "prune", "--expire=now");
+  const retainedTarget = spawnSync(
+    "git",
+    ["cat-file", "-e", `${stored.lastCommit}^{commit}`],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.equal(retainedTarget.status, 0, "reopened staged target must survive Git pruning");
+});
+
+test("reopening fails without changing gone state when its staged target is unavailable", (t) => {
+  const reported = finding("Unavailable staged defect", {
+    file: "alpha.txt",
+    start_line: 1,
+    end_line: 1,
+  });
+  const first = runReview(t, {
+    general: [{ findings: [reported] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    staged: true,
+    noState: false,
+  });
+  assert.equal(first.result.status, 0, first.result.stderr);
+
+  const statePath = join(first.repository, ".git", "agentic-review", "state.json");
+  const [stored] = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  const stagedTargetRef = `${stagedTargetRefPrefix}${stored.lastCommit}`;
+
+  writeFileSync(join(first.repository, "alpha.txt"), "alpha fixed\n");
+  git(first.repository, "add", "alpha.txt");
+  const fixed = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    existingFixture: first,
+    staged: true,
+    noState: false,
+  });
+  assert.equal(fixed.result.status, 0, fixed.result.stderr);
+  assert.equal(JSON.parse(readFileSync(statePath, "utf8")).findings[0].status, "gone");
+  const released = spawnSync(
+    "git",
+    ["show-ref", "--verify", "--quiet", stagedTargetRef],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.notEqual(released.status, 0, "gone staged finding must release its private ref");
+
+  git(first.repository, "reflog", "expire", "--expire=now", "--all");
+  git(first.repository, "prune", "--expire=now");
+  const unavailableTarget = spawnSync(
+    "git",
+    ["cat-file", "-e", `${stored.lastCommit}^{commit}`],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.notEqual(unavailableTarget.status, 0, "pruning must make the released target unavailable");
+  const goneState = readFileSync(statePath, "utf8");
+
+  const reopened = spawnSync(process.execPath, [localState, "reopen", stored.id], {
+    cwd: first.repository,
+    encoding: "utf8",
+  });
+  assert.notEqual(reopened.status, 0, "reopen must fail when its target cannot be retained");
+  assert.equal(readFileSync(statePath, "utf8"), goneState);
 });
 
 test("legacy live-checkout fallback is explicitly mutable and inconclusive", (t) => {

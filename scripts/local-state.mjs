@@ -318,8 +318,10 @@ if (cmd === "dismiss" || cmd === "reopen") {
   let n = 0;
   for (const f of state.findings) {
     if (!ids.includes(f.id)) continue;
+    const restoringStagedOwnership = f.status === "gone";
     f.status = cmd === "dismiss" ? "dismissed" : "open";
     delete f.goneAt;
+    if (restoringStagedOwnership) retainStagedTarget(state, f.lastCommit);
     n++;
   }
   save(state);

@@ -915,7 +915,7 @@ jobs:
           HEAD_SHA: ${{ steps.target.outputs.head }}
           BASE_SHA: ${{ steps.target.outputs.base }}
         run: |
-          if [ "${TARGET_ELIGIBLE:-}" != "true" ] || [ -z "${PR_NUMBER:-}" ]; then
+          if [ "${TARGET_ELIGIBLE:-}" = "false" ]; then
             exit 0
           fi
           set -euo pipefail
@@ -928,15 +928,20 @@ jobs:
               break
             fi
           done
-          if [ "$poster_configured" != "true" ] \
+          if [ "${TARGET_ELIGIBLE:-}" != "true" ] \
+            || [ -z "${GITHUB_REPO:-}" ] \
+            || [ -z "${PR_NUMBER:-}" ] \
+            || [ -z "${HEAD_SHA:-}" ] \
+            || [ -z "${BASE_SHA:-}" ] \
+            || [ "$poster_configured" != "true" ] \
             || [ -z "${TRUSTED_DATA_ROOT:-}" ] \
             || [ -z "${REVIEW_POSTER:-}" ] \
             || [[ "${TRUSTED_DATA_ROOT:-}" != /* ]] \
             || [ "${REVIEW_POSTER:-}" != "${TRUSTED_DATA_ROOT:-}/scripts/post-review.mjs" ] \
             || [ ! -f "${REVIEW_POSTER:-}" ]; then
-            echo "::warning::trusted review poster is unavailable; emitting a conservative result"
-            # The support checkout is unavailable, so this fallback must remain
-            # self-contained rather than importing anything from the target.
+            echo "::warning::review setup is incomplete; emitting a conservative result"
+            # Target resolution and the support checkout are both upstream of
+            # this always() step, so the fallback cannot import either one.
             node <<'NODE'
           const { appendFileSync, writeFileSync } = require("node:fs");
 

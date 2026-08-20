@@ -235,6 +235,7 @@ export async function reconcileSummaryFindings({
   spanChanged,
 }) {
   const matchedPrior = new Set();
+  const reconciledCurrent = [];
   for (const candidate of current) {
     let bestIndex = null;
     let bestScore = -1;
@@ -246,7 +247,12 @@ export async function reconcileSummaryFindings({
         bestScore = score;
       }
     }
-    if (bestIndex !== null) matchedPrior.add(bestIndex);
+    if (bestIndex === null) {
+      reconciledCurrent.push(candidate);
+    } else {
+      matchedPrior.add(bestIndex);
+      reconciledCurrent.push(withStrongestSeverity(candidate, prior[bestIndex]));
+    }
   }
 
   const held = [];
@@ -263,7 +269,7 @@ export async function reconcileSummaryFindings({
     if (analysisState === "complete" && changeIsConfirmed(changed)) retired.push(previous);
     else held.push(previous);
   }
-  return { current, held, retired, reconciliationKnown };
+  return { current: reconciledCurrent, held, retired, reconciliationKnown };
 }
 
 // A hash over file+title only matches when the model phrases a finding exactly
@@ -471,21 +477,61 @@ function formatCounts(counts) {
   return `Critical: ${counts.Critical} · High: ${counts.High} · Medium: ${counts.Medium}`;
 }
 
-export function renderStateTable(metadata, state) {
+function buildFinalResult(metadata, state, {
+  reconciliationKnown = true,
+  executionFailed = false,
+  resultMetadata,
+} = {}) {
+  const enriched = resultMetadata ?? enrichRunMetadata(metadata, {
+    scopeHash: metadata.scope_hash,
+    reconciliationKnown,
+    executionFailed,
+  });
+  const converged = executionFailed ? false : (state.converged ?? state.bounded_converged);
+  return {
+    analysis_state: state.analysis_state,
+    merge_state: state.merge_state,
+    sample_state: state.sample_state,
+    bounded_converged: converged,
+    base_sha: metadata.base_sha ?? "",
+    head_sha: metadata.head_sha ?? "",
+    configuration_fingerprint: metadata.configuration_fingerprint ?? "",
+    passes_requested: metadata.passes?.requested?.length ?? 0,
+    passes_completed: metadata.passes?.completed?.length ?? 0,
+    current_counts: state.current_counts,
+    unresolved_counts: state.unresolved_counts,
+    reviewed_head: enriched.reviewed_head,
+    scope_hash: enriched.scope_hash,
+    coverage: enriched.coverage,
+    remaining_analysis: enriched.remaining_analysis,
+    converged,
+  };
+}
+
+function renderFinalResultTable(result) {
   return [
     "| Result | Value |",
     "| --- | --- |",
-    `| Analysis | \`${state.analysis_state}\` |`,
-    `| Merge gate | \`${state.merge_state}\` |`,
-    `| Sample | \`${state.sample_state}\` |`,
-    `| Bounded convergence | \`${state.bounded_converged ? "yes" : "no"}\` |`,
-    `| Base SHA | \`${metadata.base_sha}\` |`,
-    `| Head SHA | \`${metadata.head_sha}\` |`,
-    `| Configuration fingerprint | \`${metadata.configuration_fingerprint}\` |`,
-    `| Passes | \`${metadata.passes.requested.length} requested / ${metadata.passes.completed.length} completed\` |`,
-    `| Current findings | \`${formatCounts(state.current_counts)}\` |`,
-    `| Held/unresolved findings | \`${formatCounts(state.unresolved_counts)}\` |`,
+    `| Analysis | \`${result.analysis_state}\` |`,
+    `| Merge gate | \`${result.merge_state}\` |`,
+    `| Sample | \`${result.sample_state}\` |`,
+    `| Bounded convergence | \`${result.bounded_converged ? "yes" : "no"}\` |`,
+    `| Reviewed head | \`${result.reviewed_head}\` |`,
+    `| Scope hash | \`${result.scope_hash}\` |`,
+    `| Coverage | \`${result.coverage}\` |`,
+    `| Remaining analysis | \`${JSON.stringify(result.remaining_analysis)}\` |`,
+    `| Converged | \`${result.converged}\` |`,
+    `| Base SHA | \`${result.base_sha}\` |`,
+    `| Head SHA | \`${result.head_sha}\` |`,
+    `| Configuration fingerprint | \`${result.configuration_fingerprint}\` |`,
+    `| Passes | \`${result.passes_requested} requested / ${result.passes_completed} completed\` |`,
+    `| Current findings | \`${formatCounts(result.current_counts)}\` |`,
+    `| Held/unresolved findings | \`${formatCounts(result.unresolved_counts)}\` |`,
   ].join("\n");
+}
+
+export function renderStateTable(metadata, state, resultOptions) {
+  return renderFinalResultTable(buildFinalResult(metadata, state, resultOptions));
 }
 
 function appendFindings(out, heading, findings, mode) {
@@ -512,11 +558,22 @@ function appendFindings(out, heading, findings, mode) {
   if (out.at(-1) === "") out.pop();
 }
 
-export function renderReviewBody({ mode, metadata, state, current, unresolved }) {
+export function renderReviewBody({
+  mode,
+  metadata,
+  state,
+  current,
+  unresolved,
+  reconciliationKnown = true,
+}) {
   if (!["summary", "inline", "suggest"].includes(mode)) {
     throw new TypeError("review mode must be summary, inline, or suggest");
   }
-  const out = ["### Agentic review", "", renderStateTable(metadata, state)];
+  const out = [
+    "### Agentic review",
+    "",
+    renderStateTable(metadata, state, { reconciliationKnown }),
+  ];
   appendFindings(out, "Current findings", current, mode);
   appendFindings(out, "Held findings", unresolved, mode);
   return out.join("\n");
@@ -565,11 +622,30 @@ function compactFindingLine(label, finding) {
   return `- ${label} ${badge(finding.severity)} — **${title}** (\`${path}${span}\`)`;
 }
 
-export function buildReviewTopBody({ mode, metadata, state, current, unresolved }) {
-  const full = renderReviewBody({ mode, metadata, state, current, unresolved });
+export function buildReviewTopBody({
+  mode,
+  metadata,
+  state,
+  current,
+  unresolved,
+  reconciliationKnown = true,
+}) {
+  const full = renderReviewBody({
+    mode,
+    metadata,
+    state,
+    current,
+    unresolved,
+    reconciliationKnown,
+  });
   if (Buffer.byteLength(full) <= GITHUB_COMMENT_MAX_BYTES) return full;
 
-  const out = ["### Agentic review", "", renderStateTable(metadata, state), ""];
+  const out = [
+    "### Agentic review",
+    "",
+    renderStateTable(metadata, state, { reconciliationKnown }),
+    "",
+  ];
   let omitted = 0;
   const footer = "_Finding prose was compacted for GitHub's request limit; complete findings and "
     + "suggestions remain in the structured review artifact._";
@@ -614,7 +690,13 @@ export function reviewFallbackPayload(payload) {
   });
 }
 
-export function buildStandingSummaryBody({ metadata, state, current, unresolved }) {
+export function buildStandingSummaryBody({
+  metadata,
+  state,
+  current,
+  unresolved,
+  reconciliationKnown = true,
+}) {
   const marker = encodeSummaryMarker({
     headSha: metadata.head_sha,
     findings: [...current, ...unresolved],
@@ -625,6 +707,7 @@ export function buildStandingSummaryBody({ metadata, state, current, unresolved 
     state,
     current,
     unresolved,
+    reconciliationKnown,
   })}\n\n${marker}`;
   if (Buffer.byteLength(full) <= GITHUB_COMMENT_MAX_BYTES) return full;
 
@@ -634,6 +717,7 @@ export function buildStandingSummaryBody({ metadata, state, current, unresolved 
     state,
     current: [],
     unresolved: [],
+    reconciliationKnown,
   })}\n\n_Display details truncated to retain the complete standing review state._\n\n${marker}`;
   if (Buffer.byteLength(safetyOnly) > GITHUB_COMMENT_MAX_BYTES) {
     throw new RangeError("standing summary safety marker exceeds GitHub comment limit");
@@ -651,30 +735,11 @@ export function emitWorkflowResult({
   executionFailed = false,
   resultMetadata,
 }) {
-  const enriched = resultMetadata ?? enrichRunMetadata(metadata, {
-    scopeHash: metadata.scope_hash,
+  const result = buildFinalResult(metadata, state, {
     reconciliationKnown,
     executionFailed,
+    resultMetadata,
   });
-  const converged = executionFailed ? false : (state.converged ?? state.bounded_converged);
-  const result = {
-    analysis_state: state.analysis_state,
-    merge_state: state.merge_state,
-    sample_state: state.sample_state,
-    bounded_converged: converged,
-    base_sha: metadata.base_sha ?? "",
-    head_sha: metadata.head_sha ?? "",
-    configuration_fingerprint: metadata.configuration_fingerprint ?? "",
-    passes_requested: metadata.passes?.requested?.length ?? 0,
-    passes_completed: metadata.passes?.completed?.length ?? 0,
-    current_counts: state.current_counts,
-    unresolved_counts: state.unresolved_counts,
-    reviewed_head: enriched.reviewed_head,
-    scope_hash: enriched.scope_hash,
-    coverage: enriched.coverage,
-    remaining_analysis: enriched.remaining_analysis,
-    converged,
-  };
   if (resultFile) writeFileSync(resultFile, `${JSON.stringify(result, null, 2)}\n`);
   if (outputFile) {
     appendFileSync(outputFile, [
@@ -698,7 +763,7 @@ export function emitWorkflowResult({
     ].join("\n"));
   }
   if (summaryFile) {
-    appendFileSync(summaryFile, `## Agentic review\n\n${renderStateTable(metadata, state)}\n`);
+    appendFileSync(summaryFile, `## Agentic review\n\n${renderFinalResultTable(result)}\n`);
   }
 }
 
@@ -865,6 +930,7 @@ const RETIRED_RE = /^(?:✅|⚠️) \*\*No longer reported\*\*/;
 const fileDiffCache = new Map();
 function fileChangedSince(t, head) {
   if (!t.path || !t.origOid || !head) return null;
+  if (t.origOid === head) return false;
   if (t.startLine && t.endLine) {
     const key = `${t.origOid}\0${head}\0${t.path}`;
     try {
@@ -1183,6 +1249,13 @@ function preferredHistoricalFinding(left, right) {
   return historicalFindingKey(left) <= historicalFindingKey(right) ? left : right;
 }
 
+function withStrongestSeverity(current, historical) {
+  if (SEVERITY_ORDER[historical.severity] < SEVERITY_ORDER[current.severity]) {
+    return { ...current, severity: historical.severity };
+  }
+  return current;
+}
+
 function mergeFindingSets(primary, secondary, resolveMatch) {
   const merged = [...primary];
   const matched = new Set();
@@ -1200,19 +1273,18 @@ function mergeFindingSets(primary, secondary, resolveMatch) {
   return merged;
 }
 
+export function reconcileFreshFindings(inlineReconciled, reconciledCurrent) {
+  if (inlineReconciled.current.length !== reconciledCurrent.length) {
+    throw new TypeError("reconciled current findings must preserve inline ordering");
+  }
+  return inlineReconciled.fresh.map((finding) => {
+    const index = inlineReconciled.current.indexOf(finding);
+    if (index < 0) throw new TypeError("fresh findings must belong to inline current findings");
+    return reconciledCurrent[index];
+  });
+}
 
-export async function runSummaryMode({ metadata, findings, repo, pr, token, botLogin, identityKnown }) {
-  const history = await loadReconciliationHistory({ repo, pr, token, botLogin, identityKnown });
-  const summaryReconciled = history.summary.reconciliationKnown
-    ? await reconcileSummaryFindings({
-      analysisState: metadata.analysis_state,
-      current: findings,
-      prior: history.summary.findings,
-      priorHeadSha: history.summary.headSha,
-      headSha: metadata.head_sha,
-      spanChanged: summarySpanChanged,
-    })
-    : { current: findings, held: [], retired: [], reconciliationKnown: false };
+export async function reconcileHostedFindings({ metadata, findings, history, writesEnabled }) {
   const standing = history.threads.filter((thread) => !thread.isResolved && !thread.retired);
   const dismissed = history.threads.filter((thread) => thread.isResolved);
   const inlineReconciled = await reconcileInlineFindings({
@@ -1221,23 +1293,53 @@ export async function runSummaryMode({ metadata, findings, repo, pr, token, botL
     standing,
     dismissed,
     resolveStale: env("RESOLVE_STALE", "true") === "true",
+    writesEnabled,
+  });
+  const summaryReconciled = history.summary.reconciliationKnown
+    ? await reconcileSummaryFindings({
+      analysisState: metadata.analysis_state,
+      current: inlineReconciled.current,
+      prior: history.summary.findings,
+      priorHeadSha: history.summary.headSha,
+      headSha: metadata.head_sha,
+      spanChanged: summarySpanChanged,
+    })
+    : { current: inlineReconciled.current, held: [], retired: [], reconciliationKnown: false };
+  return {
+    current: summaryReconciled.current,
+    fresh: reconcileFreshFindings(inlineReconciled, summaryReconciled.current),
+    unresolved: mergeFindingSets(
+      summaryReconciled.held,
+      inlineReconciled.unresolved,
+      preferredHistoricalFinding,
+    ),
+    suppressed: inlineReconciled.suppressed,
+    reconciliationKnown: history.summary.reconciliationKnown
+      && history.threadsKnown
+      && summaryReconciled.reconciliationKnown
+      && inlineReconciled.reconciliationKnown,
+  };
+}
+
+
+export async function runSummaryMode({ metadata, findings, repo, pr, token, botLogin, identityKnown }) {
+  const history = await loadReconciliationHistory({ repo, pr, token, botLogin, identityKnown });
+  const { current, unresolved, suppressed, reconciliationKnown } = await reconcileHostedFindings({
+    metadata,
+    findings,
+    history,
     writesEnabled: false,
   });
-  const reconciliationKnown = history.summary.reconciliationKnown
-    && history.threadsKnown
-    && summaryReconciled.reconciliationKnown
-    && inlineReconciled.reconciliationKnown;
-  const unresolved = mergeFindingSets(
-    summaryReconciled.held,
-    inlineReconciled.unresolved,
-    preferredHistoricalFinding,
-  );
-  const state = deriveState(metadata, summaryReconciled.current, unresolved, reconciliationKnown, true);
+  if (suppressed) {
+    console.log(`  ${suppressed} finding(s) previously resolved and unchanged — not re-raised`);
+  }
+  const state = deriveState(metadata, current, unresolved, reconciliationKnown, true);
   const body = buildStandingSummaryBody({
     metadata,
     state,
-    current: summaryReconciled.current,
+    current,
     unresolved,
+    reconciliationKnown,
   });
 
   emitState(metadata, state, { reconciliationKnown });
@@ -1248,7 +1350,7 @@ export async function runSummaryMode({ metadata, findings, repo, pr, token, botL
       token,
       existingComment: history.summary.comment,
       body,
-      hasFindings: summaryReconciled.current.length + unresolved.length > 0,
+      hasFindings: current.length + unresolved.length > 0,
       writesEnabled: WRITES_ENABLED,
     });
     console.log(`  summary comment ${action}`);
@@ -1281,7 +1383,12 @@ export async function reconcileInlineFindings({
     const match = findStandingMatch(finding, standing);
     if (match) {
       stillLive.add(match.id);
-      current.push(finding);
+      const historical = findingFromThread(match);
+      if (historical) current.push(withStrongestSeverity(finding, historical));
+      else {
+        current.push(finding);
+        reconciliationKnown = false;
+      }
       continue;
     }
     if (matchesUnchangedResolvedThread(finding, dismissed, metadata.head_sha)) {
@@ -1307,7 +1414,6 @@ export async function reconcileInlineFindings({
         }
       } else {
         console.log(`  [suppressed] would retire thread ${thread.id}`);
-        continue;
       }
     }
     const carried = findingFromThread(thread);
@@ -1335,36 +1441,12 @@ export function buildInlineReviewPayload({ metadata, state, fresh, unresolved, c
 
 async function runInlineMode({ metadata, findings, repo, pr, token, botLogin, identityKnown }) {
   const history = await loadReconciliationHistory({ repo, pr, token, botLogin, identityKnown });
-  const standing = history.threads.filter((thread) => !thread.isResolved && !thread.retired);
-  const dismissed = history.threads.filter((thread) => thread.isResolved);
-  const inlineReconciled = await reconcileInlineFindings({
+  const { current, fresh, unresolved, suppressed, reconciliationKnown } = await reconcileHostedFindings({
     metadata,
     findings,
-    standing,
-    dismissed,
-    resolveStale: env("RESOLVE_STALE", "true") === "true",
+    history,
     writesEnabled: WRITES_ENABLED && history.summary.reconciliationKnown && history.threadsKnown,
   });
-  const summaryReconciled = history.summary.reconciliationKnown
-    ? await reconcileSummaryFindings({
-      analysisState: metadata.analysis_state,
-      current: findings,
-      prior: history.summary.findings,
-      priorHeadSha: history.summary.headSha,
-      headSha: metadata.head_sha,
-      spanChanged: summarySpanChanged,
-    })
-    : { current: findings, held: [], retired: [], reconciliationKnown: false };
-  const reconciliationKnown = history.summary.reconciliationKnown
-    && history.threadsKnown
-    && inlineReconciled.reconciliationKnown
-    && summaryReconciled.reconciliationKnown;
-  const { current, fresh, suppressed } = inlineReconciled;
-  const unresolved = mergeFindingSets(
-    inlineReconciled.unresolved,
-    summaryReconciled.held,
-    preferredHistoricalFinding,
-  );
   if (suppressed) {
     console.log(`  ${suppressed} finding(s) previously resolved and unchanged — not re-raised`);
   }
@@ -1477,8 +1559,21 @@ async function main() {
     const state = deriveState(metadata, findings, unresolved, reconciliationKnown, true);
     emitState(metadata, state, { reconciliationKnown });
     const body = mode === "summary"
-      ? buildStandingSummaryBody({ metadata, state, current: findings, unresolved })
-      : renderReviewBody({ mode, metadata, state, current: findings, unresolved });
+      ? buildStandingSummaryBody({
+        metadata,
+        state,
+        current: findings,
+        unresolved,
+        reconciliationKnown,
+      })
+      : renderReviewBody({
+        mode,
+        metadata,
+        state,
+        current: findings,
+        unresolved,
+        reconciliationKnown,
+      });
     process.stdout.write(`${body}\n`);
     enforceGate(state);
     return;

@@ -568,6 +568,123 @@ test("cross-store severity conflicts retain the blocker in every presentation mo
   }
 });
 
+test("summary mode keeps the strongest severity for a current finding matching an open inline thread", () => {
+  const current = finding({ severity: "Medium", suggestion: null });
+  const prior = finding({ severity: "High", suggestion: null });
+  const inlineBody = poster.buildReviewComments(
+    [prior],
+    new Map([[prior.file, [[prior.start_line, prior.end_line]]]]),
+    { mode: "inline" },
+  ).comments[0].body;
+  const result = runPosterWithHistory({
+    mode: "summary",
+    currentFindings: [current],
+    threads: [{
+      id: "stronger-open-thread",
+      isResolved: false,
+      isOutdated: false,
+      path: prior.file,
+      originalStartLine: prior.start_line,
+      originalLine: prior.end_line,
+      comments: {
+        nodes: [{
+          databaseId: 20,
+          body: inlineBody,
+          author: { login: "github-actions[bot]" },
+          originalCommit: { oid: HEAD_SHA },
+        }],
+      },
+    }],
+  });
+
+  assert.equal(result.status, 1, `${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
+  assert.match(result.workflowOutput, /merge_state=blocked/);
+  assert.match(result.workflowOutput, /current_counts=\{"Critical":0,"High":1,"Medium":0\}/);
+  assert.match(result.workflowOutput, /unresolved_counts=\{"Critical":0,"High":0,"Medium":0\}/);
+  assert.equal(result.stdout.match(/Cache entry survives invalidation/g)?.length, 1);
+  assert.equal(decodeSummaryMarker(result.stdout).findings[0].severity, "High");
+});
+
+test("inline fresh findings use the severity reconciled against summary history", async () => {
+  const current = finding({ severity: "Medium", suggestion: null });
+  const prior = finding({ severity: "High", suggestion: null });
+  const reconciled = await poster.reconcileHostedFindings({
+    metadata: metadata(),
+    findings: [current],
+    history: {
+      summary: {
+        comment: null,
+        findings: [prior],
+        headSha: HEAD_SHA,
+        reconciliationKnown: true,
+      },
+      threads: [],
+      threadsKnown: true,
+    },
+    writesEnabled: false,
+  });
+
+  assert.deepEqual(reconciled.current.map(({ severity }) => severity), ["High"]);
+  assert.deepEqual(reconciled.fresh.map(({ severity }) => severity), ["High"]);
+});
+
+test("fresh reconciliation follows inline current positions instead of fuzzy rematching", () => {
+  const recurring = finding({
+    title: "Primary cache entry survives invalidation",
+    body: "The primary cache entry remains stale after invalidation.",
+  });
+  const fresh = finding({
+    title: "Secondary cache entry survives invalidation",
+    body: "The secondary cache entry remains stale after invalidation.",
+  });
+  const reconciled = [
+    { ...recurring, severity: "High" },
+    { ...fresh, severity: "Critical" },
+  ];
+
+  assert.deepEqual(
+    poster.reconcileFreshFindings({ current: [recurring, fresh], fresh: [fresh] }, reconciled),
+    [reconciled[1]],
+  );
+});
+
+test("summary mode keeps an unchanged dismissed inline finding suppressed", () => {
+  const dismissed = finding({ suggestion: null });
+  const inlineBody = poster.buildReviewComments(
+    [dismissed],
+    new Map([[dismissed.file, [[dismissed.start_line, dismissed.end_line]]]]),
+    { mode: "inline" },
+  ).comments[0].body;
+  const result = runPosterWithHistory({
+    mode: "summary",
+    currentFindings: [dismissed],
+    threads: [{
+      id: "dismissed-thread",
+      isResolved: true,
+      isOutdated: false,
+      path: dismissed.file,
+      originalStartLine: dismissed.start_line,
+      originalLine: dismissed.end_line,
+      comments: {
+        nodes: [{
+          databaseId: 21,
+          body: inlineBody,
+          author: { login: "github-actions[bot]" },
+          originalCommit: { oid: HEAD_SHA },
+        }],
+      },
+    }],
+  });
+
+  assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
+  assert.match(result.workflowOutput, /merge_state=ready/);
+  assert.match(result.workflowOutput, /sample_state=clean/);
+  assert.match(result.workflowOutput, /current_counts=\{"Critical":0,"High":0,"Medium":0\}/);
+  assert.match(result.workflowOutput, /unresolved_counts=\{"Critical":0,"High":0,"Medium":0\}/);
+  assert.doesNotMatch(result.stdout, /Cache entry survives invalidation/);
+  assert.deepEqual(decodeSummaryMarker(result.stdout).findings, []);
+});
+
 test("failure to read either history store prevents a clean convergence claim", () => {
   for (const history of [
     { mode: "summary", failThreadHistory: true },
@@ -578,6 +695,10 @@ test("failure to read either history store prevents a clean convergence claim", 
     assert.match(result.workflowOutput, /sample_state=unknown/);
     assert.match(result.workflowOutput, /bounded_converged=false/);
     assert.doesNotMatch(result.workflowOutput, /sample_state=clean/);
+    if (history.mode === "summary") {
+      assert.match(result.stdout, /\| Coverage \| `unknown` \|/);
+      assert.match(result.stdout, /\| Remaining analysis \| `\["reconciliation_unknown"\]` \|/);
+    }
   }
 });
 
@@ -773,6 +894,43 @@ test("inconclusive inline reconciliation holds omitted blockers and payload rend
   assert.equal(payload.comments.length, 1);
 });
 
+test("changed open inline findings remain held when retirement writes are suppressed", async () => {
+  const prior = finding({ suggestion: null });
+  const body = poster.buildReviewComments(
+    [prior],
+    new Map([[prior.file, [[prior.start_line, prior.end_line]]]]),
+    { mode: "inline" },
+  ).comments[0].body;
+  let retireCalls = 0;
+  const reconciled = await poster.reconcileInlineFindings({
+    metadata: metadata(),
+    findings: [],
+    standing: [{
+      id: "changed-open-thread",
+      path: prior.file,
+      body,
+      startLine: prior.start_line,
+      endLine: prior.end_line,
+      isResolved: false,
+      retired: false,
+      tokens: new Set(),
+    }],
+    dismissed: [],
+    resolveStale: true,
+    writesEnabled: false,
+    changedSince: () => true,
+    retire: async () => { retireCalls += 1; },
+  });
+
+  assert.deepEqual(reconciled.current, []);
+  assert.deepEqual(reconciled.unresolved.map(({ severity, title }) => ({ severity, title })), [{
+    severity: "High",
+    title: prior.title,
+  }]);
+  assert.equal(reconciled.reconciliationKnown, true);
+  assert.equal(retireCalls, 0);
+});
+
 test("state table renders the exact explicit contract", () => {
   assert.equal(renderStateTable(metadata(), state()), [
     "| Result | Value |",
@@ -781,6 +939,11 @@ test("state table renders the exact explicit contract", () => {
     "| Merge gate | `blocked` |",
     "| Sample | `findings` |",
     "| Bounded convergence | `no` |",
+    `| Reviewed head | \`${HEAD_SHA}\` |`,
+    `| Scope hash | \`${SCOPE_HASH}\` |`,
+    "| Coverage | `bounded` |",
+    "| Remaining analysis | `[]` |",
+    "| Converged | `false` |",
     `| Base SHA | \`${BASE_SHA}\` |`,
     `| Head SHA | \`${HEAD_SHA}\` |`,
     `| Configuration fingerprint | \`${FINGERPRINT}\` |`,
@@ -788,6 +951,41 @@ test("state table renders the exact explicit contract", () => {
     "| Current findings | `Critical: 0 · High: 1 · Medium: 0` |",
     "| Held/unresolved findings | `Critical: 0 · High: 0 · Medium: 1` |",
   ].join("\n"));
+});
+
+test("review body and job summary render the same reconciliation-adjusted final values", () => {
+  const dir = mkdtempSync(join(tmpdir(), "post-review-visible-result-"));
+  const summary = join(dir, "summary");
+  const reviewState = state({
+    sample_state: "unknown",
+    bounded_converged: false,
+  });
+  const body = renderReviewBody({
+    mode: "summary",
+    metadata: metadata(),
+    state: reviewState,
+    current: [],
+    unresolved: [],
+    reconciliationKnown: false,
+  });
+  emitWorkflowResult({
+    metadata: metadata(),
+    state: reviewState,
+    summaryFile: summary,
+    reconciliationKnown: false,
+  });
+
+  const jobSummary = readFileSync(summary, "utf8");
+  for (const row of [
+    `| Reviewed head | \`${HEAD_SHA}\` |`,
+    `| Scope hash | \`${SCOPE_HASH}\` |`,
+    "| Coverage | `unknown` |",
+    '| Remaining analysis | `["reconciliation_unknown"]` |',
+    "| Converged | `false` |",
+  ]) {
+    assert.equal(body.includes(row), true, row);
+    assert.equal(jobSummary.includes(row), true, row);
+  }
 });
 
 test("all modes render one current artifact before mode-specific history", () => {
@@ -799,6 +997,11 @@ test("all modes render one current artifact before mode-specific history", () =>
     assert.match(body, /Queue drops retry/);
     assert.match(body, /Prior cache leak/);
     assert.match(body, /\| Analysis \| `complete` \|/);
+    assert.match(body, new RegExp(`\\| Reviewed head \\| \`${HEAD_SHA}\` \\|`));
+    assert.match(body, new RegExp(`\\| Scope hash \\| \`${SCOPE_HASH}\` \\|`));
+    assert.match(body, /\| Coverage \| `bounded` \|/);
+    assert.match(body, /\| Remaining analysis \| `\[\]` \|/);
+    assert.match(body, /\| Converged \| `false` \|/);
   }
 });
 
@@ -1236,7 +1439,12 @@ test("successful reconciliation writes matching workflow outputs and final resul
     remaining_analysis: JSON.parse(outputs.remaining_analysis),
     converged: true,
   });
-  assert.equal(readFileSync(summary, "utf8"), `## Agentic review\n\n${renderStateTable(metadata(), cleanState)}\n`);
+  assert.equal(readFileSync(summary, "utf8"), [
+    "## Agentic review",
+    "",
+    renderStateTable(metadata(), cleanState),
+    "",
+  ].join("\n"));
 });
 
 test("gate failure is derived only from merge_state", () => {
