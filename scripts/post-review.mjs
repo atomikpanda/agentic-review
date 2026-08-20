@@ -1650,6 +1650,8 @@ async function main() {
   }
   activeMetadata = metadata;
   const findings = publishedFindings.map(projectPublicFinding);
+  lastTrustworthyState = deriveState(metadata, findings, [], false);
+  lastReconciliationKnown = false;
   const mode = env("REVIEW_MODE", "suggest");
   if (!["summary", "inline", "suggest"].includes(mode)) {
     throw new TypeError("REVIEW_MODE must be summary, inline, or suggest");

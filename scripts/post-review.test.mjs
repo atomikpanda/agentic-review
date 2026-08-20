@@ -2245,10 +2245,18 @@ test("runner and poster hard failures still write conservative outputs and a fin
     assert.equal(outputs.analysis_state, "inconclusive");
     assert.equal(outputs.sample_state, "unknown");
     assert.equal(outputs.bounded_converged, "false");
+    assert.equal(outputs.merge_state, "ready");
+    assert.deepEqual(JSON.parse(outputs.current_counts), EMPTY_COUNTS);
+    assert.deepEqual(JSON.parse(outputs.unresolved_counts), EMPTY_COUNTS);
     assert.equal(outputs.reviewed_head, HEAD_SHA);
     assert.equal(outputs.scope_hash, scenario === "poster" ? SCOPE_HASH : "");
     assert.equal(outputs.coverage, "unknown");
-    assert.deepEqual(JSON.parse(outputs.remaining_analysis), ["execution_failed"]);
+    assert.deepEqual(
+      JSON.parse(outputs.remaining_analysis),
+      scenario === "poster"
+        ? ["reconciliation_unknown", "execution_failed"]
+        : ["execution_failed"],
+    );
     assert.equal(outputs.converged, "false");
 
     const result = JSON.parse(readFileSync(resultFile, "utf8"));
@@ -2272,6 +2280,83 @@ test("runner and poster hard failures still write conservative outputs and a fin
     assert.equal(result.coverage, outputs.coverage);
     assert.deepEqual(result.remaining_analysis, JSON.parse(outputs.remaining_analysis));
     assert.equal(result.converged, false);
+  }
+});
+
+test("pre-reconciliation failures preserve validated Critical and High publication evidence", (t) => {
+  const script = fileURLToPath(new URL("./post-review.mjs", import.meta.url));
+  const scenarios = [
+    {
+      name: "invalid REVIEW_MODE",
+      env: { RENDER: "1", REVIEW_MODE: "invalid" },
+      error: /REVIEW_MODE must be summary, inline, or suggest/,
+      publishedFinding: finding({ severity: "Critical" }),
+      expectedCounts: { Critical: 1, High: 0, Medium: 0 },
+    },
+    {
+      name: "missing GitHub context",
+      env: { RENDER: "", GITHUB_REPO: "", PR_NUMBER: "", GH_TOKEN: "", REVIEW_MODE: "summary" },
+      error: /GITHUB_REPO is not set/,
+      publishedFinding: finding({ severity: "High" }),
+      expectedCounts: { Critical: 0, High: 1, Medium: 0 },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const dir = mkdtempSync(join(tmpdir(), "post-review-pre-reconciliation-failure-"));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const publicationFile = join(dir, "publication.json");
+    const outputFile = join(dir, "output");
+    const resultFile = join(dir, "review-result.json");
+    writeReviewPublication(publicationFile, metadata(), [scenario.publishedFinding]);
+
+    const failed = spawnSync(process.execPath, [script], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        REVIEW_PUBLICATION_FILE: publicationFile,
+        REVIEW_RESULT_FILE: resultFile,
+        GITHUB_OUTPUT: outputFile,
+        HEAD_SHA,
+        ...scenario.env,
+      },
+    });
+
+    assert.notEqual(failed.status, 0, scenario.name);
+    assert.match(failed.stderr, scenario.error, scenario.name);
+    const outputs = outputValues(outputFile);
+    assert.equal(outputs.analysis_state, "inconclusive", scenario.name);
+    assert.equal(outputs.merge_state, "blocked", scenario.name);
+    assert.equal(outputs.sample_state, "findings", scenario.name);
+    assert.equal(outputs.bounded_converged, "false", scenario.name);
+    assert.deepEqual(JSON.parse(outputs.current_counts), scenario.expectedCounts, scenario.name);
+    assert.deepEqual(JSON.parse(outputs.unresolved_counts), EMPTY_COUNTS, scenario.name);
+    assert.equal(outputs.reviewed_head, HEAD_SHA, scenario.name);
+    assert.equal(outputs.scope_hash, SCOPE_HASH, scenario.name);
+    assert.equal(outputs.coverage, "unknown", scenario.name);
+    assert.deepEqual(
+      JSON.parse(outputs.remaining_analysis),
+      ["reconciliation_unknown", "execution_failed"],
+      scenario.name,
+    );
+    assert.equal(outputs.converged, "false", scenario.name);
+
+    const result = JSON.parse(readFileSync(resultFile, "utf8"));
+    assert.equal(result.analysis_state, "inconclusive", scenario.name);
+    assert.equal(result.merge_state, "blocked", scenario.name);
+    assert.equal(result.sample_state, "findings", scenario.name);
+    assert.equal(result.bounded_converged, false, scenario.name);
+    assert.deepEqual(result.current_counts, scenario.expectedCounts, scenario.name);
+    assert.deepEqual(result.unresolved_counts, EMPTY_COUNTS, scenario.name);
+    assert.equal(result.reviewed_head, HEAD_SHA, scenario.name);
+    assert.equal(result.scope_hash, SCOPE_HASH, scenario.name);
+    assert.equal(result.coverage, "unknown", scenario.name);
+    assert.deepEqual(
+      result.remaining_analysis,
+      ["reconciliation_unknown", "execution_failed"],
+      scenario.name,
+    );
+    assert.equal(result.converged, false, scenario.name);
   }
 });
 
