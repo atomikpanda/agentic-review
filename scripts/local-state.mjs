@@ -319,17 +319,26 @@ if (cmd === "list") {
 if (cmd === "dismiss" || cmd === "reopen") {
   const ids = process.argv.slice(3);
   const state = load();
+  const stagedTargetsToRestore = new Set();
+  if (cmd === "reopen") {
+    for (const f of state.findings) {
+      if (ids.includes(f.id) && f.status !== "open" && f.stagedTarget === true) {
+        stagedTargetsToRestore.add(f.lastCommit);
+      }
+    }
+    for (const target of stagedTargetsToRestore) {
+      git(["cat-file", "-e", `${target}^{commit}`]);
+    }
+  }
+
   let n = 0;
   for (const f of state.findings) {
     if (!ids.includes(f.id)) continue;
-    const restoringStagedOwnership = cmd === "reopen"
-      && f.status !== "open"
-      && f.stagedTarget === true;
     f.status = cmd === "dismiss" ? "dismissed" : "open";
     delete f.goneAt;
-    if (restoringStagedOwnership) retainStagedTarget(state, f.lastCommit);
     n++;
   }
+  for (const target of stagedTargetsToRestore) retainStagedTarget(state, target);
   save(state);
   pruneUnownedStagedTargets(state);
   console.log(`${cmd === "dismiss" ? "dismissed" : "reopened"} ${n}`);

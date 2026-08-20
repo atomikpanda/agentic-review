@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -36,22 +36,24 @@ const SCOPE_HASH = "5".repeat(64);
 const EMPTY_COUNTS = { Critical: 0, High: 0, Medium: 0 };
 
 function metadata(overrides = {}) {
+  const baseSha = overrides.base_sha ?? BASE_SHA;
+  const headSha = overrides.head_sha ?? HEAD_SHA;
   const pass = (id) => ({
     id,
     status: "valid",
     attempts: 1,
     finding_count: 1,
     capped: false,
-    base_sha: BASE_SHA,
-    head_sha: HEAD_SHA,
+    base_sha: baseSha,
+    head_sha: headSha,
     configuration_fingerprint: FINGERPRINT,
   });
   return {
     schema_version: 1,
-    base_sha: BASE_SHA,
-    head_sha: HEAD_SHA,
+    base_sha: baseSha,
+    head_sha: headSha,
     configuration_fingerprint: FINGERPRINT,
-    reviewed_head: HEAD_SHA,
+    reviewed_head: headSha,
     scope_hash: SCOPE_HASH,
     coverage: "bounded",
     remaining_analysis: [],
@@ -113,6 +115,42 @@ function incompressible(length) {
   return value.slice(0, length);
 }
 
+function runGit(cwd, args) {
+  const result = spawnSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: "Post Review Test",
+      GIT_AUTHOR_EMAIL: "post-review@example.invalid",
+      GIT_COMMITTER_NAME: "Post Review Test",
+      GIT_COMMITTER_EMAIL: "post-review@example.invalid",
+    },
+  });
+  assert.equal(result.status, 0, `${args.join(" ")}: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+function commitChangedFindingSpan(dir, prior) {
+  runGit(dir, ["init", "--quiet"]);
+  const path = join(dir, prior.file);
+  mkdirSync(dirname(path), { recursive: true });
+  const original = Array.from({ length: prior.end_line + 2 }, (_, index) => `original line ${index + 1}`);
+  writeFileSync(path, `${original.join("\n")}\n`);
+  runGit(dir, ["add", "--", prior.file]);
+  runGit(dir, ["commit", "--quiet", "-m", "original"]);
+  const originalSha = runGit(dir, ["rev-parse", "HEAD"]);
+
+  const changed = [...original];
+  for (let line = prior.start_line; line <= prior.end_line; line += 1) {
+    changed[line - 1] = `changed line ${line}`;
+  }
+  writeFileSync(path, `${changed.join("\n")}\n`);
+  runGit(dir, ["add", "--", prior.file]);
+  runGit(dir, ["commit", "--quiet", "-m", "changed"]);
+  return { originalSha, headSha: runGit(dir, ["rev-parse", "HEAD"]) };
+}
+
 function runPosterWithHistory({
   mode,
   summaryComments = [],
@@ -121,8 +159,39 @@ function runPosterWithHistory({
   failSummaryHistory = false,
   failThreadHistory = false,
   failSummaryPost = false,
+  failRetirement = false,
+  writesEnabled = false,
+  suppressWrites = false,
+  changedOpenFinding = null,
 }) {
   const dir = mkdtempSync(join(tmpdir(), "post-review-history-"));
+  let runtimeMetadata = metadata();
+  let runtimeThreads = threads;
+  if (changedOpenFinding) {
+    const { originalSha, headSha } = commitChangedFindingSpan(dir, changedOpenFinding);
+    runtimeMetadata = metadata({ base_sha: originalSha, head_sha: headSha });
+    const body = poster.buildReviewComments(
+      [changedOpenFinding],
+      new Map([[changedOpenFinding.file, [[changedOpenFinding.start_line, changedOpenFinding.end_line]]]]),
+      { mode: "inline" },
+    ).comments[0].body;
+    runtimeThreads = [...threads, {
+      id: "changed-open-thread",
+      isResolved: false,
+      isOutdated: false,
+      path: changedOpenFinding.file,
+      originalStartLine: changedOpenFinding.start_line,
+      originalLine: changedOpenFinding.end_line,
+      comments: {
+        nodes: [{
+          databaseId: 901,
+          body,
+          author: { login: "github-actions[bot]" },
+          originalCommit: { oid: originalSha },
+        }],
+      },
+    }];
+  }
   const findingsFile = join(dir, "findings.json");
   const metadataFile = join(dir, "metadata.json");
   const outputFile = join(dir, "output");
@@ -130,7 +199,7 @@ function runPosterWithHistory({
   const resultFile = join(dir, "review-result.json");
   const preloadFile = join(dir, "mock-github.cjs");
   writeFileSync(findingsFile, JSON.stringify({ findings: currentFindings }));
-  writeFileSync(metadataFile, JSON.stringify(metadata()));
+  writeFileSync(metadataFile, JSON.stringify(runtimeMetadata));
   writeFileSync(preloadFile, `
 const fixture = JSON.parse(process.env.POST_REVIEW_TEST_HISTORY);
 const reply = (value, status = 200) => ({
@@ -142,6 +211,13 @@ const reply = (value, status = 200) => ({
 globalThis.fetch = async (url, options = {}) => {
   if (url === "https://api.github.com/graphql") {
     const request = JSON.parse(options.body);
+    if (request.query.includes("resolveReviewThread")) {
+      console.log("[test] resolved thread " + request.variables.id);
+      if (fixture.failRetirement) {
+        return reply({ errors: [{ message: "retirement unavailable" }] });
+      }
+      return reply({ data: { resolveReviewThread: { thread: { id: request.variables.id } } } });
+    }
     if (request.query.includes("viewer")) {
       return reply({ data: { viewer: { login: "github-actions[bot]" } } });
     }
@@ -157,8 +233,10 @@ globalThis.fetch = async (url, options = {}) => {
     if (fixture.failSummaryHistory) return reply({ message: "summary history unavailable" }, 500);
     return reply(fixture.summaryComments);
   }
-  if (fixture.failSummaryPost && ["POST", "PATCH"].includes(options.method)) {
-    return reply({ message: "summary post unavailable" }, 500);
+  if (["POST", "PATCH"].includes(options.method) && String(url).includes("/issues/")) {
+    if (fixture.failSummaryPost) return reply({ message: "summary post unavailable" }, 500);
+    console.log("[test] wrote standing summary");
+    return reply({});
   }
   throw new Error(\`unexpected GitHub request: \${url}\`);
 };
@@ -168,15 +246,17 @@ globalThis.fetch = async (url, options = {}) => {
     [fileURLToPath(new URL("./post-review.mjs", import.meta.url))],
     {
       encoding: "utf8",
+      cwd: changedOpenFinding ? dir : undefined,
       env: {
         ...process.env,
         NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${preloadFile}`.trim(),
         POST_REVIEW_TEST_HISTORY: JSON.stringify({
           summaryComments,
-          threads,
+          threads: runtimeThreads,
           failSummaryHistory,
           failThreadHistory,
           failSummaryPost,
+          failRetirement,
         }),
         FINDINGS_FILE: findingsFile,
         REVIEW_METADATA_FILE: metadataFile,
@@ -187,7 +267,10 @@ globalThis.fetch = async (url, options = {}) => {
         PR_NUMBER: "7",
         GH_TOKEN: "token",
         REVIEW_MODE: mode,
-        DRY_RUN: failSummaryPost ? "0" : "1",
+        DRY_RUN: writesEnabled || failSummaryPost ? "0" : "1",
+        SUPPRESS_WRITES: suppressWrites ? "true" : "false",
+        POST_COMMENT: "true",
+        RESOLVE_STALE: "true",
         FAIL_ON_FINDINGS: "true",
       },
     },
@@ -384,6 +467,79 @@ test("deleting the standing summary comment resets summary history only", () => 
     headSha: null,
     reconciliationKnown: true,
   });
+});
+
+test("coordinate-less bot threads make summary and inline reconciliation unknown without invalid findings", async () => {
+  const blocker = finding({
+    title: "Coordinate-less blocker",
+    body: "The open bot-authored blocker has no trustworthy line span.",
+    suggestion: null,
+  });
+  const threadBody = poster.buildReviewComments(
+    [blocker],
+    new Map([[blocker.file, [[blocker.start_line, blocker.end_line]]]]),
+    { mode: "inline" },
+  ).comments[0].body;
+  const rawThread = {
+    id: "coordinate-less-thread",
+    isResolved: false,
+    isOutdated: false,
+    path: blocker.file,
+    originalStartLine: null,
+    originalLine: null,
+    comments: {
+      nodes: [{
+        databaseId: 16,
+        body: threadBody,
+        author: { login: "github-actions[bot]" },
+        originalCommit: { oid: PRIOR_HEAD_SHA },
+      }],
+    },
+  };
+  const threads = await fetchOurThreads({
+    owner: "o",
+    name: "r",
+    pr: 7,
+    botLogin: "github-actions[bot]",
+    graphqlImpl: async () => ({
+      repository: {
+        pullRequest: {
+          reviewThreads: {
+            nodes: [rawThread],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+      },
+    }),
+  });
+  assert.equal(threads.length, 1);
+  assert.deepEqual(
+    {
+      path: threads[0].path,
+      startLine: threads[0].startLine,
+      endLine: threads[0].endLine,
+    },
+    { path: blocker.file, startLine: null, endLine: null },
+  );
+  assert.equal(findingFromThread(threads[0]), null);
+
+  for (const mode of ["summary", "inline"]) {
+    const result = runPosterWithHistory({ mode, threads: [rawThread] });
+    assert.equal(result.status, 0, `${mode}: ${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
+    assert.match(result.workflowOutput, /sample_state=unknown/);
+    assert.match(result.workflowOutput, /bounded_converged=false/);
+    assert.match(result.workflowOutput, /coverage=unknown/);
+    assert.match(result.workflowOutput, /remaining_analysis=\["reconciliation_unknown"\]/);
+    assert.doesNotMatch(result.workflowOutput, /sample_state=clean/);
+    assert.doesNotMatch(result.stdout, /Coordinate-less blocker/);
+    if (mode === "summary") {
+      assert.match(result.stdout, /standing summary comment was not changed/);
+      assert.deepEqual(decodeSummaryMarker(result.stdout).findings, []);
+    } else {
+      assert.match(result.stdout, /review writes were suppressed/);
+      assert.doesNotMatch(result.stdout, /"comments":/);
+    }
+  }
 });
 
 test("switching presentation modes reconciles blocking evidence from both history stores", () => {
@@ -614,6 +770,74 @@ test("summary mode keeps the strongest severity for a current finding matching a
   assert.match(result.workflowOutput, /unresolved_counts=\{"Critical":0,"High":0,"Medium":0\}/);
   assert.equal(result.stdout.match(/Cache entry survives invalidation/g)?.length, 1);
   assert.equal(decodeSummaryMarker(result.stdout).findings[0].severity, "High");
+});
+
+test("summary mode retires an omitted changed inline finding when writes are enabled", () => {
+  const prior = finding({ suggestion: null });
+  const result = runPosterWithHistory({
+    mode: "summary",
+    changedOpenFinding: prior,
+    writesEnabled: true,
+  });
+
+  assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
+  assert.match(result.stdout, /\[test\] resolved thread changed-open-thread/);
+  assert.match(result.stdout, /summary comment skipped/);
+  assert.doesNotMatch(result.stdout, /\[test\] wrote standing summary/);
+  assert.match(result.workflowOutput, /merge_state=ready/);
+  assert.match(result.workflowOutput, /sample_state=clean/);
+  assert.match(result.workflowOutput, /bounded_converged=true/);
+  assert.match(result.workflowOutput, /unresolved_counts=\{"Critical":0,"High":0,"Medium":0\}/);
+  assert.match(result.workflowOutput, /converged=true/);
+});
+
+test("summary mode holds changed inline evidence when writes are dry, suppressed, or history is unknown", () => {
+  const prior = finding({ suggestion: null });
+  const cases = [
+    { label: "dry run", options: {} },
+    { label: "suppressed writes", options: { writesEnabled: true, suppressWrites: true } },
+    { label: "unknown summary history", options: { writesEnabled: true, failSummaryHistory: true } },
+  ];
+
+  for (const { label, options } of cases) {
+    const result = runPosterWithHistory({
+      mode: "summary",
+      changedOpenFinding: prior,
+      ...options,
+    });
+
+    assert.equal(result.status, 1, `${label}: ${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
+    assert.doesNotMatch(result.stdout, /\[test\] resolved thread/, label);
+    assert.match(result.workflowOutput, /merge_state=blocked/, label);
+    assert.match(result.workflowOutput, /bounded_converged=false/, label);
+    assert.match(
+      result.workflowOutput,
+      /unresolved_counts=\{"Critical":0,"High":1,"Medium":0\}/,
+      label,
+    );
+    assert.match(result.workflowOutput, /converged=false/, label);
+  }
+});
+
+test("summary mode keeps changed inline evidence held when enabled retirement fails", () => {
+  const prior = finding({ suggestion: null });
+  const result = runPosterWithHistory({
+    mode: "summary",
+    changedOpenFinding: prior,
+    writesEnabled: true,
+    failRetirement: true,
+  });
+
+  assert.equal(result.status, 1, `${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
+  assert.match(result.stdout, /\[test\] resolved thread changed-open-thread/);
+  assert.match(result.stdout, /could not retire a thread/);
+  assert.doesNotMatch(result.stdout, /\[test\] wrote standing summary/);
+  assert.match(result.workflowOutput, /merge_state=blocked/);
+  assert.match(result.workflowOutput, /sample_state=findings/);
+  assert.match(result.workflowOutput, /bounded_converged=false/);
+  assert.match(result.workflowOutput, /unresolved_counts=\{"Critical":0,"High":1,"Medium":0\}/);
+  assert.match(result.workflowOutput, /remaining_analysis=\["reconciliation_unknown"\]/);
+  assert.match(result.workflowOutput, /converged=false/);
 });
 
 test("inline fresh findings use the severity reconciled against summary history", async () => {

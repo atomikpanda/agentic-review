@@ -823,7 +823,7 @@ writeFileSync(process.env.UNTRUSTED_POSTER_MARKER, "executed");
     env,
   });
 
-  assert.equal(finalized.status, 0, finalized.stderr);
+  assert.equal(finalized.status, 1, finalized.stderr);
   assert.equal(existsSync(untrustedPosterMarker), false);
   const outputs = envFileValues(outputFile);
   const result = JSON.parse(readFileSync(resultFile, "utf8"));
@@ -890,7 +890,7 @@ writeFileSync(process.env.TARGET_POSTER_MARKER, "executed");
     },
   });
 
-  assert.equal(failedResolution.status, 0, failedResolution.stderr);
+  assert.equal(failedResolution.status, 1, failedResolution.stderr);
   assert.equal(existsSync(markerFile), false);
   const expectedResult = {
     analysis_state: "inconclusive",
@@ -2020,6 +2020,112 @@ test("unavailable staged targets block reopen atomically but not dismissal", (t)
     { cwd: first.repository, encoding: "utf8" },
   );
   assert.notEqual(retained.status, 0, "dismissing a gone finding must not retain its target");
+});
+
+test("multi-ID reopen validates every gone staged target before mutating state or refs", (t) => {
+  const reachableFinding = finding("Reachable staged defect", {
+    file: "alpha.txt",
+    start_line: 1,
+    end_line: 1,
+  });
+  const first = runReview(t, {
+    general: [{ findings: [reachableFinding] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    staged: true,
+    noState: false,
+  });
+  assert.equal(first.result.status, 0, first.result.stderr);
+
+  const statePath = join(first.repository, ".git", "agentic-review", "state.json");
+  const reachableTarget = first.metadata.head_sha;
+  const temporaryRef = "refs/agentic-review/test-multi-reopen-target";
+  git(first.repository, "update-ref", temporaryRef, reachableTarget);
+
+  writeFileSync(join(first.repository, "alpha.txt"), "alpha fixed\n");
+  writeFileSync(join(first.repository, "beta.txt"), "beta second defect\n");
+  git(first.repository, "add", "alpha.txt", "beta.txt");
+  const prunedFinding = finding("Pruned staged defect", {
+    file: "beta.txt",
+    start_line: 1,
+    end_line: 1,
+  });
+  const second = runReview(t, {
+    general: [{ findings: [prunedFinding] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    existingFixture: first,
+    staged: true,
+    noState: false,
+  });
+  assert.equal(second.result.status, 0, second.result.stderr);
+  const prunedTarget = second.metadata.head_sha;
+  assert.notEqual(prunedTarget, reachableTarget);
+
+  writeFileSync(join(first.repository, "beta.txt"), "beta fixed\n");
+  git(first.repository, "add", "beta.txt");
+  const retired = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    existingFixture: first,
+    staged: true,
+    noState: false,
+  });
+  assert.equal(retired.result.status, 0, retired.result.stderr);
+
+  const goneFindings = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  const reachable = goneFindings.find(({ title }) => title === reachableFinding.title);
+  const pruned = goneFindings.find(({ title }) => title === prunedFinding.title);
+  assert.equal(reachable.status, "gone");
+  assert.equal(reachable.stagedTarget, true);
+  assert.equal(reachable.lastCommit, reachableTarget);
+  assert.equal(pruned.status, "gone");
+  assert.equal(pruned.stagedTarget, true);
+  assert.equal(pruned.lastCommit, prunedTarget);
+
+  git(first.repository, "reflog", "expire", "--expire=now", "--all");
+  git(first.repository, "prune", "--expire=now");
+  const reachableObject = spawnSync(
+    "git",
+    ["cat-file", "-e", `${reachableTarget}^{commit}`],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.equal(reachableObject.status, 0, "the first target must remain available for partial mutation");
+  const unavailableObject = spawnSync(
+    "git",
+    ["cat-file", "-e", `${prunedTarget}^{commit}`],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.notEqual(unavailableObject.status, 0, "the later target must be pruned");
+
+  const stateBefore = readFileSync(statePath);
+  const refsBefore = git(
+    first.repository,
+    "for-each-ref",
+    "--format=%(refname) %(objectname)",
+    stagedTargetRefPrefix,
+  );
+  const reopened = spawnSync(
+    process.execPath,
+    [localState, "reopen", reachable.id, pruned.id],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+
+  assert.notEqual(reopened.status, 0, "one unavailable target must fail the whole reopen");
+  assert.deepEqual(readFileSync(statePath), stateBefore);
+  assert.equal(git(
+    first.repository,
+    "for-each-ref",
+    "--format=%(refname) %(objectname)",
+    stagedTargetRefPrefix,
+  ), refsBefore);
 });
 
 test("legacy live-checkout fallback is explicitly mutable and inconclusive", (t) => {

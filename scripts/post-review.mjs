@@ -974,7 +974,14 @@ function summarySpanChanged(finding, fromHead, toHead) {
 export function findingFromThread(thread) {
   const firstLine = String(thread.body ?? "").split("\n", 1)[0];
   const match = firstLine.match(/^`P[012]` (Critical|High|Medium) — \*\*(.+?)\*\*/);
-  if (!thread.path || !match) return null;
+  if (
+    !thread.path
+    || !match
+    || !Number.isInteger(thread.startLine)
+    || thread.startLine < 1
+    || !Number.isInteger(thread.endLine)
+    || thread.endLine < thread.startLine
+  ) return null;
   return {
     file: thread.path,
     start_line: thread.startLine,
@@ -1334,7 +1341,7 @@ export async function runSummaryMode({ metadata, findings, repo, pr, token, botL
     metadata,
     findings,
     history,
-    writesEnabled: false,
+    writesEnabled: WRITES_ENABLED && history.summary.reconciliationKnown && history.threadsKnown,
   });
   if (suppressed) {
     console.log(`  ${suppressed} finding(s) previously resolved and unchanged — not re-raised`);

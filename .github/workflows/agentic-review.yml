@@ -1015,7 +1015,7 @@ jobs:
             ].join("\n"));
           }
           NODE
-            exit 0
+            exit 1
           fi
 
           REVIEW_MODE="$REVIEW_MODE" \
