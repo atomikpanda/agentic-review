@@ -120,11 +120,14 @@ function runPosterWithHistory({
   currentFindings = [],
   failSummaryHistory = false,
   failThreadHistory = false,
+  failSummaryPost = false,
 }) {
   const dir = mkdtempSync(join(tmpdir(), "post-review-history-"));
   const findingsFile = join(dir, "findings.json");
   const metadataFile = join(dir, "metadata.json");
   const outputFile = join(dir, "output");
+  const summaryFile = join(dir, "summary");
+  const resultFile = join(dir, "review-result.json");
   const preloadFile = join(dir, "mock-github.cjs");
   writeFileSync(findingsFile, JSON.stringify({ findings: currentFindings }));
   writeFileSync(metadataFile, JSON.stringify(metadata()));
@@ -154,6 +157,9 @@ globalThis.fetch = async (url, options = {}) => {
     if (fixture.failSummaryHistory) return reply({ message: "summary history unavailable" }, 500);
     return reply(fixture.summaryComments);
   }
+  if (fixture.failSummaryPost && ["POST", "PATCH"].includes(options.method)) {
+    return reply({ message: "summary post unavailable" }, 500);
+  }
   throw new Error(\`unexpected GitHub request: \${url}\`);
 };
 `);
@@ -170,22 +176,27 @@ globalThis.fetch = async (url, options = {}) => {
           threads,
           failSummaryHistory,
           failThreadHistory,
+          failSummaryPost,
         }),
         FINDINGS_FILE: findingsFile,
         REVIEW_METADATA_FILE: metadataFile,
         GITHUB_OUTPUT: outputFile,
+        GITHUB_STEP_SUMMARY: summaryFile,
+        REVIEW_RESULT_FILE: resultFile,
         GITHUB_REPO: "o/r",
         PR_NUMBER: "7",
         GH_TOKEN: "token",
         REVIEW_MODE: mode,
-        DRY_RUN: "1",
+        DRY_RUN: failSummaryPost ? "0" : "1",
         FAIL_ON_FINDINGS: "true",
       },
     },
   );
   const workflowOutput = readFileSync(outputFile, "utf8");
+  const jobSummary = existsSync(summaryFile) ? readFileSync(summaryFile, "utf8") : "";
+  const finalResult = existsSync(resultFile) ? JSON.parse(readFileSync(resultFile, "utf8")) : null;
   rmSync(dir, { recursive: true, force: true });
-  return { ...result, workflowOutput };
+  return { ...result, workflowOutput, jobSummary, finalResult };
 }
 
 test("summary marker round-trips only normalized carry-forward fields", () => {
@@ -628,26 +639,6 @@ test("inline fresh findings use the severity reconciled against summary history"
   assert.deepEqual(reconciled.fresh.map(({ severity }) => severity), ["High"]);
 });
 
-test("fresh reconciliation follows inline current positions instead of fuzzy rematching", () => {
-  const recurring = finding({
-    title: "Primary cache entry survives invalidation",
-    body: "The primary cache entry remains stale after invalidation.",
-  });
-  const fresh = finding({
-    title: "Secondary cache entry survives invalidation",
-    body: "The secondary cache entry remains stale after invalidation.",
-  });
-  const reconciled = [
-    { ...recurring, severity: "High" },
-    { ...fresh, severity: "Critical" },
-  ];
-
-  assert.deepEqual(
-    poster.reconcileFreshFindings({ current: [recurring, fresh], fresh: [fresh] }, reconciled),
-    [reconciled[1]],
-  );
-});
-
 test("summary mode keeps an unchanged dismissed inline finding suppressed", () => {
   const dismissed = finding({ suggestion: null });
   const inlineBody = poster.buildReviewComments(
@@ -683,6 +674,91 @@ test("summary mode keeps an unchanged dismissed inline finding suppressed", () =
   assert.match(result.workflowOutput, /unresolved_counts=\{"Critical":0,"High":0,"Medium":0\}/);
   assert.doesNotMatch(result.stdout, /Cache entry survives invalidation/);
   assert.deepEqual(decodeSummaryMarker(result.stdout).findings, []);
+});
+
+test("summary mode suppresses a dismissed summary duplicate without consuming a distinct fuzzy neighbor", () => {
+  const dismissed = finding({ suggestion: null });
+  const unrelated = finding({
+    start_line: 30,
+    end_line: 31,
+    title: "Secondary cache invalidation path remains stale",
+    body: "A distinct stale cache entry also survives invalidation.",
+    suggestion: null,
+    identity_tokens: ["cache", "entry", "stale", "survives", "invalidation", "secondary"],
+  });
+  const inlineBody = poster.buildReviewComments(
+    [dismissed],
+    new Map([[dismissed.file, [[dismissed.start_line, dismissed.end_line]]]]),
+    { mode: "inline" },
+  ).comments[0].body;
+  const result = runPosterWithHistory({
+    mode: "summary",
+    currentFindings: [dismissed],
+    summaryComments: [
+      botComment(1, encodeSummaryMarker({ headSha: HEAD_SHA, findings: [dismissed, unrelated] })),
+    ],
+    threads: [{
+      id: "dismissed-summary-duplicate",
+      isResolved: true,
+      isOutdated: false,
+      path: dismissed.file,
+      originalStartLine: dismissed.start_line,
+      originalLine: dismissed.end_line,
+      comments: {
+        nodes: [{
+          databaseId: 22,
+          body: inlineBody,
+          author: { login: "github-actions[bot]" },
+          originalCommit: { oid: HEAD_SHA },
+        }],
+      },
+    }],
+  });
+
+  assert.equal(result.status, 1, `${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
+  assert.match(result.workflowOutput, /merge_state=blocked/);
+  assert.match(result.workflowOutput, /current_counts=\{"Critical":0,"High":0,"Medium":0\}/);
+  assert.match(result.workflowOutput, /unresolved_counts=\{"Critical":0,"High":1,"Medium":0\}/);
+  assert.doesNotMatch(result.stdout, /Cache entry survives invalidation/);
+  assert.deepEqual(
+    decodeSummaryMarker(result.stdout).findings.map(({ title }) => title),
+    [unrelated.title],
+  );
+});
+
+test("inline summary-history dismissal does not produce a negative already-open count", () => {
+  const dismissed = finding({ suggestion: null });
+  const inlineBody = poster.buildReviewComments(
+    [dismissed],
+    new Map([[dismissed.file, [[dismissed.start_line, dismissed.end_line]]]]),
+    { mode: "inline" },
+  ).comments[0].body;
+  const result = runPosterWithHistory({
+    mode: "inline",
+    summaryComments: [
+      botComment(1, encodeSummaryMarker({ headSha: HEAD_SHA, findings: [dismissed] })),
+    ],
+    threads: [{
+      id: "dismissed-summary-only",
+      isResolved: true,
+      isOutdated: false,
+      path: dismissed.file,
+      originalStartLine: dismissed.start_line,
+      originalLine: dismissed.end_line,
+      comments: {
+        nodes: [{
+          databaseId: 23,
+          body: inlineBody,
+          author: { login: "github-actions[bot]" },
+          originalCommit: { oid: HEAD_SHA },
+        }],
+      },
+    }],
+  });
+
+  assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
+  assert.match(result.stdout, /0 finding\(s\): 0 anchored, 0 summary-only, 0 already open/);
+  assert.doesNotMatch(result.stdout, /-1 already open/);
 });
 
 test("failure to read either history store prevents a clean convergence claim", () => {
@@ -1664,5 +1740,50 @@ test("runner and poster hard failures still write conservative outputs and a fin
     assert.equal(result.coverage, outputs.coverage);
     assert.deepEqual(result.remaining_analysis, JSON.parse(outputs.remaining_analysis));
     assert.equal(result.converged, false);
+  }
+});
+
+test("poster failure appends a conservative final result after an optimistic job summary", () => {
+  const result = runPosterWithHistory({
+    mode: "summary",
+    summaryComments: [botComment(
+      41,
+      encodeSummaryMarker({ headSha: PRIOR_HEAD_SHA, findings: [] }),
+    )],
+    failSummaryPost: true,
+  });
+
+  assert.notEqual(result.status, 0, result.stderr);
+  const outputs = Object.fromEntries(result.workflowOutput.trim().split("\n").map((line) => {
+    const separator = line.indexOf("=");
+    return [line.slice(0, separator), line.slice(separator + 1)];
+  }));
+  assert.equal(outputs.analysis_state, "inconclusive");
+  assert.equal(outputs.sample_state, "unknown");
+  assert.equal(outputs.bounded_converged, "false");
+  assert.equal(outputs.coverage, "unknown");
+  assert.deepEqual(JSON.parse(outputs.remaining_analysis), ["execution_failed"]);
+  assert.equal(outputs.converged, "false");
+  assert.deepEqual(result.finalResult, {
+    ...result.finalResult,
+    analysis_state: outputs.analysis_state,
+    sample_state: outputs.sample_state,
+    bounded_converged: false,
+    coverage: outputs.coverage,
+    remaining_analysis: JSON.parse(outputs.remaining_analysis),
+    converged: false,
+  });
+
+  const optimistic = result.jobSummary.indexOf("| Sample | `clean` |");
+  assert.notEqual(optimistic, -1);
+  for (const row of [
+    "| Analysis | `inconclusive` |",
+    "| Sample | `unknown` |",
+    "| Bounded convergence | `no` |",
+    "| Coverage | `unknown` |",
+    '| Remaining analysis | `["execution_failed"]` |',
+    "| Converged | `false` |",
+  ]) {
+    assert.ok(result.jobSummary.lastIndexOf(row) > optimistic, row);
   }
 });

@@ -902,7 +902,7 @@ jobs:
         id: poster
         # Run even after runner failure so the poster can emit a conservative
         # result; it never posts missing/invalid artifacts and preserves failure.
-        if: always()
+        if: ${{ !cancelled() }}
         env:
           # The write-capable credential is confined to this presentation step.
           GH_TOKEN: ${{ steps.target.outputs.eligible == 'true' && (steps.target.outputs.token || github.token) || '' }}
@@ -987,6 +987,30 @@ jobs:
               `coverage=${result.coverage}`,
               `remaining_analysis=${JSON.stringify(result.remaining_analysis)}`,
               `converged=${result.converged}`,
+              "",
+            ].join("\n"));
+          }
+          if (process.env.GITHUB_STEP_SUMMARY) {
+            appendFileSync(process.env.GITHUB_STEP_SUMMARY, [
+              "## Agentic review",
+              "",
+              "| Result | Value |",
+              "| --- | --- |",
+              `| Analysis | \`${result.analysis_state}\` |`,
+              `| Merge gate | \`${result.merge_state}\` |`,
+              `| Sample | \`${result.sample_state}\` |`,
+              `| Bounded convergence | \`${result.bounded_converged ? "yes" : "no"}\` |`,
+              `| Reviewed head | \`${result.reviewed_head}\` |`,
+              `| Scope hash | \`${result.scope_hash}\` |`,
+              `| Coverage | \`${result.coverage}\` |`,
+              `| Remaining analysis | \`${JSON.stringify(result.remaining_analysis)}\` |`,
+              `| Converged | \`${result.converged}\` |`,
+              `| Base SHA | \`${result.base_sha}\` |`,
+              `| Head SHA | \`${result.head_sha}\` |`,
+              `| Configuration fingerprint | \`${result.configuration_fingerprint}\` |`,
+              `| Passes | \`${result.passes_requested} requested / ${result.passes_completed} completed\` |`,
+              `| Current findings | \`Critical: ${result.current_counts.Critical} · High: ${result.current_counts.High} · Medium: ${result.current_counts.Medium}\` |`,
+              `| Held/unresolved findings | \`Critical: ${result.unresolved_counts.Critical} · High: ${result.unresolved_counts.High} · Medium: ${result.unresolved_counts.Medium}\` |`,
               "",
             ].join("\n"));
           }

@@ -48,6 +48,29 @@ function envFileValues(path) {
   }));
 }
 
+function assertFinalResultSummary(summary, result) {
+  const counts = (value) => `Critical: ${value.Critical} · High: ${value.High} · Medium: ${value.Medium}`;
+  for (const row of [
+    `| Analysis | \`${result.analysis_state}\` |`,
+    `| Merge gate | \`${result.merge_state}\` |`,
+    `| Sample | \`${result.sample_state}\` |`,
+    `| Bounded convergence | \`${result.bounded_converged ? "yes" : "no"}\` |`,
+    `| Reviewed head | \`${result.reviewed_head}\` |`,
+    `| Scope hash | \`${result.scope_hash}\` |`,
+    `| Coverage | \`${result.coverage}\` |`,
+    `| Remaining analysis | \`${JSON.stringify(result.remaining_analysis)}\` |`,
+    `| Converged | \`${result.converged}\` |`,
+    `| Base SHA | \`${result.base_sha}\` |`,
+    `| Head SHA | \`${result.head_sha}\` |`,
+    `| Configuration fingerprint | \`${result.configuration_fingerprint}\` |`,
+    `| Passes | \`${result.passes_requested} requested / ${result.passes_completed} completed\` |`,
+    `| Current findings | \`${counts(result.current_counts)}\` |`,
+    `| Held/unresolved findings | \`${counts(result.unresolved_counts)}\` |`,
+  ]) {
+    assert.ok(summary.includes(row), row);
+  }
+}
+
 function finding(title, overrides = {}) {
   return {
     title,
@@ -724,14 +747,26 @@ test("workflow exposes and always retains the additive final result contract", (
     assert.match(source, new RegExp(`^      ${field}:`, "m"));
     assert.match(source, new RegExp(`^      ${field}: \\$\\{\\{ steps\\.poster\\.outputs\\.${field} \\}\\}`, "m"));
   }
-  assert.match(source, /- name: post review[\s\S]*?\n\s+if: always\(\)/);
   assert.match(source, /\/tmp\/review-result\.json/);
 });
 
-test("early hosted setup failure still emits conservative reusable-workflow outputs", (t) => {
+test("workflow skips the write-capable poster after cancellation but not ordinary failure", () => {
+  const source = readFileSync(workflow, "utf8");
+  const posterStep = source.match(
+    /^      - name: post review\n[\s\S]*?(?=^      - (?:name:|uses:))/m,
+  )?.[0];
+
+  assert.ok(posterStep);
+  assert.match(posterStep, /^\s+GH_TOKEN:/m);
+  assert.match(posterStep, /^\s+if: \$\{\{ !cancelled\(\) \}\}$/m);
+});
+
+test("early hosted setup failure emits the same conservative result everywhere", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "hosted-finalizer-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const outputFile = join(directory, "github-output");
+  const resultFile = join(directory, "review-result.json");
+  const summaryFile = join(directory, "step-summary");
   const untrustedPosterMarker = join(directory, "untrusted-poster-ran");
   mkdirSync(join(directory, "scripts"));
   writeFileSync(join(directory, "scripts", "post-review.mjs"), `
@@ -747,6 +782,8 @@ writeFileSync(process.env.UNTRUSTED_POSTER_MARKER, "executed");
     HEAD_SHA: "2222222222222222222222222222222222222222",
     BASE_SHA: "1111111111111111111111111111111111111111",
     GITHUB_OUTPUT: outputFile,
+    REVIEW_RESULT_FILE: resultFile,
+    GITHUB_STEP_SUMMARY: summaryFile,
     UNTRUSTED_POSTER_MARKER: untrustedPosterMarker,
   };
   for (const name of [
@@ -774,11 +811,20 @@ writeFileSync(process.env.UNTRUSTED_POSTER_MARKER, "executed");
   assert.equal(finalized.status, 0, finalized.stderr);
   assert.equal(existsSync(untrustedPosterMarker), false);
   const outputs = envFileValues(outputFile);
+  const result = JSON.parse(readFileSync(resultFile, "utf8"));
   assert.equal(outputs.analysis_state, "inconclusive");
   assert.equal(outputs.sample_state, "unknown");
   assert.equal(outputs.bounded_converged, "false");
   assert.equal(outputs.coverage, "unknown");
   assert.equal(outputs.converged, "false");
+  assert.deepEqual(
+    outputs,
+    Object.fromEntries(Object.entries(result).map(([name, value]) => [
+      name,
+      typeof value === "object" ? JSON.stringify(value) : String(value),
+    ])),
+  );
+  assertFinalResultSummary(readFileSync(summaryFile, "utf8"), result);
 
   const source = readFileSync(workflow, "utf8");
   for (const field of ["analysis_state", "sample_state", "bounded_converged", "coverage", "converged"]) {
@@ -817,6 +863,7 @@ writeFileSync(process.env.TARGET_POSTER_MARKER, "executed");
 
   const failureOutput = join(directory, "failure-output");
   const failureResult = join(directory, "failure-result.json");
+  const failureSummary = join(directory, "failure-summary");
   const failedResolution = spawnSync("bash", ["-c", workflowRunStep("post review")], {
     cwd: directory,
     encoding: "utf8",
@@ -824,6 +871,7 @@ writeFileSync(process.env.TARGET_POSTER_MARKER, "executed");
       ...env,
       GITHUB_OUTPUT: failureOutput,
       REVIEW_RESULT_FILE: failureResult,
+      GITHUB_STEP_SUMMARY: failureSummary,
     },
   });
 
@@ -855,6 +903,7 @@ writeFileSync(process.env.TARGET_POSTER_MARKER, "executed");
       typeof value === "object" ? JSON.stringify(value) : String(value),
     ])),
   );
+  assertFinalResultSummary(readFileSync(failureSummary, "utf8"), expectedResult);
 
   const skippedOutput = join(directory, "skipped-output");
   const skippedResult = join(directory, "skipped-result.json");

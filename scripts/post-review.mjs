@@ -1168,16 +1168,26 @@ function enforceGate(state) {
   }
 }
 
-function findStandingMatch(finding, threads) {
+function findStandingMatch(finding, threads, matched = null, unchangedAtHead = null) {
   const fp = fingerprint(finding);
-  const exact = threads.find((thread) => thread.fp === fp);
+  const exact = threads.find((thread) => (
+    thread.fp === fp
+    && !matched?.has(thread)
+    && (unchangedAtHead === null || fileChangedSince(thread, unchangedAtHead) === false)
+  ));
   if (exact) return exact;
-  const tokens = tokenSet(`${finding.title} ${finding.body}`);
+  const tokens = new Set(identityTokens(finding));
   const file = String(finding.file).replace(/^\.\//, "");
   let best = null;
   let bestScore = 0;
   for (const thread of threads) {
-    if (thread.path !== file) continue;
+    if (
+      matched?.has(thread)
+      || thread.path !== file
+      || (unchangedAtHead !== null && fileChangedSince(thread, unchangedAtHead) !== false)
+    ) {
+      continue;
+    }
     const score = similarity(tokens, thread.tokens);
     if (score > bestScore) {
       best = thread;
@@ -1187,15 +1197,6 @@ function findStandingMatch(finding, threads) {
   return bestScore >= SIMILARITY ? best : null;
 }
 
-function matchesUnchangedResolvedThread(finding, threads, headSha) {
-  const tokens = tokenSet(`${finding.title} ${finding.body}`);
-  const file = String(finding.file).replace(/^\.\//, "");
-  return threads.some((thread) => (
-    thread.path === file
-    && similarity(tokens, thread.tokens) >= SIMILARITY
-    && fileChangedSince(thread, headSha) === false
-  ));
-}
 async function loadReconciliationHistory({ repo, pr, token, botLogin, identityKnown }) {
   const summary = { comment: null, findings: [], headSha: null, reconciliationKnown: identityKnown };
   if (!identityKnown) return { summary, threads: [], threadsKnown: false };
@@ -1273,54 +1274,55 @@ function mergeFindingSets(primary, secondary, resolveMatch) {
   return merged;
 }
 
-export function reconcileFreshFindings(inlineReconciled, reconciledCurrent) {
-  if (inlineReconciled.current.length !== reconciledCurrent.length) {
-    throw new TypeError("reconciled current findings must preserve inline ordering");
-  }
-  return inlineReconciled.fresh.map((finding) => {
-    const index = inlineReconciled.current.indexOf(finding);
-    if (index < 0) throw new TypeError("fresh findings must belong to inline current findings");
-    return reconciledCurrent[index];
-  });
-}
-
 export async function reconcileHostedFindings({ metadata, findings, history, writesEnabled }) {
   const standing = history.threads.filter((thread) => !thread.isResolved && !thread.retired);
   const dismissed = history.threads.filter((thread) => thread.isResolved);
-  const inlineReconciled = await reconcileInlineFindings({
-    metadata,
-    findings,
-    standing,
-    dismissed,
-    resolveStale: env("RESOLVE_STALE", "true") === "true",
-    writesEnabled,
-  });
   const summaryReconciled = history.summary.reconciliationKnown
     ? await reconcileSummaryFindings({
       analysisState: metadata.analysis_state,
-      current: inlineReconciled.current,
+      current: findings,
       prior: history.summary.findings,
       priorHeadSha: history.summary.headSha,
       headSha: metadata.head_sha,
       spanChanged: summarySpanChanged,
     })
-    : { current: inlineReconciled.current, held: [], retired: [], reconciliationKnown: false };
+    : { current: findings, held: [], retired: [], reconciliationKnown: false };
+  const matchedDismissed = new Set();
+  const inlineReconciled = await reconcileInlineFindings({
+    metadata,
+    findings: summaryReconciled.current,
+    standing,
+    dismissed,
+    matchedDismissed,
+    resolveStale: env("RESOLVE_STALE", "true") === "true",
+    writesEnabled,
+  });
+  const summaryHeld = [];
+  let suppressed = inlineReconciled.suppressed;
+  for (const finding of summaryReconciled.held) {
+    const match = findStandingMatch(finding, dismissed, matchedDismissed, metadata.head_sha);
+    if (match) {
+      matchedDismissed.add(match);
+      suppressed += 1;
+    } else {
+      summaryHeld.push(finding);
+    }
+  }
   return {
-    current: summaryReconciled.current,
-    fresh: reconcileFreshFindings(inlineReconciled, summaryReconciled.current),
+    current: inlineReconciled.current,
+    fresh: inlineReconciled.fresh,
     unresolved: mergeFindingSets(
-      summaryReconciled.held,
+      summaryHeld,
       inlineReconciled.unresolved,
       preferredHistoricalFinding,
     ),
-    suppressed: inlineReconciled.suppressed,
+    suppressed,
     reconciliationKnown: history.summary.reconciliationKnown
       && history.threadsKnown
       && summaryReconciled.reconciliationKnown
       && inlineReconciled.reconciliationKnown,
   };
 }
-
 
 export async function runSummaryMode({ metadata, findings, repo, pr, token, botLogin, identityKnown }) {
   const history = await loadReconciliationHistory({ repo, pr, token, botLogin, identityKnown });
@@ -1368,6 +1370,7 @@ export async function reconcileInlineFindings({
   findings,
   standing,
   dismissed,
+  matchedDismissed = new Set(),
   resolveStale,
   writesEnabled,
   changedSince = fileChangedSince,
@@ -1375,14 +1378,14 @@ export async function reconcileInlineFindings({
 }) {
   const current = [];
   const fresh = [];
-  const stillLive = new Set();
+  const matchedStanding = new Set();
   let suppressed = 0;
   let reconciliationKnown = true;
 
   for (const finding of findings) {
-    const match = findStandingMatch(finding, standing);
+    const match = findStandingMatch(finding, standing, matchedStanding);
     if (match) {
-      stillLive.add(match.id);
+      matchedStanding.add(match);
       const historical = findingFromThread(match);
       if (historical) current.push(withStrongestSeverity(finding, historical));
       else {
@@ -1391,7 +1394,14 @@ export async function reconcileInlineFindings({
       }
       continue;
     }
-    if (matchesUnchangedResolvedThread(finding, dismissed, metadata.head_sha)) {
+    const dismissedMatch = findStandingMatch(
+      finding,
+      dismissed,
+      matchedDismissed,
+      metadata.head_sha,
+    );
+    if (dismissedMatch) {
+      matchedDismissed.add(dismissedMatch);
       suppressed += 1;
       continue;
     }
@@ -1401,7 +1411,7 @@ export async function reconcileInlineFindings({
 
   const unresolved = [];
   for (const thread of standing) {
-    if (stillLive.has(thread.id)) continue;
+    if (matchedStanding.has(thread)) continue;
     const changed = changedSince(thread, metadata.head_sha);
     if (metadata.analysis_state === "complete" && changeIsConfirmed(changed) && resolveStale) {
       if (writesEnabled) {
@@ -1461,7 +1471,7 @@ async function runInlineMode({ metadata, findings, repo, pr, token, botLogin, id
   emitState(metadata, state, { reconciliationKnown });
   console.log(
     `  ${findings.length} finding(s): ${comments.length} anchored, `
-      + `${unanchored.length} summary-only, ${findings.length - fresh.length - suppressed} already open`,
+      + `${unanchored.length} summary-only, ${current.length - fresh.length} already open`,
   );
 
   if (!reconciliationKnown) {
@@ -1523,6 +1533,7 @@ function emitHardFailureResult() {
     metadata,
     state,
     outputFile: env("GITHUB_OUTPUT", ""),
+    summaryFile: env("GITHUB_STEP_SUMMARY", ""),
     resultFile: env("REVIEW_RESULT_FILE", ""),
     executionFailed: true,
     resultMetadata,
