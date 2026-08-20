@@ -21,7 +21,7 @@
 //   REVIEW_PUBLICATION_FILE atomic findings, run metadata, and reviewed scope (required)
 //   GITHUB_REPO           owner/name                           (required except RENDER)
 //   PR_NUMBER             pull request number                  (required except RENDER)
-//   GH_TOKEN              token with pull-requests: write      (required except RENDER)
+//   GH_TOKEN              token with pull-requests/issues: write (required except RENDER)
 //   REVIEW_MODE           "summary" | "inline" | "suggest"     (default suggest)
 //   DRY_RUN               "1" reads and reconciles but does not write
 //   SUPPRESS_WRITES       "true" reads and reconciles but does not write

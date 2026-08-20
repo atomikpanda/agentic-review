@@ -241,12 +241,14 @@ The reusable workflow exposes these exact outputs:
 | `current_counts`, `unresolved_counts` | JSON severity maps for current and held findings |
 
 The same values appear in the review body and GitHub job summary. The hosted
-`agentic-review` artifact retains the final result (`review-result.json`), a
-human-readable structured findings document (`review.md`), the authoritative
-atomic findings-metadata-scope publication (`review-publication.json`), and
-runner stdout and stderr for seven days. The poster writes the final result at
-`/tmp/review-result.json` before artifact upload. Locally, `--out` and
-`--publication-out` write the human-readable findings and authoritative
+`agentic-review` artifact always retains the required final result
+(`review-result.json`) for seven days. When available, the separate
+`agentic-review-diagnostics` artifact retains the human-readable structured
+findings (`review.md`), the authoritative atomic findings-metadata-scope
+publication (`review-publication.json`), and runner stdout and stderr. Missing
+optional diagnostics never prevent upload of the final result. The poster writes
+that result at `/tmp/review-result.json` before artifact upload. Locally, `--out`
+and `--publication-out` write the human-readable findings and authoritative
 publication artifacts directly.
 
 ### Standing summaries and finding history

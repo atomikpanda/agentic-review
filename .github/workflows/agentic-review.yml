@@ -274,6 +274,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
   pull-requests: write
 
 concurrency:
@@ -407,12 +408,12 @@ jobs:
           const tok = await api(inst.access_tokens_url, {
             method: "POST",
             headers: { "content-type": "application/json" },
-            // Scope the token to the one repository and the two permissions the
-            // review actually uses. The App may be installed far more widely;
+            // Scope the token to the one repository and the three permissions
+            // the review actually uses. The App may be installed far more widely;
             // this token must not be.
             body: JSON.stringify({
               repositories: [repo.split("/")[1]],
-              permissions: { contents: "read", pull_requests: "write" },
+              permissions: { contents: "read", issues: "write", pull_requests: "write" },
             }),
           });
           process.stdout.write(tok.token);
@@ -1476,25 +1477,24 @@ jobs:
             exit "$poster_status"
           fi
 
-      - name: upload review artifacts
-        if: ${{ !cancelled() && steps.target.outputs.eligible == 'true' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: agentic-review
-          path: |
-            /tmp/review.md
-            /tmp/review-publication.json
-            /tmp/review-runner.out
-            /tmp/review-runner.err
-            /tmp/review-result.json
-          retention-days: 7
-          if-no-files-found: error
-
-      - name: upload target-resolution fallback result
-        if: ${{ !cancelled() && steps.target.outputs.eligible == '' }}
+      - name: upload review result
+        if: ${{ !cancelled() && steps.target.outputs.eligible != 'false' }}
         uses: actions/upload-artifact@v4
         with:
           name: agentic-review
           path: /tmp/review-result.json
           retention-days: 7
           if-no-files-found: error
+
+      - name: upload optional review diagnostics
+        if: ${{ !cancelled() && steps.target.outputs.eligible == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentic-review-diagnostics
+          path: |
+            /tmp/review.md
+            /tmp/review-publication.json
+            /tmp/review-runner.out
+            /tmp/review-runner.err
+          retention-days: 7
+          if-no-files-found: ignore

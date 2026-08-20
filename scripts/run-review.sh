@@ -923,9 +923,28 @@ write_publication() {
   fi
 }
 
+publish_findings() {
+  node "$MERGE" --check "$TMP_OUT" 2>/dev/null \
+    || die "review result is not a structured findings document"
+  if [ -n "$OUT" ]; then
+    local out_tmp="${OUT}.tmp.$$"
+    cp "$TMP_OUT" "$out_tmp" || die "could not write review beside $OUT"
+    if ! node "$MERGE" --check "$out_tmp" 2>/dev/null; then
+      rm -f "$out_tmp"
+      die "structured review at $out_tmp failed validation"
+    fi
+    mv -f "$out_tmp" "$OUT" || {
+      rm -f "$out_tmp"
+      die "could not publish review at $OUT"
+    }
+    ok "written to $OUT"
+  fi
+}
+
 if [ ${#VALID_OUTS[@]} -eq 0 ]; then
   printf '%s\n' '{"findings":[]}' > "$TMP_OUT"
   write_publication not-run 1
+  publish_findings
   die "every configured pass failed"
 fi
 UNION_OUT="$RUN_TMP/union.json"
@@ -950,19 +969,7 @@ else
     mv -f "$UNION_OUT" "$TMP_OUT"
   fi
 fi
-node "$MERGE" --check "$TMP_OUT" 2>/dev/null \
-  || die "review result is not a structured findings document"
-
-if [ -n "$OUT" ]; then
-  out_tmp="${OUT}.tmp.$$"
-  cp "$TMP_OUT" "$out_tmp" || die "could not write review beside $OUT"
-  if ! node "$MERGE" --check "$out_tmp" 2>/dev/null; then
-    rm -f "$out_tmp"
-    die "structured review at $out_tmp failed validation"
-  fi
-  mv -f "$out_tmp" "$OUT"
-  ok "written to $OUT"
-fi
+publish_findings
 write_publication "$MERGE_SUCCEEDED"
 ANALYSIS_STATE="$(node "$RESULT_HELPER" analysis "$RUN_TMP/metadata.json")" \
   || die "could not derive validated analysis state"

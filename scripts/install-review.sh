@@ -215,6 +215,7 @@ on:
 # review and then fail at the moment it tried to post the result.
 permissions:
   contents: read
+  issues: write
   pull-requests: write
 
 jobs:

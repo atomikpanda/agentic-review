@@ -678,6 +678,8 @@ exit 1
   assert.match(generated, new RegExp(`uses: atomikpanda/agentic-review/.github/workflows/agentic-review.yml@${sha}`));
   assert.match(generated, new RegExp(`central_ref: ${sha}`));
   assert.match(generated, /extra_omp_args: --print-thoughts --no-title/);
+  assert.match(generated, /^  issues: write$/m);
+  assert.match(generated, /^  pull-requests: write$/m);
 
   const outputFile = join(directory, "sha-output");
   const resolved = spawnSync("bash", ["-c", workflowRunStep("resolve trusted central ref")], {
@@ -732,6 +734,31 @@ test("runner rejects CR or LF in finding titles before merge or posting", (t) =>
     assert.notEqual(run.result.status, 0);
     assert.match(run.result.stderr, /every configured pass failed/);
     assert.equal(run.logs.length, 2);
+  }
+});
+
+test("every-pass failure atomically creates or replaces --out with validated conservative findings", (t) => {
+  const staleFinding = finding("Stale finding", { file: "alpha.txt" });
+  const malformedFinding = finding("Invalid\nfinding", { file: "alpha.txt" });
+  for (const initialFindings of [null, [staleFinding]]) {
+    const run = runReview(t, {
+      general: [{ findings: [malformedFinding] }, { findings: [malformedFinding] }],
+    }, {
+      args: ["--passes", "1", "--lenses", "", "--json"],
+      outputPaths: ({ directory, publicationFile }) => {
+        const findingsFile = join(directory, "findings.json");
+        if (initialFindings) {
+          writeFileSync(findingsFile, JSON.stringify({ findings: initialFindings }));
+        }
+        return { findingsFile, publicationFile };
+      },
+    });
+
+    assert.notEqual(run.result.status, 0);
+    assert.match(run.result.stderr, /every configured pass failed/);
+    assert.deepEqual(run.findings, { findings: [] });
+    assert.equal(run.publication?.metadata.analysis_state, "inconclusive");
+    assert.equal(run.publication?.metadata.remaining_analysis.includes("execution_failed"), true);
   }
 });
 
@@ -871,20 +898,32 @@ test("workflow skips the write-capable poster after cancellation but not ordinar
   assert.match(posterStep, /^\s+if: \$\{\{ !cancelled\(\) \}\}$/m);
 });
 
-test("workflow retains one authoritative publication and result-only target fallbacks", () => {
+test("workflow independently retains the required result and optional diagnostics", () => {
   const source = readFileSync(workflow, "utf8");
-  const artifactStep = source.match(
-    /^      - name: upload review artifacts\n[\s\S]*?(?=^      - name:)/m,
+  const resultStep = source.match(
+    /^      - name: upload review result\n[\s\S]*?(?=^      - name:)/m,
   )?.[0];
-  const fallbackArtifactStep = source.match(
-    /^      - name: upload target-resolution fallback result\n[\s\S]*$/m,
+  const diagnosticsStep = source.match(
+    /^      - name: upload optional review diagnostics\n[\s\S]*$/m,
   )?.[0];
 
   assert.match(source, /^\s+REVIEW_PUBLICATION_FILE: \/tmp\/review-publication\.json$/m);
   assert.doesNotMatch(source, /AGENTIC_REVIEW_SCOPE_OUT|review-scope\.json/);
-  assert.ok(artifactStep);
+  assert.ok(resultStep);
   assert.match(
-    artifactStep,
+    resultStep,
+    /^\s+if: \$\{\{ !cancelled\(\) && steps\.target\.outputs\.eligible != 'false' \}\}$/m,
+  );
+  assert.match(resultStep, /^\s+path: \/tmp\/review-result\.json$/m);
+  assert.match(resultStep, /^\s+if-no-files-found: error$/m);
+  assert.doesNotMatch(
+    resultStep,
+    /\/tmp\/review(?:\.md|-publication\.json|-runner\.(?:out|err))/,
+  );
+
+  assert.ok(diagnosticsStep);
+  assert.match(
+    diagnosticsStep,
     /^\s+if: \$\{\{ !cancelled\(\) && steps\.target\.outputs\.eligible == 'true' \}\}$/m,
   );
   for (const path of [
@@ -892,23 +931,21 @@ test("workflow retains one authoritative publication and result-only target fall
     "/tmp/review-publication.json",
     "/tmp/review-runner.out",
     "/tmp/review-runner.err",
-    "/tmp/review-result.json",
   ]) {
-    assert.match(artifactStep, new RegExp(`^\\s+${path.replaceAll(".", "\\.")}$`, "m"));
+    assert.match(diagnosticsStep, new RegExp(`^\\s+${path.replaceAll(".", "\\.")}$`, "m"));
   }
-  assert.match(artifactStep, /^\s+if-no-files-found: error$/m);
+  assert.doesNotMatch(diagnosticsStep, /^\s+\/tmp\/review-result\.json$/m);
+  assert.match(diagnosticsStep, /^\s+if-no-files-found: ignore$/m);
+});
 
-  assert.ok(fallbackArtifactStep);
+test("hosted workflows request issue-comment history and write permissions", () => {
+  const source = readFileSync(workflow, "utf8");
+  assert.match(source, /^  issues: write$/m);
+  assert.match(source, /^  pull-requests: write$/m);
   assert.match(
-    fallbackArtifactStep,
-    /^\s+if: \$\{\{ !cancelled\(\) && steps\.target\.outputs\.eligible == '' \}\}$/m,
+    source,
+    /permissions: \{ contents: "read", issues: "write", pull_requests: "write" \}/,
   );
-  assert.match(fallbackArtifactStep, /^\s+path: \/tmp\/review-result\.json$/m);
-  assert.doesNotMatch(
-    fallbackArtifactStep,
-    /\/tmp\/review(?:\.md|-publication\.json|-runner\.(?:out|err))/,
-  );
-  assert.match(fallbackArtifactStep, /^\s+if-no-files-found: error$/m);
 });
 
 test("early hosted setup failure without a publication uses target fallback defaults", (t) => {
@@ -2352,7 +2389,7 @@ test("a permanently malformed pass is failed while valid pass findings survive t
   assert.equal(validatePublication(run.publicationFile).status, 0);
 });
 
-test("all-pass failure writes a valid diagnostic publication before exiting nonzero", (t) => {
+test("all-pass failure writes validated findings and publication diagnostics before exiting nonzero", (t) => {
   const run = runReview(t, {
     general: ["bad", "bad again"],
     correctness: ["bad", "bad again"],
@@ -2360,7 +2397,7 @@ test("all-pass failure writes a valid diagnostic publication before exiting nonz
   });
 
   assert.notEqual(run.result.status, 0);
-  assert.equal(run.findings, null);
+  assert.deepEqual(run.findings, { findings: [] });
   assert.deepEqual(run.publication.findings, []);
   assert.equal(run.metadata.analysis_state, "inconclusive");
   assert.equal(run.metadata.coverage, "unknown");
