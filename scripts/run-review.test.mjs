@@ -496,6 +496,8 @@ printf '%s\\n' '1.3.14'
       AGENTIC_REVIEW_PASSES: "",
       AGENTIC_REVIEW_PROMPT: "",
       AGENTIC_REVIEW_SKILL: "",
+      AGENTIC_REVIEW_PHASE: "",
+      AGENTIC_REVIEW_KNOWN_FINDINGS: "",
       AGENTIC_REVIEW_TRUSTED_DATA_ROOT: "",
       PATH: `${fixture.bin}:${process.env.PATH}`,
       OPENROUTER_API_KEY: "sk-or-runner-test",
@@ -554,6 +556,8 @@ function runWorkflowConfig(t, overrides = {}) {
     IN_PROMPT_PATH: "",
     IN_SKILLS_PATH: "",
     IN_MAX_FINDINGS: "",
+    IN_MAX_DISCOVERY_ROUNDS: "",
+    IN_REVIEW_CYCLE_OVERRIDE_REASON: "",
     IN_MAX_DIFF_BYTES: "",
     IN_CODEGRAPH: "",
     IN_CODEGRAPH_VERSION: "",
@@ -639,6 +643,17 @@ test("hosted config allows harmless display flags and rejects prompt, parser, an
   assert.equal(valid.result.status, 0, valid.result.stderr);
   assert.equal(valid.values.EXTRA_ARGS, "--print-thoughts --hide-thinking --no-title");
   assert.equal(valid.values.OMP_VERSION, "17.4.0-rc.1");
+  assert.equal(valid.values.MAX_DISCOVERY_ROUNDS, "2");
+  const customCycle = runWorkflowConfig(t, { IN_MAX_DISCOVERY_ROUNDS: "3" });
+  assert.equal(customCycle.result.status, 0, customCycle.result.stderr);
+  assert.equal(customCycle.values.MAX_DISCOVERY_ROUNDS, "3");
+  for (const invalid of ["0", "-1", "two"]) {
+    assert.notEqual(
+      runWorkflowConfig(t, { IN_MAX_DISCOVERY_ROUNDS: invalid }).result.status,
+      0,
+      invalid,
+    );
+  }
   for (const version of ["latest", "next", "17.3.0", "17.4.0-rc.1"]) {
     const accepted = runWorkflowConfig(t, { IN_OMP_VERSION: version });
     assert.equal(accepted.result.status, 0, `${version}: ${accepted.result.stderr}`);
@@ -713,6 +728,7 @@ exit 1
     "--repo", "owner/repo",
     "--ref", sha,
     "--extra-omp-args", "--print-thoughts --no-title",
+    "--max-discovery-rounds", "3",
     "--no-pr-agent",
     "--yes",
   ], { encoding: "utf8", env: baseEnv });
@@ -724,9 +740,13 @@ exit 1
   assert.ok(encoded);
   const generated = Buffer.from(encoded, "base64").toString("utf8");
   assert.match(generated, /^on:\n  pull_request_target:/m);
+  assert.match(generated, /^  workflow_dispatch:\n    inputs:\n      pr_number:/m);
+  assert.match(generated, /target_repo: \$\{\{ github\.event_name == 'workflow_dispatch' && github\.repository \|\| '' \}\}/);
+  assert.match(generated, /review_cycle_override_reason: \$\{\{ inputs\.review_cycle_override_reason \|\| '' \}\}/);
   assert.match(generated, new RegExp(`uses: atomikpanda/agentic-review/.github/workflows/agentic-review.yml@${sha}`));
   assert.match(generated, new RegExp(`central_ref: ${sha}`));
   assert.match(generated, /extra_omp_args: --print-thoughts --no-title/);
+  assert.match(generated, /max_discovery_rounds: 3/);
   assert.match(generated, /^  pull-requests: write$/m);
 
   const outputFile = join(directory, "sha-output");
@@ -920,6 +940,43 @@ test("the default profile runs general, correctness, and boundaries into one val
   assert.deepEqual(JSON.parse(validation.stdout), run.metadata);
 });
 
+test("verification phase restricts review to persisted findings and affected invariants", (t) => {
+  const fixture = createFixture(t);
+  const known = finding("Known cache invalidation defect", {
+    file: "alpha.txt",
+    verification_id: "K1",
+  });
+  const unrelated = finding("Unrelated queue defect", { file: "beta.txt" });
+  const linked = finding("Fix causes queue regression", {
+    file: "gamma.txt",
+    verification_of: "K1",
+    verification_classification: "linked_regression",
+  });
+  const knownFindingsFile = join(fixture.directory, "known-findings.json");
+  writeFileSync(knownFindingsFile, JSON.stringify({ findings: [known] }));
+  const run = runReview(t, { general: [{ findings: [known, linked, unrelated] }] }, {
+    existingFixture: fixture,
+    args: ["--passes", "1", "--lenses", "", "--json"],
+    env: {
+      AGENTIC_REVIEW_PHASE: "verification",
+      AGENTIC_REVIEW_KNOWN_FINDINGS: knownFindingsFile,
+    },
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.equal(run.logs.length, 1);
+  assert.match(run.logs[0].prompt, /## Verification phase/);
+  assert.match(run.logs[0].prompt, /Known cache invalidation defect/);
+  assert.match(run.logs[0].prompt, /Do not report unrelated findings/);
+  assert.match(run.logs[0].prompt, /affected invariants/);
+  assert.match(run.logs[0].prompt, /verification_of/);
+  assert.deepEqual(
+    JSON.parse(run.result.stdout).findings.map(({ title }) => title),
+    [known.title, linked.title],
+  );
+  assert.match(run.result.stderr, /withheld 1 unrelated verification finding/);
+});
+
 test("workflow exposes and always retains the additive final result contract", () => {
   const source = readFileSync(workflow, "utf8");
   for (const field of [
@@ -930,9 +987,36 @@ test("workflow exposes and always retains the additive final result contract", (
     "converged",
   ]) {
     assert.match(source, new RegExp(`^      ${field}:`, "m"));
-    assert.match(source, new RegExp(`^      ${field}: \\$\\{\\{ steps\\.poster\\.outputs\\.${field} \\}\\}`, "m"));
+    assert.match(source, new RegExp(`^      ${field}: \\$\\{\\{ steps\\.poster\\.outputs\\.${field} \\|\\| steps\\.cycle\\.outputs\\.${field} \\}\\}`, "m"));
   }
   assert.match(source, /\/tmp\/review-result\.json/);
+});
+
+test("workflow plans and persists a bounded discovery-verification cycle", () => {
+  const source = readFileSync(workflow, "utf8");
+  const cycleStep = source.match(
+    /^      - name: plan bounded review cycle\n[\s\S]*?(?=^      - (?:name:|uses:))/m,
+  )?.[0];
+  const runnerStep = source.match(
+    /^      - name: run agentic review \(read-only\)\n[\s\S]*?(?=^      - (?:name:|uses:))/m,
+  )?.[0];
+  const posterStep = source.match(
+    /^      - name: post review\n[\s\S]*?(?=^      - (?:name:|uses:))/m,
+  )?.[0];
+
+  assert.ok(cycleStep);
+  assert.match(cycleStep, /node "\$REVIEW_POSTER" cycle-plan/);
+  assert.match(cycleStep, /REVIEW_CYCLE_PLAN_FILE: \/tmp\/review-cycle-plan\.json/);
+  assert.match(cycleStep, /KNOWN_FINDINGS_FILE: \/tmp\/review-known-findings\.json/);
+  assert.match(cycleStep, /github\.event_name == 'workflow_dispatch'/);
+  assert.match(cycleStep, /REVIEW_CYCLE_OVERRIDE_INVOCATION:.*github\.run_id/);
+  assert.match(source, /same-repository dispatch/);
+  assert.ok(runnerStep);
+  assert.match(runnerStep, /steps\.cycle\.outputs\.should_run == 'true'/);
+  assert.match(runnerStep, /AGENTIC_REVIEW_PHASE: \$\{\{ steps\.cycle\.outputs\.phase \}\}/);
+  assert.ok(posterStep);
+  assert.match(posterStep, /REVIEW_CYCLE_PLAN_FILE: \/tmp\/review-cycle-plan\.json/);
+  assert.match(posterStep, /review cycle exhausted; an authenticated override is required/);
 });
 
 test("workflow skips the write-capable poster after cancellation but not ordinary failure", () => {
@@ -1073,7 +1157,7 @@ writeFileSync(process.env.UNTRUSTED_POSTER_MARKER, "executed");
   const source = readFileSync(workflow, "utf8");
   for (const field of ["analysis_state", "sample_state", "bounded_converged", "coverage", "converged"]) {
     assert.match(source, new RegExp(`^        value: \\$\\{\\{ jobs\\.review\\.outputs\\.${field} \\}\\}`, "m"));
-    assert.match(source, new RegExp(`^      ${field}: \\$\\{\\{ steps\\.poster\\.outputs\\.${field} \\}\\}`, "m"));
+    assert.match(source, new RegExp(`^      ${field}: \\$\\{\\{ steps\\.poster\\.outputs\\.${field} \\|\\| steps\\.cycle\\.outputs\\.${field} \\}\\}`, "m"));
   }
 });
 

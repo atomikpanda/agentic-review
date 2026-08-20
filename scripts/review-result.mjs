@@ -15,6 +15,9 @@ export const DEFAULT_PASS_DESCRIPTORS = [
 const ANALYSIS_STATES = new Set(["complete", "inconclusive"]);
 const PASS_STATUSES = new Set(["valid", "failed"]);
 const COVERAGE_STATES = new Set(["bounded", "unknown"]);
+export const REVIEW_CYCLE_SCHEMA_VERSION = 1;
+const REVIEW_PHASES = new Set(["discovery", "verification"]);
+const REVIEW_CYCLE_STATES = new Set(["active", "ready", "review_cycle_exhausted"]);
 export const REMAINING_ANALYSIS_REASONS = [
   "diff_truncated",
   "finding_cap_reached",
@@ -204,6 +207,315 @@ function requireFingerprint(value, path) {
   if (typeof value !== "string" || !FINGERPRINT_PATTERN.test(value)) {
     throw new TypeError(`${path} must be a 64-character lowercase hexadecimal SHA-256`);
   }
+}
+
+function validateCycleOverride(value, path) {
+  if (value === null) return null;
+  requirePlainObject(value, path);
+  const keys = Object.keys(value).sort();
+  if (!arraysEqual(keys, ["actor", "reason"]) && !arraysEqual(keys, ["actor", "invocation", "reason"])) {
+    throw new TypeError(`${path} must contain actor and reason, with an optional invocation`);
+  }
+  requireString(value.actor, `${path}.actor`);
+  requireString(value.reason, `${path}.reason`);
+  if (value.invocation !== undefined) requireString(value.invocation, `${path}.invocation`);
+  if (
+    value.actor.trim().length === 0
+    || value.reason.trim().length === 0
+    || value.invocation?.trim().length === 0
+  ) {
+    throw new TypeError(`${path} fields must contain non-whitespace text`);
+  }
+  if (
+    value.actor !== value.actor.trim()
+    || value.reason !== value.reason.trim()
+    || (value.invocation !== undefined && value.invocation !== value.invocation.trim())
+  ) {
+    throw new TypeError(`${path} fields must not begin or end with whitespace`);
+  }
+  return value;
+}
+
+export function validateReviewCycle(value) {
+  requirePlainObject(value, "review cycle");
+  const expectedKeys = [
+    "discovery_round",
+    "last_analysis_state",
+    "last_phase",
+    "last_reviewed_head",
+    "last_scope_hash",
+    "lineage_base_sha",
+    "max_discovery_rounds",
+    "next_phase",
+    "override",
+    "schema_version",
+    "state",
+  ];
+  if (!arraysEqual(Object.keys(value).sort(), expectedKeys)) {
+    throw new TypeError(`review cycle must contain exactly ${expectedKeys.join(", ")}`);
+  }
+  if (value.schema_version !== REVIEW_CYCLE_SCHEMA_VERSION) {
+    throw new TypeError(`review cycle schema_version must be ${REVIEW_CYCLE_SCHEMA_VERSION}`);
+  }
+  requireSha(value.lineage_base_sha, "review cycle.lineage_base_sha");
+  requireInteger(value.discovery_round, "review cycle.discovery_round", 1);
+  requireInteger(value.max_discovery_rounds, "review cycle.max_discovery_rounds", 1);
+  if (value.discovery_round > value.max_discovery_rounds) {
+    throw new TypeError("review cycle.discovery_round cannot exceed max_discovery_rounds");
+  }
+  if (!REVIEW_CYCLE_STATES.has(value.state)) {
+    throw new TypeError("review cycle.state must be active, ready, or review_cycle_exhausted");
+  }
+  if (!REVIEW_PHASES.has(value.last_phase)) {
+    throw new TypeError("review cycle.last_phase must be discovery or verification");
+  }
+  if (value.next_phase !== null && !REVIEW_PHASES.has(value.next_phase)) {
+    throw new TypeError("review cycle.next_phase must be discovery, verification, or null");
+  }
+  requireSha(value.last_reviewed_head, "review cycle.last_reviewed_head");
+  requireFingerprint(value.last_scope_hash, "review cycle.last_scope_hash");
+  if (!ANALYSIS_STATES.has(value.last_analysis_state)) {
+    throw new TypeError("review cycle.last_analysis_state must be complete or inconclusive");
+  }
+  validateCycleOverride(value.override, "review cycle.override");
+  if (value.state === "ready" && value.next_phase !== null) {
+    throw new TypeError("ready cycle must have next_phase null");
+  }
+  if (value.state === "active" && value.next_phase === null) {
+    throw new TypeError("active cycle must have a next_phase");
+  }
+  if (
+    value.state === "review_cycle_exhausted"
+    && value.discovery_round < value.max_discovery_rounds
+  ) {
+    throw new TypeError("review_cycle_exhausted requires the discovery limit");
+  }
+  return value;
+}
+
+function validateCycleFindingList(value, path) {
+  if (!Array.isArray(value)) throw new TypeError(`${path} must be an array`);
+  value.forEach((entry, index) => validateFinding(entry, `${path}[${index}]`));
+  return value;
+}
+
+function migratedReviewCycle({
+  priorHeadSha,
+  baseSha,
+  maxDiscoveryRounds,
+}) {
+  if (!priorHeadSha) return null;
+  requireSha(priorHeadSha, "priorHeadSha");
+  return {
+    schema_version: REVIEW_CYCLE_SCHEMA_VERSION,
+    lineage_base_sha: baseSha,
+    discovery_round: 1,
+    max_discovery_rounds: maxDiscoveryRounds,
+    state: "active",
+    last_phase: "discovery",
+    next_phase: "discovery",
+    last_reviewed_head: priorHeadSha,
+    last_scope_hash: "0".repeat(64),
+    last_analysis_state: "inconclusive",
+    override: null,
+  };
+}
+
+export function planReviewCycle({
+  priorCycle = null,
+  priorHeadSha = null,
+  priorFindings = [],
+  baseSha,
+  headSha,
+  maxDiscoveryRounds = 2,
+  override = null,
+  lineageValid = true,
+}) {
+  requireSha(baseSha, "baseSha");
+  requireSha(headSha, "headSha");
+  requireInteger(maxDiscoveryRounds, "maxDiscoveryRounds", 1);
+  if (typeof lineageValid !== "boolean") {
+    throw new TypeError("lineageValid must be a boolean");
+  }
+  validateCycleFindingList(priorFindings, "priorFindings");
+  validateCycleOverride(override, "override");
+  let cycle = priorCycle === null
+    ? migratedReviewCycle({ priorHeadSha, baseSha, maxDiscoveryRounds })
+    : validateReviewCycle(priorCycle);
+  const exhaustedLineageInvalid = !lineageValid
+    && cycle?.state === "review_cycle_exhausted";
+  if (
+    (!lineageValid && !exhaustedLineageInvalid)
+    || (cycle?.state === "ready" && cycle.last_reviewed_head !== headSha)
+  ) {
+    cycle = null;
+  }
+  const lineageBaseSha = cycle?.lineage_base_sha ?? baseSha;
+
+  const overrideReplayed = override !== null
+    && cycle?.override != null
+    && (
+      override.invocation !== undefined && cycle.override.invocation !== undefined
+        ? override.invocation === cycle.override.invocation
+        : override.actor === cycle.override.actor && override.reason === cycle.override.reason
+    );
+  const requestedOverride = overrideReplayed ? null : override;
+  if (requestedOverride !== null) {
+    if (cycle?.state !== "review_cycle_exhausted") {
+      throw new TypeError("review-cycle override requires an exhausted cycle");
+    }
+    if (cycle.next_phase !== null) {
+      throw new TypeError("review-cycle override cannot skip pending verification");
+    }
+    const discoveryRound = cycle.discovery_round + 1;
+    const resumedCycle = exhaustedLineageInvalid
+      ? { ...cycle, lineage_base_sha: baseSha }
+      : cycle;
+    return {
+      should_run: true,
+      phase: "discovery",
+      discovery_round: discoveryRound,
+      lineage_base_sha: resumedCycle.lineage_base_sha,
+      cycle: resumedCycle,
+      known_findings: [],
+      override: requestedOverride,
+      max_discovery_rounds: discoveryRound,
+    };
+  }
+  if (cycle === null) {
+    return {
+      should_run: true,
+      phase: "discovery",
+      discovery_round: 1,
+      lineage_base_sha: lineageBaseSha,
+      max_discovery_rounds: maxDiscoveryRounds,
+      cycle: null,
+      known_findings: [],
+      override: null,
+    };
+  }
+
+  const retry = cycle.last_analysis_state === "inconclusive"
+    && cycle.last_reviewed_head === headSha;
+  const phase = retry ? cycle.last_phase : cycle.next_phase;
+  if (phase === null) {
+    return {
+      should_run: false,
+      phase: null,
+      discovery_round: cycle.discovery_round,
+      lineage_base_sha: lineageBaseSha,
+      max_discovery_rounds: cycle.max_discovery_rounds,
+      cycle,
+      known_findings: priorFindings,
+      override: cycle.override,
+    };
+  }
+  const discoveryRound = phase === "discovery" && !retry
+    ? cycle.discovery_round + 1
+    : cycle.discovery_round;
+  if (phase === "discovery" && discoveryRound > cycle.max_discovery_rounds) {
+    return {
+      should_run: false,
+      phase: null,
+      discovery_round: cycle.discovery_round,
+      lineage_base_sha: lineageBaseSha,
+      max_discovery_rounds: cycle.max_discovery_rounds,
+      cycle: {
+        ...cycle,
+        state: "review_cycle_exhausted",
+        next_phase: null,
+      },
+      known_findings: priorFindings,
+      override: cycle.override,
+    };
+  }
+  return {
+    should_run: true,
+    phase,
+    discovery_round: discoveryRound,
+    lineage_base_sha: lineageBaseSha,
+    max_discovery_rounds: cycle.max_discovery_rounds,
+    cycle,
+    known_findings: phase === "verification" ? priorFindings : [],
+    override: cycle.override,
+  };
+}
+
+export function advanceReviewCycle({
+  plan,
+  analysisState,
+  headSha,
+  scopeHash: reviewedScopeHash,
+  findings,
+  blockSeverities = ["Critical", "High"],
+}) {
+  requirePlainObject(plan, "review cycle plan");
+  if (plan.should_run !== true || !REVIEW_PHASES.has(plan.phase)) {
+    throw new TypeError("review cycle plan must describe a runnable phase");
+  }
+  requireInteger(plan.discovery_round, "review cycle plan.discovery_round", 1);
+  if (!ANALYSIS_STATES.has(analysisState)) {
+    throw new TypeError("analysisState must be complete or inconclusive");
+  }
+  requireSha(headSha, "headSha");
+  requireFingerprint(reviewedScopeHash, "scopeHash");
+  validateCycleFindingList(findings, "findings");
+  if (
+    !Array.isArray(blockSeverities)
+    || blockSeverities.some((severity) => !SEVERITY_SET.has(severity))
+  ) {
+    throw new TypeError("blockSeverities must contain only supported severities");
+  }
+
+  const prior = plan.cycle === null ? null : validateReviewCycle(plan.cycle);
+  const maxDiscoveryRounds = plan.max_discovery_rounds
+    ?? prior?.max_discovery_rounds
+    ?? Math.max(2, plan.discovery_round);
+  const atDiscoveryLimit = plan.discovery_round >= maxDiscoveryRounds;
+  const cycleFindingCount = atDiscoveryLimit
+    ? findings.filter((finding) => blockSeverities.includes(finding.severity)).length
+    : findings.length;
+  let state;
+  let nextPhase;
+  if (analysisState === "inconclusive") {
+    state = prior?.state === "review_cycle_exhausted"
+      ? "review_cycle_exhausted"
+      : "active";
+    nextPhase = plan.phase;
+  } else if (plan.phase === "discovery") {
+    if (cycleFindingCount === 0) {
+      state = "ready";
+      nextPhase = null;
+    } else {
+      state = atDiscoveryLimit ? "review_cycle_exhausted" : "active";
+      nextPhase = "verification";
+    }
+  } else if (cycleFindingCount > 0) {
+    state = prior?.state === "review_cycle_exhausted"
+      ? "review_cycle_exhausted"
+      : "active";
+    nextPhase = "verification";
+  } else if (atDiscoveryLimit) {
+    state = "review_cycle_exhausted";
+    nextPhase = null;
+  } else {
+    state = "active";
+    nextPhase = "discovery";
+  }
+
+  return validateReviewCycle({
+    schema_version: REVIEW_CYCLE_SCHEMA_VERSION,
+    lineage_base_sha: plan.lineage_base_sha,
+    discovery_round: plan.discovery_round,
+    max_discovery_rounds: maxDiscoveryRounds,
+    state,
+    last_phase: plan.phase,
+    next_phase: nextPhase,
+    last_reviewed_head: headSha,
+    last_scope_hash: reviewedScopeHash,
+    last_analysis_state: analysisState,
+    override: plan.override,
+  });
 }
 
 function decodeCanonicalBase64(value, path) {

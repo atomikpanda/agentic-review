@@ -53,13 +53,10 @@ comments as they arrive. Read-only — it never comments, resolves or edits.
 
 ## Suppressing writes
 
-`suppress_writes: true` (workflow) produces the review and changes **nothing** on
-the pull request: no comment, no resolved thread, no edited comment. The
-artifact is still uploaded and `fail_on_findings` still applies. Use it to trial
-a configuration against a live pull request without touching it.
-
-`post_comment: false` is retained as a compatibility switch and also suppresses
-review writes; `suppress_writes` is the explicit choice for trial runs.
+`suppress_writes: true` and `post_comment: false` suppress every pull-request
+write while still producing the review artifact. Because no standing marker can
+persist cross-run state, hosted runs use one-off discovery with cycle state
+disabled; they do not claim bounded cross-run convergence or advance a cycle.
 
 ## Run it locally (details)
 
@@ -169,6 +166,44 @@ Every valid pass contributes to one union with `min_votes=1`, so a finding seen
 by only one pass survives. One result is rendered or posted: the union, or an
 explicitly inconclusive first-valid structured fallback if union fails.
 
+Hosted reviews add a bounded **cross-run cycle** around that per-run ensemble:
+
+1. A discovery phase may report new defects across the reviewed scope.
+2. After a remediation push, verification re-checks persisted finding
+   identities and invariants directly affected by their fixes. A directly
+   linked regression names its causal `verification_id`; the runner withholds
+   new identities without that provenance from its published result.
+3. A clean verification schedules one more discovery round.
+4. The default `max_discovery_rounds: 2` permits that final discovery, but never
+   an automatic third broad round. Verification retries do not consume the
+   discovery budget.
+
+The bot persists the cycle beside held findings in its authenticated
+pull-request review marker. Marker v2 carries the cycle and workflow run
+identity; readers prefer the higher run identity across heads, so a late
+cancelled run cannot roll state backward. Existing v1 markers migrate as
+discovery round one. Head lineage and advancing base lineage are retained.
+Force-pushes and unrelated base retargets reset active or ready state; exhausted
+state remains blocked until an authorized dispatch explicitly reopens discovery
+on the new lineage. An inconclusive retry of the same immutable head repeats
+the same phase and ordinal.
+At the discovery limit, severities named by `block_severities` remain blockers
+and receive verification; other valid findings remain visible as follow-up
+items without extending the automatic cycle. Rejected findings, recorded with
+evidence outside the current or held finding sets, do not block. After that
+verification the cycle ends in `review_cycle_exhausted`; unresolved findings
+are retained. The workflow does not apply fixes or start remediation itself.
+
+`review_cycle_exhausted` always fails the GitHub check, independently of
+`fail_on_findings`, so a completed runner cannot look approval-equivalent while
+the cross-run machine requires a decision. Only an authenticated
+`workflow_dispatch` or explicit API dispatch may supply
+`review_cycle_override_reason`; ordinary pull-request events cannot authorize
+it. GitHub records the actor, reason, and unique workflow-run invocation, and
+exactly one additional discovery round opens. Installer-generated workflows
+expose the same-repository manual dispatch with required pull-request number
+and reason inputs.
+
 The result separates four primary operator-visible values:
 
 | Output | Values | Meaning |
@@ -222,9 +257,10 @@ merge makes analysis `inconclusive`. Known findings still produce
 `sample_state=findings`; no known finding produces `sample_state=unknown`, never
 `clean`. None of those runs can set `bounded_converged=true`.
 
-`fail_on_findings: true` fails the hosted job only when
-`merge_state=blocked`. Without it, job success means execution succeeded, not
-that the sample was clean or converged.
+`fail_on_findings: true` additionally fails the hosted job when
+`merge_state=blocked`. Without it, a non-exhausted job success means execution
+succeeded, not that the sample was clean or converged. Cycle exhaustion always
+fails as described above.
 
 Hard execution failures still run the hosted poster. Missing or invalid review
 artifacts are never posted to the pull request and produce a conservative
@@ -246,6 +282,7 @@ The reusable workflow exposes these exact outputs:
 | `base_sha`, `head_sha`, `configuration_fingerprint` | The immutable review identity |
 | `passes_requested`, `passes_completed` | Counts of configured and valid passes |
 | `current_counts`, `unresolved_counts` | JSON severity maps for current and held findings |
+| `review_cycle_state`, `review_phase`, `discovery_round`, `max_discovery_rounds` | Persisted cross-run phase, terminal state, ordinal, and discovery budget |
 
 The same values appear in the review body and GitHub job summary. The hosted
 `agentic-review` artifact always retains the required final result
@@ -277,6 +314,10 @@ does not make reconciliation unknown and never suppresses current review writes.
 Pull-request review history remains authoritative; if it cannot be read,
 reconciliation is unknown. Summary bodies have no per-finding GitHub
 resolved-thread signal; use `inline` or `suggest` when that signal is required.
+
+Cycle state uses the same authenticated standing review transport. A malformed
+newest bot marker fails cycle planning rather than falling back to older state.
+Human- or attacker-authored markers never affect the cycle.
 
 A prior finding omitted by a later stochastic sample remains held while the run
 is inconclusive or its original span is unchanged or indeterminate, and still
@@ -376,6 +417,8 @@ cell means that surface does not expose the setting.
 | Injected knowledge | both skills | `skills_path` | `--skill` | `--skill` |
 | Review style | `suggest` | `review_mode` | `--review-mode` | `--review-mode` |
 | Findings cap | `20` (`0` = none) | `max_findings` | `--max-findings` | `--max-findings` |
+| Broad discovery rounds per cycle | `2` | `max_discovery_rounds` | `--max-discovery-rounds` |  |
+| One additional human-authorized discovery | none | `review_cycle_override_reason` |  |  |
 | Post a PR comment | `true` | `post_comment` | `--no-comment` |  |
 | Resolve stale threads | `true` | `resolve_stale` |  |  |
 | Suppress every PR write | `false` | `suppress_writes` |  |  |
