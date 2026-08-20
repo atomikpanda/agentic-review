@@ -21,6 +21,16 @@ Otherwise:
       ]
     }
 
+During a verification phase, a remediation-caused regression with a new finding
+identity must also include:
+
+    "verification_of": "K1",
+    "verification_classification": "linked_regression"
+
+`verification_of` must name the causal persisted finding's `verification_id`
+from the verification prompt. Do not add these fields during discovery or to a
+persisted finding that still reproduces under its existing identity.
+
 Rules that decide whether a finding can be shown at all:
 
 - `start_line` and `end_line` are line numbers **in the new version of the

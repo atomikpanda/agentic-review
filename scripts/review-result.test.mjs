@@ -8,11 +8,14 @@ import test from "node:test";
 import {
   DEFAULT_PASS_DESCRIPTORS,
   REVIEW_RESULT_SCHEMA_VERSION,
+  advanceReviewCycle,
   configurationFingerprint,
   createReviewPublication,
   deriveAnalysisState,
   deriveReviewState,
   derivePublicationFailureResult,
+  planReviewCycle,
+  validateReviewCycle,
   validateReviewPublication,
   validateRunMetadata,
 } from "./review-result.mjs";
@@ -737,4 +740,328 @@ test("the guarded CLI uses the importable fingerprint, analysis, and validation 
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("review cycles progress from discovery through verification to one final discovery", () => {
+  const discoveryOne = planReviewCycle({
+    baseSha: BASE_SHA,
+    headSha: HEAD_SHA,
+    maxDiscoveryRounds: 2,
+  });
+  assert.deepEqual(discoveryOne, {
+    should_run: true,
+    phase: "discovery",
+    discovery_round: 1,
+    lineage_base_sha: BASE_SHA,
+    max_discovery_rounds: 2,
+    cycle: null,
+    known_findings: [],
+    override: null,
+  });
+
+  const afterDiscovery = advanceReviewCycle({
+    plan: discoveryOne,
+    analysisState: "complete",
+    headSha: HEAD_SHA,
+    scopeHash: SCOPE_HASH,
+    findings: [finding("High")],
+  });
+  assert.equal(afterDiscovery.state, "active");
+  assert.equal(afterDiscovery.last_phase, "discovery");
+  assert.equal(afterDiscovery.next_phase, "verification");
+  const configured = planReviewCycle({
+    baseSha: BASE_SHA,
+    headSha: HEAD_SHA,
+    maxDiscoveryRounds: 3,
+  });
+  assert.equal(advanceReviewCycle({
+    plan: configured,
+    analysisState: "complete",
+    headSha: HEAD_SHA,
+    scopeHash: SCOPE_HASH,
+    findings: [finding("High")],
+  }).max_discovery_rounds, 3);
+  assert.equal(afterDiscovery.discovery_round, 1);
+
+  const verification = planReviewCycle({
+    priorCycle: afterDiscovery,
+    priorFindings: [finding("High")],
+    baseSha: BASE_SHA,
+    headSha: "4".repeat(40),
+    maxDiscoveryRounds: 2,
+  });
+  assert.equal(verification.phase, "verification");
+  assert.equal(verification.discovery_round, 1);
+  assert.deepEqual(verification.known_findings, [finding("High")]);
+
+  const afterVerification = advanceReviewCycle({
+    plan: verification,
+    analysisState: "complete",
+    headSha: "4".repeat(40),
+    scopeHash: "5".repeat(64),
+    findings: [],
+  });
+  assert.equal(afterVerification.state, "active");
+  assert.equal(afterVerification.next_phase, "discovery");
+
+  const discoveryTwo = planReviewCycle({
+    priorCycle: afterVerification,
+    priorFindings: [],
+    baseSha: BASE_SHA,
+    headSha: "4".repeat(40),
+    maxDiscoveryRounds: 2,
+  });
+  assert.equal(discoveryTwo.phase, "discovery");
+  assert.equal(discoveryTwo.discovery_round, 2);
+
+  const exhausted = advanceReviewCycle({
+    plan: discoveryTwo,
+    analysisState: "complete",
+    headSha: "4".repeat(40),
+    scopeHash: "6".repeat(64),
+    findings: [finding("High")],
+  });
+  assert.equal(exhausted.state, "review_cycle_exhausted");
+  assert.equal(exhausted.next_phase, "verification");
+  const followUp = advanceReviewCycle({
+    plan: discoveryTwo,
+    analysisState: "complete",
+    headSha: "4".repeat(40),
+    scopeHash: "6".repeat(64),
+    findings: [finding("Medium")],
+  });
+  assert.equal(followUp.state, "ready");
+  assert.equal(followUp.next_phase, null);
+
+  const finalVerification = planReviewCycle({
+    priorCycle: exhausted,
+    priorFindings: [finding("High")],
+    baseSha: BASE_SHA,
+    headSha: "5".repeat(40),
+    maxDiscoveryRounds: 2,
+  });
+  const finalState = advanceReviewCycle({
+    plan: finalVerification,
+    analysisState: "complete",
+    headSha: "5".repeat(40),
+    scopeHash: "7".repeat(64),
+    findings: [],
+  });
+  assert.equal(finalState.state, "review_cycle_exhausted");
+  assert.equal(finalState.next_phase, null);
+});
+
+test("an inconclusive retry of one immutable head does not consume another discovery round", () => {
+  const firstPlan = planReviewCycle({
+    baseSha: BASE_SHA,
+    headSha: HEAD_SHA,
+    maxDiscoveryRounds: 2,
+  });
+  const inconclusive = advanceReviewCycle({
+    plan: firstPlan,
+    analysisState: "inconclusive",
+    headSha: HEAD_SHA,
+    scopeHash: SCOPE_HASH,
+    findings: [],
+  });
+
+  const retry = planReviewCycle({
+    priorCycle: inconclusive,
+    priorFindings: [],
+    baseSha: BASE_SHA,
+    headSha: HEAD_SHA,
+    maxDiscoveryRounds: 2,
+  });
+  assert.equal(retry.phase, "discovery");
+  assert.equal(retry.discovery_round, 1);
+});
+
+
+test("head lineage changes cannot inherit a terminal or unrelated cycle", () => {
+  const ready = validateReviewCycle({
+    schema_version: 1,
+    lineage_base_sha: BASE_SHA,
+    discovery_round: 1,
+    max_discovery_rounds: 2,
+    state: "ready",
+    last_phase: "discovery",
+    next_phase: null,
+    last_reviewed_head: HEAD_SHA,
+    last_scope_hash: SCOPE_HASH,
+    last_analysis_state: "complete",
+    override: null,
+  });
+  const changedAfterReady = planReviewCycle({
+    priorCycle: ready,
+    priorFindings: [],
+    baseSha: BASE_SHA,
+    headSha: "4".repeat(40),
+    maxDiscoveryRounds: 2,
+    lineageValid: true,
+  });
+  assert.equal(changedAfterReady.phase, "discovery");
+  assert.equal(changedAfterReady.discovery_round, 1);
+  assert.equal(changedAfterReady.cycle, null);
+
+  const active = {
+    ...ready,
+    state: "active",
+    next_phase: "verification",
+  };
+  const forcePushed = planReviewCycle({
+    priorCycle: active,
+    priorFindings: [finding("High")],
+    baseSha: BASE_SHA,
+    headSha: "5".repeat(40),
+    maxDiscoveryRounds: 2,
+    lineageValid: false,
+  });
+  assert.equal(forcePushed.phase, "discovery");
+  assert.equal(forcePushed.discovery_round, 1);
+  assert.equal(forcePushed.cycle, null);
+
+  const exhausted = {
+    ...active,
+    discovery_round: 2,
+    state: "review_cycle_exhausted",
+    next_phase: null,
+  };
+  const blockedRetarget = planReviewCycle({
+    priorCycle: exhausted,
+    priorFindings: [finding("High")],
+    baseSha: "7".repeat(40),
+    headSha: "6".repeat(40),
+    maxDiscoveryRounds: 2,
+    lineageValid: false,
+  });
+  assert.equal(blockedRetarget.should_run, false);
+  assert.equal(blockedRetarget.cycle, exhausted);
+
+  const authorizedRetarget = planReviewCycle({
+    priorCycle: exhausted,
+    priorFindings: [finding("High")],
+    baseSha: "7".repeat(40),
+    headSha: "6".repeat(40),
+    maxDiscoveryRounds: 2,
+    lineageValid: false,
+    override: {
+      actor: "release-manager",
+      reason: "authorize retarget review",
+      invocation: "run-103",
+    },
+  });
+  assert.equal(authorizedRetarget.phase, "discovery");
+  assert.equal(authorizedRetarget.cycle.lineage_base_sha, "7".repeat(40));
+});
+test("an explicit override opens exactly one discovery round after exhaustion", () => {
+  const exhausted = validateReviewCycle({
+    schema_version: 1,
+    lineage_base_sha: BASE_SHA,
+    discovery_round: 2,
+    max_discovery_rounds: 2,
+    state: "review_cycle_exhausted",
+    last_phase: "verification",
+    next_phase: null,
+    last_reviewed_head: HEAD_SHA,
+    last_scope_hash: SCOPE_HASH,
+    last_analysis_state: "complete",
+    override: null,
+  });
+  const override = {
+    actor: "release-manager",
+    reason: "release-blocking re-review",
+    invocation: "run-101",
+  };
+  assert.throws(() => planReviewCycle({
+    priorCycle: exhausted,
+    priorFindings: [],
+    baseSha: BASE_SHA,
+    headSha: HEAD_SHA,
+    maxDiscoveryRounds: 2,
+    override: { actor: "release-manager", reason: "   " },
+  }), /non-whitespace/);
+  const plan = planReviewCycle({
+    priorCycle: exhausted,
+    priorFindings: [],
+    baseSha: BASE_SHA,
+    headSha: HEAD_SHA,
+    maxDiscoveryRounds: 2,
+    override,
+  });
+
+  assert.equal(plan.phase, "discovery");
+  assert.equal(plan.discovery_round, 3);
+  assert.deepEqual(plan.override, override);
+  const afterOverride = advanceReviewCycle({
+    plan,
+    analysisState: "complete",
+    headSha: HEAD_SHA,
+    scopeHash: SCOPE_HASH,
+    findings: [finding("High")],
+  });
+  const verification = planReviewCycle({
+    priorCycle: afterOverride,
+    priorFindings: [finding("High")],
+    baseSha: BASE_SHA,
+    headSha: "5".repeat(40),
+    maxDiscoveryRounds: 2,
+    override,
+  });
+  assert.equal(verification.phase, "verification");
+  assert.equal(verification.discovery_round, 3);
+  const freshOverride = {
+    actor: "release-manager",
+    reason: "release-blocking re-review",
+    invocation: "run-102",
+  };
+  assert.throws(() => planReviewCycle({
+    priorCycle: afterOverride,
+    priorFindings: [finding("High")],
+    baseSha: BASE_SHA,
+    headSha: "5".repeat(40),
+    maxDiscoveryRounds: 2,
+    override: freshOverride,
+  }), /pending verification/);
+  const afterVerification = advanceReviewCycle({
+    plan: verification,
+    analysisState: "complete",
+    headSha: "5".repeat(40),
+    scopeHash: "6".repeat(64),
+    findings: [],
+  });
+  const stopped = planReviewCycle({
+    priorCycle: afterVerification,
+    priorFindings: [],
+    baseSha: BASE_SHA,
+    headSha: "5".repeat(40),
+    maxDiscoveryRounds: 2,
+    override,
+  });
+  assert.equal(stopped.should_run, false);
+  const secondAuthorization = planReviewCycle({
+    priorCycle: afterVerification,
+    priorFindings: [],
+    baseSha: BASE_SHA,
+    headSha: "5".repeat(40),
+    maxDiscoveryRounds: 2,
+    override: freshOverride,
+  });
+  assert.equal(secondAuthorization.phase, "discovery");
+  assert.equal(secondAuthorization.discovery_round, 4);
+});
+
+test("cycle validation rejects silent blocker loss and malformed transitions", () => {
+  assert.throws(() => validateReviewCycle({
+    schema_version: 1,
+    lineage_base_sha: BASE_SHA,
+    discovery_round: 2,
+    max_discovery_rounds: 2,
+    state: "ready",
+    last_phase: "verification",
+    next_phase: "discovery",
+    last_reviewed_head: HEAD_SHA,
+    last_scope_hash: SCOPE_HASH,
+    last_analysis_state: "complete",
+    override: null,
+  }), /ready cycle.*next_phase/);
 });

@@ -16,6 +16,7 @@ import {
   fetchOurThreads,
   fetchSummaryComments,
   fetchSummaryReviews,
+  planHostedReviewCycle,
   fetchViewerLogin,
   findingFromThread,
   reconcileSummaryFindings,
@@ -218,6 +219,9 @@ function runPosterWithHistory({
   externalDiff = false,
   textconv = false,
   gitFinding = null,
+  scriptArgs = [],
+  extraEnv = {},
+  reviewCyclePlan = null,
 }) {
   const dir = mkdtempSync(join(tmpdir(), "post-review-history-"));
   let runtimeMetadata = metadata();
@@ -282,6 +286,11 @@ exit 0
   const outputFile = join(dir, "output");
   const summaryFile = join(dir, "summary");
   const resultFile = join(dir, "review-result.json");
+  const cyclePlanFile = join(dir, "review-cycle-plan.json");
+  const knownFindingsFile = join(dir, "review-known-findings.json");
+  if (reviewCyclePlan !== null) {
+    writeFileSync(cyclePlanFile, `${JSON.stringify(reviewCyclePlan, null, 2)}\n`);
+  }
   const preloadFile = join(dir, "mock-github.cjs");
   writeReviewPublication(publicationFile, runtimeMetadata, currentFindings);
   writeFileSync(preloadFile, `
@@ -342,7 +351,7 @@ globalThis.fetch = async (url, options = {}) => {
 `);
   const result = spawnSync(
     process.execPath,
-    [fileURLToPath(new URL("./post-review.mjs", import.meta.url))],
+    [fileURLToPath(new URL("./post-review.mjs", import.meta.url)), ...scriptArgs],
     {
       encoding: "utf8",
       cwd: changedSpan ? dir : undefined,
@@ -364,6 +373,9 @@ globalThis.fetch = async (url, options = {}) => {
         GITHUB_OUTPUT: outputFile,
         GITHUB_STEP_SUMMARY: summaryFile,
         REVIEW_RESULT_FILE: resultFile,
+        BASE_SHA: runtimeMetadata.base_sha,
+        REVIEW_CYCLE_PLAN_FILE: cyclePlanFile,
+        KNOWN_FINDINGS_FILE: knownFindingsFile,
         GITHUB_REPO: "o/r",
         PR_NUMBER: "7",
         GH_TOKEN: "token",
@@ -383,12 +395,17 @@ globalThis.fetch = async (url, options = {}) => {
         ...(textconv
           ? { TEXTCONV_LOG: textconvLog }
           : {}),
+        ...extraEnv,
       },
     },
   );
   const workflowOutput = readFileSync(outputFile, "utf8");
   const jobSummary = existsSync(summaryFile) ? readFileSync(summaryFile, "utf8") : "";
   const finalResult = existsSync(resultFile) ? JSON.parse(readFileSync(resultFile, "utf8")) : null;
+  const cyclePlan = existsSync(cyclePlanFile) ? JSON.parse(readFileSync(cyclePlanFile, "utf8")) : null;
+  const knownFindings = existsSync(knownFindingsFile)
+    ? JSON.parse(readFileSync(knownFindingsFile, "utf8")).findings
+    : null;
   const externalDiffExecuted = existsSync(externalDiffLog);
   const textconvExecuted = existsSync(textconvLog);
   rmSync(dir, { recursive: true, force: true });
@@ -397,6 +414,8 @@ globalThis.fetch = async (url, options = {}) => {
     workflowOutput,
     jobSummary,
     finalResult,
+    cyclePlan,
+    knownFindings,
     externalDiffExecuted,
     textconvExecuted,
   };
@@ -422,6 +441,257 @@ test("summary marker round-trips only normalized carry-forward fields", () => {
   assert.ok(!marker.includes("discard me"));
 });
 
+test("summary marker v2 round-trips hosted cycle state while v1 remains readable", () => {
+  const cycle = {
+    schema_version: 1,
+    lineage_base_sha: BASE_SHA,
+    discovery_round: 2,
+    max_discovery_rounds: 2,
+    state: "review_cycle_exhausted",
+    last_phase: "discovery",
+    next_phase: "verification",
+    last_reviewed_head: HEAD_SHA,
+    last_scope_hash: SCOPE_HASH,
+    last_analysis_state: "complete",
+    override: null,
+  };
+  const marker = encodeSummaryMarker({
+    headSha: HEAD_SHA,
+    findings: [finding()],
+    cycle,
+  });
+  assert.match(marker, /^<!-- agentic-review-summary:v2:[A-Za-z0-9_-]+ -->$/);
+  assert.deepEqual(decodeSummaryMarker(marker).cycle, cycle);
+
+  const body = buildStandingSummaryBody({
+    metadata: metadata(),
+    state: deriveReviewState({
+      analysisState: "complete",
+      current: [finding()],
+      unresolved: [],
+      reconciliationKnown: true,
+      blockSeverities: ["Critical", "High"],
+    }),
+    current: [finding()],
+    unresolved: [],
+    cycle,
+  });
+  assert.deepEqual(decodeSummaryMarker(body).cycle, cycle);
+  const legacy = encodeSummaryMarker({ headSha: PRIOR_HEAD_SHA, findings: [] });
+  assert.match(legacy, /^<!-- agentic-review-summary:v1:[A-Za-z0-9_-]+ -->$/);
+  assert.deepEqual(decodeSummaryMarker(legacy), {
+    head_sha: PRIOR_HEAD_SHA,
+    findings: [],
+  });
+});
+
+test("hosted cycle planning migrates v1 evidence into conservative discovery", () => {
+  const priorFinding = finding();
+  const plan = planHostedReviewCycle({
+    reviews: [botComment(
+      9,
+      encodeSummaryMarker({ headSha: PRIOR_HEAD_SHA, findings: [priorFinding] }),
+    )],
+    comments: [],
+    botLogin: "github-actions[bot]",
+    baseSha: BASE_SHA,
+    headSha: HEAD_SHA,
+    maxDiscoveryRounds: 2,
+  });
+
+  assert.equal(plan.phase, "discovery");
+  assert.equal(plan.discovery_round, 2);
+  assert.equal(plan.cycle.last_phase, "discovery");
+  assert.equal(plan.cycle.last_analysis_state, "inconclusive");
+  assert.deepEqual(plan.known_findings, []);
+});
+
+
+test("unrelated base retarget resets hosted cycle lineage", () => {
+  const cycle = {
+    schema_version: 1,
+    lineage_base_sha: BASE_SHA,
+    discovery_round: 1,
+    max_discovery_rounds: 2,
+    state: "active",
+    last_phase: "discovery",
+    next_phase: "verification",
+    last_reviewed_head: PRIOR_HEAD_SHA,
+    last_scope_hash: SCOPE_HASH,
+    last_analysis_state: "complete",
+    override: null,
+  };
+  const plan = planHostedReviewCycle({
+    reviews: [botReview(1, encodeSummaryMarker({
+      headSha: PRIOR_HEAD_SHA,
+      findings: [finding()],
+      cycle,
+    }))],
+    botLogin: "github-actions[bot]",
+    baseSha: "7".repeat(40),
+    headSha: HEAD_SHA,
+    maxDiscoveryRounds: 2,
+    isAncestor: (ancestor, descendant) =>
+      ancestor === PRIOR_HEAD_SHA && descendant === HEAD_SHA,
+  });
+
+  assert.equal(plan.phase, "discovery");
+  assert.equal(plan.discovery_round, 1);
+  assert.equal(plan.cycle, null);
+});
+test("terminal cycle planning emits conservative evidence without another review run", () => {
+  const priorFinding = finding();
+  const cycle = {
+    schema_version: 1,
+    lineage_base_sha: BASE_SHA,
+    discovery_round: 2,
+    max_discovery_rounds: 2,
+    state: "review_cycle_exhausted",
+    last_phase: "verification",
+    next_phase: null,
+    last_reviewed_head: HEAD_SHA,
+    last_scope_hash: SCOPE_HASH,
+    last_analysis_state: "complete",
+    override: null,
+  };
+  const result = runPosterWithHistory({
+    mode: "summary",
+    summaryReviews: [botComment(
+      9,
+      encodeSummaryMarker({ headSha: HEAD_SHA, findings: [priorFinding], cycle }),
+    )],
+    writesEnabled: true,
+    scriptArgs: ["cycle-plan"],
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.cyclePlan.should_run, false);
+  assert.equal(result.knownFindings[0].title, priorFinding.title);
+  assert.equal(result.knownFindings[0].suggestion, null);
+  assert.equal(result.finalResult.analysis_state, "inconclusive");
+  assert.equal(result.finalResult.merge_state, "blocked");
+  assert.equal(result.finalResult.sample_state, "findings");
+  assert.equal(result.finalResult.coverage, "unknown");
+  assert.deepEqual(result.finalResult.remaining_analysis, ["execution_failed"]);
+  assert.equal(result.finalResult.bounded_converged, false);
+  assert.equal(result.finalResult.converged, false);
+  assert.deepEqual(result.finalResult.unresolved_counts, {
+    Critical: 0,
+    High: 1,
+    Medium: 0,
+  });
+});
+
+
+test("hosted cycle planning does not advance unpersisted state", () => {
+  const cycle = {
+    schema_version: 1,
+    lineage_base_sha: BASE_SHA,
+    discovery_round: 2,
+    max_discovery_rounds: 2,
+    state: "review_cycle_exhausted",
+    last_phase: "verification",
+    next_phase: null,
+    last_reviewed_head: PRIOR_HEAD_SHA,
+    last_scope_hash: SCOPE_HASH,
+    last_analysis_state: "complete",
+    override: null,
+  };
+  const result = runPosterWithHistory({
+    mode: "summary",
+    summaryReviews: [botComment(
+      9,
+      encodeSummaryMarker({ headSha: PRIOR_HEAD_SHA, findings: [finding()], cycle }),
+    )],
+    scriptArgs: ["cycle-plan"],
+    extraEnv: { POST_COMMENT: "false" },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.cyclePlan.persistence_enabled, false);
+  assert.equal(result.cyclePlan.should_run, true);
+  assert.equal(result.cyclePlan.phase, "discovery");
+  assert.equal(result.cyclePlan.cycle, null);
+  assert.equal(result.finalResult, null);
+});
+
+
+test("a pending cycle phase cannot publish a clean green result", () => {
+  const priorCycle = {
+    schema_version: 1,
+    lineage_base_sha: BASE_SHA,
+    discovery_round: 1,
+    max_discovery_rounds: 2,
+    state: "active",
+    last_phase: "discovery",
+    next_phase: "verification",
+    last_reviewed_head: PRIOR_HEAD_SHA,
+    last_scope_hash: SCOPE_HASH,
+    last_analysis_state: "complete",
+    override: null,
+  };
+  const result = runPosterWithHistory({
+    mode: "summary",
+    reviewCyclePlan: {
+      should_run: true,
+      phase: "verification",
+      discovery_round: 1,
+      lineage_base_sha: BASE_SHA,
+      max_discovery_rounds: 2,
+      cycle: priorCycle,
+      known_findings: [],
+      override: null,
+    },
+    extraEnv: { RENDER: "1" },
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /review cycle requires discovery/);
+  assert.equal(result.finalResult.sample_state, "unknown");
+  assert.equal(result.finalResult.bounded_converged, false);
+  assert.equal(result.finalResult.review_cycle.state, "active");
+  assert.equal(result.finalResult.review_cycle.next_phase, "discovery");
+});
+test("cycle exhaustion fails the gate without rewriting successful execution evidence", () => {
+  const priorCycle = {
+    schema_version: 1,
+    lineage_base_sha: BASE_SHA,
+    discovery_round: 2,
+    max_discovery_rounds: 2,
+    state: "review_cycle_exhausted",
+    last_phase: "discovery",
+    next_phase: "verification",
+    last_reviewed_head: PRIOR_HEAD_SHA,
+    last_scope_hash: SCOPE_HASH,
+    last_analysis_state: "complete",
+    override: null,
+  };
+  const reviewCyclePlan = {
+    should_run: true,
+    phase: "verification",
+    discovery_round: 2,
+    lineage_base_sha: BASE_SHA,
+    max_discovery_rounds: 2,
+    cycle: priorCycle,
+    known_findings: [],
+    override: null,
+  };
+  const result = runPosterWithHistory({
+    mode: "summary",
+    reviewCyclePlan,
+    extraEnv: { RENDER: "1" },
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /review cycle exhausted/);
+  assert.equal(result.finalResult.analysis_state, "complete");
+  assert.equal(result.finalResult.sample_state, "unknown");
+  assert.equal(result.finalResult.bounded_converged, false);
+  assert.equal(result.finalResult.converged, false);
+  assert.equal(result.finalResult.review_cycle.state, "review_cycle_exhausted");
+  assert.equal(result.finalResult.review_cycle.next_phase, null);
+  assert.equal(result.finalResult.coverage, "bounded");
+  assert.deepEqual(result.finalResult.remaining_analysis, []);
+});
 test("distinct held marker identities survive shared placeholder prose and keep the gate blocked", () => {
   const held = [
     finding({
@@ -496,6 +766,27 @@ test("newest trusted summary marker wins globally across reviews and legacy comm
   assert.equal(selected.headSha, HEAD_SHA);
 });
 
+
+test("higher workflow run identity wins cross-head state despite later stale publication", () => {
+  const newerRun = encodeSummaryMarker({
+    headSha: HEAD_SHA,
+    findings: [finding({ title: "Newer run state" })],
+    runId: "102",
+  });
+  const staleRun = encodeSummaryMarker({
+    headSha: PRIOR_HEAD_SHA,
+    findings: [finding({ title: "Stale run state" })],
+    runId: "101",
+  });
+  const selected = selectSummaryHistory([
+    botReview(1, newerRun),
+    botReview(2, staleRun),
+  ], { botLogin: "github-actions[bot]" });
+
+  assert.equal(selected.comment.id, 1);
+  assert.equal(selected.runId, "102");
+  assert.equal(selected.findings[0].title, "Newer run state");
+});
 test("authenticated App bot identity owns and posts pull-request review history", async () => {
   const login = await fetchViewerLogin({
     token: "token",
@@ -1718,7 +2009,14 @@ test("summary lifecycle appends pull-request reviews including a later clean sta
   assert.equal(updated, "posted");
   assert.equal(calls[1].options.method, "POST");
   assert.match(calls[1].url, /\/repos\/o\/r\/pulls\/7\/reviews$/);
+  const markerOnly = await postSummaryReview({
+    repo: "o/r", pr: 7, token: "token", headSha: HEAD_SHA, hasHistory: false,
+    body: "cycle marker", hasFindings: false, hasCycleState: true, writesEnabled: true, fetchImpl,
+  });
+  assert.equal(markerOnly, "posted");
+  assert.equal(calls[2].options.method, "POST");
 });
+
 
 test("summary lifecycle creates no empty review and suppresses every write", async () => {
   let calls = 0;

@@ -82,6 +82,8 @@ TOOLS="${AGENTIC_REVIEW_TOOLS:-read,grep,glob}"
 MAX_TIME="${AGENTIC_REVIEW_MAX_TIME:-}"
 PROMPT_FILE="${AGENTIC_REVIEW_PROMPT:-review/prompt.md}"
 SKILL="${AGENTIC_REVIEW_SKILL:-}"
+REVIEW_PHASE="${AGENTIC_REVIEW_PHASE:-discovery}"
+KNOWN_FINDINGS_FILE="${AGENTIC_REVIEW_KNOWN_FINDINGS:-}"
 SKILL_DEFAULT="skills/infra-review/SKILL.md,skills/security-review/SKILL.md"
 MAX_FINDINGS="${AGENTIC_REVIEW_MAX_FINDINGS:-20}"
 # suggest by default. summary was the old default and it quietly disabled two
@@ -503,6 +505,16 @@ RESULT_HELPER="$(support_exec scripts/review-result.mjs)" \
 MERGE="$(support_exec scripts/merge-findings.mjs)" \
   || die "scripts/merge-findings.mjs is missing from $SELF_ROOT"
 command -v node >/dev/null 2>&1 || die "node is required for structured review results"
+case "$REVIEW_PHASE" in
+  discovery) ;;
+  verification)
+    [ -n "$KNOWN_FINDINGS_FILE" ] \
+      || die "verification phase requires AGENTIC_REVIEW_KNOWN_FINDINGS"
+    node "$MERGE" --check "$KNOWN_FINDINGS_FILE" 2>/dev/null \
+      || die "verification findings are not valid structured findings"
+    ;;
+  *) die "review phase must be discovery or verification (got '$REVIEW_PHASE')" ;;
+esac
 
 RUN_TMP="$(mktemp -d)"
 CODEGRAPH_READY=0
@@ -652,6 +664,29 @@ build_prompt() {
     cat "$PROMPT_FILE"
     echo
     if [ -n "$lens_file" ]; then echo; lens_focus_file "$lens_file"; echo; fi
+    if [ "$REVIEW_PHASE" = "verification" ]; then
+      echo "## Verification phase"
+      echo
+      echo "Re-check only the persisted findings below and the affected invariants"
+      echo "directly changed by their remediation. Do not report unrelated findings,"
+      echo "even if broader review discovers them. Return a finding only when it still"
+      echo "reproduces, or when the remediation caused a directly linked regression."
+      echo "For a linked regression, copy the causal finding's verification_id into"
+      echo "verification_of and set verification_classification to linked_regression."
+      echo "The runner rejects unlinked new identities from verification output."
+      echo
+      echo '```json'
+      cat "$KNOWN_FINDINGS_FILE"
+      echo
+      echo '```'
+      echo
+    else
+      echo "## Discovery phase"
+      echo
+      echo "Search the reviewed scope broadly for new defects. This is the phase that"
+      echo "may add findings to the review cycle."
+      echo
+    fi
     if [ -n "${INTENT:-}" ]; then
       echo "## What this change is meant to do"
       echo
@@ -717,6 +752,7 @@ CONFIG_FILE="$RUN_TMP/configuration.json"
 MODEL="$MODEL" THINKING="$THINKING" TOOLS="$TOOLS" MAX_TIME="$MAX_TIME" \
 OMP_VERSION="$OMP_VERSION" MAX_DIFF_BYTES="$MAX_DIFF_BYTES" MAX_FINDINGS="$MAX_FINDINGS" \
 MIN_VOTES="$MIN_VOTES" USE_CODEGRAPH="$USE_CODEGRAPH" CODEGRAPH_READY="$CODEGRAPH_READY" \
+REVIEW_PHASE="$REVIEW_PHASE" KNOWN_FINDINGS_FILE="$KNOWN_FINDINGS_FILE" \
 PROMPT_FILE="$PROMPT_FILE" FORMAT_FILE="$FORMAT_FILE" node -e '
   const fs = require("node:fs");
   const output = process.argv[1];
@@ -742,6 +778,10 @@ PROMPT_FILE="$PROMPT_FILE" FORMAT_FILE="$FORMAT_FILE" node -e '
     omp_version: process.env.OMP_VERSION,
     prompt_content: fs.readFileSync(process.env.PROMPT_FILE, "utf8"),
     format_content: fs.readFileSync(process.env.FORMAT_FILE, "utf8"),
+    review_phase: process.env.REVIEW_PHASE,
+    known_findings_content: process.env.KNOWN_FINDINGS_FILE
+      ? fs.readFileSync(process.env.KNOWN_FINDINGS_FILE, "utf8")
+      : "",
     diff_cap: Number(process.env.MAX_DIFF_BYTES),
     finding_cap: Number(process.env.MAX_FINDINGS),
     min_votes: Number(process.env.MIN_VOTES),
@@ -967,6 +1007,12 @@ else
     say "min-votes $MIN_VOTES merge failed — preserving the union"
     mv -f "$UNION_OUT" "$TMP_OUT"
   fi
+fi
+if [ "$REVIEW_PHASE" = "verification" ]; then
+  verification_out="$RUN_TMP/verification.json"
+  node "$MERGE" --known-only "$KNOWN_FINDINGS_FILE" "$TMP_OUT" > "$verification_out" \
+    || die "could not enforce verification finding identities"
+  mv -f "$verification_out" "$TMP_OUT"
 fi
 publish_findings
 write_publication "$MERGE_SUCCEEDED"

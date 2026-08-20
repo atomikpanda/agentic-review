@@ -30,6 +30,7 @@
 #   --skill FILE             file appended to the system prompt
 #   --review-mode M          suggest|inline|summary (default suggest)
 #   --max-findings N         0 disables the cap
+#   --max-discovery-rounds N  broad review rounds before human override is required
 #   --fail-on-findings       make the review a blocking check
 #   --no-comment             don't post a PR comment (artifact only)
 #   --omp-version V          pin @oh-my-pi/pi-coding-agent
@@ -61,8 +62,8 @@ fi
 REPO=""; OR_KEY=""; ASSUME_YES=0; WITH_PR_AGENT=""; PR_AGENT_MODEL=""
 # Reviewer knobs. Empty means "not specified" — omitted from `with:` entirely.
 I_MODEL=""; I_THINKING=""; I_TOOLS=""; I_MAX_TIME=""; I_PROMPT=""; I_SKILL=""
-I_MAX_FINDINGS=""; I_FAIL=""; I_COMMENT=""; I_OMP_VERSION=""; I_BUN_VERSION=""
-I_REVIEW_MODE=""
+I_MAX_FINDINGS=""; I_MAX_DISCOVERY_ROUNDS=""; I_FAIL=""; I_COMMENT=""
+I_OMP_VERSION=""; I_BUN_VERSION=""; I_REVIEW_MODE=""
 I_EXTRA_ARGS=""
 
 while [ $# -gt 0 ]; do
@@ -80,6 +81,7 @@ while [ $# -gt 0 ]; do
     --prompt)           I_PROMPT="${2:-}"; shift 2 ;;
     --skill)            I_SKILL="${2:-}"; shift 2 ;;
     --max-findings)     I_MAX_FINDINGS="${2:-}"; shift 2 ;;
+    --max-discovery-rounds) I_MAX_DISCOVERY_ROUNDS="${2:-}"; shift 2 ;;
     --review-mode)      I_REVIEW_MODE="${2:-}"; shift 2 ;;
     --fail-on-findings) I_FAIL="true"; shift ;;
     --no-comment)       I_COMMENT="false"; shift ;;
@@ -113,6 +115,13 @@ if [ -n "$I_EXTRA_ARGS" ]; then
         exit 2 ;;
     esac
   done
+fi
+if [ -n "$I_MAX_DISCOVERY_ROUNDS" ]; then
+  case "$I_MAX_DISCOVERY_ROUNDS" in
+    *[!0-9]*|'') printf '%s\n' "--max-discovery-rounds must be a positive integer" >&2; exit 2 ;;
+  esac
+  [ "$I_MAX_DISCOVERY_ROUNDS" -ge 1 ] \
+    || { printf '%s\n' "--max-discovery-rounds must be a positive integer" >&2; exit 2; }
 fi
 
 _c() { if [ -t 1 ]; then printf '\033[%sm' "$1"; fi; }
@@ -209,6 +218,16 @@ name: agentic-review
 on:
   pull_request_target:
     types: [opened, reopened, ready_for_review, synchronize]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to re-review after cycle exhaustion.
+        required: true
+        type: string
+      review_cycle_override_reason:
+        description: Security-critical or release-blocking reason for one additional discovery round.
+        required: true
+        type: string
 
 # A called workflow cannot grant itself more than the caller has. Without
 # pull-request write access a read-only default token could review successfully
@@ -222,16 +241,16 @@ jobs:
     uses: ${CENTRAL_REPO}/.github/workflows/agentic-review.yml@${CENTRAL_REF}
     secrets:
       OPENROUTER_API_KEY: \${{ secrets.OPENROUTER_API_KEY }}
+    with:
+      target_repo: \${{ github.event_name == 'workflow_dispatch' && github.repository || '' }}
+      target_pr: \${{ inputs.pr_number || '' }}
+      review_cycle_override_reason: \${{ inputs.review_cycle_override_reason || '' }}
 YAML
 
   # Only the knobs that were explicitly asked for. Everything else is left out
   # so it keeps following the central repo's default instead of being frozen at
   # whatever it happened to be on install day.
   emit() { if [ -n "$2" ]; then printf '      %s: %s\n' "$1" "$2" >> "$tmp"; fi; }
-  if [ -n "$I_MODEL$I_THINKING$I_TOOLS$I_MAX_TIME$I_PROMPT$I_SKILL$I_MAX_FINDINGS$I_REVIEW_MODE$I_FAIL$I_COMMENT$I_OMP_VERSION$I_BUN_VERSION$I_EXTRA_ARGS" ] \
-     || [ "$CENTRAL_REF" != "main" ]; then
-    printf '    with:\n' >> "$tmp"
-  fi
   emit model            "$I_MODEL"
   emit thinking         "$I_THINKING"
   emit tools            "$I_TOOLS"
@@ -246,6 +265,7 @@ YAML
   # normal install emits `central_ref: v1` and both halves stay in step.
   if [ "$CENTRAL_REF" != "main" ]; then emit central_ref "$CENTRAL_REF"; fi
   emit max_findings     "$I_MAX_FINDINGS"
+  emit max_discovery_rounds "$I_MAX_DISCOVERY_ROUNDS"
   emit fail_on_findings "$I_FAIL"
   emit post_comment     "$I_COMMENT"
   emit omp_version      "$I_OMP_VERSION"
@@ -271,6 +291,7 @@ YAML
 #   review_mode:      suggest       # suggest | inline | summary
 #   central_ref:      main          # pin support files to the same ref
 #   max_findings:     20            # 0 disables the cap
+#   max_discovery_rounds: 2           # broad rounds; verification retries do not count
 #   post_comment:     true
 #   fail_on_findings: false         # true makes this a blocking check
 #   timeout_minutes:  20

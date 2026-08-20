@@ -31,7 +31,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { deflateRawSync, inflateRawSync } from "node:zlib";
 
@@ -45,9 +45,12 @@ import {
   tokenSet,
 } from "./lib-findings.mjs";
 import {
+  advanceReviewCycle,
   derivePublicationFailureResult,
+  planReviewCycle,
   deriveReviewState,
   enrichRunMetadata,
+  validateReviewCycle,
 } from "./review-result.mjs";
 import {
   GIT_DIFF_MAX_BUFFER_BYTES,
@@ -75,9 +78,9 @@ const fingerprint = (f) =>
 const stamp = (fp) => `\n\n<!-- ${MARKER}:${fp} -->`;
 
 const SUMMARY_MARKER = "agentic-review-summary";
-const SUMMARY_MARKER_VERSION = 1;
+const SUMMARY_MARKER_VERSION = 2;
 const SUMMARY_STATE_MAX_BYTES = 1024 * 1024;
-const SUMMARY_MARKER_RE = /<!-- agentic-review-summary:v1:([A-Za-z0-9_-]+) -->\s*$/;
+const SUMMARY_MARKER_RE = /<!-- agentic-review-summary:v(1|2):([A-Za-z0-9_-]+) -->\s*$/;
 const SUMMARY_MARKER_PRESENT_RE = /<!-- agentic-review-summary:v\d+:[^>]*-->\s*$/;
 const SUMMARY_SEVERITIES = ["Critical", "High", "Medium"];
 const SUMMARY_SEVERITY_SET = new Set(SUMMARY_SEVERITIES);
@@ -86,6 +89,7 @@ const SUMMARY_IDENTITY_MAX_TOKENS = 32;
 const SUMMARY_IDENTITY_TOKEN_MAX_CHARS = 64;
 const HELD_FINDING_BODY = "Previously reported finding remains held from an earlier review sample.";
 const SHA_RE = /^[0-9a-f]{40}$/;
+const RUN_ID_RE = /^[1-9][0-9]*$/;
 
 function summaryIdentityTokens(value) {
   const explicit = value && typeof value === "object" && Object.hasOwn(value, "identity_tokens");
@@ -158,22 +162,29 @@ function decodeSummaryFinding(value, index) {
   }, index);
 }
 
-export function encodeSummaryMarker({ headSha, findings }) {
+export function encodeSummaryMarker({ headSha, findings, cycle = null, runId = "" }) {
   if (!SHA_RE.test(headSha)) throw new TypeError("summary headSha must be a lowercase 40-character SHA");
   if (!Array.isArray(findings)) throw new TypeError("summary findings must be an array");
+  if (runId !== "" && !RUN_ID_RE.test(runId)) {
+    throw new TypeError("summary runId must be a positive decimal integer");
+  }
+  const version = cycle === null ? 1 : SUMMARY_MARKER_VERSION;
   const state = {
     h: headSha,
     f: findings.map(encodeSummaryFinding),
   };
+  if (cycle !== null) state.c = validateReviewCycle(cycle);
+  if (runId !== "") state.r = runId;
   const encoded = deflateRawSync(Buffer.from(JSON.stringify(state))).toString("base64url");
-  return `<!-- ${SUMMARY_MARKER}:v${SUMMARY_MARKER_VERSION}:${encoded} -->`;
+  return `<!-- ${SUMMARY_MARKER}:v${version}:${encoded} -->`;
 }
 
 export function decodeSummaryMarker(body) {
-  const encoded = String(body ?? "").match(SUMMARY_MARKER_RE)?.[1];
-  if (!encoded) return null;
+  const match = String(body ?? "").match(SUMMARY_MARKER_RE);
+  if (!match) return null;
   try {
-    const text = inflateRawSync(Buffer.from(encoded, "base64url"), {
+    const version = Number(match[1]);
+    const text = inflateRawSync(Buffer.from(match[2], "base64url"), {
       maxOutputLength: SUMMARY_STATE_MAX_BYTES,
     }).toString("utf8");
     const parsed = JSON.parse(text);
@@ -181,10 +192,16 @@ export function decodeSummaryMarker(body) {
       return null;
     }
     if (!Array.isArray(parsed.f)) return null;
-    return {
+    const decoded = {
       head_sha: parsed.h,
       findings: parsed.f.map(decodeSummaryFinding),
     };
+    if (version === 2) decoded.cycle = validateReviewCycle(parsed.c);
+    if (parsed.r !== undefined) {
+      if (typeof parsed.r !== "string" || !RUN_ID_RE.test(parsed.r)) return null;
+      decoded.run_id = parsed.r;
+    }
+    return decoded;
   } catch {
     return null;
   }
@@ -200,6 +217,14 @@ export function selectSummaryHistory(comments, { botLogin } = {}) {
   const candidates = (Array.isArray(comments) ? comments : [])
     .filter((comment) => isBotComment(comment, botLogin) && SUMMARY_MARKER_PRESENT_RE.test(String(comment.body ?? "")))
     .sort((left, right) => {
+      const leftMarker = decodeSummaryMarker(left.body);
+      const rightMarker = decodeSummaryMarker(right.body);
+      if (leftMarker?.run_id && rightMarker?.run_id) {
+        const byRun = BigInt(rightMarker.run_id) - BigInt(leftMarker.run_id);
+        if (byRun !== 0n) return byRun > 0n ? 1 : -1;
+      } else if (leftMarker?.run_id || rightMarker?.run_id) {
+        return rightMarker?.run_id ? 1 : -1;
+      }
       const leftTime = String(left.submitted_at ?? left.created_at ?? "");
       const rightTime = String(right.submitted_at ?? right.created_at ?? "");
       const byTime = rightTime.localeCompare(leftTime);
@@ -217,8 +242,43 @@ export function selectSummaryHistory(comments, { botLogin } = {}) {
     comment,
     findings: decoded.findings,
     headSha: decoded.head_sha,
+    ...(decoded.cycle ? { cycle: decoded.cycle } : {}),
+    ...(decoded.run_id ? { runId: decoded.run_id } : {}),
     reconciliationKnown: true,
   };
+}
+
+export function planHostedReviewCycle({
+  reviews = [],
+  comments = [],
+  botLogin,
+  baseSha,
+  headSha,
+  maxDiscoveryRounds = 2,
+  override = null,
+  isAncestor = () => true,
+}) {
+  const selected = selectSummaryHistory([...reviews, ...comments], { botLogin });
+  if (!selected.reconciliationKnown) {
+    throw new TypeError("trusted hosted review-cycle state is malformed");
+  }
+  const headLineageValid = selected.headSha === null
+    || selected.headSha === headSha
+    || isAncestor(selected.headSha, headSha);
+  const baseLineageValid = selected.cycle === undefined
+    || selected.cycle.lineage_base_sha === baseSha
+    || isAncestor(selected.cycle.lineage_base_sha, baseSha);
+  const lineageValid = headLineageValid && baseLineageValid;
+  return planReviewCycle({
+    priorCycle: selected.cycle ?? null,
+    priorHeadSha: selected.headSha,
+    priorFindings: selected.findings,
+    baseSha,
+    headSha,
+    maxDiscoveryRounds,
+    override,
+    lineageValid,
+  });
 }
 
 function summaryFindingSimilarity(left, right) {
@@ -544,6 +604,7 @@ function buildFinalResult(metadata, state, {
   reconciliationKnown = true,
   executionFailed = false,
   resultMetadata,
+  cycle = null,
 } = {}) {
   const enriched = resultMetadata ?? enrichRunMetadata(metadata, {
     scopeHash: metadata.scope_hash,
@@ -568,6 +629,7 @@ function buildFinalResult(metadata, state, {
     coverage: enriched.coverage,
     remaining_analysis: enriched.remaining_analysis,
     converged,
+    ...(cycle ? { review_cycle: cycle } : {}),
   };
 }
 
@@ -583,6 +645,9 @@ function renderFinalResultTable(result) {
     `| Scope hash | \`${result.scope_hash}\` |`,
     `| Coverage | \`${result.coverage}\` |`,
     `| Remaining analysis | \`${JSON.stringify(result.remaining_analysis)}\` |`,
+    ...(result.review_cycle
+      ? [`| Review cycle | \`${result.review_cycle.state}\` · phase \`${result.review_cycle.last_phase}\` · discovery ${result.review_cycle.discovery_round}/${result.review_cycle.max_discovery_rounds} |`]
+      : []),
     `| Converged | \`${result.converged}\` |`,
     `| Base SHA | \`${result.base_sha}\` |`,
     `| Head SHA | \`${result.head_sha}\` |`,
@@ -756,6 +821,7 @@ export function reviewFallbackPayload(payload) {
 export function buildStandingSummaryBody({
   metadata,
   state,
+  cycle = null,
   current,
   unresolved,
   reconciliationKnown = true,
@@ -763,6 +829,8 @@ export function buildStandingSummaryBody({
   const marker = encodeSummaryMarker({
     headSha: metadata.head_sha,
     findings: [...current, ...unresolved],
+    cycle,
+    runId: env("GITHUB_RUN_ID", ""),
   });
   const full = `${renderReviewBody({
     mode: "summary",
@@ -797,10 +865,12 @@ export function emitWorkflowResult({
   reconciliationKnown = true,
   executionFailed = false,
   resultMetadata,
+  cycle = null,
 }) {
   const result = buildFinalResult(metadata, state, {
     reconciliationKnown,
     executionFailed,
+    cycle,
     resultMetadata,
   });
   if (resultFile) writeFileSync(resultFile, `${JSON.stringify(result, null, 2)}\n`);
@@ -819,6 +889,14 @@ export function emitWorkflowResult({
       `unresolved_counts=${JSON.stringify(result.unresolved_counts)}`,
       `reviewed_head=${result.reviewed_head}`,
       `scope_hash=${result.scope_hash}`,
+      ...(result.review_cycle
+        ? [
+            `review_cycle_state=${result.review_cycle.state}`,
+            `review_phase=${result.review_cycle.last_phase}`,
+            `discovery_round=${result.review_cycle.discovery_round}`,
+            `max_discovery_rounds=${result.review_cycle.max_discovery_rounds}`,
+          ]
+        : []),
       `coverage=${result.coverage}`,
       `remaining_analysis=${JSON.stringify(result.remaining_analysis)}`,
       `converged=${result.converged}`,
@@ -926,10 +1004,11 @@ export async function postSummaryReview({
   hasHistory,
   body,
   hasFindings,
+  hasCycleState = false,
   writesEnabled,
   fetchImpl = fetch,
 }) {
-  if (!hasHistory && !hasFindings) return "skipped";
+  if (!hasHistory && !hasFindings && !hasCycleState) return "skipped";
   if (!writesEnabled) return "suppressed";
   if (Buffer.byteLength(body) > GITHUB_COMMENT_MAX_BYTES) {
     throw new RangeError("summary review exceeds GitHub comment limit");
@@ -1233,10 +1312,37 @@ function deriveState(metadata, current, unresolved, reconciliationKnown, evidenc
   });
 }
 
-function emitState(metadata, state, { reconciliationKnown = true, executionFailed = false } = {}) {
+function cycleAfterReview(plan, metadata, current, unresolved, reconciliationKnown) {
+  if (plan === null) return null;
+  return advanceReviewCycle({
+    plan,
+    analysisState: reconciliationKnown ? metadata.analysis_state : "inconclusive",
+    headSha: metadata.head_sha,
+    scopeHash: metadata.scope_hash,
+    findings: [...current, ...unresolved],
+    blockSeverities: blockSeverities(),
+  });
+}
+
+function reviewStateForCycle(state, cycle) {
+  if (cycle === null || cycle.state === "ready") return state;
+  return {
+    ...state,
+    sample_state: state.sample_state === "clean" ? "unknown" : state.sample_state,
+    bounded_converged: false,
+    converged: false,
+  };
+}
+
+function emitState(
+  metadata,
+  state,
+  { reconciliationKnown = true, executionFailed = false, cycle = null } = {},
+) {
   if (!executionFailed) {
     lastTrustworthyState = state;
     lastReconciliationKnown = reconciliationKnown;
+    if (cycle !== null) lastReviewCycle = cycle;
   }
   emitWorkflowResult({
     metadata,
@@ -1246,10 +1352,23 @@ function emitState(metadata, state, { reconciliationKnown = true, executionFaile
     resultFile: env("REVIEW_RESULT_FILE", ""),
     reconciliationKnown,
     executionFailed,
+    cycle,
   });
 }
 
-function enforceGate(state) {
+function enforceGate(state, cycle = null) {
+  if (cycle?.state === "review_cycle_exhausted") {
+    console.error(
+      `::error::review cycle exhausted after ${cycle.discovery_round} discovery round(s); explicit human override required`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  if (cycle?.state === "active") {
+    console.error(`::error::review cycle requires ${cycle.next_phase} before it can become ready`);
+    process.exitCode = 1;
+    return;
+  }
   if (shouldFailGate(state, env("FAIL_ON_FINDINGS", "false") === "true")) {
     const blocking = Object.entries(state.current_counts)
       .concat(Object.entries(state.unresolved_counts))
@@ -1430,7 +1549,16 @@ export async function reconcileHostedFindings({ metadata, findings, history, wri
   };
 }
 
-export async function runSummaryMode({ metadata, findings, repo, pr, token, botLogin, identityKnown }) {
+export async function runSummaryMode({
+  metadata,
+  findings,
+  repo,
+  pr,
+  token,
+  botLogin,
+  identityKnown,
+  cyclePlan = null,
+}) {
   const history = await loadReconciliationHistory({ repo, pr, token, botLogin, identityKnown });
   const { current, unresolved, suppressed, reconciliationKnown } = await reconcileHostedFindings({
     metadata,
@@ -1441,16 +1569,21 @@ export async function runSummaryMode({ metadata, findings, repo, pr, token, botL
   if (suppressed) {
     console.log(`  ${suppressed} finding(s) previously resolved and unchanged — not re-raised`);
   }
-  const state = deriveState(metadata, current, unresolved, reconciliationKnown, true);
+  const cycle = cycleAfterReview(cyclePlan, metadata, current, unresolved, reconciliationKnown);
+  const state = reviewStateForCycle(
+    deriveState(metadata, current, unresolved, reconciliationKnown, true),
+    cycle,
+  );
   const body = buildStandingSummaryBody({
     metadata,
     state,
+    cycle,
     current,
     unresolved,
     reconciliationKnown,
   });
 
-  emitState(metadata, state, { reconciliationKnown });
+  emitState(metadata, state, { reconciliationKnown, cycle });
   if (reconciliationKnown) {
     const action = await postSummaryReview({
       repo,
@@ -1460,6 +1593,7 @@ export async function runSummaryMode({ metadata, findings, repo, pr, token, botL
       hasHistory: Boolean(history.summary.comment),
       body,
       hasFindings: current.length + unresolved.length > 0,
+      hasCycleState: cycle !== null,
       writesEnabled: WRITES_ENABLED,
     });
     console.log(`  summary review ${action}`);
@@ -1469,7 +1603,7 @@ export async function runSummaryMode({ metadata, findings, repo, pr, token, botL
   if (DRY_RUN && env("SUPPRESS_WRITES", "") !== "true" && env("POST_COMMENT", "true") !== "false") {
     process.stdout.write(`${body}\n`);
   }
-  enforceGate(state);
+  enforceGate(state, cycle);
 }
 
 export async function reconcileInlineFindings({
@@ -1553,22 +1687,48 @@ export async function reconcileInlineFindings({
   return { current, fresh, unresolved, suppressed, reconciliationKnown };
 }
 
-export function buildInlineReviewPayload({ metadata, state, fresh, unresolved, comments }) {
+export function buildInlineReviewPayload({
+  metadata,
+  state,
+  current = [],
+  fresh,
+  unresolved,
+  comments,
+  cycle = null,
+}) {
+  const topBody = buildReviewTopBody({
+    mode: REVIEW_MODE,
+    metadata,
+    state,
+    current: fresh,
+    unresolved,
+  });
+  const body = cycle === null
+    ? topBody
+    : `${topBody}\n\n${encodeSummaryMarker({
+        headSha: metadata.head_sha,
+        findings: [...current, ...unresolved],
+        cycle,
+        runId: env("GITHUB_RUN_ID", ""),
+      })}`;
   return {
     commit_id: metadata.head_sha,
     event: "COMMENT",
-    body: buildReviewTopBody({
-      mode: REVIEW_MODE,
-      metadata,
-      state,
-      current: fresh,
-      unresolved,
-    }),
+    body,
     comments,
   };
 }
 
-async function runInlineMode({ metadata, findings, repo, pr, token, botLogin, identityKnown }) {
+async function runInlineMode({
+  metadata,
+  findings,
+  repo,
+  pr,
+  token,
+  botLogin,
+  identityKnown,
+  cyclePlan = null,
+}) {
   const history = await loadReconciliationHistory({ repo, pr, token, botLogin, identityKnown });
   const { current, fresh, unresolved, suppressed, reconciliationKnown } = await reconcileHostedFindings({
     metadata,
@@ -1584,10 +1744,22 @@ async function runInlineMode({ metadata, findings, repo, pr, token, botLogin, id
     ? commentableRanges(metadata.base_sha, metadata.head_sha)
     : new Map();
   const { comments, unanchored } = buildReviewComments(fresh, ranges, { mode: REVIEW_MODE });
-  const state = deriveState(metadata, current, unresolved, reconciliationKnown, true);
-  const payload = buildInlineReviewPayload({ metadata, state, fresh, unresolved, comments });
+  const cycle = cycleAfterReview(cyclePlan, metadata, current, unresolved, reconciliationKnown);
+  const state = reviewStateForCycle(
+    deriveState(metadata, current, unresolved, reconciliationKnown, true),
+    cycle,
+  );
+  const payload = buildInlineReviewPayload({
+    metadata,
+    state,
+    current,
+    fresh,
+    unresolved,
+    comments,
+    cycle,
+  });
 
-  emitState(metadata, state, { reconciliationKnown });
+  emitState(metadata, state, { reconciliationKnown, cycle });
   console.log(
     `  ${findings.length} finding(s): ${comments.length} anchored, `
       + `${unanchored.length} summary-only, ${current.length - fresh.length} already open`,
@@ -1595,20 +1767,21 @@ async function runInlineMode({ metadata, findings, repo, pr, token, botLogin, id
 
   if (!reconciliationKnown) {
     console.log("::warning::reconciliation is unknown; review writes were suppressed");
-    enforceGate(state);
+    enforceGate(state, cycle);
     return;
   }
   if (DRY_RUN) {
     if (env("SUPPRESS_WRITES", "") !== "true" && env("POST_COMMENT", "true") !== "false") {
+
       console.log(JSON.stringify(payload, null, 2));
     }
     console.log(`  [suppressed] ${comments.length} inline comment(s) withheld`);
-    enforceGate(state);
+    enforceGate(state, cycle);
     return;
   }
-  if (comments.length === 0 && unanchored.length === 0) {
+  if (cycle === null && comments.length === 0 && unanchored.length === 0) {
     console.log("  nothing new to say");
-    enforceGate(state);
+    enforceGate(state, cycle);
     return;
   }
 
@@ -1622,12 +1795,168 @@ async function runInlineMode({ metadata, findings, repo, pr, token, botLogin, id
     }
   }
   console.log("  review posted");
-  enforceGate(state);
+  enforceGate(state, cycle);
+}
+async function runCyclePlanMode() {
+  const repo = required("GITHUB_REPO");
+  const pr = Number(required("PR_NUMBER"));
+  const token = required("GH_TOKEN");
+  const baseSha = required("BASE_SHA");
+  const headSha = required("HEAD_SHA");
+  const planFile = required("REVIEW_CYCLE_PLAN_FILE");
+  const knownFindingsFile = required("KNOWN_FINDINGS_FILE");
+  const maxDiscoveryRounds = Number(env("MAX_DISCOVERY_ROUNDS", "2"));
+  if (!Number.isInteger(maxDiscoveryRounds) || maxDiscoveryRounds < 1) {
+    throw new TypeError("MAX_DISCOVERY_ROUNDS must be a positive integer");
+  }
+  const overrideActor = env("REVIEW_CYCLE_OVERRIDE_ACTOR", "").trim();
+  const overrideReason = env("REVIEW_CYCLE_OVERRIDE_REASON", "").trim();
+  const overrideInvocation = env("REVIEW_CYCLE_OVERRIDE_INVOCATION", "").trim();
+  if (
+    Boolean(overrideActor) !== Boolean(overrideReason)
+    || Boolean(overrideActor) !== Boolean(overrideInvocation)
+  ) {
+    throw new TypeError("review-cycle override requires actor, reason, and invocation");
+  }
+  const override = overrideActor
+    ? { actor: overrideActor, reason: overrideReason, invocation: overrideInvocation }
+    : null;
+  let plan;
+  if (!WRITES_ENABLED) {
+    if (override !== null) {
+      throw new TypeError("review-cycle override requires hosted state persistence");
+    }
+    plan = {
+      persistence_enabled: false,
+      should_run: true,
+      phase: "discovery",
+      discovery_round: 1,
+      lineage_base_sha: baseSha,
+      max_discovery_rounds: maxDiscoveryRounds,
+      cycle: null,
+      known_findings: [],
+      override: null,
+    };
+  } else {
+    const botLogin = await fetchViewerLogin({ token });
+    const [reviews, comments] = await Promise.all([
+      fetchSummaryReviews({ repo, pr, token }),
+      fetchSummaryComments({ repo, pr, token }),
+    ]);
+    plan = planHostedReviewCycle({
+      reviews,
+      comments,
+      botLogin,
+      baseSha,
+      headSha,
+      maxDiscoveryRounds,
+      override,
+      isAncestor: (priorHead, currentHead) => {
+        try {
+          execFileSync("git", ["merge-base", "--is-ancestor", priorHead, currentHead], {
+            stdio: "ignore",
+          });
+          return true;
+        } catch {
+          return false;
+        }
+      },
+    });
+  }
+  writeFileSync(planFile, `${JSON.stringify(plan, null, 2)}\n`);
+  const verificationFindings = plan.known_findings.map((finding, index) => ({
+    ...finding,
+    suggestion: finding.suggestion ?? null,
+    verification_id: `K${index + 1}`,
+  }));
+  writeFileSync(knownFindingsFile, `${JSON.stringify({ findings: verificationFindings }, null, 2)}\n`);
+  const cycle = plan.cycle;
+  const cycleState = plan.persistence_enabled === false ? "" : cycle?.state ?? "active";
+  const phase = plan.phase ?? cycle?.last_phase ?? "";
+  const configuredMaximum = cycle?.max_discovery_rounds
+    ?? plan.max_discovery_rounds
+    ?? maxDiscoveryRounds;
+  let terminalResult = null;
+  if (!plan.should_run) {
+    const state = deriveReviewState({
+      analysisState: "inconclusive",
+      current: [],
+      unresolved: plan.known_findings,
+      reconciliationKnown: true,
+      blockSeverities: blockSeverities(),
+      evidenceReconciled: true,
+    });
+    const converged = false;
+    terminalResult = {
+      analysis_state: state.analysis_state,
+      merge_state: state.merge_state,
+      sample_state: state.sample_state,
+      bounded_converged: converged,
+      base_sha: cycle?.lineage_base_sha ?? baseSha,
+      head_sha: cycle?.last_reviewed_head ?? headSha,
+      configuration_fingerprint: "0".repeat(64),
+      passes_requested: 0,
+      passes_completed: 0,
+      current_counts: state.current_counts,
+      unresolved_counts: state.unresolved_counts,
+      reviewed_head: cycle?.last_reviewed_head ?? headSha,
+      scope_hash: cycle?.last_scope_hash ?? "0".repeat(64),
+      coverage: "unknown",
+      remaining_analysis: ["execution_failed"],
+      converged,
+      ...(cycle === null ? {} : { review_cycle: cycle }),
+    };
+    const resultFile = env("REVIEW_RESULT_FILE", "");
+    if (resultFile) writeFileSync(resultFile, `${JSON.stringify(terminalResult, null, 2)}\n`);
+  }
+  const outputFile = env("GITHUB_OUTPUT", "");
+  if (outputFile) {
+    appendFileSync(outputFile, [
+      `should_run=${plan.should_run}`,
+      `phase=${phase}`,
+      `discovery_round=${plan.discovery_round}`,
+      `max_discovery_rounds=${configuredMaximum}`,
+      `cycle_state=${cycleState}`,
+      ...(terminalResult
+        ? [
+            `analysis_state=${terminalResult.analysis_state}`,
+            `merge_state=${terminalResult.merge_state}`,
+            `sample_state=${terminalResult.sample_state}`,
+            `bounded_converged=${terminalResult.bounded_converged}`,
+            `reviewed_head=${terminalResult.reviewed_head}`,
+            `scope_hash=${terminalResult.scope_hash}`,
+            `coverage=${terminalResult.coverage}`,
+            `remaining_analysis=${JSON.stringify(terminalResult.remaining_analysis)}`,
+            `converged=${terminalResult.converged}`,
+            `base_sha=${terminalResult.base_sha}`,
+            `head_sha=${terminalResult.head_sha}`,
+            `configuration_fingerprint=${terminalResult.configuration_fingerprint}`,
+            `passes_requested=${terminalResult.passes_requested}`,
+            `passes_completed=${terminalResult.passes_completed}`,
+            `current_counts=${JSON.stringify(terminalResult.current_counts)}`,
+            `unresolved_counts=${JSON.stringify(terminalResult.unresolved_counts)}`,
+          ]
+        : []),
+      "",
+    ].join("\n"));
+  }
+}
+
+let runningCyclePlan = false;
+
+async function dispatchMain() {
+  if (process.argv[2] === "cycle-plan") {
+    runningCyclePlan = true;
+    await runCyclePlanMode();
+    return;
+  }
+  await main();
 }
 
 let activeMetadata = null;
 let lastTrustworthyState = null;
 let lastReconciliationKnown = true;
+let lastReviewCycle = null;
 
 function emitHardFailureResult() {
   const metadata = activeMetadata ?? {
@@ -1670,7 +1999,19 @@ function emitHardFailureResult() {
     reconciliationKnown: lastTrustworthyState ? lastReconciliationKnown : true,
     executionFailed: true,
     resultMetadata,
+    cycle: lastReviewCycle,
   });
+}
+
+function loadReviewCyclePlan() {
+  const planPath = env("REVIEW_CYCLE_PLAN_FILE", "");
+  if (!planPath || !existsSync(planPath)) return null;
+  const plan = JSON.parse(readFileSync(planPath, "utf8"));
+  if (!plan || typeof plan !== "object" || Array.isArray(plan)) {
+    throw new TypeError("review cycle plan must be an object");
+  }
+  if (plan.persistence_enabled === false) return null;
+  return plan;
 }
 
 async function main() {
@@ -1684,6 +2025,7 @@ async function main() {
   const { findings: publishedFindings, metadata } = publication;
   activeMetadata = metadata;
   const findings = publishedFindings.map(projectPublicFinding);
+  const cyclePlan = loadReviewCyclePlan();
   lastTrustworthyState = {
     analysis_state: failureResult.analysis_state,
     merge_state: failureResult.merge_state,
@@ -1713,12 +2055,17 @@ async function main() {
         reconciliationKnown = false;
       }
     }
-    const state = deriveState(metadata, findings, unresolved, reconciliationKnown, true);
-    emitState(metadata, state, { reconciliationKnown });
+    const cycle = cycleAfterReview(cyclePlan, metadata, findings, unresolved, reconciliationKnown);
+    const state = reviewStateForCycle(
+      deriveState(metadata, findings, unresolved, reconciliationKnown, true),
+      cycle,
+    );
+    emitState(metadata, state, { reconciliationKnown, cycle });
     const body = mode === "summary"
       ? buildStandingSummaryBody({
         metadata,
         state,
+        cycle,
         current: findings,
         unresolved,
         reconciliationKnown,
@@ -1732,7 +2079,7 @@ async function main() {
         reconciliationKnown,
       });
     process.stdout.write(`${body}\n`);
-    enforceGate(state);
+    enforceGate(state, cycle);
     return;
   }
 
@@ -1749,19 +2096,39 @@ async function main() {
   }
 
   if (mode === "summary") {
-    await runSummaryMode({ metadata, findings, repo, pr, token, botLogin, identityKnown });
+    await runSummaryMode({
+      metadata,
+      findings,
+      repo,
+      pr,
+      token,
+      botLogin,
+      identityKnown,
+      cyclePlan,
+    });
     return;
   }
-  await runInlineMode({ metadata, findings, repo, pr, token, botLogin, identityKnown });
+  await runInlineMode({
+    metadata,
+    findings,
+    repo,
+    pr,
+    token,
+    botLogin,
+    identityKnown,
+    cyclePlan,
+  });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch((error) => {
+  dispatchMain().catch((error) => {
     console.error(`::error::${error?.message ?? error}`);
-    try {
-      emitHardFailureResult();
-    } catch (resultError) {
-      console.error(`::error::could not persist conservative review result (${resultError?.message ?? resultError})`);
+    if (!runningCyclePlan) {
+      try {
+        emitHardFailureResult();
+      } catch (resultError) {
+        console.error(`::error::could not persist conservative review result (${resultError?.message ?? resultError})`);
+      }
     }
     process.exitCode = 1;
   });

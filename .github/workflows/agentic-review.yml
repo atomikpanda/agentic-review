@@ -78,8 +78,28 @@ on:
       unresolved_counts:
         description: JSON severity map for held findings from prior reviews.
         value: ${{ jobs.review.outputs.unresolved_counts }}
+      review_cycle_state:
+        description: "Cross-run cycle state: active, ready, or review_cycle_exhausted."
+        value: ${{ jobs.review.outputs.review_cycle_state }}
+      review_phase:
+        description: "Phase completed by this run: discovery or verification."
+        value: ${{ jobs.review.outputs.review_phase }}
+      discovery_round:
+        description: Discovery round ordinal in the cross-run cycle.
+        value: ${{ jobs.review.outputs.discovery_round }}
+      max_discovery_rounds:
+        description: Configured discovery-round budget for the cycle.
+        value: ${{ jobs.review.outputs.max_discovery_rounds }}
     inputs:
       # --- model ------------------------------------------------------------
+      target_repo:
+        description: Optional owner/name override used by a same-repository manual dispatcher.
+        type: string
+        default: ''
+      target_pr:
+        description: Optional pull request number used by a same-repository manual dispatcher.
+        type: string
+        default: ''
       model:
         description: Model slug, provider-prefixed (as it appears on openrouter.ai/models).
         type: string
@@ -120,6 +140,18 @@ on:
         description: Upper bound on findings requested in the prompt. 0 disables the cap.
         type: number
         default: 20
+      max_discovery_rounds:
+        description: >-
+          Maximum broad discovery rounds in one cross-run review cycle.
+          Verification retries do not consume this budget.
+        type: number
+        default: 2
+      review_cycle_override_reason:
+        description: >-
+          Authenticated human reason for opening exactly one additional discovery
+          round after cycle exhaustion. Empty means no override.
+        type: string
+        default: ''
       codegraph:
         description: >-
           Build a symbol/dependency index of the changed files with codegraph
@@ -251,6 +283,15 @@ on:
         description: Pull request number to review.
         type: string
         required: true
+      max_discovery_rounds:
+        description: Maximum broad discovery rounds in one cross-run review cycle.
+        type: number
+        default: 2
+      review_cycle_override_reason:
+        description: Reason for opening one additional discovery round after exhaustion.
+        type: string
+        required: false
+        default: ''
 
   # `pull_request_target` loads this entry-point from the trusted base branch.
   # The reviewed head is checked out only as data; executable support is fetched
@@ -302,22 +343,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.timeout_minutes || 20 }}
     outputs:
-      analysis_state: ${{ steps.poster.outputs.analysis_state }}
-      merge_state: ${{ steps.poster.outputs.merge_state }}
-      sample_state: ${{ steps.poster.outputs.sample_state }}
-      bounded_converged: ${{ steps.poster.outputs.bounded_converged }}
-      reviewed_head: ${{ steps.poster.outputs.reviewed_head }}
-      scope_hash: ${{ steps.poster.outputs.scope_hash }}
-      coverage: ${{ steps.poster.outputs.coverage }}
-      remaining_analysis: ${{ steps.poster.outputs.remaining_analysis }}
-      converged: ${{ steps.poster.outputs.converged }}
-      base_sha: ${{ steps.poster.outputs.base_sha }}
-      head_sha: ${{ steps.poster.outputs.head_sha }}
-      configuration_fingerprint: ${{ steps.poster.outputs.configuration_fingerprint }}
-      passes_requested: ${{ steps.poster.outputs.passes_requested }}
-      passes_completed: ${{ steps.poster.outputs.passes_completed }}
-      current_counts: ${{ steps.poster.outputs.current_counts }}
-      unresolved_counts: ${{ steps.poster.outputs.unresolved_counts }}
+      analysis_state: ${{ steps.poster.outputs.analysis_state || steps.cycle.outputs.analysis_state }}
+      merge_state: ${{ steps.poster.outputs.merge_state || steps.cycle.outputs.merge_state }}
+      sample_state: ${{ steps.poster.outputs.sample_state || steps.cycle.outputs.sample_state }}
+      bounded_converged: ${{ steps.poster.outputs.bounded_converged || steps.cycle.outputs.bounded_converged }}
+      reviewed_head: ${{ steps.poster.outputs.reviewed_head || steps.cycle.outputs.reviewed_head }}
+      scope_hash: ${{ steps.poster.outputs.scope_hash || steps.cycle.outputs.scope_hash }}
+      coverage: ${{ steps.poster.outputs.coverage || steps.cycle.outputs.coverage }}
+      remaining_analysis: ${{ steps.poster.outputs.remaining_analysis || steps.cycle.outputs.remaining_analysis }}
+      converged: ${{ steps.poster.outputs.converged || steps.cycle.outputs.converged }}
+      base_sha: ${{ steps.poster.outputs.base_sha || steps.cycle.outputs.base_sha }}
+      head_sha: ${{ steps.poster.outputs.head_sha || steps.cycle.outputs.head_sha }}
+      configuration_fingerprint: ${{ steps.poster.outputs.configuration_fingerprint || steps.cycle.outputs.configuration_fingerprint }}
+      passes_requested: ${{ steps.poster.outputs.passes_requested || steps.cycle.outputs.passes_requested }}
+      passes_completed: ${{ steps.poster.outputs.passes_completed || steps.cycle.outputs.passes_completed }}
+      current_counts: ${{ steps.poster.outputs.current_counts || steps.cycle.outputs.current_counts }}
+      unresolved_counts: ${{ steps.poster.outputs.unresolved_counts || steps.cycle.outputs.unresolved_counts }}
+      review_cycle_state: ${{ steps.poster.outputs.review_cycle_state || steps.cycle.outputs.cycle_state }}
+      review_phase: ${{ steps.poster.outputs.review_phase || steps.cycle.outputs.phase }}
+      discovery_round: ${{ steps.poster.outputs.discovery_round || steps.cycle.outputs.discovery_round }}
+      max_discovery_rounds: ${{ steps.poster.outputs.max_discovery_rounds || inputs.max_discovery_rounds || 2 }}
     steps:
       # ONE place that answers "what am I reviewing, and with what credential".
       # Everything downstream reads these outputs instead of
@@ -361,17 +406,44 @@ jobs:
             exit 0
           fi
 
-          # App mode. The workflow token cannot read another repository, so the
-          # credential has to come from the App installation.
-          [ -n "${APP_ID:-}" ] && [ -n "${APP_PRIVATE_KEY:-}" ] \
-            || { echo "::error::target_repo was given but APP_ID/APP_PRIVATE_KEY are not set — dispatch mode needs the App credentials to mint an installation token"; exit 1; }
-
           case "$IN_REPO" in
             */*[!A-Za-z0-9._/-]*|*/*/*|/*|*/) echo "::error::target_repo is not a plain owner/name: $IN_REPO"; exit 1 ;;
             */*) ;;
             *) echo "::error::target_repo is not owner/name: $IN_REPO"; exit 1 ;;
           esac
           case "$IN_PR" in ''|*[!0-9]*) echo "::error::target_pr is not a number: $IN_PR"; exit 1 ;; esac
+
+          if [ "$IN_REPO" = "$GITHUB_REPOSITORY" ]; then
+            gh_t() { gh api "repos/${IN_REPO}/pulls/${IN_PR}" --jq "$1"; }
+            [ "$(gh_t .state)" = "open" ] || { echo "::error::${IN_REPO}#${IN_PR} is not open"; exit 1; }
+            if [ "$(gh_t .draft)" = "true" ]; then
+              echo "eligible=false" >> "$GITHUB_OUTPUT"
+              echo "  same-repository dispatch: ${IN_REPO}#${IN_PR} is a draft — skipped"
+              exit 0
+            fi
+            if [ "$(gh_t '.head.repo.full_name == .base.repo.full_name')" != "true" ]; then
+              echo "eligible=false" >> "$GITHUB_OUTPUT"
+              echo "  same-repository dispatch: ${IN_REPO}#${IN_PR} is from a fork — skipped"
+              exit 0
+            fi
+            {
+              echo "repo=$IN_REPO"
+              echo "eligible=true"
+              echo "pr=$IN_PR"
+              echo "base=$(gh_t .base.sha)"
+              echo "head=$(gh_t .head.sha)"
+              echo "ref=$(gh_t .head.sha)"
+            } >> "$GITHUB_OUTPUT"
+            echo "  same-repository dispatch: ${IN_REPO}#${IN_PR}"
+            exit 0
+          fi
+
+          # App mode. The workflow token cannot read another repository, so the
+          # credential has to come from the App installation.
+          [ -n "${APP_ID:-}" ] && [ -n "${APP_PRIVATE_KEY:-}" ] \
+            || { echo "::error::target_repo was given but APP_ID/APP_PRIVATE_KEY are not set — dispatch mode needs the App credentials to mint an installation token"; exit 1; }
+
+          # Cross-repository App mode is validated above before minting credentials.
 
           # Minted inline rather than from a checked-out script: this step runs
           # BEFORE any checkout, because the checkout needs the credential this
@@ -546,6 +618,8 @@ jobs:
           IN_PROMPT_PATH: ${{ inputs.prompt_path }}
           IN_SKILLS_PATH: ${{ inputs.skills_path }}
           IN_MAX_FINDINGS: ${{ inputs.max_findings }}
+          IN_MAX_DISCOVERY_ROUNDS: ${{ inputs.max_discovery_rounds }}
+          IN_REVIEW_CYCLE_OVERRIDE_REASON: ${{ inputs.review_cycle_override_reason }}
           IN_MAX_DIFF_BYTES: ${{ inputs.max_diff_bytes }}
           IN_CODEGRAPH: ${{ inputs.codegraph }}
           IN_CODEGRAPH_VERSION: ${{ inputs.codegraph_version }}
@@ -567,7 +641,8 @@ jobs:
           # unrelated variable AFTER the allowlist checks in this step had
           # already passed. None of these values has any reason to span lines.
           for v in IN_MODEL IN_THINKING IN_TOOLS IN_MAX_TIME IN_PROMPT_PATH \
-                   IN_SKILLS_PATH IN_MAX_FINDINGS IN_REVIEW_MODE IN_POST_COMMENT \
+                   IN_SKILLS_PATH IN_MAX_FINDINGS IN_MAX_DISCOVERY_ROUNDS \
+                   IN_REVIEW_CYCLE_OVERRIDE_REASON IN_REVIEW_MODE IN_POST_COMMENT \
                    IN_FAIL_ON_FINDINGS IN_BUN_VERSION IN_OMP_VERSION IN_EXTRA_ARGS \
                    IN_CENTRAL_REPO IN_MAX_DIFF_BYTES IN_CODEGRAPH_VERSION \
                    IN_BLOCK_SEVERITIES IN_SUPPRESS_WRITES IN_RESOLVE_STALE; do
@@ -645,6 +720,10 @@ jobs:
             suggest|inline|summary) ;;
             *) echo "::error::review_mode must be suggest, inline or summary (got '$REVIEW_MODE')"; exit 1 ;;
           esac
+          MAX_DISCOVERY_ROUNDS="${IN_MAX_DISCOVERY_ROUNDS:-2}"
+          case "$MAX_DISCOVERY_ROUNDS" in
+            ''|*[!0-9]*|0) echo "::error::max_discovery_rounds must be a positive integer"; exit 1 ;;
+          esac
 
 
           {
@@ -657,6 +736,8 @@ jobs:
             echo "PROMPT_PATH=${IN_PROMPT_PATH:-review/prompt.md}"
             echo "SKILLS_PATH=${IN_SKILLS_PATH:-skills/infra-review/SKILL.md,skills/security-review/SKILL.md}"
             echo "MAX_FINDINGS=${IN_MAX_FINDINGS:-20}"
+            echo "MAX_DISCOVERY_ROUNDS=$MAX_DISCOVERY_ROUNDS"
+            echo "REVIEW_CYCLE_OVERRIDE_REASON=${IN_REVIEW_CYCLE_OVERRIDE_REASON:-}"
             echo "MAX_DIFF_BYTES=${IN_MAX_DIFF_BYTES:-400000}"
             echo "CODEGRAPH=${IN_CODEGRAPH:-true}"
             echo "CODEGRAPH_VERSION=${IN_CODEGRAPH_VERSION:-}"
@@ -818,6 +899,24 @@ jobs:
       #
       # The diff still contains every one of these files, so the agent can
       # still see and report on them. It simply cannot be configured by them.
+      - name: plan bounded review cycle
+        id: cycle
+        if: steps.target.outputs.eligible == 'true'
+        env:
+          GH_TOKEN: ${{ steps.target.outputs.token || github.token }}
+          GITHUB_REPO: ${{ steps.target.outputs.repo }}
+          PR_NUMBER: ${{ steps.target.outputs.pr }}
+          HEAD_SHA: ${{ steps.target.outputs.head }}
+          BASE_SHA: ${{ steps.target.outputs.base }}
+          REVIEW_CYCLE_PLAN_FILE: /tmp/review-cycle-plan.json
+          KNOWN_FINDINGS_FILE: /tmp/review-known-findings.json
+          REVIEW_RESULT_FILE: /tmp/review-result.json
+          REVIEW_CYCLE_OVERRIDE_ACTOR: ${{ inputs.review_cycle_override_reason && github.event_name == 'workflow_dispatch' && github.actor || '' }}
+          REVIEW_CYCLE_OVERRIDE_INVOCATION: ${{ inputs.review_cycle_override_reason && github.event_name == 'workflow_dispatch' && github.run_id || '' }}
+        run: |
+          set -euo pipefail
+          node "$REVIEW_POSTER" cycle-plan
+
       - name: strip agent configuration from the checkout
         if: steps.target.outputs.eligible == 'true'
         run: |
@@ -846,11 +945,13 @@ jobs:
           if [ -n "$out" ]; then echo "  $out"; else echo "  no agent configuration present"; fi
 
       - name: run agentic review (read-only)
-        if: steps.target.outputs.eligible == 'true'
+        if: steps.target.outputs.eligible == 'true' && steps.cycle.outputs.should_run == 'true'
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           BASE: ${{ steps.target.outputs.base }}
           HEAD: ${{ steps.target.outputs.head }}
+          AGENTIC_REVIEW_PHASE: ${{ steps.cycle.outputs.phase }}
+          AGENTIC_REVIEW_KNOWN_FINDINGS: /tmp/review-known-findings.json
         run: |
           set -euo pipefail
           actual_head="$(git rev-parse --verify 'HEAD^{commit}')"
@@ -914,8 +1015,26 @@ jobs:
           PR_NUMBER: ${{ steps.target.outputs.pr }}
           HEAD_SHA: ${{ steps.target.outputs.head }}
           BASE_SHA: ${{ steps.target.outputs.base }}
+          REVIEW_CYCLE_PLAN_FILE: /tmp/review-cycle-plan.json
+          CYCLE_SHOULD_RUN: ${{ steps.cycle.outputs.should_run }}
+          CYCLE_STATE: ${{ steps.cycle.outputs.cycle_state }}
+          CYCLE_PHASE: ${{ steps.cycle.outputs.phase }}
+          CYCLE_DISCOVERY_ROUND: ${{ steps.cycle.outputs.discovery_round }}
         run: |
           if [ "${TARGET_ELIGIBLE:-}" = "false" ]; then
+            exit 0
+          fi
+          if [ "${CYCLE_SHOULD_RUN:-}" = "false" ]; then
+            {
+              echo "review_cycle_state=${CYCLE_STATE}"
+              echo "review_phase=${CYCLE_PHASE}"
+              echo "discovery_round=${CYCLE_DISCOVERY_ROUND}"
+              echo "max_discovery_rounds=${MAX_DISCOVERY_ROUNDS}"
+            } >> "$GITHUB_OUTPUT"
+            if [ "$CYCLE_STATE" = "review_cycle_exhausted" ]; then
+              echo "::error::review cycle exhausted; an authenticated override is required"
+              exit 1
+            fi
             exit 0
           fi
           set -euo pipefail
@@ -1115,11 +1234,15 @@ jobs:
                 "merge_state must agree with configured blocking severity counts",
               );
             }
+            const cycleIncomplete = candidate.review_cycle
+              && candidate.review_cycle.state !== "ready";
             const expectedSampleState = findingCount > 0
               ? "findings"
-              : candidate.analysis_state === "complete" && candidate.coverage === "bounded"
-                ? "clean"
-                : "unknown";
+              : cycleIncomplete
+                ? "unknown"
+                : candidate.analysis_state === "complete" && candidate.coverage === "bounded"
+                  ? "clean"
+                  : "unknown";
             if (candidate.sample_state !== expectedSampleState) {
               throw new TypeError("sample_state must agree with counts, analysis, and coverage");
             }
@@ -1188,7 +1311,7 @@ jobs:
             }
             const expectedBoundedCoverage = (
               candidate.analysis_state === "complete"
-              && candidate.sample_state !== "unknown"
+              && (candidate.sample_state !== "unknown" || cycleIncomplete)
               && candidate.remaining_analysis.length === 0
             );
             if (
@@ -1202,6 +1325,7 @@ jobs:
             const expectedConvergence = (
               candidate.analysis_state === "complete"
               && candidate.sample_state === "clean"
+              && !cycleIncomplete
             );
             if (
               candidate.bounded_converged !== expectedConvergence

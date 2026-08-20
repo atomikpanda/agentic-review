@@ -24,6 +24,7 @@
 export const SIMILARITY_DEFAULT = 0.20;
 
 const FINDING_SEVERITIES = new Set(["Critical", "High", "Medium"]);
+const VERIFICATION_ID_RE = /^K[1-9][0-9]*$/;
 
 export function isValidFinding(value) {
   return value !== null
@@ -41,6 +42,17 @@ export function isValidFinding(value) {
     && value.start_line > 0
     && Number.isInteger(value.end_line)
     && value.end_line >= value.start_line
+    && (value.verification_id === undefined || (
+      typeof value.verification_id === "string"
+      && VERIFICATION_ID_RE.test(value.verification_id)
+    ))
+    && (
+      value.verification_of === undefined
+      ? value.verification_classification === undefined
+      : typeof value.verification_of === "string"
+        && VERIFICATION_ID_RE.test(value.verification_of)
+        && value.verification_classification === "linked_regression"
+    )
     && (typeof value.suggestion === "string" || value.suggestion === null);
 }
 
@@ -54,6 +66,15 @@ export function projectPublicFinding(value) {
     start_line: value.start_line,
     end_line: value.end_line,
     suggestion: value.suggestion,
+    ...(value.verification_id === undefined
+      ? {}
+      : { verification_id: value.verification_id }),
+    ...(value.verification_of === undefined
+      ? {}
+      : {
+          verification_of: value.verification_of,
+          verification_classification: value.verification_classification,
+        }),
   };
 }
 

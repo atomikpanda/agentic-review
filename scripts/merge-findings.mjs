@@ -165,13 +165,32 @@ export function mergeFindingDocuments(documents, { minVotes = 1 } = {}) {
   };
 }
 
+export function filterKnownFindings(knownDocument, currentDocument) {
+  if (!isValidDocument(knownDocument) || !isValidDocument(currentDocument)) {
+    throw new TypeError("known and current findings must be valid structured documents");
+  }
+  return currentDocument.findings
+    .filter((candidate) => (
+      knownDocument.findings.some((known) =>
+        sameFinding(candidate, known, SIMILARITY_DEFAULT))
+      || (
+        candidate.verification_classification === "linked_regression"
+        && knownDocument.findings.some((known) =>
+          known.verification_id === candidate.verification_of)
+      )
+    ))
+    .map(projectPublicFinding);
+}
+
 function main(args) {
   let minVotes = 1;
   let checkOnly = false;
+  let knownOnly = false;
   const files = [];
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--min-votes") { minVotes = Number(args[++i]) || 1; continue; }
     if (args[i] === "--check") { checkOnly = true; continue; }
+    if (args[i] === "--known-only") { knownOnly = true; continue; }
     files.push(args[i]);
   }
 
@@ -183,6 +202,25 @@ function main(args) {
       let parsed = null;
       try { parsed = extractJson(readFileSync(file, "utf8"), { strict: true }); } catch { /* invalid */ }
       if (!parsed) return 1;
+    }
+    return 0;
+  }
+  if (knownOnly) {
+    if (files.length !== 2) return 2;
+    let known = null;
+    let current = null;
+    try {
+      known = extractJson(readFileSync(files[0], "utf8"), { strict: true });
+      current = extractJson(readFileSync(files[1], "utf8"), { strict: true });
+    } catch {
+      return 1;
+    }
+    if (!known || !current) return 1;
+    const findings = filterKnownFindings(known, current);
+    const withheld = current.findings.length - findings.length;
+    process.stdout.write(JSON.stringify({ findings }, null, 2));
+    if (withheld > 0) {
+      process.stderr.write(`  withheld ${withheld} unrelated verification finding(s)\n`);
     }
     return 0;
   }

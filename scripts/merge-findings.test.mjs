@@ -140,6 +140,36 @@ test("an explicit stricter min-votes filters findings without changing the defau
   assert.equal(JSON.parse(defaultUnion.stdout).findings.length, 2);
 });
 
+
+test("verification output keeps known identities and explicitly linked regressions", () => {
+  const known = {
+    ...finding("Configured Bun version is ignored", {
+      body: "The configured Bun version is never passed to setup-bun, so the action always installs latest.",
+      file: "action.yml",
+    }),
+    verification_id: "K1",
+  };
+  const reworded = finding("Configured Bun version is not passed to setup-bun", {
+    body: "The configured Bun version is ignored because setup-bun never receives the requested version.",
+    file: "./action.yml",
+  });
+  const linkedRegression = finding("Remediation breaks queue ordering", {
+    file: "src/queue.js",
+    verification_of: "K1",
+    verification_classification: "linked_regression",
+  });
+  const result = runCli([
+    { findings: [known] },
+    { findings: [reworded, linkedRegression, finding("Unrelated broad finding")] },
+  ], ["--known-only"]);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(
+    JSON.parse(result.stdout).findings.map(({ title }) => title),
+    [reworded.title, linkedRegression.title],
+  );
+  assert.match(result.stderr, /withheld 1 unrelated verification finding/);
+});
 test("malformed documents report status to importers and diagnostics to the CLI", () => {
   const valid = JSON.stringify({ findings: [finding("Valid pass")] });
   const code = `
