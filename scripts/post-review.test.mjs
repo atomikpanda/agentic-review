@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -32,6 +32,7 @@ const BASE_SHA = "1".repeat(40);
 const HEAD_SHA = "2".repeat(40);
 const PRIOR_HEAD_SHA = "4".repeat(40);
 const FINGERPRINT = "3".repeat(64);
+const SCOPE_HASH = "5".repeat(64);
 const EMPTY_COUNTS = { Critical: 0, High: 0, Medium: 0 };
 
 function metadata(overrides = {}) {
@@ -50,6 +51,10 @@ function metadata(overrides = {}) {
     base_sha: BASE_SHA,
     head_sha: HEAD_SHA,
     configuration_fingerprint: FINGERPRINT,
+    reviewed_head: HEAD_SHA,
+    scope_hash: SCOPE_HASH,
+    coverage: "bounded",
+    remaining_analysis: [],
     snapshot_immutable: true,
     analysis_state: "complete",
     diff: { bytes: 120, included_bytes: 120, truncated: false },
@@ -89,6 +94,13 @@ function state(overrides = {}) {
   };
 }
 
+function outputValues(path) {
+  return Object.fromEntries(readFileSync(path, "utf8").trim().split("\n").map((line) => {
+    const separator = line.indexOf("=");
+    return [line.slice(0, separator), line.slice(separator + 1)];
+  }));
+}
+
 function botComment(id, body, createdAt = `2026-08-19T00:00:0${id}Z`) {
   return { id, body, created_at: createdAt, user: { login: "github-actions[bot]", type: "Bot" } };
 }
@@ -99,6 +111,81 @@ function incompressible(length) {
     value += createHash("sha256").update(String(index)).digest("base64url");
   }
   return value.slice(0, length);
+}
+
+function runPosterWithHistory({
+  mode,
+  summaryComments = [],
+  threads = [],
+  currentFindings = [],
+  failSummaryHistory = false,
+  failThreadHistory = false,
+}) {
+  const dir = mkdtempSync(join(tmpdir(), "post-review-history-"));
+  const findingsFile = join(dir, "findings.json");
+  const metadataFile = join(dir, "metadata.json");
+  const outputFile = join(dir, "output");
+  const preloadFile = join(dir, "mock-github.cjs");
+  writeFileSync(findingsFile, JSON.stringify({ findings: currentFindings }));
+  writeFileSync(metadataFile, JSON.stringify(metadata()));
+  writeFileSync(preloadFile, `
+const fixture = JSON.parse(process.env.POST_REVIEW_TEST_HISTORY);
+const reply = (value, status = 200) => ({
+  ok: status >= 200 && status < 300,
+  status,
+  json: async () => value,
+  text: async () => JSON.stringify(value),
+});
+globalThis.fetch = async (url, options = {}) => {
+  if (url === "https://api.github.com/graphql") {
+    const request = JSON.parse(options.body);
+    if (request.query.includes("viewer")) {
+      return reply({ data: { viewer: { login: "github-actions[bot]" } } });
+    }
+    if (request.query.includes("reviewThreads")) {
+      if (fixture.failThreadHistory) return reply({ errors: [{ message: "thread history unavailable" }] }, 500);
+      return reply({ data: { repository: { pullRequest: { reviewThreads: {
+        nodes: fixture.threads,
+        pageInfo: { hasNextPage: false, endCursor: null },
+      } } } } });
+    }
+  }
+  if (String(url).includes("/issues/7/comments?")) {
+    if (fixture.failSummaryHistory) return reply({ message: "summary history unavailable" }, 500);
+    return reply(fixture.summaryComments);
+  }
+  throw new Error(\`unexpected GitHub request: \${url}\`);
+};
+`);
+  const result = spawnSync(
+    process.execPath,
+    [fileURLToPath(new URL("./post-review.mjs", import.meta.url))],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${preloadFile}`.trim(),
+        POST_REVIEW_TEST_HISTORY: JSON.stringify({
+          summaryComments,
+          threads,
+          failSummaryHistory,
+          failThreadHistory,
+        }),
+        FINDINGS_FILE: findingsFile,
+        REVIEW_METADATA_FILE: metadataFile,
+        GITHUB_OUTPUT: outputFile,
+        GITHUB_REPO: "o/r",
+        PR_NUMBER: "7",
+        GH_TOKEN: "token",
+        REVIEW_MODE: mode,
+        DRY_RUN: "1",
+        FAIL_ON_FINDINGS: "true",
+      },
+    },
+  );
+  const workflowOutput = readFileSync(outputFile, "utf8");
+  rmSync(dir, { recursive: true, force: true });
+  return { ...result, workflowOutput };
 }
 
 test("summary marker round-trips only normalized carry-forward fields", () => {
@@ -262,6 +349,9 @@ test("unknown authenticated identity prevents a clean state and every standing w
   assert.equal(calls, 0);
   assert.match(readFileSync(output, "utf8"), /sample_state=unknown/);
   assert.match(readFileSync(output, "utf8"), /bounded_converged=false/);
+  assert.match(readFileSync(output, "utf8"), /coverage=unknown/);
+  assert.match(readFileSync(output, "utf8"), /remaining_analysis=\["reconciliation_unknown"\]/);
+  assert.match(readFileSync(output, "utf8"), /converged=false/);
 });
 
 test("malformed selected bot marker makes reconciliation unknown without trusting older state", () => {
@@ -285,6 +375,212 @@ test("deleting the standing summary comment resets summary history only", () => 
   });
 });
 
+test("switching presentation modes reconciles blocking evidence from both history stores", () => {
+  const priorInline = finding({
+    title: "Inline blocker survives mode switch",
+    body: "The standing inline review still records a blocking cache defect.",
+    suggestion: null,
+  });
+  const inlineBody = poster.buildReviewComments(
+    [priorInline],
+    new Map([[priorInline.file, [[priorInline.start_line, priorInline.end_line]]]]),
+    { mode: "inline" },
+  ).comments[0].body;
+  const inlineThread = {
+    id: "thread-1",
+    isResolved: false,
+    isOutdated: false,
+    path: priorInline.file,
+    originalStartLine: priorInline.start_line,
+    originalLine: priorInline.end_line,
+    comments: {
+      nodes: [{
+        databaseId: 17,
+        body: inlineBody,
+        author: { login: "github-actions[bot]" },
+        originalCommit: { oid: PRIOR_HEAD_SHA },
+      }],
+    },
+  };
+  const priorSummary = finding({
+    file: "src/auth.mjs",
+    start_line: 8,
+    end_line: 9,
+    title: "Summary blocker survives mode switch",
+    body: "The standing summary still records a blocking authorization defect.",
+    suggestion: null,
+  });
+  const summaryMarker = encodeSummaryMarker({ headSha: PRIOR_HEAD_SHA, findings: [priorSummary] });
+  const cases = [
+    {
+      mode: "summary",
+      summaryComments: [],
+      threads: [inlineThread],
+      expectedTitle: priorInline.title,
+    },
+    {
+      mode: "inline",
+      summaryComments: [botComment(1, summaryMarker)],
+      threads: [],
+      expectedTitle: priorSummary.title,
+    },
+    {
+      mode: "suggest",
+      summaryComments: [botComment(1, summaryMarker)],
+      threads: [],
+      expectedTitle: priorSummary.title,
+    },
+  ];
+
+  for (const history of cases) {
+    const result = runPosterWithHistory(history);
+    assert.equal(result.status, 1, `${history.mode}: ${result.stderr}`);
+    assert.match(result.workflowOutput, /merge_state=blocked/);
+    assert.match(result.workflowOutput, /sample_state=findings/);
+    assert.match(result.workflowOutput, /bounded_converged=false/);
+    assert.match(result.workflowOutput, /current_counts=\{"Critical":0,"High":0,"Medium":0\}/);
+    assert.match(result.workflowOutput, /unresolved_counts=\{"Critical":0,"High":1,"Medium":0\}/);
+    assert.match(result.stdout, new RegExp(history.expectedTitle));
+    if (history.mode === "summary") {
+      const persisted = decodeSummaryMarker(result.stdout);
+      assert.deepEqual(persisted.findings.map(({ title }) => title), [priorInline.title]);
+    }
+  }
+});
+
+test("summary mode deduplicates one unchanged blocker across both history stores on repeated runs", () => {
+  const blocker = finding({ suggestion: null });
+  const inlineBody = poster.buildReviewComments(
+    [blocker],
+    new Map([[blocker.file, [[blocker.start_line, blocker.end_line]]]]),
+    { mode: "inline" },
+  ).comments[0].body;
+  const inlineThread = {
+    id: "duplicate-thread",
+    isResolved: false,
+    isOutdated: false,
+    path: blocker.file,
+    originalStartLine: blocker.start_line,
+    originalLine: blocker.end_line,
+    comments: {
+      nodes: [{
+        databaseId: 18,
+        body: inlineBody,
+        author: { login: "github-actions[bot]" },
+        originalCommit: { oid: HEAD_SHA },
+      }],
+    },
+  };
+  let summaryBody = encodeSummaryMarker({ headSha: HEAD_SHA, findings: [blocker] });
+
+  for (let run = 1; run <= 2; run += 1) {
+    const result = runPosterWithHistory({
+      mode: "summary",
+      summaryComments: [botComment(run, summaryBody)],
+      threads: [inlineThread],
+    });
+
+    assert.equal(result.status, 1, `run ${run}: ${result.stderr}`);
+    assert.match(result.workflowOutput, /merge_state=blocked/);
+    assert.match(result.workflowOutput, /unresolved_counts=\{"Critical":0,"High":1,"Medium":0\}/);
+    assert.equal(result.stdout.match(/Cache entry survives invalidation/g)?.length, 1);
+    const marker = decodeSummaryMarker(result.stdout);
+    assert.equal(marker.findings.length, 1);
+    assert.equal(marker.findings[0].title, blocker.title);
+    summaryBody = result.stdout;
+  }
+});
+
+test("summary mode preserves an unmatched prior blocker after one fuzzy current match", () => {
+  const matched = finding({
+    severity: "Medium",
+    title: "Primary stale cache path",
+    body: "The primary stale cache entry survives invalidation.",
+    identity_tokens: ["cache", "entry", "stale", "survives", "invalidation"],
+  });
+  const unmatched = finding({
+    severity: "High",
+    title: "Secondary stale cache path",
+    body: "A distinct stale cache path also survives invalidation.",
+    identity_tokens: ["cache", "entry", "stale", "survives", "invalidation", "secondary"],
+  });
+  const current = finding({
+    severity: "Medium",
+    title: "Stale cache entry survives invalidation",
+    body: "The stale cache entry survives invalidation.",
+    identity_tokens: ["cache", "entry", "stale", "survives", "invalidation"],
+  });
+  const result = runPosterWithHistory({
+    mode: "summary",
+    currentFindings: [current],
+    summaryComments: [
+      botComment(1, encodeSummaryMarker({ headSha: HEAD_SHA, findings: [matched, unmatched] })),
+    ],
+  });
+
+  assert.equal(result.status, 1, `${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
+  assert.match(result.workflowOutput, /merge_state=blocked/);
+  assert.match(result.workflowOutput, /current_counts=\{"Critical":0,"High":0,"Medium":1\}/);
+  assert.match(result.workflowOutput, /unresolved_counts=\{"Critical":0,"High":1,"Medium":0\}/);
+  assert.deepEqual(
+    decodeSummaryMarker(result.stdout).findings.map(({ title }) => title),
+    [current.title, unmatched.title],
+  );
+});
+
+test("cross-store severity conflicts retain the blocker in every presentation mode", () => {
+  const medium = finding({ severity: "Medium", suggestion: null });
+  const high = finding({ severity: "High", suggestion: null });
+  const inlineBody = poster.buildReviewComments(
+    [high],
+    new Map([[high.file, [[high.start_line, high.end_line]]]]),
+    { mode: "inline" },
+  ).comments[0].body;
+  const inlineThread = {
+    id: "higher-severity-thread",
+    isResolved: false,
+    isOutdated: false,
+    path: high.file,
+    originalStartLine: high.start_line,
+    originalLine: high.end_line,
+    comments: {
+      nodes: [{
+        databaseId: 19,
+        body: inlineBody,
+        author: { login: "github-actions[bot]" },
+        originalCommit: { oid: HEAD_SHA },
+      }],
+    },
+  };
+  const summaryComments = [
+    botComment(1, encodeSummaryMarker({ headSha: HEAD_SHA, findings: [medium] })),
+  ];
+
+  for (const mode of ["summary", "inline"]) {
+    const result = runPosterWithHistory({
+      mode,
+      summaryComments,
+      threads: [inlineThread],
+    });
+    assert.equal(result.status, 1, `${mode}: ${result.stderr}`);
+    assert.match(result.workflowOutput, /merge_state=blocked/);
+    assert.match(result.workflowOutput, /unresolved_counts=\{"Critical":0,"High":1,"Medium":0\}/);
+  }
+});
+
+test("failure to read either history store prevents a clean convergence claim", () => {
+  for (const history of [
+    { mode: "summary", failThreadHistory: true },
+    { mode: "inline", failSummaryHistory: true },
+  ]) {
+    const result = runPosterWithHistory(history);
+    assert.equal(result.status, 0, `${history.mode}: ${result.stderr}`);
+    assert.match(result.workflowOutput, /sample_state=unknown/);
+    assert.match(result.workflowOutput, /bounded_converged=false/);
+    assert.doesNotMatch(result.workflowOutput, /sample_state=clean/);
+  }
+});
+
 test("current summary finding replaces a fuzzy prior duplicate", async () => {
   const prior = finding({ severity: "Medium" });
   const current = finding({ severity: "Critical", title: "Cache entry persists after invalidation" });
@@ -299,6 +595,59 @@ test("current summary finding replaces a fuzzy prior duplicate", async () => {
   assert.deepEqual(result.current, [current]);
   assert.deepEqual(result.held, []);
   assert.deepEqual(result.retired, []);
+});
+
+test("one current fuzzy match consumes only one prior summary finding", async () => {
+  const matched = finding({
+    severity: "Medium",
+    title: "Primary stale cache path",
+    body: "The primary stale cache entry survives invalidation.",
+    identity_tokens: ["cache", "entry", "stale", "survives", "invalidation"],
+  });
+  const unmatched = finding({
+    severity: "High",
+    title: "Secondary stale cache path",
+    body: "A distinct stale cache path also survives invalidation.",
+    identity_tokens: ["cache", "entry", "stale", "survives", "invalidation", "secondary"],
+  });
+  const current = finding({
+    severity: "Medium",
+    title: "Stale cache entry survives invalidation",
+    body: "The stale cache entry survives invalidation.",
+    identity_tokens: ["cache", "entry", "stale", "survives", "invalidation"],
+  });
+  const reconciled = await reconcileSummaryFindings({
+    analysisState: "complete",
+    current: [current],
+    prior: [matched, unmatched],
+    priorHeadSha: PRIOR_HEAD_SHA,
+    headSha: HEAD_SHA,
+    spanChanged: async () => false,
+  });
+
+  assert.deepEqual(reconciled.held, [unmatched]);
+  const reviewState = deriveReviewState({
+    analysisState: "complete",
+    current: reconciled.current,
+    unresolved: reconciled.held,
+    reconciliationKnown: reconciled.reconciliationKnown,
+    blockSeverities: ["Critical", "High"],
+  });
+  assert.equal(reviewState.merge_state, "blocked");
+  assert.equal(reviewState.sample_state, "findings");
+  assert.equal(reviewState.bounded_converged, false);
+  assert.equal(shouldFailGate(reviewState, true), true);
+
+  const body = buildStandingSummaryBody({
+    metadata: metadata(),
+    state: reviewState,
+    current: reconciled.current,
+    unresolved: reconciled.held,
+  });
+  assert.deepEqual(
+    decodeSummaryMarker(body).findings.map(({ title }) => title),
+    [current.title, unmatched.title],
+  );
 });
 
 for (const [label, changed] of [["unchanged", false], ["indeterminate", null]]) {
@@ -830,26 +1179,64 @@ test("poster rejects a finding title containing CR or LF while preserving multil
   assert.match(accepted.stdout, /First body line\.\nSecond body line\./);
 });
 
-test("machine outputs and matching job summary are emitted without a comment", () => {
+test("successful reconciliation writes matching workflow outputs and final result artifact", () => {
   const dir = mkdtempSync(join(tmpdir(), "post-review-output-"));
   const output = join(dir, "output");
   const summary = join(dir, "summary");
-  emitWorkflowResult({ metadata: metadata(), state: state(), outputFile: output, summaryFile: summary });
-  assert.equal(readFileSync(output, "utf8"), [
-    "analysis_state=complete",
-    "merge_state=blocked",
-    "sample_state=findings",
-    "bounded_converged=false",
-    `base_sha=${BASE_SHA}`,
-    `head_sha=${HEAD_SHA}`,
-    `configuration_fingerprint=${FINGERPRINT}`,
-    "passes_requested=3",
-    "passes_completed=3",
-    'current_counts={"Critical":0,"High":1,"Medium":0}',
-    'unresolved_counts={"Critical":0,"High":0,"Medium":1}',
-    "",
-  ].join("\n"));
-  assert.equal(readFileSync(summary, "utf8"), `## Agentic review\n\n${renderStateTable(metadata(), state())}\n`);
+  const resultFile = join(dir, "review-result.json");
+  const cleanState = state({
+    merge_state: "ready",
+    sample_state: "clean",
+    bounded_converged: true,
+    current_counts: EMPTY_COUNTS,
+    unresolved_counts: EMPTY_COUNTS,
+  });
+  emitWorkflowResult({
+    metadata: metadata(),
+    state: cleanState,
+    outputFile: output,
+    summaryFile: summary,
+    resultFile,
+  });
+
+  const outputs = outputValues(output);
+  assert.deepEqual(outputs, {
+    analysis_state: "complete",
+    merge_state: "ready",
+    sample_state: "clean",
+    bounded_converged: "true",
+    base_sha: BASE_SHA,
+    head_sha: HEAD_SHA,
+    configuration_fingerprint: FINGERPRINT,
+    passes_requested: "3",
+    passes_completed: "3",
+    current_counts: '{"Critical":0,"High":0,"Medium":0}',
+    unresolved_counts: '{"Critical":0,"High":0,"Medium":0}',
+    reviewed_head: HEAD_SHA,
+    scope_hash: SCOPE_HASH,
+    coverage: "bounded",
+    remaining_analysis: "[]",
+    converged: "true",
+  });
+  assert.deepEqual(JSON.parse(readFileSync(resultFile, "utf8")), {
+    analysis_state: outputs.analysis_state,
+    merge_state: outputs.merge_state,
+    sample_state: outputs.sample_state,
+    bounded_converged: true,
+    base_sha: outputs.base_sha,
+    head_sha: outputs.head_sha,
+    configuration_fingerprint: outputs.configuration_fingerprint,
+    passes_requested: 3,
+    passes_completed: 3,
+    current_counts: JSON.parse(outputs.current_counts),
+    unresolved_counts: JSON.parse(outputs.unresolved_counts),
+    reviewed_head: outputs.reviewed_head,
+    scope_hash: outputs.scope_hash,
+    coverage: outputs.coverage,
+    remaining_analysis: JSON.parse(outputs.remaining_analysis),
+    converged: true,
+  });
+  assert.equal(readFileSync(summary, "utf8"), `## Agentic review\n\n${renderStateTable(metadata(), cleanState)}\n`);
 });
 
 test("gate failure is derived only from merge_state", () => {
@@ -992,4 +1379,82 @@ test("malformed injected identity tokens are stripped before summary rendering",
   assert.equal(rendered.status, 0, rendered.stderr);
   assert.match(rendered.stdout, /Cache entry survives invalidation/);
   assert.match(rendered.stdout, /<!-- agentic-review-summary:v1:/);
+});
+
+test("runner and poster hard failures still write conservative outputs and a final result", (t) => {
+  const script = fileURLToPath(new URL("./post-review.mjs", import.meta.url));
+  for (const scenario of ["runner", "poster"]) {
+    const dir = mkdtempSync(join(tmpdir(), `post-review-${scenario}-failure-`));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const findingsFile = join(dir, "findings.json");
+    const metadataFile = join(dir, "metadata.json");
+    const outputFile = join(dir, "output");
+    const resultFile = join(dir, "review-result.json");
+    if (scenario === "poster") {
+      writeFileSync(findingsFile, "{not-json");
+      writeFileSync(metadataFile, JSON.stringify(metadata()));
+    }
+
+    const failed = spawnSync(process.execPath, [script], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        FINDINGS_FILE: findingsFile,
+        REVIEW_METADATA_FILE: metadataFile,
+        REVIEW_RESULT_FILE: resultFile,
+        GITHUB_OUTPUT: outputFile,
+        HEAD_SHA,
+        BASE_SHA,
+        RENDER: "1",
+        REVIEW_MODE: "summary",
+      },
+    });
+    assert.notEqual(failed.status, 0, scenario);
+    assert.equal(existsSync(outputFile), true, `${scenario} failure must emit workflow outputs`);
+    assert.equal(existsSync(resultFile), true, `${scenario} failure must retain review-result.json`);
+
+    const outputs = outputValues(outputFile);
+    for (const field of [
+      "merge_state",
+      "base_sha",
+      "head_sha",
+      "configuration_fingerprint",
+      "passes_requested",
+      "passes_completed",
+      "current_counts",
+      "unresolved_counts",
+    ]) {
+      assert.equal(Object.hasOwn(outputs, field), true, `${scenario} failure omitted ${field}`);
+    }
+    assert.equal(outputs.analysis_state, "inconclusive");
+    assert.equal(outputs.sample_state, "unknown");
+    assert.equal(outputs.bounded_converged, "false");
+    assert.equal(outputs.reviewed_head, HEAD_SHA);
+    assert.equal(outputs.scope_hash, scenario === "poster" ? SCOPE_HASH : "");
+    assert.equal(outputs.coverage, "unknown");
+    assert.deepEqual(JSON.parse(outputs.remaining_analysis), ["execution_failed"]);
+    assert.equal(outputs.converged, "false");
+
+    const result = JSON.parse(readFileSync(resultFile, "utf8"));
+    for (const field of [
+      "merge_state",
+      "base_sha",
+      "head_sha",
+      "configuration_fingerprint",
+      "passes_requested",
+      "passes_completed",
+      "current_counts",
+      "unresolved_counts",
+    ]) {
+      assert.equal(Object.hasOwn(result, field), true, `${scenario} result omitted ${field}`);
+    }
+    assert.equal(result.analysis_state, outputs.analysis_state);
+    assert.equal(result.sample_state, outputs.sample_state);
+    assert.equal(result.bounded_converged, false);
+    assert.equal(result.reviewed_head, outputs.reviewed_head);
+    assert.equal(result.scope_hash, outputs.scope_hash);
+    assert.equal(result.coverage, outputs.coverage);
+    assert.deepEqual(result.remaining_analysis, JSON.parse(outputs.remaining_analysis));
+    assert.equal(result.converged, false);
+  }
 });

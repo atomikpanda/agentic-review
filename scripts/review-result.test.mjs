@@ -18,6 +18,17 @@ const BASE_SHA = "1".repeat(40);
 const HEAD_SHA = "2".repeat(40);
 const FINGERPRINT = "3".repeat(64);
 const PASS_IDS = ["general", "correctness", "boundaries"];
+const DIFF = [
+  "diff --git a/a.txt b/a.txt",
+  "index 1111111..2222222 100644",
+  "--- a/a.txt",
+  "+++ b/a.txt",
+  "@@ -1 +1 @@",
+  "-old",
+  "+new",
+  "",
+].join("\n");
+const SCOPE_HASH = "0012d7453c71630d2e70e36517ba3482fb1e190611543c94b1955dd9a8083ebb";
 const EMPTY_COUNTS = { Critical: 0, High: 0, Medium: 0 };
 
 function passResult(id, overrides = {}) {
@@ -40,6 +51,10 @@ function completeRun(overrides = {}) {
     head_sha: HEAD_SHA,
     configuration_fingerprint: FINGERPRINT,
     snapshot_immutable: true,
+    reviewed_head: HEAD_SHA,
+    scope_hash: SCOPE_HASH,
+    coverage: "bounded",
+    remaining_analysis: [],
     diff: { bytes: 100, included_bytes: 100, truncated: false },
     finding_cap: 20,
     merge_succeeded: true,
@@ -70,6 +85,7 @@ function expectedState(analysisState, mergeState, sampleState, boundedConverged,
     merge_state: mergeState,
     sample_state: sampleState,
     bounded_converged: boundedConverged,
+    converged: boundedConverged,
     current_counts: currentCounts,
     unresolved_counts: unresolvedCounts,
   };
@@ -153,6 +169,13 @@ test("bounded convergence is derived exactly from complete plus clean", () => {
     blockSeverities: ["Critical", "High"],
     boundedConverged: false,
   }).bounded_converged, true);
+  assert.equal(deriveReviewState({
+    analysisState: "complete",
+    current: [],
+    unresolved: [],
+    reconciliationKnown: true,
+    blockSeverities: ["Critical", "High"],
+  }).converged, true);
 
   assert.equal(deriveReviewState({
     analysisState: "inconclusive",
@@ -162,6 +185,13 @@ test("bounded convergence is derived exactly from complete plus clean", () => {
     blockSeverities: ["Critical", "High"],
     boundedConverged: true,
   }).bounded_converged, false);
+  assert.equal(deriveReviewState({
+    analysisState: "inconclusive",
+    current: [],
+    unresolved: [],
+    reconciliationKnown: true,
+    blockSeverities: ["Critical", "High"],
+  }).converged, false);
 });
 
 test("analysis is complete only for successful uncapped passes on one target and fingerprint", () => {
@@ -312,6 +342,38 @@ test("run metadata validation rejects target, fingerprint, pass, and derived-sta
   assert.throws(() => validateRunMetadata(duplicatePass), /passes\.requested/i);
 });
 
+test("run metadata validation preserves the additive contract and stable reason vocabulary", () => {
+  const metadata = {
+    schema_version: REVIEW_RESULT_SCHEMA_VERSION,
+    ...completeRun(),
+    analysis_state: "complete",
+  };
+  assert.equal(validateRunMetadata(metadata), metadata);
+
+  for (const [mutate, message] of [
+    [(value) => { value.reviewed_head = BASE_SHA; }, /reviewed_head/],
+    [(value) => { value.scope_hash = "not-a-hash"; }, /scope_hash/],
+    [(value) => { value.coverage = "complete"; }, /coverage/],
+    [(value) => { value.remaining_analysis = ["not_a_reason"]; }, /remaining_analysis/],
+    [(value) => {
+      value.coverage = "unknown";
+      value.remaining_analysis = ["pass_failed", "diff_truncated"];
+      value.analysis_state = "inconclusive";
+      value.diff = { bytes: 101, included_bytes: 100, truncated: true };
+      value.passes.completed = [];
+      value.passes.results = value.passes.results.map((pass) => ({
+        ...pass,
+        status: "failed",
+        attempts: 2,
+      }));
+    }, /remaining_analysis/],
+  ]) {
+    const malformed = structuredClone(metadata);
+    mutate(malformed);
+    assert.throws(() => validateRunMetadata(malformed), message);
+  }
+});
+
 test("run metadata validation rejects malformed values instead of coercing them", () => {
   const metadata = {
     schema_version: REVIEW_RESULT_SCHEMA_VERSION,
@@ -333,6 +395,34 @@ test("run metadata validation rejects malformed values instead of coercing them"
     mutate(malformed);
     assert.throws(() => validateRunMetadata(malformed), message);
   }
+});
+
+test("scope hashes are exact, canonical, and sensitive to the full diff and configuration", () => {
+  const script = new URL("./review-result.mjs", import.meta.url);
+  const scope = {
+    base_sha: BASE_SHA,
+    head_sha: HEAD_SHA,
+    diff: DIFF,
+    configuration_fingerprint: FINGERPRINT,
+  };
+  const hash = (value) => {
+    const result = spawnSync(process.execPath, [script.pathname, "scope", "-"], {
+      input: JSON.stringify(value),
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+
+  assert.equal(hash(scope), SCOPE_HASH);
+  assert.equal(hash({
+    configuration_fingerprint: FINGERPRINT,
+    diff: DIFF,
+    head_sha: HEAD_SHA,
+    base_sha: BASE_SHA,
+  }), SCOPE_HASH);
+  assert.notEqual(hash({ ...scope, diff: `${DIFF}+another line\n` }), SCOPE_HASH);
+  assert.notEqual(hash({ ...scope, configuration_fingerprint: "4".repeat(64) }), SCOPE_HASH);
 });
 
 test("the guarded CLI uses the importable fingerprint, analysis, and validation implementations", () => {

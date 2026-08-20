@@ -160,7 +160,7 @@ Every valid pass contributes to one union with `min_votes=1`, so a finding seen
 by only one pass survives. One result is rendered or posted: the union, or an
 explicitly inconclusive first-valid structured fallback if union fails.
 
-The result separates four operator-visible values:
+The result separates four primary operator-visible values:
 
 | Output | Values | Meaning |
 |---|---|---|
@@ -168,6 +168,30 @@ The result separates four operator-visible values:
 | `merge_state` | `ready`, `blocked` | Whether any current or held finding has a severity in `block_severities` |
 | `sample_state` | `clean`, `findings`, `unknown` | Whether actionable evidence remains; `clean` additionally requires complete analysis and known reconciliation |
 | `bounded_converged` | `true`, `false` | `true` exactly when `analysis_state=complete` **and** `sample_state=clean` |
+
+The additive final-result contract also exposes:
+
+- `reviewed_head`, which is exactly `head_sha`;
+- `scope_hash`, the SHA-256 of canonical JSON
+  `{base_sha, configuration_fingerprint, diff, head_sha}`;
+- `coverage`, which is `bounded` only when the configured execution completed
+  against its immutable snapshot, and otherwise `unknown`;
+- `remaining_analysis`, a JSON reason-code array; and
+- `converged`, an exact alias of `bounded_converged`.
+
+A successful configured execution has `remaining_analysis=[]`. Otherwise reason
+codes appear once in this deterministic order:
+
+| Reason code | Meaning |
+|---|---|
+| `diff_truncated` | The configured diff byte limit omitted part of the diff |
+| `finding_cap_reached` | At least one pass reached its finding cap |
+| `pass_failed` | A configured pass did not return valid structured output |
+| `snapshot_mutable` | The reviewed snapshot was not immutable |
+| `pass_scope_mismatch` | Passes did not share the same base, head, or configuration |
+| `merge_failed` | Valid pass results could not be merged |
+| `reconciliation_unknown` | Prior finding state could not be reconciled safely |
+| `execution_failed` | Hosted execution or final-result construction failed |
 
 In short, `complete` qualifies execution, `ready` applies the configured
 severity policy, `clean` describes the reconciled bounded sample, and bounded
@@ -190,20 +214,29 @@ set `bounded_converged=true`.
 `merge_state=blocked`. Without it, job success means execution succeeded, not
 that the sample was clean or converged.
 
+Hard execution failures still run the hosted poster. Missing or invalid review
+artifacts are never posted to the pull request; the poster emits a conservative
+final result (`analysis_state=inconclusive`, `sample_state=unknown`,
+`coverage=unknown`, both convergence fields `false`, and
+`remaining_analysis` including `execution_failed`) and exits nonzero so an
+earlier runner failure cannot be hidden.
+
 The reusable workflow exposes these exact outputs:
 
 | Output | Content |
 |---|---|
-| `analysis_state`, `merge_state`, `sample_state`, `bounded_converged` | The four result values above |
+| `analysis_state`, `merge_state`, `sample_state`, `bounded_converged` | The four primary result values above |
+| `reviewed_head`, `scope_hash`, `coverage`, `remaining_analysis`, `converged` | Immutable reviewed head and scope plus bounded coverage, outstanding reason codes, and the convergence alias |
 | `base_sha`, `head_sha`, `configuration_fingerprint` | The immutable review identity |
 | `passes_requested`, `passes_completed` | Counts of configured and valid passes |
 | `current_counts`, `unresolved_counts` | JSON severity maps for current and held findings |
 
 The same values appear in the review body and GitHub job summary. The hosted
-`agentic-review` artifact retains the structured findings result (`review.md`),
-bounded-run metadata (`review-meta.json`), and runner stdout and stderr for
-seven days. Locally, `--out` and `--metadata-out` write the first two artifacts
-directly.
+`agentic-review` artifact retains the final result (`review-result.json`),
+structured findings (`review.md`), bounded-run metadata (`review-meta.json`),
+and runner stdout and stderr for seven days. The poster writes the final result
+at `/tmp/review-result.json` before artifact upload. Locally, `--out` and
+`--metadata-out` write the findings and metadata artifacts directly.
 
 ### Standing summaries and finding history
 

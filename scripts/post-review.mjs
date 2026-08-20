@@ -32,7 +32,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { deflateRawSync, inflateRawSync } from "node:zlib";
 
@@ -45,7 +45,7 @@ import {
   SIMILARITY_DEFAULT,
   tokenSet,
 } from "./lib-findings.mjs";
-import { deriveReviewState, validateRunMetadata } from "./review-result.mjs";
+import { deriveReviewState, enrichRunMetadata, validateRunMetadata } from "./review-result.mjs";
 import {
   GIT_DIFF_MAX_BUFFER_BYTES,
   changeIsConfirmed,
@@ -55,10 +55,7 @@ import {
 const env = (k, d) => process.env[k] ?? d;
 const required = (k) => {
   const v = process.env[k];
-  if (!v) {
-    console.error(`::error::${k} is not set`);
-    process.exit(1);
-  }
+  if (!v) throw new TypeError(`${k} is not set`);
   return v;
 };
 
@@ -219,14 +216,14 @@ export function selectSummaryHistory(comments, { botLogin } = {}) {
   };
 }
 
-function sameSummaryFinding(left, right) {
+function summaryFindingSimilarity(left, right) {
   const leftFile = String(left.file ?? "").replace(/^\.\//, "");
   const rightFile = String(right.file ?? "").replace(/^\.\//, "");
-  if (leftFile !== rightFile) return false;
+  if (leftFile !== rightFile) return -1;
   return similarity(
     new Set(summaryIdentityTokens(left)),
     new Set(summaryIdentityTokens(right)),
-  ) >= SIMILARITY;
+  );
 }
 
 export async function reconcileSummaryFindings({
@@ -237,11 +234,26 @@ export async function reconcileSummaryFindings({
   headSha,
   spanChanged,
 }) {
+  const matchedPrior = new Set();
+  for (const candidate of current) {
+    let bestIndex = null;
+    let bestScore = -1;
+    for (const [index, previous] of prior.entries()) {
+      if (matchedPrior.has(index)) continue;
+      const score = summaryFindingSimilarity(candidate, previous);
+      if (score >= SIMILARITY && (bestIndex === null || score > bestScore)) {
+        bestIndex = index;
+        bestScore = score;
+      }
+    }
+    if (bestIndex !== null) matchedPrior.add(bestIndex);
+  }
+
   const held = [];
   const retired = [];
   let reconciliationKnown = true;
-  for (const previous of prior) {
-    if (current.some((candidate) => sameSummaryFinding(candidate, previous))) continue;
+  for (const [index, previous] of prior.entries()) {
+    if (matchedPrior.has(index)) continue;
     let changed = null;
     try {
       changed = await spanChanged(previous, priorHeadSha, headSha);
@@ -629,20 +641,59 @@ export function buildStandingSummaryBody({ metadata, state, current, unresolved 
   return safetyOnly;
 }
 
-export function emitWorkflowResult({ metadata, state, outputFile, summaryFile }) {
+export function emitWorkflowResult({
+  metadata,
+  state,
+  outputFile,
+  summaryFile,
+  resultFile,
+  reconciliationKnown = true,
+  executionFailed = false,
+  resultMetadata,
+}) {
+  const enriched = resultMetadata ?? enrichRunMetadata(metadata, {
+    scopeHash: metadata.scope_hash,
+    reconciliationKnown,
+    executionFailed,
+  });
+  const converged = executionFailed ? false : (state.converged ?? state.bounded_converged);
+  const result = {
+    analysis_state: state.analysis_state,
+    merge_state: state.merge_state,
+    sample_state: state.sample_state,
+    bounded_converged: converged,
+    base_sha: metadata.base_sha ?? "",
+    head_sha: metadata.head_sha ?? "",
+    configuration_fingerprint: metadata.configuration_fingerprint ?? "",
+    passes_requested: metadata.passes?.requested?.length ?? 0,
+    passes_completed: metadata.passes?.completed?.length ?? 0,
+    current_counts: state.current_counts,
+    unresolved_counts: state.unresolved_counts,
+    reviewed_head: enriched.reviewed_head,
+    scope_hash: enriched.scope_hash,
+    coverage: enriched.coverage,
+    remaining_analysis: enriched.remaining_analysis,
+    converged,
+  };
+  if (resultFile) writeFileSync(resultFile, `${JSON.stringify(result, null, 2)}\n`);
   if (outputFile) {
     appendFileSync(outputFile, [
-      `analysis_state=${state.analysis_state}`,
-      `merge_state=${state.merge_state}`,
-      `sample_state=${state.sample_state}`,
-      `bounded_converged=${state.bounded_converged}`,
-      `base_sha=${metadata.base_sha}`,
-      `head_sha=${metadata.head_sha}`,
-      `configuration_fingerprint=${metadata.configuration_fingerprint}`,
-      `passes_requested=${metadata.passes.requested.length}`,
-      `passes_completed=${metadata.passes.completed.length}`,
-      `current_counts=${JSON.stringify(state.current_counts)}`,
-      `unresolved_counts=${JSON.stringify(state.unresolved_counts)}`,
+      `analysis_state=${result.analysis_state}`,
+      `merge_state=${result.merge_state}`,
+      `sample_state=${result.sample_state}`,
+      `bounded_converged=${result.bounded_converged}`,
+      `base_sha=${result.base_sha}`,
+      `head_sha=${result.head_sha}`,
+      `configuration_fingerprint=${result.configuration_fingerprint}`,
+      `passes_requested=${result.passes_requested}`,
+      `passes_completed=${result.passes_completed}`,
+      `current_counts=${JSON.stringify(result.current_counts)}`,
+      `unresolved_counts=${JSON.stringify(result.unresolved_counts)}`,
+      `reviewed_head=${result.reviewed_head}`,
+      `scope_hash=${result.scope_hash}`,
+      `coverage=${result.coverage}`,
+      `remaining_analysis=${JSON.stringify(result.remaining_analysis)}`,
+      `converged=${result.converged}`,
       "",
     ].join("\n"));
   }
@@ -1017,22 +1068,26 @@ function blockSeverities() {
     .filter(Boolean);
 }
 
-function deriveState(metadata, current, unresolved, reconciliationKnown) {
+function deriveState(metadata, current, unresolved, reconciliationKnown, evidenceReconciled = false) {
   return deriveReviewState({
     analysisState: metadata.analysis_state,
     current,
     unresolved,
     reconciliationKnown,
     blockSeverities: blockSeverities(),
+    evidenceReconciled,
   });
 }
 
-function emitState(metadata, state) {
+function emitState(metadata, state, { reconciliationKnown = true, executionFailed = false } = {}) {
   emitWorkflowResult({
     metadata,
     state,
     outputFile: env("GITHUB_OUTPUT", ""),
     summaryFile: env("GITHUB_STEP_SUMMARY", ""),
+    resultFile: env("REVIEW_RESULT_FILE", ""),
+    reconciliationKnown,
+    executionFailed,
   });
 }
 
@@ -1075,53 +1130,130 @@ function matchesUnchangedResolvedThread(finding, threads, headSha) {
     && fileChangedSince(thread, headSha) === false
   ));
 }
+async function loadReconciliationHistory({ repo, pr, token, botLogin, identityKnown }) {
+  const summary = { comment: null, findings: [], headSha: null, reconciliationKnown: identityKnown };
+  if (!identityKnown) return { summary, threads: [], threadsKnown: false };
 
-export async function runSummaryMode({ metadata, findings, repo, pr, token, botLogin, identityKnown }) {
-  let history = { comment: null, findings: [], headSha: null, reconciliationKnown: identityKnown };
-  if (identityKnown) {
-    try {
-      const comments = await fetchSummaryComments({ repo, pr, token });
-      history = selectSummaryHistory(comments, { botLogin });
-    } catch (error) {
-      history = { comment: null, findings: [], headSha: null, reconciliationKnown: false };
-      console.log(`::warning::could not read standing summary comment (${error.message})`);
-    }
+  const [summaryResult, threadsResult] = await Promise.allSettled([
+    fetchSummaryComments({ repo, pr, token }),
+    (() => {
+      const [owner, name] = repo.split("/");
+      return fetchOurThreads({ owner, name, pr, botLogin });
+    })(),
+  ]);
+
+  let selectedSummary = summary;
+  if (summaryResult.status === "fulfilled") {
+    selectedSummary = selectSummaryHistory(summaryResult.value, { botLogin });
+  } else {
+    selectedSummary = { comment: null, findings: [], headSha: null, reconciliationKnown: false };
+    console.log(
+      `::warning::could not read standing summary comment (${summaryResult.reason?.message ?? summaryResult.reason})`,
+    );
   }
 
-  const reconciled = history.reconciliationKnown
+  let threads = [];
+  let threadsKnown = true;
+  if (threadsResult.status === "fulfilled") {
+    threads = threadsResult.value;
+  } else {
+    threadsKnown = false;
+    console.log(
+      `::warning::could not read existing review threads (${threadsResult.reason?.message ?? threadsResult.reason})`,
+    );
+  }
+  return { summary: selectedSummary, threads, threadsKnown };
+}
+
+function historicalFindingKey(finding) {
+  return JSON.stringify([
+    finding.file,
+    finding.start_line,
+    finding.end_line,
+    finding.title,
+    finding.body,
+    finding.suggestion ?? null,
+    [...(finding.identity_tokens ?? [])].sort(),
+  ]);
+}
+
+function preferredHistoricalFinding(left, right) {
+  const severityDifference = SEVERITY_ORDER[left.severity] - SEVERITY_ORDER[right.severity];
+  if (severityDifference !== 0) return severityDifference < 0 ? left : right;
+  return historicalFindingKey(left) <= historicalFindingKey(right) ? left : right;
+}
+
+function mergeFindingSets(primary, secondary, resolveMatch) {
+  const merged = [...primary];
+  const matched = new Set();
+  for (const finding of secondary) {
+    const match = primary.findIndex(
+      (candidate, index) => !matched.has(index) && sameFinding(candidate, finding, SIMILARITY),
+    );
+    if (match < 0) {
+      merged.push(finding);
+    } else {
+      matched.add(match);
+      merged[match] = resolveMatch(primary[match], finding);
+    }
+  }
+  return merged;
+}
+
+
+export async function runSummaryMode({ metadata, findings, repo, pr, token, botLogin, identityKnown }) {
+  const history = await loadReconciliationHistory({ repo, pr, token, botLogin, identityKnown });
+  const summaryReconciled = history.summary.reconciliationKnown
     ? await reconcileSummaryFindings({
       analysisState: metadata.analysis_state,
       current: findings,
-      prior: history.findings,
-      priorHeadSha: history.headSha,
+      prior: history.summary.findings,
+      priorHeadSha: history.summary.headSha,
       headSha: metadata.head_sha,
       spanChanged: summarySpanChanged,
     })
     : { current: findings, held: [], retired: [], reconciliationKnown: false };
-  const reconciliationKnown = history.reconciliationKnown && reconciled.reconciliationKnown;
-  const state = deriveState(metadata, reconciled.current, reconciled.held, reconciliationKnown);
-  const carried = [...reconciled.current, ...reconciled.held];
+  const standing = history.threads.filter((thread) => !thread.isResolved && !thread.retired);
+  const dismissed = history.threads.filter((thread) => thread.isResolved);
+  const inlineReconciled = await reconcileInlineFindings({
+    metadata,
+    findings,
+    standing,
+    dismissed,
+    resolveStale: env("RESOLVE_STALE", "true") === "true",
+    writesEnabled: false,
+  });
+  const reconciliationKnown = history.summary.reconciliationKnown
+    && history.threadsKnown
+    && summaryReconciled.reconciliationKnown
+    && inlineReconciled.reconciliationKnown;
+  const unresolved = mergeFindingSets(
+    summaryReconciled.held,
+    inlineReconciled.unresolved,
+    preferredHistoricalFinding,
+  );
+  const state = deriveState(metadata, summaryReconciled.current, unresolved, reconciliationKnown, true);
   const body = buildStandingSummaryBody({
     metadata,
     state,
-    current: reconciled.current,
-    unresolved: reconciled.held,
+    current: summaryReconciled.current,
+    unresolved,
   });
 
-  emitState(metadata, state);
+  emitState(metadata, state, { reconciliationKnown });
   if (reconciliationKnown) {
     const action = await upsertSummaryComment({
       repo,
       pr,
       token,
-      existingComment: history.comment,
+      existingComment: history.summary.comment,
       body,
-      hasFindings: carried.length > 0,
+      hasFindings: summaryReconciled.current.length + unresolved.length > 0,
       writesEnabled: WRITES_ENABLED,
     });
     console.log(`  summary comment ${action}`);
   } else {
-    console.log("::warning::summary reconciliation is unknown; standing comment was not changed");
+    console.log("::warning::reconciliation is unknown; standing summary comment was not changed");
   }
   if (DRY_RUN && env("SUPPRESS_WRITES", "") !== "true" && env("POST_COMMENT", "true") !== "false") {
     process.stdout.write(`${body}\n`);
@@ -1201,50 +1333,57 @@ export function buildInlineReviewPayload({ metadata, state, fresh, unresolved, c
   };
 }
 
-async function runInlineMode({ metadata, findings, repo, pr, botLogin, identityKnown }) {
-  let prior = [];
-  let reconciliationKnown = identityKnown;
-  if (identityKnown) {
-    try {
-      const [owner, name] = repo.split("/");
-      prior = await fetchOurThreads({ owner, name, pr, botLogin });
-    } catch (error) {
-      reconciliationKnown = false;
-      console.log(`::warning::could not read existing review threads (${error.message}); posting without dedupe`);
-    }
-  }
-
-  const standing = prior.filter((thread) => !thread.isResolved && !thread.retired);
-  const dismissed = prior.filter((thread) => thread.isResolved);
-  const reconciled = await reconcileInlineFindings({
+async function runInlineMode({ metadata, findings, repo, pr, token, botLogin, identityKnown }) {
+  const history = await loadReconciliationHistory({ repo, pr, token, botLogin, identityKnown });
+  const standing = history.threads.filter((thread) => !thread.isResolved && !thread.retired);
+  const dismissed = history.threads.filter((thread) => thread.isResolved);
+  const inlineReconciled = await reconcileInlineFindings({
     metadata,
     findings,
     standing,
     dismissed,
     resolveStale: env("RESOLVE_STALE", "true") === "true",
-    writesEnabled: WRITES_ENABLED,
+    writesEnabled: WRITES_ENABLED && history.summary.reconciliationKnown && history.threadsKnown,
   });
-  reconciliationKnown = reconciliationKnown && reconciled.reconciliationKnown;
-  const { current, fresh, unresolved, suppressed } = reconciled;
+  const summaryReconciled = history.summary.reconciliationKnown
+    ? await reconcileSummaryFindings({
+      analysisState: metadata.analysis_state,
+      current: findings,
+      prior: history.summary.findings,
+      priorHeadSha: history.summary.headSha,
+      headSha: metadata.head_sha,
+      spanChanged: summarySpanChanged,
+    })
+    : { current: findings, held: [], retired: [], reconciliationKnown: false };
+  const reconciliationKnown = history.summary.reconciliationKnown
+    && history.threadsKnown
+    && inlineReconciled.reconciliationKnown
+    && summaryReconciled.reconciliationKnown;
+  const { current, fresh, suppressed } = inlineReconciled;
+  const unresolved = mergeFindingSets(
+    inlineReconciled.unresolved,
+    summaryReconciled.held,
+    preferredHistoricalFinding,
+  );
   if (suppressed) {
     console.log(`  ${suppressed} finding(s) previously resolved and unchanged — not re-raised`);
   }
 
-  const ranges = fresh.length > 0
+  const ranges = fresh.length > 0 && reconciliationKnown
     ? commentableRanges(metadata.base_sha, metadata.head_sha)
     : new Map();
   const { comments, unanchored } = buildReviewComments(fresh, ranges, { mode: REVIEW_MODE });
-  const state = deriveState(metadata, current, unresolved, reconciliationKnown);
+  const state = deriveState(metadata, current, unresolved, reconciliationKnown, true);
   const payload = buildInlineReviewPayload({ metadata, state, fresh, unresolved, comments });
 
-  emitState(metadata, state);
+  emitState(metadata, state, { reconciliationKnown });
   console.log(
     `  ${findings.length} finding(s): ${comments.length} anchored, `
       + `${unanchored.length} summary-only, ${findings.length - fresh.length - suppressed} already open`,
   );
 
-  if (!identityKnown) {
-    console.log("::warning::authenticated bot identity is unknown; review writes were suppressed");
+  if (!reconciliationKnown) {
+    console.log("::warning::reconciliation is unknown; review writes were suppressed");
     enforceGate(state);
     return;
   }
@@ -1275,10 +1414,44 @@ async function runInlineMode({ metadata, findings, repo, pr, botLogin, identityK
   enforceGate(state);
 }
 
+let activeMetadata = null;
+
+function emitHardFailureResult() {
+  const metadata = activeMetadata ?? {
+    base_sha: env("BASE_SHA", ""),
+    head_sha: env("HEAD_SHA", ""),
+    configuration_fingerprint: "",
+    passes: { requested: [], completed: [] },
+  };
+  const state = {
+    analysis_state: "inconclusive",
+    merge_state: "ready",
+    sample_state: "unknown",
+    bounded_converged: false,
+    current_counts: { Critical: 0, High: 0, Medium: 0 },
+    unresolved_counts: { Critical: 0, High: 0, Medium: 0 },
+  };
+  const resultMetadata = activeMetadata ? undefined : {
+    reviewed_head: env("HEAD_SHA", metadata.head_sha ?? ""),
+    scope_hash: "",
+    coverage: "unknown",
+    remaining_analysis: ["execution_failed"],
+  };
+  emitWorkflowResult({
+    metadata,
+    state,
+    outputFile: env("GITHUB_OUTPUT", ""),
+    resultFile: env("REVIEW_RESULT_FILE", ""),
+    executionFailed: true,
+    resultMetadata,
+  });
+}
+
 async function main() {
   const findingsPath = required("FINDINGS_FILE");
   const metadataPath = required("REVIEW_METADATA_FILE");
   const metadata = validateRunMetadata(JSON.parse(readFileSync(metadataPath, "utf8")));
+  activeMetadata = metadata;
   const parsed = extractJson(readFileSync(findingsPath, "utf8"));
   if (!parsed) throw new TypeError("findings artifact is not the requested structured JSON");
   const findings = parsed.findings;
@@ -1295,14 +1468,14 @@ async function main() {
       try {
         const prior = extractJson(readFileSync(unresolvedPath, "utf8"));
         if (!prior) throw new TypeError("unresolved findings are not structured JSON");
-        unresolved = prior.findings.filter((priorFinding) =>
-          !findings.some((currentFinding) => sameFinding(currentFinding, priorFinding)));
+        unresolved = mergeFindingSets(findings, prior.findings, (current) => current)
+          .slice(findings.length);
       } catch {
         reconciliationKnown = false;
       }
     }
-    const state = deriveState(metadata, findings, unresolved, reconciliationKnown);
-    emitState(metadata, state);
+    const state = deriveState(metadata, findings, unresolved, reconciliationKnown, true);
+    emitState(metadata, state, { reconciliationKnown });
     const body = mode === "summary"
       ? buildStandingSummaryBody({ metadata, state, current: findings, unresolved })
       : renderReviewBody({ mode, metadata, state, current: findings, unresolved });
@@ -1327,12 +1500,17 @@ async function main() {
     await runSummaryMode({ metadata, findings, repo, pr, token, botLogin, identityKnown });
     return;
   }
-  await runInlineMode({ metadata, findings, repo, pr, botLogin, identityKnown });
+  await runInlineMode({ metadata, findings, repo, pr, token, botLogin, identityKnown });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {
     console.error(`::error::${error?.message ?? error}`);
+    try {
+      emitHardFailureResult();
+    } catch (resultError) {
+      console.error(`::error::could not persist conservative review result (${resultError?.message ?? resultError})`);
+    }
     process.exitCode = 1;
   });
 }

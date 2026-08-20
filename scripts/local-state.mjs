@@ -38,6 +38,29 @@ const STATE_FILE = join(STATE_DIR, "state.json");
 const STORED_STATUSES = new Set(["open", "dismissed", "gone"]);
 const STORED_SEVERITIES = new Set(["Critical", "High", "Medium"]);
 const NON_LOWERCASE_HEX = /[^0-9a-f]/;
+const STAGED_TARGET_REF_PREFIX = "refs/agentic-review/staged-targets/";
+
+const findingOwnsStagedTarget = (finding) => finding.status !== "gone";
+
+function retainStagedTarget(state, target) {
+  if (!target) return;
+  if (state.findings.some((finding) => findingOwnsStagedTarget(finding) && finding.lastCommit === target)) {
+    git(["update-ref", `${STAGED_TARGET_REF_PREFIX}${target}`, target]);
+  }
+}
+
+function pruneUnownedStagedTargets(state) {
+  const owned = new Set(
+    state.findings
+      .filter(findingOwnsStagedTarget)
+      .map((finding) => finding.lastCommit),
+  );
+  const refs = git(["for-each-ref", "--format=%(refname)", STAGED_TARGET_REF_PREFIX]);
+  for (const ref of refs ? refs.split("\n") : []) {
+    const target = ref.slice(STAGED_TARGET_REF_PREFIX.length);
+    if (!owned.has(target)) git(["update-ref", "-d", ref]);
+  }
+}
 
 function isTimestamp(value) {
   if (typeof value !== "string") return false;
@@ -176,6 +199,13 @@ if (cmd === "record") {
   if (extra.length > 0 || !["complete", "inconclusive"].includes(analysisState)) {
     throw new TypeError("record requires an explicit complete or inconclusive analysis state");
   }
+  const stagedTarget = process.env.AGENTIC_REVIEW_STAGED_TARGET ?? "";
+  if (
+    stagedTarget
+    && (stagedTarget !== head || stagedTarget.length !== 40 || NON_LOWERCASE_HEX.test(stagedTarget))
+  ) {
+    throw new TypeError("AGENTIC_REVIEW_STAGED_TARGET must match the recorded head SHA");
+  }
   const parsed = extractJson(readFileSync(file, "utf8"));
   if (!parsed) { console.error("unparseable findings"); process.exit(1); }
   const findings = parsed.findings.map((finding, index) => {
@@ -235,7 +265,11 @@ if (cmd === "record") {
   const stamp = now.replace(/[:.]/g, "-");
   writeFileSync(join(RUNS_DIR, `${stamp}.json`), JSON.stringify(
     { at: now, base, head, analysis_state: analysisState, branch: git(["rev-parse", "--abbrev-ref", "HEAD"]), findings }, null, 2));
+  // A staged worktree may be the target's only other reachability. Add its ref
+  // before persisting ownership, then prune only after the new state is durable.
+  retainStagedTarget(state, stagedTarget);
   save(state);
+  pruneUnownedStagedTargets(state);
 
   const bits = [`${fresh} new`, `${again} recurring`];
   if (muted) bits.push(`${muted} dismissed`);
@@ -289,6 +323,7 @@ if (cmd === "dismiss" || cmd === "reopen") {
     n++;
   }
   save(state);
+  pruneUnownedStagedTargets(state);
   console.log(`${cmd === "dismiss" ? "dismissed" : "reopened"} ${n}`);
   process.exit(0);
 }

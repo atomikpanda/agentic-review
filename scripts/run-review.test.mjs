@@ -693,6 +693,10 @@ test("the default profile runs general, correctness, and boundaries into one val
   assert.equal(run.metadata.head_sha, run.headSha);
   assert.equal(run.metadata.analysis_state, "complete");
   assert.equal(run.metadata.snapshot_immutable, true);
+  assert.equal(run.metadata.reviewed_head, run.headSha);
+  assert.match(run.metadata.scope_hash, /^[a-f0-9]{64}$/);
+  assert.equal(run.metadata.coverage, "bounded");
+  assert.deepEqual(run.metadata.remaining_analysis, []);
   assert.equal(new Set(run.metadata.passes.results.map((pass) => pass.configuration_fingerprint)).size, 1);
   for (const pass of run.metadata.passes.results) {
     assert.equal(pass.base_sha, run.baseSha);
@@ -705,6 +709,81 @@ test("the default profile runs general, correctness, and boundaries into one val
   const validation = validateMetadata(run.metadataFile);
   assert.equal(validation.status, 0, validation.stderr);
   assert.deepEqual(JSON.parse(validation.stdout), run.metadata);
+});
+
+test("workflow exposes and always retains the additive final result contract", () => {
+  const source = readFileSync(workflow, "utf8");
+  for (const field of [
+    "reviewed_head",
+    "scope_hash",
+    "coverage",
+    "remaining_analysis",
+    "converged",
+  ]) {
+    assert.match(source, new RegExp(`^      ${field}:`, "m"));
+    assert.match(source, new RegExp(`^      ${field}: \\$\\{\\{ steps\\.poster\\.outputs\\.${field} \\}\\}`, "m"));
+  }
+  assert.match(source, /- name: post review[\s\S]*?\n\s+if: always\(\)/);
+  assert.match(source, /\/tmp\/review-result\.json/);
+});
+
+test("early hosted setup failure still emits conservative reusable-workflow outputs", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hosted-finalizer-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const outputFile = join(directory, "github-output");
+  const untrustedPosterMarker = join(directory, "untrusted-poster-ran");
+  mkdirSync(join(directory, "scripts"));
+  writeFileSync(join(directory, "scripts", "post-review.mjs"), `
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.UNTRUSTED_POSTER_MARKER, "executed");
+`);
+
+  const env = {
+    ...process.env,
+    TARGET_ELIGIBLE: "true",
+    PR_NUMBER: "7",
+    GITHUB_REPO: "example/repository",
+    HEAD_SHA: "2222222222222222222222222222222222222222",
+    BASE_SHA: "1111111111111111111111111111111111111111",
+    GITHUB_OUTPUT: outputFile,
+    UNTRUSTED_POSTER_MARKER: untrustedPosterMarker,
+  };
+  for (const name of [
+    "TRUSTED_DATA_ROOT",
+    "REVIEW_RUNNER",
+    "REVIEW_STRIPPER",
+    "REVIEW_POSTER",
+    "REVIEW_MODE",
+    "POST_COMMENT",
+    "SUPPRESS_WRITES",
+    "RESOLVE_STALE",
+    "MAX_FINDINGS",
+    "FAIL_ON_FINDINGS",
+    "BLOCK_SEVERITIES",
+  ]) {
+    delete env[name];
+  }
+
+  const finalized = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env,
+  });
+
+  assert.equal(finalized.status, 0, finalized.stderr);
+  assert.equal(existsSync(untrustedPosterMarker), false);
+  const outputs = envFileValues(outputFile);
+  assert.equal(outputs.analysis_state, "inconclusive");
+  assert.equal(outputs.sample_state, "unknown");
+  assert.equal(outputs.bounded_converged, "false");
+  assert.equal(outputs.coverage, "unknown");
+  assert.equal(outputs.converged, "false");
+
+  const source = readFileSync(workflow, "utf8");
+  for (const field of ["analysis_state", "sample_state", "bounded_converged", "coverage", "converged"]) {
+    assert.match(source, new RegExp(`^        value: \\$\\{\\{ jobs\\.review\\.outputs\\.${field} \\}\\}`, "m"));
+    assert.match(source, new RegExp(`^      ${field}: \\$\\{\\{ steps\\.poster\\.outputs\\.${field} \\}\\}`, "m"));
+  }
 });
 
 test("hosted contract runs one trusted ensemble and one suppressed poster gate", (t) => {
@@ -896,6 +975,10 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
   assert.deepEqual(metadata.passes.requested, ["general", "correctness", "boundaries"]);
   assert.deepEqual(metadata.passes.completed, ["general", "correctness", "boundaries"]);
   assert.equal(metadata.analysis_state, "complete");
+  assert.equal(metadata.reviewed_head, fixture.headSha);
+  assert.match(metadata.scope_hash, /^[a-f0-9]{64}$/);
+  assert.equal(metadata.coverage, "bounded");
+  assert.deepEqual(metadata.remaining_analysis, []);
   assert.deepEqual(
     findings.findings.map(({ title }) => title).sort(),
     ["Correctness hosted defect", "Shared hosted defect"],
@@ -916,6 +999,9 @@ globalThis.fetch = async (url, options = {}) => {
   appendFileSync(process.env.FAKE_GITHUB_LOG, JSON.stringify({ url: String(url), method, body }) + "\\n");
   if (String(url).endsWith("/graphql") && body.includes("viewer")) {
     return { ok: true, status: 200, json: async () => ({ data: { viewer: { login: "review-app[bot]" } } }), text: async () => "" };
+  }
+  if (String(url).endsWith("/graphql") && body.includes("reviewThreads")) {
+    return { ok: true, status: 200, json: async () => ({ data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } }), text: async () => "" };
   }
   if (String(url).includes("/issues/17/comments") && method === "GET") {
     return { ok: true, status: 200, json: async () => [], text: async () => "" };
@@ -941,6 +1027,7 @@ globalThis.fetch = async (url, options = {}) => {
       BASE_SHA: fixture.baseSha,
       TARGET_REPO: "outside/target",
       PR: "17",
+      TARGET_ELIGIBLE: "true",
       BASE: fixture.baseSha,
       HEAD: fixture.headSha,
       REVIEW_MODE: "summary",
@@ -962,13 +1049,18 @@ globalThis.fetch = async (url, options = {}) => {
   assert.equal(outputs.merge_state, "blocked");
   assert.equal(outputs.sample_state, "findings");
   assert.equal(outputs.bounded_converged, "false");
+  assert.equal(outputs.reviewed_head, fixture.headSha);
+  assert.equal(outputs.scope_hash, metadata.scope_hash);
+  assert.equal(outputs.coverage, "bounded");
+  assert.deepEqual(JSON.parse(outputs.remaining_analysis), []);
+  assert.equal(outputs.converged, "false");
   assert.equal(outputs.passes_requested, "3");
   assert.equal(outputs.passes_completed, "3");
   assert.deepEqual(JSON.parse(outputs.current_counts), { Critical: 0, High: 1, Medium: 1 });
   assert.deepEqual(JSON.parse(outputs.unresolved_counts), { Critical: 0, High: 0, Medium: 0 });
   assert.match(readFileSync(summaryFile, "utf8"), /\| Passes \| `3 requested \/ 3 completed` \|/);
   const githubRequests = readFileSync(githubLogFile, "utf8").trim().split("\n").map(JSON.parse);
-  assert.equal(githubRequests.length, 2);
+  assert.equal(githubRequests.length, 3);
   assert.equal(
     githubRequests.some(({ url, method }) => url.includes("/comments") && method !== "GET"),
     false,
@@ -1272,6 +1364,8 @@ test("a permanently malformed pass is failed while valid pass findings survive t
   assert.equal(run.result.status, 0, run.result.stderr);
   assert.deepEqual(run.metadata.passes.completed, ["general", "boundaries"]);
   assert.equal(run.metadata.analysis_state, "inconclusive");
+  assert.equal(run.metadata.coverage, "unknown");
+  assert.deepEqual(run.metadata.remaining_analysis, ["pass_failed"]);
   assert.deepEqual(
     run.metadata.passes.results.map(({ id, status, attempts, finding_count }) => ({
       id, status, attempts, finding_count,
@@ -1299,6 +1393,8 @@ test("all-pass failure writes valid diagnostic metadata before exiting nonzero",
   assert.notEqual(run.result.status, 0);
   assert.equal(run.findings, null);
   assert.equal(run.metadata.analysis_state, "inconclusive");
+  assert.equal(run.metadata.coverage, "unknown");
+  assert.deepEqual(run.metadata.remaining_analysis, ["pass_failed", "execution_failed"]);
   assert.deepEqual(run.metadata.passes.completed, []);
   assert.deepEqual(
     run.metadata.passes.results.map(({ status, attempts, finding_count, capped }) => ({
@@ -1323,6 +1419,8 @@ test("a raw finding count equal to the nonzero cap is capped and inconclusive", 
 
   assert.equal(run.result.status, 0, run.result.stderr);
   assert.equal(run.metadata.analysis_state, "inconclusive");
+  assert.equal(run.metadata.coverage, "unknown");
+  assert.deepEqual(run.metadata.remaining_analysis, ["finding_cap_reached"]);
   assert.equal(run.metadata.finding_cap, 1);
   assert.deepEqual(
     run.metadata.passes.results.map(({ finding_count, capped }) => ({ finding_count, capped })),
@@ -1346,6 +1444,8 @@ test("diff truncation is recorded and makes an otherwise valid run inconclusive"
 
   assert.equal(run.result.status, 0, run.result.stderr);
   assert.equal(run.metadata.analysis_state, "inconclusive");
+  assert.equal(run.metadata.coverage, "unknown");
+  assert.deepEqual(run.metadata.remaining_analysis, ["diff_truncated"]);
   assert.equal(run.metadata.diff.truncated, true);
   assert.ok(run.metadata.diff.bytes > run.metadata.diff.included_bytes);
   assert.equal(run.metadata.diff.included_bytes, 80);
@@ -1504,6 +1604,127 @@ test("branch and staged reviews stay pinned when the source changes after worktr
   }
 });
 
+test("staged review state keeps its synthetic target reachable for later reconciliation", (t) => {
+  const reported = finding("Fixed staged defect", {
+    file: "alpha.txt",
+    start_line: 1,
+    end_line: 1,
+  });
+  const first = runReview(t, {
+    general: [{ findings: [reported] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    staged: true,
+    noState: false,
+  });
+  assert.equal(first.result.status, 0, first.result.stderr);
+
+  const statePath = join(first.repository, ".git", "agentic-review", "state.json");
+  const [stored] = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  assert.equal(stored.lastCommit, first.metadata.head_sha);
+  assert.notEqual(stored.lastCommit, git(first.repository, "rev-parse", "HEAD"));
+  const retainingRefs = git(
+    first.repository,
+    "for-each-ref",
+    "--format=%(refname)",
+    "--contains",
+    stored.lastCommit,
+  ).split("\n").filter(Boolean);
+  assert.ok(retainingRefs.length > 0, "stored staged target must have a durable Git ref");
+
+  git(first.repository, "reflog", "expire", "--expire=now", "--all");
+  git(first.repository, "prune", "--expire=now");
+  const retainedTarget = spawnSync(
+    "git",
+    ["cat-file", "-e", `${stored.lastCommit}^{commit}`],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.equal(retainedTarget.status, 0, "stored staged target must survive Git pruning");
+
+  writeFileSync(join(first.repository, "alpha.txt"), "alpha fixed\n");
+  git(first.repository, "add", "alpha.txt");
+  const fixed = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    existingFixture: first,
+    staged: true,
+    noState: false,
+  });
+
+  assert.equal(fixed.result.status, 0, fixed.result.stderr);
+  assert.match(fixed.result.stdout, /\| Sample \| `clean` \|/);
+  const [retired] = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  assert.equal(retired.status, "gone");
+});
+
+test("reopened staged findings retain their synthetic target through pruning", (t) => {
+  const reported = finding("Reopened staged defect", {
+    file: "alpha.txt",
+    start_line: 1,
+    end_line: 1,
+  });
+  const first = runReview(t, {
+    general: [{ findings: [reported] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    staged: true,
+    noState: false,
+  });
+  assert.equal(first.result.status, 0, first.result.stderr);
+
+  const statePath = join(first.repository, ".git", "agentic-review", "state.json");
+  const [stored] = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  for (const command of ["dismiss", "reopen"]) {
+    const result = spawnSync(process.execPath, [localState, command, stored.id], {
+      cwd: first.repository,
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+  }
+
+  const retainingRefs = git(
+    first.repository,
+    "for-each-ref",
+    "--format=%(refname)",
+    "--contains",
+    stored.lastCommit,
+  ).split("\n").filter(Boolean);
+  assert.ok(retainingRefs.length > 0, "reopened staged target must regain a durable Git ref");
+
+  git(first.repository, "reflog", "expire", "--expire=now", "--all");
+  git(first.repository, "prune", "--expire=now");
+  const retainedTarget = spawnSync(
+    "git",
+    ["cat-file", "-e", `${stored.lastCommit}^{commit}`],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.equal(retainedTarget.status, 0, "reopened staged target must survive Git pruning");
+
+  writeFileSync(join(first.repository, "alpha.txt"), "alpha fixed after reopening\n");
+  git(first.repository, "add", "alpha.txt");
+  const fixed = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    existingFixture: first,
+    staged: true,
+    noState: false,
+  });
+
+  assert.equal(fixed.result.status, 0, fixed.result.stderr);
+  const [retired] = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  assert.equal(retired.status, "gone");
+});
+
 test("legacy live-checkout fallback is explicitly mutable and inconclusive", (t) => {
   const run = runReview(t, {
     general: [{ findings: [] }],
@@ -1517,6 +1738,8 @@ test("legacy live-checkout fallback is explicitly mutable and inconclusive", (t)
   assert.ok(run.logs.every(({ cwd }) => cwd === run.repository));
   assert.equal(run.metadata.snapshot_immutable, false);
   assert.equal(run.metadata.analysis_state, "inconclusive");
+  assert.equal(run.metadata.coverage, "unknown");
+  assert.deepEqual(run.metadata.remaining_analysis, ["snapshot_mutable"]);
   assert.equal(validateMetadata(run.metadataFile).status, 0);
 });
 
@@ -1887,5 +2110,7 @@ test("merge failure preserves a structured valid-pass artifact but is never comp
   assert.deepEqual(run.findings.findings.map(({ title }) => title), [general.title]);
   assert.equal(run.metadata.analysis_state, "inconclusive");
   assert.equal(run.metadata.merge_succeeded, false);
+  assert.equal(run.metadata.coverage, "unknown");
+  assert.deepEqual(run.metadata.remaining_analysis, ["merge_failed"]);
   assert.equal(validateMetadata(run.metadataFile).status, 0);
 });

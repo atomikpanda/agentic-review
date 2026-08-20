@@ -42,6 +42,21 @@ on:
       bounded_converged:
         description: True exactly when analysis is complete and the sample is clean.
         value: ${{ jobs.review.outputs.bounded_converged }}
+      reviewed_head:
+        description: Immutable head SHA recorded in the final review result.
+        value: ${{ jobs.review.outputs.reviewed_head }}
+      scope_hash:
+        description: SHA-256 identity of the immutable review scope.
+        value: ${{ jobs.review.outputs.scope_hash }}
+      coverage:
+        description: Whether the configured immutable bounded execution completed.
+        value: ${{ jobs.review.outputs.coverage }}
+      remaining_analysis:
+        description: JSON array of deterministic reason codes for incomplete analysis.
+        value: ${{ jobs.review.outputs.remaining_analysis }}
+      converged:
+        description: Alias of bounded_converged.
+        value: ${{ jobs.review.outputs.converged }}
       base_sha:
         description: Immutable base SHA reviewed by every pass.
         value: ${{ jobs.review.outputs.base_sha }}
@@ -292,6 +307,11 @@ jobs:
       merge_state: ${{ steps.poster.outputs.merge_state }}
       sample_state: ${{ steps.poster.outputs.sample_state }}
       bounded_converged: ${{ steps.poster.outputs.bounded_converged }}
+      reviewed_head: ${{ steps.poster.outputs.reviewed_head }}
+      scope_hash: ${{ steps.poster.outputs.scope_hash }}
+      coverage: ${{ steps.poster.outputs.coverage }}
+      remaining_analysis: ${{ steps.poster.outputs.remaining_analysis }}
+      converged: ${{ steps.poster.outputs.converged }}
       base_sha: ${{ steps.poster.outputs.base_sha }}
       head_sha: ${{ steps.poster.outputs.head_sha }}
       configuration_fingerprint: ${{ steps.poster.outputs.configuration_fingerprint }}
@@ -880,19 +900,95 @@ jobs:
 
       - name: post review
         id: poster
-        # A failed/all-pass-empty runner must never post partial output.
-        if: success() && steps.target.outputs.eligible == 'true' && steps.target.outputs.pr != ''
+        # Run even after runner failure so the poster can emit a conservative
+        # result; it never posts missing/invalid artifacts and preserves failure.
+        if: always()
         env:
           # The write-capable credential is confined to this presentation step.
-          GH_TOKEN: ${{ steps.target.outputs.token || github.token }}
+          GH_TOKEN: ${{ steps.target.outputs.eligible == 'true' && (steps.target.outputs.token || github.token) || '' }}
+          TARGET_ELIGIBLE: ${{ steps.target.outputs.eligible }}
           FINDINGS_FILE: /tmp/review.md
           REVIEW_METADATA_FILE: /tmp/review-meta.json
+          REVIEW_RESULT_FILE: /tmp/review-result.json
           GITHUB_REPO: ${{ steps.target.outputs.repo }}
           PR_NUMBER: ${{ steps.target.outputs.pr }}
           HEAD_SHA: ${{ steps.target.outputs.head }}
           BASE_SHA: ${{ steps.target.outputs.base }}
         run: |
+          if [ "${TARGET_ELIGIBLE:-}" != "true" ] || [ -z "${PR_NUMBER:-}" ]; then
+            exit 0
+          fi
           set -euo pipefail
+
+          poster_configured=true
+          for name in REVIEW_MODE POST_COMMENT SUPPRESS_WRITES RESOLVE_STALE \
+                      MAX_FINDINGS FAIL_ON_FINDINGS BLOCK_SEVERITIES; do
+            if [ -z "${!name+x}" ]; then
+              poster_configured=false
+              break
+            fi
+          done
+          if [ "$poster_configured" != "true" ] \
+            || [ -z "${TRUSTED_DATA_ROOT:-}" ] \
+            || [ -z "${REVIEW_POSTER:-}" ] \
+            || [[ "${TRUSTED_DATA_ROOT:-}" != /* ]] \
+            || [ "${REVIEW_POSTER:-}" != "${TRUSTED_DATA_ROOT:-}/scripts/post-review.mjs" ] \
+            || [ ! -f "${REVIEW_POSTER:-}" ]; then
+            echo "::warning::trusted review poster is unavailable; emitting a conservative result"
+            # The support checkout is unavailable, so this fallback must remain
+            # self-contained rather than importing anything from the target.
+            node <<'NODE'
+          const { appendFileSync, writeFileSync } = require("node:fs");
+
+          const baseSha = process.env.BASE_SHA ?? "";
+          const headSha = process.env.HEAD_SHA ?? "";
+          const result = {
+            analysis_state: "inconclusive",
+            merge_state: "ready",
+            sample_state: "unknown",
+            bounded_converged: false,
+            base_sha: baseSha,
+            head_sha: headSha,
+            configuration_fingerprint: "",
+            passes_requested: 0,
+            passes_completed: 0,
+            current_counts: { Critical: 0, High: 0, Medium: 0 },
+            unresolved_counts: { Critical: 0, High: 0, Medium: 0 },
+            reviewed_head: headSha,
+            scope_hash: "",
+            coverage: "unknown",
+            remaining_analysis: ["execution_failed"],
+            converged: false,
+          };
+          writeFileSync(
+            process.env.REVIEW_RESULT_FILE || "/tmp/review-result.json",
+            `${JSON.stringify(result, null, 2)}\n`,
+          );
+          if (process.env.GITHUB_OUTPUT) {
+            appendFileSync(process.env.GITHUB_OUTPUT, [
+              `analysis_state=${result.analysis_state}`,
+              `merge_state=${result.merge_state}`,
+              `sample_state=${result.sample_state}`,
+              `bounded_converged=${result.bounded_converged}`,
+              `base_sha=${result.base_sha}`,
+              `head_sha=${result.head_sha}`,
+              `configuration_fingerprint=${result.configuration_fingerprint}`,
+              `passes_requested=${result.passes_requested}`,
+              `passes_completed=${result.passes_completed}`,
+              `current_counts=${JSON.stringify(result.current_counts)}`,
+              `unresolved_counts=${JSON.stringify(result.unresolved_counts)}`,
+              `reviewed_head=${result.reviewed_head}`,
+              `scope_hash=${result.scope_hash}`,
+              `coverage=${result.coverage}`,
+              `remaining_analysis=${JSON.stringify(result.remaining_analysis)}`,
+              `converged=${result.converged}`,
+              "",
+            ].join("\n"));
+          }
+          NODE
+            exit 0
+          fi
+
           REVIEW_MODE="$REVIEW_MODE" \
           POST_COMMENT="$POST_COMMENT" \
           SUPPRESS_WRITES="$SUPPRESS_WRITES" \
@@ -911,6 +1007,7 @@ jobs:
             /tmp/review-meta.json
             /tmp/review-runner.out
             /tmp/review-runner.err
+            /tmp/review-result.json
           retention-days: 7
           # This step is `always()`, so it also runs when the review failed
           # before either file existed. Without this the real error is followed

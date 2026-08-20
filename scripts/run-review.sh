@@ -382,12 +382,14 @@ cleanup_worktree() {
 trap cleanup_worktree EXIT
 
 step "Working out what changed"
+STAGED_TARGET_SHA=""
 if [ "$STAGED" = 1 ]; then
   # Capture the parent and index tree once, then represent that exact pair as a
   # dangling commit. Later restaging cannot change the review target.
   SOURCE_BASE_SHA="$(git rev-parse --verify 'HEAD^{commit}')"
   SOURCE_INDEX_TREE="$(git write-tree)"
   SOURCE_TARGET_SHA="$(git commit-tree "$SOURCE_INDEX_TREE" -p "$SOURCE_BASE_SHA" -m 'agentic-review: staged state')"
+  STAGED_TARGET_SHA="$SOURCE_TARGET_SHA"
   RANGE="--staged"
   INTENT=""
 else
@@ -749,6 +751,19 @@ PROMPT_FILE="$PROMPT_FILE" FORMAT_FILE="$FORMAT_FILE" node -e '
 ' "$CONFIG_FILE" "$RUN_TMP" "${PASSTHRU[@]+"${PASSTHRU[@]}"}"
 CONFIGURATION_FINGERPRINT="$(node "$RESULT_HELPER" fingerprint "$CONFIG_FILE")" \
   || die "could not fingerprint review configuration"
+SCOPE_FILE="$RUN_TMP/scope.json"
+BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" \
+CONFIGURATION_FINGERPRINT="$CONFIGURATION_FINGERPRINT" node -e '
+  const fs = require("node:fs");
+  fs.writeFileSync(process.argv[2], JSON.stringify({
+    base_sha: process.env.BASE_SHA,
+    configuration_fingerprint: process.env.CONFIGURATION_FINGERPRINT,
+    diff: fs.readFileSync(process.argv[1], "utf8"),
+    head_sha: process.env.HEAD_SHA,
+  }));
+' "$RUN_TMP/diff.full" "$SCOPE_FILE"
+SCOPE_HASH="$(node "$RESULT_HELPER" scope "$SCOPE_FILE")" \
+  || die "could not hash review scope"
 
 step "Reviewing with $MODEL"
 say "read-only tools: $TOOLS${THINKING:+ | thinking: $THINKING} | passes: ${#PASS_IDS[@]}"
@@ -814,7 +829,7 @@ for ((i = 0; i < ${#PASS_IDS[@]}; i++)); do
 done
 
 write_metadata() {
-  local merge_succeeded="$1" records="$RUN_TMP/pass-records" raw="$RUN_TMP/metadata.raw.json"
+  local merge_succeeded="$1" execution_failed="${2:-0}" records="$RUN_TMP/pass-records"
   : > "$records"
   for ((j = 0; j < ${#PASS_IDS[@]}; j++)); do
     printf '%s\t%s\t%s\t%s\t%s\n' \
@@ -822,10 +837,15 @@ write_metadata() {
       "${PASS_COUNTS[j]}" "${PASS_CAPPED[j]}" >> "$records"
   done
   BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" CONFIGURATION_FINGERPRINT="$CONFIGURATION_FINGERPRINT" \
-  SNAPSHOT_IMMUTABLE="$SNAPSHOT_IMMUTABLE" DIFF_BYTES="$DIFF_BYTES" \
-  INCLUDED_DIFF_BYTES="$INCLUDED_DIFF_BYTES" TRUNCATED="$TRUNCATED" \
-  MAX_FINDINGS="$MAX_FINDINGS" MERGE_SUCCEEDED="$merge_succeeded" node -e '
-    const fs = require("node:fs");
+  SCOPE_HASH="$SCOPE_HASH" SNAPSHOT_IMMUTABLE="$SNAPSHOT_IMMUTABLE" \
+  DIFF_BYTES="$DIFF_BYTES" INCLUDED_DIFF_BYTES="$INCLUDED_DIFF_BYTES" \
+  TRUNCATED="$TRUNCATED" MAX_FINDINGS="$MAX_FINDINGS" \
+  MERGE_SUCCEEDED="$merge_succeeded" EXECUTION_FAILED="$execution_failed" \
+  node --input-type=module -e '
+    import fs from "node:fs";
+    import { pathToFileURL } from "node:url";
+
+    const { enrichRunMetadata } = await import(pathToFileURL(process.argv[3]).href);
     const results = fs.readFileSync(process.argv[1], "utf8").trimEnd().split("\n").filter(Boolean)
       .map((line) => {
         const [id, status, attempts, finding_count, capped] = line.split("\t");
@@ -840,13 +860,12 @@ write_metadata() {
           configuration_fingerprint: process.env.CONFIGURATION_FINGERPRINT,
         };
       });
-    const metadata = {
+    const run = {
       schema_version: 1,
       base_sha: process.env.BASE_SHA,
       head_sha: process.env.HEAD_SHA,
       configuration_fingerprint: process.env.CONFIGURATION_FINGERPRINT,
       snapshot_immutable: process.env.SNAPSHOT_IMMUTABLE === "1",
-      analysis_state: "inconclusive",
       diff: {
         bytes: Number(process.env.DIFF_BYTES),
         included_bytes: Number(process.env.INCLUDED_DIFF_BYTES),
@@ -859,17 +878,14 @@ write_metadata() {
         results,
       },
     };
-    if (process.env.MERGE_SUCCEEDED === "false") metadata.merge_succeeded = false;
-    fs.writeFileSync(process.argv[2], JSON.stringify(metadata));
-  ' "$records" "$raw"
-  ANALYSIS_STATE="$(node "$RESULT_HELPER" analysis "$raw")" \
-    || die "could not derive review analysis state"
-  ANALYSIS_STATE="$ANALYSIS_STATE" node -e '
-    const fs = require("node:fs");
-    const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-    value.analysis_state = process.env.ANALYSIS_STATE;
-    fs.writeFileSync(process.argv[2], JSON.stringify(value, null, 2));
-  ' "$raw" "$RUN_TMP/metadata.json"
+    if (process.env.MERGE_SUCCEEDED === "false") run.merge_succeeded = false;
+    const metadata = enrichRunMetadata(run, {
+      scopeHash: process.env.SCOPE_HASH,
+      executionFailed: process.env.EXECUTION_FAILED === "1" ? true : undefined,
+    });
+    fs.writeFileSync(process.argv[2], JSON.stringify(metadata, null, 2));
+  ' "$records" "$RUN_TMP/metadata.json" "$RESULT_HELPER" \
+    || die "could not derive review metadata"
   node "$RESULT_HELPER" validate "$RUN_TMP/metadata.json" >/dev/null \
     || die "generated review metadata failed validation"
   if [ -n "$METADATA_OUT" ]; then
@@ -885,7 +901,7 @@ write_metadata() {
 }
 
 if [ ${#VALID_OUTS[@]} -eq 0 ]; then
-  write_metadata not-run
+  write_metadata not-run 1
   die "every configured pass failed"
 fi
 
@@ -936,7 +952,8 @@ local_unresolved_tmp="$LOCAL_UNRESOLVED_FILE.tmp"
 if ST="$(support_exec scripts/local-state.mjs)"; then
   state_ready=1
   if [ "$RECORD_STATE" = 1 ]; then
-    if _delta="$(node "$ST" record "$TMP_OUT" "$BASE_SHA" "$HEAD_SHA" "$ANALYSIS_STATE" 2>/dev/null)"; then
+    if _delta="$(AGENTIC_REVIEW_STAGED_TARGET="$STAGED_TARGET_SHA" \
+      node "$ST" record "$TMP_OUT" "$BASE_SHA" "$HEAD_SHA" "$ANALYSIS_STATE" 2>/dev/null)"; then
       say "state: $_delta"
     else
       state_ready=0
