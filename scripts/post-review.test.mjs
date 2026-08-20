@@ -15,6 +15,7 @@ import {
   encodeSummaryMarker,
   fetchOurThreads,
   fetchSummaryComments,
+  fetchSummaryReviews,
   fetchViewerLogin,
   findingFromThread,
   reconcileSummaryFindings,
@@ -23,7 +24,7 @@ import {
   runSummaryMode,
   selectSummaryHistory,
   shouldFailGate,
-  upsertSummaryComment,
+  postSummaryReview,
 } from "./post-review.mjs";
 import * as poster from "./post-review.mjs";
 import { createReviewPublication, deriveReviewState, scopeHash } from "./review-result.mjs";
@@ -151,6 +152,10 @@ function botComment(id, body, createdAt = `2026-08-19T00:00:0${id}Z`) {
   return { id, body, created_at: createdAt, user: { login: "github-actions[bot]", type: "Bot" } };
 }
 
+function botReview(id, body, submittedAt = `2026-08-19T00:00:0${id}Z`) {
+  return { id, body, submitted_at: submittedAt, user: { login: "github-actions[bot]", type: "Bot" } };
+}
+
 function incompressible(length) {
   let value = "";
   for (let index = 0; value.length < length; index += 1) {
@@ -198,9 +203,11 @@ function commitChangedFindingSpan(dir, prior) {
 function runPosterWithHistory({
   mode,
   summaryComments = [],
+  summaryReviews = [],
   threads = [],
   currentFindings = [],
   failSummaryHistory = false,
+  failReviewHistory = false,
   failThreadHistory = false,
   failSummaryPost = false,
   failRetirement = false,
@@ -307,8 +314,12 @@ globalThis.fetch = async (url, options = {}) => {
       } } } } });
     }
   }
+  if (String(url).includes("/pulls/7/reviews?")) {
+    if (fixture.failReviewHistory) return reply({ message: "review history unavailable" }, 500);
+    return reply(fixture.summaryReviews);
+  }
   if (String(url).includes("/issues/7/comments?")) {
-    if (fixture.failSummaryHistory) return reply({ message: "summary history unavailable" }, 500);
+    if (fixture.failSummaryHistory) return reply({ message: "summary history unavailable" }, 403);
     return reply(fixture.summaryComments);
   }
   if (options.method === "PATCH" && String(url).includes("/pulls/comments/")) {
@@ -316,6 +327,7 @@ globalThis.fetch = async (url, options = {}) => {
     return reply({});
   }
   if (options.method === "POST" && String(url).includes("/pulls/7/reviews")) {
+    if (fixture.failSummaryPost) return reply({ message: "summary post unavailable" }, 500);
     console.log("[test] hosted mutation review");
     return reply({});
   }
@@ -339,8 +351,10 @@ globalThis.fetch = async (url, options = {}) => {
         NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${preloadFile}`.trim(),
         POST_REVIEW_TEST_HISTORY: JSON.stringify({
           summaryComments,
+          summaryReviews,
           threads: runtimeThreads,
           failSummaryHistory,
+          failReviewHistory,
           failThreadHistory,
           failSummaryPost,
           failRetirement,
@@ -465,15 +479,15 @@ test("decoder uses only the valid trailing standing marker", () => {
   assert.equal(decoded.findings[0].title, "Trailing state");
 });
 
-test("newest trusted summary marker wins while untrusted markers are ignored", () => {
+test("newest trusted summary marker wins globally across reviews and legacy comments", () => {
   const older = encodeSummaryMarker({ headSha: PRIOR_HEAD_SHA, findings: [finding()] });
   const newer = encodeSummaryMarker({
     headSha: HEAD_SHA,
     findings: [finding({ title: "New state", body: "New state remains broken." })],
   });
-  const forged = { id: 99, body: newer, created_at: "2026-08-19T00:01:00Z", user: { login: "dependabot[bot]", type: "Bot" } };
+  const forged = { id: 99, body: newer, submitted_at: "2026-08-19T00:01:00Z", user: { login: "dependabot[bot]", type: "Bot" } };
   const selected = selectSummaryHistory(
-    [botComment(1, older), forged, botComment(2, newer)],
+    [botComment(1, older), forged, botReview(2, newer)],
     { botLogin: "github-actions[bot]" },
   );
   assert.equal(selected.reconciliationKnown, true);
@@ -482,7 +496,7 @@ test("newest trusted summary marker wins while untrusted markers are ignored", (
   assert.equal(selected.headSha, HEAD_SHA);
 });
 
-test("authenticated App bot identity owns and updates its standing history", async () => {
+test("authenticated App bot identity owns and posts pull-request review history", async () => {
   const login = await fetchViewerLogin({
     token: "token",
     fetchImpl: async () => ({
@@ -496,17 +510,18 @@ test("authenticated App bot identity owns and updates its standing history", asy
   const history = selectSummaryHistory([{
     id: 41,
     body: marker,
-    created_at: "2026-08-19T00:00:00Z",
+    submitted_at: "2026-08-19T00:00:00Z",
     user: { login, type: "Bot" },
   }], { botLogin: login });
   assert.equal(history.comment.id, 41);
 
   const calls = [];
-  await upsertSummaryComment({
+  await postSummaryReview({
     repo: "o/r",
     pr: 7,
     token: "token",
-    existingComment: history.comment,
+    headSha: HEAD_SHA,
+    hasHistory: true,
     body: `updated\n\n${marker}`,
     hasFindings: true,
     writesEnabled: true,
@@ -516,8 +531,8 @@ test("authenticated App bot identity owns and updates its standing history", asy
     },
   });
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].options.method, "PATCH");
-  assert.match(calls[0].url, /issues\/comments\/41$/);
+  assert.equal(calls[0].options.method, "POST");
+  assert.match(calls[0].url, /pulls\/7\/reviews$/);
 });
 
 test("unknown authenticated identity prevents a clean state and every standing write", async () => {
@@ -566,7 +581,7 @@ test("malformed selected bot marker makes reconciliation unknown without trustin
   assert.deepEqual(selected.findings, []);
 });
 
-test("deleting the standing summary comment resets summary history only", () => {
+test("absence of marked reviews and legacy comments resets summary history", () => {
   assert.deepEqual(selectSummaryHistory([], { botLogin: "github-actions[bot]" }), {
     comment: null,
     findings: [],
@@ -575,6 +590,65 @@ test("deleting the standing summary comment resets summary history only", () => 
   });
 });
 
+
+test("legacy issue-comment permission failures do not suppress current hosted writes", () => {
+  const current = finding({ severity: "Medium", suggestion: null });
+  for (const mode of ["inline", "summary"]) {
+    const result = runPosterWithHistory({
+      mode,
+      currentFindings: [current],
+      failSummaryHistory: true,
+      gitFinding: current,
+      writesEnabled: true,
+    });
+
+    assert.equal(result.status, 0, `${mode}: ${result.stderr}`);
+    assert.match(result.stdout, /legacy issue-comment summary history is unavailable/, mode);
+    assert.match(result.stdout, /\[test\] hosted mutation review/, mode);
+    assert.doesNotMatch(result.stdout, /review writes were suppressed/, mode);
+    assert.match(result.workflowOutput, /current_counts=\{"Critical":0,"High":0,"Medium":1\}/, mode);
+  }
+});
+test("unknown primary summary history cannot dismiss a current Critical finding", () => {
+  const critical = finding({
+    severity: "Critical",
+    title: "Current critical blocker",
+    suggestion: null,
+  });
+  const body = poster.buildReviewComments(
+    [critical],
+    new Map([[critical.file, [[critical.start_line, critical.end_line]]]]),
+    { mode: "inline" },
+  ).comments[0].body;
+  const result = runPosterWithHistory({
+    mode: "inline",
+    currentFindings: [critical],
+    failReviewHistory: true,
+    threads: [{
+      id: "dismissed-critical",
+      isResolved: true,
+      isOutdated: false,
+      path: critical.file,
+      originalStartLine: critical.start_line,
+      originalLine: critical.end_line,
+      comments: {
+        nodes: [{
+          databaseId: 902,
+          body,
+          author: { login: "github-actions[bot]" },
+          originalCommit: { oid: BASE_SHA },
+        }],
+      },
+    }],
+    writesEnabled: true,
+  });
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.workflowOutput, /merge_state=blocked/);
+  assert.match(result.workflowOutput, /current_counts=\{"Critical":1,"High":0,"Medium":0\}/);
+  assert.match(result.workflowOutput, /remaining_analysis=\["reconciliation_unknown"\]/);
+  assert.doesNotMatch(result.stdout, /previously resolved and unchanged/);
+});
 test("coordinate-less bot threads make reconciliation unknown and leave other omitted threads untouched", async () => {
   const blocker = finding({
     title: "Coordinate-less blocker",
@@ -639,7 +713,7 @@ test("coordinate-less bot threads make reconciliation unknown and leave other om
     assert.doesNotMatch(result.workflowOutput, /sample_state=clean/);
     assert.doesNotMatch(result.stdout, /Coordinate-less blocker/);
     if (mode === "summary") {
-      assert.match(result.stdout, /standing summary comment was not changed/);
+      assert.match(result.stdout, /summary review was not changed/);
       assert.deepEqual(decodeSummaryMarker(result.stdout).findings, []);
     } else {
       assert.match(result.stdout, /review writes were suppressed/);
@@ -913,8 +987,8 @@ test("summary mode uses intrinsic diff spans to retire omitted changed evidence"
   assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
   assert.equal(result.textconvExecuted, false);
   assert.match(result.stdout, /\[test\] resolved thread changed-open-thread/);
-  assert.match(result.stdout, /summary comment skipped/);
-  assert.doesNotMatch(result.stdout, /\[test\] wrote standing summary/);
+  assert.match(result.stdout, /summary review skipped/);
+  assert.doesNotMatch(result.stdout, /\[test\] hosted mutation review/);
   assert.match(result.workflowOutput, /merge_state=ready/);
   assert.match(result.workflowOutput, /sample_state=clean/);
   assert.match(result.workflowOutput, /bounded_converged=true/);
@@ -945,7 +1019,7 @@ test("summary mode holds changed inline evidence when writes are dry, suppressed
   const cases = [
     { label: "dry run", options: {} },
     { label: "suppressed writes", options: { writesEnabled: true, suppressWrites: true } },
-    { label: "unknown summary history", options: { writesEnabled: true, failSummaryHistory: true } },
+    { label: "unknown summary history", options: { writesEnabled: true, failReviewHistory: true } },
   ];
 
   for (const { label, options } of cases) {
@@ -980,7 +1054,7 @@ test("summary mode keeps changed inline evidence held when enabled retirement fa
   assert.equal(result.status, 1, `${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
   assert.match(result.stdout, /\[test\] resolved thread changed-open-thread/);
   assert.match(result.stdout, /could not retire a thread/);
-  assert.doesNotMatch(result.stdout, /\[test\] wrote standing summary/);
+  assert.doesNotMatch(result.stdout, /\[test\] hosted mutation review/);
   assert.match(result.workflowOutput, /merge_state=blocked/);
   assert.match(result.workflowOutput, /sample_state=findings/);
   assert.match(result.workflowOutput, /bounded_converged=false/);
@@ -1213,7 +1287,7 @@ test("inline mode keeps downgraded held summary evidence dismissed without a neg
 test("failure to read either history store prevents a clean convergence claim", () => {
   for (const history of [
     { mode: "summary", failThreadHistory: true },
-    { mode: "inline", failSummaryHistory: true },
+    { mode: "inline", failReviewHistory: true },
   ]) {
     const result = runPosterWithHistory(history);
     assert.equal(result.status, 0, `${history.mode}: ${result.stderr}`);
@@ -1618,38 +1692,43 @@ test("rendered bodies remove confidence heuristics and exhaustive or safety word
   }
 });
 
-test("summary lifecycle creates once then updates the standing comment including clean", async () => {
+test("summary lifecycle appends pull-request reviews including a later clean state", async () => {
   const calls = [];
   const fetchImpl = async (url, options) => {
     calls.push({ url, options });
     return { ok: true, status: 200, text: async () => "{}" };
   };
-  const created = await upsertSummaryComment({
-    repo: "o/r", pr: 7, token: "token", existingComment: null,
+  const created = await postSummaryReview({
+    repo: "o/r", pr: 7, token: "token", headSha: HEAD_SHA, hasHistory: false,
     body: "findings", hasFindings: true, writesEnabled: true, fetchImpl,
   });
-  assert.equal(created, "created");
+  assert.equal(created, "posted");
   assert.equal(calls[0].options.method, "POST");
-  assert.match(calls[0].url, /\/repos\/o\/r\/issues\/7\/comments$/);
+  assert.match(calls[0].url, /\/repos\/o\/r\/pulls\/7\/reviews$/);
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    body: "findings",
+    commit_id: HEAD_SHA,
+    event: "COMMENT",
+  });
 
-  const updated = await upsertSummaryComment({
-    repo: "o/r", pr: 7, token: "token", existingComment: { id: 41 },
+  const updated = await postSummaryReview({
+    repo: "o/r", pr: 7, token: "token", headSha: HEAD_SHA, hasHistory: true,
     body: "clean", hasFindings: false, writesEnabled: true, fetchImpl,
   });
-  assert.equal(updated, "updated");
-  assert.equal(calls[1].options.method, "PATCH");
-  assert.match(calls[1].url, /\/repos\/o\/r\/issues\/comments\/41$/);
+  assert.equal(updated, "posted");
+  assert.equal(calls[1].options.method, "POST");
+  assert.match(calls[1].url, /\/repos\/o\/r\/pulls\/7\/reviews$/);
 });
 
-test("summary lifecycle creates no clean comment and suppresses every write", async () => {
+test("summary lifecycle creates no empty review and suppresses every write", async () => {
   let calls = 0;
   const fetchImpl = async () => { calls += 1; throw new Error("unexpected write"); };
-  assert.equal(await upsertSummaryComment({
-    repo: "o/r", pr: 7, token: "token", existingComment: null,
+  assert.equal(await postSummaryReview({
+    repo: "o/r", pr: 7, token: "token", headSha: HEAD_SHA, hasHistory: false,
     body: "clean", hasFindings: false, writesEnabled: true, fetchImpl,
   }), "skipped");
-  assert.equal(await upsertSummaryComment({
-    repo: "o/r", pr: 7, token: "token", existingComment: { id: 41 },
+  assert.equal(await postSummaryReview({
+    repo: "o/r", pr: 7, token: "token", headSha: HEAD_SHA, hasHistory: true,
     body: "findings", hasFindings: true, writesEnabled: false, fetchImpl,
   }), "suppressed");
   assert.equal(calls, 0);
@@ -1834,11 +1913,12 @@ test("oversize safety markers and API bodies fail before POST or PATCH", async (
 
   let writes = 0;
   await assert.rejects(
-    upsertSummaryComment({
+    postSummaryReview({
       repo: "o/r",
       pr: 7,
       token: "token",
-      existingComment: { id: 41 },
+      headSha: HEAD_SHA,
+      hasHistory: true,
       body: "x".repeat(GITHUB_COMMENT_MAX_BYTES + 1),
       hasFindings: true,
       writesEnabled: true,
@@ -1852,7 +1932,24 @@ test("oversize safety markers and API bodies fail before POST or PATCH", async (
   assert.equal(writes, 0);
 });
 
-test("summary history reads every issue-comment page and fails loud on query uncertainty", async () => {
+test("summary history reads every pull-request review page with pull-request permission", async () => {
+  const urls = [];
+  const pageOne = Array.from({ length: 100 }, (_, id) => ({ id }));
+  const reviews = await fetchSummaryReviews({
+    repo: "o/r",
+    pr: 7,
+    token: "token",
+    fetchImpl: async (url) => {
+      urls.push(url);
+      const body = url.endsWith("page=1") ? pageOne : [{ id: 101 }];
+      return { ok: true, json: async () => body, text: async () => "" };
+    },
+  });
+  assert.equal(reviews.length, 101);
+  assert.deepEqual(urls.map((url) => new URL(url).searchParams.get("page")), ["1", "2"]);
+});
+
+test("legacy summary history reads every issue-comment page and fails loud on query uncertainty", async () => {
   const urls = [];
   const pageOne = Array.from({ length: 100 }, (_, id) => ({ id }));
   const comments = await fetchSummaryComments({
@@ -2089,7 +2186,7 @@ test("normal execution requires and validates REVIEW_PUBLICATION_FILE", () => {
     },
   });
   assert.notEqual(wrongHead.status, 0);
-  assert.match(wrongHead.stderr, /publication head_sha must match HEAD_SHA/);
+  assert.match(wrongHead.stderr, /publication head_sha must match expected head_sha/);
 });
 
 test("summary render smoke uses the authoritative publication and emits no heuristic language", () => {

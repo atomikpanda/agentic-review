@@ -12,6 +12,7 @@ import {
   createReviewPublication,
   deriveAnalysisState,
   deriveReviewState,
+  derivePublicationFailureResult,
   validateReviewPublication,
   validateRunMetadata,
 } from "./review-result.mjs";
@@ -148,6 +149,71 @@ for (const row of reviewStateCases) {
     }), row.expected);
   });
 }
+
+test("publication failure results retain trusted current blockers and scope", () => {
+  const publication = createReviewPublication(
+    {
+      schema_version: REVIEW_RESULT_SCHEMA_VERSION,
+      ...completeRun(),
+      analysis_state: "complete",
+    },
+    TRUSTED_SCOPE,
+    [finding("Critical"), { ...finding("Medium", "Medium cache eviction failure"), file: "src/eviction.mjs" }],
+  );
+
+  assert.deepEqual(
+    derivePublicationFailureResult(publication, {
+      expectedHeadSha: HEAD_SHA,
+      blockSeverities: ["Critical", "High"],
+    }),
+    {
+      analysis_state: "inconclusive",
+      merge_state: "blocked",
+      sample_state: "findings",
+      bounded_converged: false,
+      base_sha: BASE_SHA,
+      head_sha: HEAD_SHA,
+      configuration_fingerprint: FINGERPRINT,
+      passes_requested: 3,
+      passes_completed: 3,
+      current_counts: { Critical: 1, High: 0, Medium: 1 },
+      unresolved_counts: EMPTY_COUNTS,
+      reviewed_head: HEAD_SHA,
+      scope_hash: SCOPE_HASH,
+      coverage: "unknown",
+      remaining_analysis: ["reconciliation_unknown", "execution_failed"],
+      converged: false,
+    },
+  );
+  const incompletePublication = createReviewPublication(
+    {
+      schema_version: REVIEW_RESULT_SCHEMA_VERSION,
+      ...completeRun({
+        min_votes: 2,
+        coverage: "unknown",
+        remaining_analysis: ["vote_threshold_applied"],
+      }),
+      analysis_state: "inconclusive",
+    },
+    TRUSTED_SCOPE,
+    [finding("High")],
+  );
+  assert.deepEqual(
+    derivePublicationFailureResult(incompletePublication, {
+      expectedHeadSha: HEAD_SHA,
+      blockSeverities: ["Critical", "High"],
+    }).remaining_analysis,
+    ["vote_threshold_applied", "reconciliation_unknown", "execution_failed"],
+  );
+
+  assert.throws(
+    () => derivePublicationFailureResult(publication, {
+      expectedHeadSha: BASE_SHA,
+      blockSeverities: ["Critical", "High"],
+    }),
+    /head_sha must match expected head/i,
+  );
+});
 
 test("current and prior fuzzy duplicates count once and the current severity wins", () => {
   const current = finding(

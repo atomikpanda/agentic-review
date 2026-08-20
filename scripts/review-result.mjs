@@ -488,6 +488,39 @@ export function deriveReviewState({
   };
 }
 
+export function derivePublicationFailureResult(publication, {
+  expectedHeadSha,
+  blockSeverities = ["Critical", "High"],
+} = {}) {
+  const { findings, metadata } = validateReviewPublication(publication);
+  requireSha(expectedHeadSha, "expected head_sha");
+  if (metadata.head_sha !== expectedHeadSha) {
+    throw new TypeError("publication head_sha must match expected head_sha");
+  }
+  const state = deriveReviewState({
+    analysisState: "inconclusive",
+    current: findings,
+    unresolved: [],
+    reconciliationKnown: false,
+    blockSeverities,
+  });
+  return {
+    ...state,
+    base_sha: metadata.base_sha,
+    head_sha: metadata.head_sha,
+    configuration_fingerprint: metadata.configuration_fingerprint,
+    passes_requested: metadata.passes.requested.length,
+    passes_completed: metadata.passes.completed.length,
+    reviewed_head: metadata.head_sha,
+    scope_hash: metadata.scope_hash,
+    coverage: "unknown",
+    remaining_analysis: REMAINING_ANALYSIS_REASONS.filter(
+      (reason) => ["reconciliation_unknown", "execution_failed"].includes(reason)
+        || metadata.remaining_analysis.includes(reason),
+    ),
+  };
+}
+
 export function validateRunMetadata(value, trustedScope) {
   canonicalize(value, "metadata");
   requirePlainObject(value, "metadata");
@@ -622,10 +655,10 @@ function readJson(source) {
 
 function runCli(argv) {
   const [command, source, ...extra] = argv;
-  const commands = ["fingerprint", "scope", "analysis", "validate"];
+  const commands = ["fingerprint", "scope", "analysis", "validate", "failure"];
   if (extra.length > 0 || !commands.includes(command)) {
     throw new TypeError(
-      "usage: review-result.mjs <fingerprint|scope|analysis|validate> [JSON_FILE|-]",
+      "usage: review-result.mjs <fingerprint|scope|analysis|validate|failure> [JSON_FILE|-]",
     );
   }
   const value = readJson(source);
@@ -636,6 +669,15 @@ function runCli(argv) {
       : scopeHash(value);
   }
   if (command === "analysis") return deriveAnalysisState(value);
+  if (command === "failure") {
+    return JSON.stringify(derivePublicationFailureResult(value, {
+      expectedHeadSha: process.env.HEAD_SHA,
+      blockSeverities: (process.env.BLOCK_SEVERITIES ?? "Critical,High")
+        .split(",")
+        .map((severity) => severity.trim())
+        .filter(Boolean),
+    }));
+  }
   return JSON.stringify(validateReviewPublication(value).metadata);
 }
 

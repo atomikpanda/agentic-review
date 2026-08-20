@@ -91,7 +91,10 @@ immutable base and head SHAs, the configuration fingerprint and configured vote
 threshold, diff and cap status, requested/completed pass identifiers, per-pass
 status, merge success, and `analysis_state`. Both outputs reject a symlink
 destination before model work, and the paths must resolve to different
-destinations. `--no-state` still reads existing history for the
+destinations. Publication staging lives only inside the run's private temporary
+directory and is atomically renamed onto the checked destination; predictable
+destination-adjacent temp files are never opened. `--no-state` still reads
+existing history for the
 rendered state and exit status but never mutates it. Advanced local experiments
 can change the ensemble with `--passes N`, `--lenses a,b,c`, and
 `--min-votes N`; pass/lens changes appear in the metadata identifiers, and all
@@ -132,7 +135,7 @@ human reviewer, not a wall of prose at the bottom of the PR.
 |---|---|
 | `suggest` (default) | Inline comments anchored to the offending lines, each with a ready-to-commit fix where the agent could produce a complete one |
 | `inline` | The same inline comments, explanation only, no fixes |
-| `summary` | One standing issue comment rendered from the structured findings result and metadata — no line anchoring |
+| `summary` | One bot-authored pull-request review body rendered from the structured findings result and metadata — no line anchoring |
 
 This is a different mechanism, not a different format. A suggestion has to be
 an inline review comment attached to a line range **inside the pull request's
@@ -224,11 +227,15 @@ merge makes analysis `inconclusive`. Known findings still produce
 that the sample was clean or converged.
 
 Hard execution failures still run the hosted poster. Missing or invalid review
-artifacts are never posted to the pull request; the poster emits a conservative
-final result (`analysis_state=inconclusive`, `sample_state=unknown`,
-`coverage=unknown`, both convergence fields `false`, and
-`remaining_analysis` including `execution_failed`) and exits nonzero so an
-earlier runner failure cannot be hidden.
+artifacts are never posted to the pull request and produce a conservative
+zero-count final result. If the poster crashes after the runner atomically
+published a valid schema-v2 publication for the target head, the fallback keeps
+that publication's finding counts, blocking severity, immutable review identity,
+and scope while forcing `analysis_state=inconclusive`, `coverage=unknown`, both
+convergence fields `false`, and `remaining_analysis` retaining every runner
+reason followed by `reconciliation_unknown` and `execution_failed` in canonical
+order. The step exits nonzero so an earlier failure cannot be
+hidden.
 
 The reusable workflow exposes these exact outputs:
 
@@ -257,27 +264,33 @@ Summary mode does not ask the model for Markdown. It deterministically renders
 the same structured findings result and metadata used by inline and suggest
 modes.
 
-When findings exist, summary mode maintains one bot-authored standing issue
-comment with an embedded state marker and edits it on later runs instead of
-appending another. A no-findings run creates no empty comment, but updates an
-existing standing comment when prior findings can be retired. Deleting that
-comment explicitly resets summary-mode history.
+When findings exist, summary mode appends a bot-authored pull-request review
+body with an embedded state marker. Later runs read the newest marked review and
+append its replacement state; a no-findings run creates no empty review unless
+prior summary state must be retired. This transport uses the same
+`pull-requests: write` permission as inline and suggest mode, so existing caller
+workflows do not need `issues` permission.
 
-Because the standing summary is an issue comment, it has no per-finding GitHub
+For migration, marked legacy issue comments are read opportunistically and
+compete by timestamp with marked review bodies. Missing issue-comment permission
+does not make reconciliation unknown and never suppresses current review writes.
+Pull-request review history remains authoritative; if it cannot be read,
+reconciliation is unknown. Summary bodies have no per-finding GitHub
 resolved-thread signal; use `inline` or `suggest` when that signal is required.
 
 A prior finding omitted by a later stochastic sample remains held while the run
 is inconclusive or its original span is unchanged or indeterminate, and still
 affects `merge_state`/`sample_state`. It is retired only when a complete run
 confirms that span changed. Suppressed-write runs read and reconcile the standing
-state for outputs and gating but do not edit it. If identity lookup or
-reconciliation fails, the comment is left untouched and the result cannot be
+state for outputs and gating but do not append a review. If identity lookup,
+pull-request review history, or reconciliation fails, summary-derived
+dismissals are not applied, the state is not changed, and the result cannot be
 clean or converged.
 
 Only the currently authenticated **Bot** identity can own standing state. A
 human user's manual PAT or an unrecognized viewer makes identity unknown; the
 poster emits conservative outputs and gate state but suppresses every PR write.
-It neither trusts nor edits a marker in a human or attacker-authored comment.
+It never trusts a marker in a human or attacker-authored review or comment.
 
 Inline and suggest modes use bot-authored fingerprinted threads. A recurring
 finding stays silent while its thread is open and is not repeated in a new

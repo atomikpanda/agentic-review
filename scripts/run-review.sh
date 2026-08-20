@@ -906,18 +906,19 @@ write_publication() {
   node "$RESULT_HELPER" validate "$RUN_TMP/publication.json" >/dev/null \
     || die "generated review publication failed validation"
   if [ -n "$PUBLICATION_OUT" ]; then
-    publication_tmp="${PUBLICATION_OUT}.tmp.$$"
+    local publication_tmp="$RUN_TMP/publication-out.json"
     if ! cp "$RUN_TMP/publication.json" "$publication_tmp"; then
       rm -f "$publication_tmp"
-      die "could not write review publication beside $PUBLICATION_OUT"
+      die "could not stage review publication for $PUBLICATION_OUT"
     fi
     if ! node "$RESULT_HELPER" validate "$publication_tmp" >/dev/null; then
       rm -f "$publication_tmp"
-      die "review publication at $publication_tmp failed validation"
+      die "staged review publication failed validation"
     fi
-    mv -f "$publication_tmp" "$PUBLICATION_OUT" || {
+    node -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' \
+      "$publication_tmp" "$PUBLICATION_OUT" || {
       rm -f "$publication_tmp"
-      die "could not publish review publication at $PUBLICATION_OUT"
+      die "could not atomically publish review publication at $PUBLICATION_OUT"
     }
     ok "publication written to $PUBLICATION_OUT"
   fi

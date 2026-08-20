@@ -145,7 +145,7 @@ on:
           suggest — inline review comments with committable ```suggestion blocks
           where the agent can produce a complete fix (default).
           inline — the same inline comments, explanations only, no fixes.
-          summary — one issue comment with everything in it, no line anchoring.
+          summary — one pull-request review body with everything in it, no line anchoring.
         type: string
         default: suggest
       resolve_stale:
@@ -274,7 +274,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
   pull-requests: write
 
 concurrency:
@@ -413,7 +412,7 @@ jobs:
             // this token must not be.
             body: JSON.stringify({
               repositories: [repo.split("/")[1]],
-              permissions: { contents: "read", issues: "write", pull_requests: "write" },
+              permissions: { contents: "read", pull_requests: "write" },
             }),
           });
           process.stdout.write(tok.token);
@@ -702,8 +701,9 @@ jobs:
 
           REVIEW_RUNNER="$SUPPORT_ROOT/scripts/run-review.sh"
           REVIEW_POSTER="$SUPPORT_ROOT/scripts/post-review.mjs"
+          REVIEW_RESULT_HELPER="$SUPPORT_ROOT/scripts/review-result.mjs"
           REVIEW_STRIPPER="$SUPPORT_ROOT/scripts/strip-agent-config.sh"
-          for file in "$REVIEW_RUNNER" "$REVIEW_POSTER" "$REVIEW_STRIPPER"; do
+          for file in "$REVIEW_RUNNER" "$REVIEW_POSTER" "$REVIEW_RESULT_HELPER" "$REVIEW_STRIPPER"; do
             [ -f "$file" ] || {
               echo "::error::trusted support file is missing: $file"
               exit 1
@@ -714,6 +714,7 @@ jobs:
             echo "TRUSTED_DATA_ROOT=$SUPPORT_ROOT"
             echo "REVIEW_RUNNER=$REVIEW_RUNNER"
             echo "REVIEW_POSTER=$REVIEW_POSTER"
+            echo "REVIEW_RESULT_HELPER=$REVIEW_RESULT_HELPER"
             echo "REVIEW_STRIPPER=$REVIEW_STRIPPER"
           } >> "$GITHUB_ENV"
 
@@ -932,18 +933,28 @@ jobs:
           const baseSha = process.env.BASE_SHA ?? "";
           const headSha = process.env.HEAD_SHA ?? "";
           const resultFile = process.env.REVIEW_RESULT_FILE || "/tmp/review-result.json";
-          const trustedBaseSha = process.env.TRUSTED_BASE_SHA ?? "";
-          const trustedHeadSha = process.env.TRUSTED_HEAD_SHA ?? "";
-          const trustedScopeHash = process.env.TRUSTED_SCOPE_HASH ?? "";
+          let trustedMetadata = null;
+          let trustedFailureResult = null;
+          try {
+            trustedMetadata = JSON.parse(process.env.TRUSTED_METADATA ?? "");
+            trustedFailureResult = JSON.parse(process.env.TRUSTED_FAILURE_RESULT ?? "");
+          } catch {
+            // Missing or invalid trusted evidence keeps the zero-valued fallback.
+          }
+          const trustedBaseSha = trustedFailureResult?.base_sha ?? "";
+          const trustedHeadSha = trustedFailureResult?.head_sha ?? "";
+          const trustedScopeHash = trustedFailureResult?.scope_hash ?? "";
           const trustedConfigurationFingerprint = (
-            process.env.TRUSTED_CONFIGURATION_FINGERPRINT ?? ""
+            trustedFailureResult?.configuration_fingerprint ?? ""
           );
-          const trustedPassesRequested = Number(process.env.TRUSTED_PASSES_REQUESTED ?? "0");
-          const trustedPassesCompleted = Number(process.env.TRUSTED_PASSES_COMPLETED ?? "0");
-          const trustedAnalysisState = process.env.TRUSTED_ANALYSIS_STATE ?? "";
-          const trustedCoverage = process.env.TRUSTED_COVERAGE ?? "";
-          const trustedRemainingAnalysisText = process.env.TRUSTED_REMAINING_ANALYSIS ?? "";
-          const conservativeResult = {
+          const trustedPassesRequested = trustedFailureResult?.passes_requested ?? 0;
+          const trustedPassesCompleted = trustedFailureResult?.passes_completed ?? 0;
+          const trustedAnalysisState = trustedMetadata?.analysis_state ?? "";
+          const trustedCoverage = trustedMetadata?.coverage ?? "";
+          const trustedRemainingAnalysis = Array.isArray(trustedMetadata?.remaining_analysis)
+            ? trustedMetadata.remaining_analysis
+            : null;
+          const conservativeResult = trustedFailureResult ?? {
             analysis_state: "inconclusive",
             merge_state: "ready",
             sample_state: "unknown",
@@ -1002,55 +1013,10 @@ jobs:
             "execution_failed",
           ];
           const remainingAnalysisReasonSet = new Set(remainingAnalysisReasons);
-          let trustedRemainingAnalysis = null;
-          try {
-            const parsed = JSON.parse(trustedRemainingAnalysisText);
-            if (
-              Array.isArray(parsed)
-              && parsed.every((reason) => remainingAnalysisReasonSet.has(reason))
-              && new Set(parsed).size === parsed.length
-            ) {
-              trustedRemainingAnalysis = parsed;
-            }
-          } catch {
-            // Invalid trusted evidence makes every poster candidate unpreservable.
-          }
           const posterOwnedRemainingAnalysisReasons = new Set([
             "reconciliation_unknown",
             "execution_failed",
           ]);
-          // A poster crash invalidates presentation and reconciliation, not the
-          // immutable runner identity. Retain that evidence without promoting
-          // its sample, coverage, or convergence into the final result.
-          const trustedPublicationAvailable = (
-            /^[0-9a-f]{40}$/.test(trustedBaseSha)
-            && trustedHeadSha === headSha
-            && fingerprintPattern.test(trustedScopeHash)
-            && fingerprintPattern.test(trustedConfigurationFingerprint)
-            && Number.isSafeInteger(trustedPassesRequested)
-            && trustedPassesRequested >= 0
-            && Number.isSafeInteger(trustedPassesCompleted)
-            && trustedPassesCompleted >= 0
-            && trustedPassesCompleted <= trustedPassesRequested
-            && stateValues.analysis_state.has(trustedAnalysisState)
-            && stateValues.coverage.has(trustedCoverage)
-            && trustedRemainingAnalysis !== null
-          );
-          if (trustedPublicationAvailable) {
-            Object.assign(conservativeResult, {
-              base_sha: trustedBaseSha,
-              head_sha: trustedHeadSha,
-              configuration_fingerprint: trustedConfigurationFingerprint,
-              passes_requested: trustedPassesRequested,
-              passes_completed: trustedPassesCompleted,
-              reviewed_head: trustedHeadSha,
-              scope_hash: trustedScopeHash,
-              remaining_analysis: remainingAnalysisReasons.filter(
-                (reason) => reason === "execution_failed"
-                  || trustedRemainingAnalysis.includes(reason),
-              ),
-            });
-          }
 
           function validateFinalResult(candidate) {
             if (
@@ -1342,15 +1308,8 @@ jobs:
           }
           NODE
           }
-          export TRUSTED_SCOPE_HASH=""
-          export TRUSTED_BASE_SHA=""
-          export TRUSTED_HEAD_SHA=""
-          export TRUSTED_CONFIGURATION_FINGERPRINT=""
-          export TRUSTED_PASSES_REQUESTED=0
-          export TRUSTED_PASSES_COMPLETED=0
-          export TRUSTED_ANALYSIS_STATE=""
-          export TRUSTED_COVERAGE=""
-          export TRUSTED_REMAINING_ANALYSIS=""
+          export TRUSTED_METADATA=""
+          export TRUSTED_FAILURE_RESULT=""
 
           poster_configured=true
           for name in REVIEW_MODE POST_COMMENT SUPPRESS_WRITES RESOLVE_STALE \
@@ -1367,10 +1326,12 @@ jobs:
             || [ -z "${BASE_SHA:-}" ] \
             || [ "$poster_configured" != "true" ] \
             || [ -z "${TRUSTED_DATA_ROOT:-}" ] \
-            || [ -z "${REVIEW_POSTER:-}" ] \
+            || [ -z "${REVIEW_RESULT_HELPER:-}" ] \
             || [[ "${TRUSTED_DATA_ROOT:-}" != /* ]] \
             || [ "${REVIEW_POSTER:-}" != "${TRUSTED_DATA_ROOT:-}/scripts/post-review.mjs" ] \
-            || [ ! -f "${REVIEW_POSTER:-}" ]; then
+            || [ "${REVIEW_RESULT_HELPER:-}" != "${TRUSTED_DATA_ROOT:-}/scripts/review-result.mjs" ] \
+            || [ ! -f "${REVIEW_POSTER:-}" ] \
+            || [ ! -f "${REVIEW_RESULT_HELPER:-}" ]; then
             echo "::warning::review setup is incomplete; emitting a conservative result"
             # Target resolution and the support checkout are both upstream of
             # this always() step, so the fallback cannot import either one.
@@ -1378,85 +1339,22 @@ jobs:
             exit 1
           fi
 
-          # Snapshot runner-produced identity, pass, and bounded-analysis
-          # evidence from the validated atomic publication before the poster
-          # runs. Reusing the metadata avoids importing the review module or
-          # duplicating its canonical contracts.
-          trusted_metadata_snapshot=""
+          # Snapshot the validated publication before presentation. The shared
+          # result owner derives the crash fallback as well as the metadata used
+          # to reject any invalid or strengthened result left by the poster.
           if [ -s "${REVIEW_PUBLICATION_FILE:-}" ]; then
-            if trusted_metadata_snapshot="$(
-              node - "$REVIEW_PUBLICATION_FILE" <<'NODE'
-          const { readFileSync } = require("node:fs");
-          try {
-            const publication = JSON.parse(readFileSync(process.argv[2], "utf8"));
-            const trustedMetadata = publication?.metadata;
-            if (
-              trustedMetadata === null
-              || typeof trustedMetadata !== "object"
-              || Array.isArray(trustedMetadata)
-              || publication === null
-              || typeof publication !== "object"
-              || Array.isArray(publication)
-              || publication.schema_version !== 2
-              || !Array.isArray(publication.findings)
-              || Object.keys(publication).sort().join(",") !== "findings,metadata,schema_version,scope"
-              || !/^[0-9a-f]{40}$/.test(trustedMetadata.base_sha)
-              || !/^[0-9a-f]{40}$/.test(trustedMetadata.head_sha)
-              || trustedMetadata.head_sha !== process.env.HEAD_SHA
-              || !/^[0-9a-f]{64}$/.test(trustedMetadata.scope_hash)
-              || !/^[0-9a-f]{64}$/.test(trustedMetadata.configuration_fingerprint)
-              || trustedMetadata.passes === null
-              || typeof trustedMetadata.passes !== "object"
-              || Array.isArray(trustedMetadata.passes)
-              || !Array.isArray(trustedMetadata.passes.requested)
-              || !Array.isArray(trustedMetadata.passes.completed)
-              || !["complete", "inconclusive"].includes(trustedMetadata.analysis_state)
-              || !["bounded", "unknown"].includes(trustedMetadata.coverage)
-              || !Array.isArray(trustedMetadata.remaining_analysis)
-              || trustedMetadata.remaining_analysis.some(
-                (reason) => typeof reason !== "string",
-              )
-            ) {
-              process.exitCode = 1;
-            } else {
-              process.stdout.write([
-                trustedMetadata.base_sha,
-                trustedMetadata.head_sha,
-                trustedMetadata.scope_hash,
-                trustedMetadata.configuration_fingerprint,
-                trustedMetadata.passes.requested.length,
-                trustedMetadata.passes.completed.length,
-                trustedMetadata.analysis_state,
-                trustedMetadata.coverage,
-                JSON.stringify(trustedMetadata.remaining_analysis),
-              ].join("\t"));
-            }
-          } catch {
-            process.exitCode = 1;
-          }
-          NODE
+            if TRUSTED_METADATA="$(
+              node "$REVIEW_RESULT_HELPER" validate "$REVIEW_PUBLICATION_FILE"
+            )" && TRUSTED_FAILURE_RESULT="$(
+              HEAD_SHA="$HEAD_SHA" BLOCK_SEVERITIES="$BLOCK_SEVERITIES" \
+                node "$REVIEW_RESULT_HELPER" failure "$REVIEW_PUBLICATION_FILE"
             )"; then
-              IFS=$'\t' read -r \
-                TRUSTED_BASE_SHA \
-                TRUSTED_HEAD_SHA \
-                TRUSTED_SCOPE_HASH \
-                TRUSTED_CONFIGURATION_FINGERPRINT \
-                TRUSTED_PASSES_REQUESTED \
-                TRUSTED_PASSES_COMPLETED \
-                TRUSTED_ANALYSIS_STATE \
-                TRUSTED_COVERAGE \
-                TRUSTED_REMAINING_ANALYSIS <<< "$trusted_metadata_snapshot"
-              export TRUSTED_SCOPE_HASH
-              export TRUSTED_BASE_SHA
-              export TRUSTED_HEAD_SHA
-              export TRUSTED_CONFIGURATION_FINGERPRINT
-              export TRUSTED_PASSES_REQUESTED
-              export TRUSTED_PASSES_COMPLETED
-              export TRUSTED_ANALYSIS_STATE
-              export TRUSTED_COVERAGE
-              export TRUSTED_REMAINING_ANALYSIS
+              export TRUSTED_METADATA
+              export TRUSTED_FAILURE_RESULT
             else
-              echo "::warning::trusted review metadata has invalid identity, pass, or analysis evidence"
+              export TRUSTED_METADATA=""
+              export TRUSTED_FAILURE_RESULT=""
+              echo "::warning::trusted review publication is invalid or does not match the target head"
             fi
           fi
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -20,7 +21,12 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 
-import { deriveTrustedScopeMetadata, scopeHash } from "./review-result.mjs";
+import {
+  createReviewPublication,
+  deriveTrustedScopeMetadata,
+  enrichRunMetadata,
+  scopeHash,
+} from "./review-result.mjs";
 
 const runner = fileURLToPath(new URL("./run-review.sh", import.meta.url));
 const resultCli = fileURLToPath(new URL("./review-result.mjs", import.meta.url));
@@ -80,20 +86,24 @@ function expectedExecutionFailureResult(baseSha, headSha, evidence = {}) {
   const remainingAnalysis = evidence.remainingAnalysis ?? [];
   return {
     analysis_state: "inconclusive",
-    merge_state: "ready",
-    sample_state: "unknown",
+    merge_state: evidence.mergeState ?? "ready",
+    sample_state: evidence.sampleState ?? "unknown",
     bounded_converged: false,
     base_sha: baseSha,
     head_sha: headSha,
     configuration_fingerprint: evidence.configurationFingerprint ?? "",
     passes_requested: evidence.passesRequested ?? 0,
     passes_completed: evidence.passesCompleted ?? 0,
-    current_counts: { Critical: 0, High: 0, Medium: 0 },
+    current_counts: evidence.currentCounts ?? { Critical: 0, High: 0, Medium: 0 },
     unresolved_counts: { Critical: 0, High: 0, Medium: 0 },
     reviewed_head: headSha,
     scope_hash: evidence.scopeHash ?? "",
     coverage: "unknown",
-    remaining_analysis: [...remainingAnalysis, "execution_failed"],
+    remaining_analysis: [
+      ...remainingAnalysis,
+      ...(evidence.scopeHash ? ["reconciliation_unknown"] : []),
+      "execution_failed",
+    ],
     converged: false,
   };
 }
@@ -110,33 +120,55 @@ function writeTrustedPublication({
   requestedPasses,
   remainingAnalysis = [],
 }) {
+  const diffTruncated = remainingAnalysis.includes("diff_truncated");
+  const findingCapReached = remainingAnalysis.includes("finding_cap_reached");
   const scope = {
     base_sha: baseSha,
-    bytes: 0,
+    bytes: diffTruncated ? 1 : 0,
     configuration_fingerprint: configurationFingerprint,
-    diff_base64: "",
+    diff_base64: diffTruncated ? Buffer.from("x").toString("base64") : "",
     head_sha: headSha,
     included_bytes: 0,
   };
   const trustedScopeHash = deriveTrustedScopeMetadata(scope).scope_hash;
-  writeFileSync(publicationFile, `${JSON.stringify({
-    schema_version: 2,
-    findings,
-    metadata: {
-      analysis_state: analysisState,
-      base_sha: baseSha,
-      configuration_fingerprint: configurationFingerprint,
-      coverage,
-      head_sha: headSha,
-      passes: {
-        requested: requestedPasses,
-        completed: completedPasses,
-      },
-      remaining_analysis: remainingAnalysis,
-      scope_hash: trustedScopeHash,
+  const completed = new Set(completedPasses);
+  const run = {
+    schema_version: 1,
+    base_sha: baseSha,
+    head_sha: headSha,
+    configuration_fingerprint: configurationFingerprint,
+    snapshot_immutable: !remainingAnalysis.includes("snapshot_mutable"),
+    diff: {
+      bytes: scope.bytes,
+      included_bytes: scope.included_bytes,
+      truncated: diffTruncated,
     },
-    scope,
-  })}\n`);
+    finding_cap: 20,
+    min_votes: remainingAnalysis.includes("vote_threshold_applied") ? 2 : 1,
+    merge_succeeded: !remainingAnalysis.includes("merge_failed"),
+    passes: {
+      requested: requestedPasses,
+      completed: completedPasses,
+      results: requestedPasses.map((id, index) => ({
+        id,
+        status: completed.has(id) ? "valid" : "failed",
+        attempts: completed.has(id) ? 1 : 2,
+        finding_count: findingCapReached && index === 0 ? 20 : findings.length,
+        capped: findingCapReached && index === 0,
+        base_sha: baseSha,
+        head_sha: headSha,
+        configuration_fingerprint: configurationFingerprint,
+      })),
+    },
+  };
+  const metadata = enrichRunMetadata(run, { scopeHash: trustedScopeHash });
+  assert.equal(metadata.analysis_state, analysisState);
+  assert.equal(metadata.coverage, coverage);
+  assert.deepEqual(metadata.remaining_analysis, remainingAnalysis);
+  writeFileSync(
+    publicationFile,
+    `${JSON.stringify(createReviewPublication(metadata, scope, findings))}\n`,
+  );
   return trustedScopeHash;
 }
 
@@ -678,7 +710,6 @@ exit 1
   assert.match(generated, new RegExp(`uses: atomikpanda/agentic-review/.github/workflows/agentic-review.yml@${sha}`));
   assert.match(generated, new RegExp(`central_ref: ${sha}`));
   assert.match(generated, /extra_omp_args: --print-thoughts --no-title/);
-  assert.match(generated, /^  issues: write$/m);
   assert.match(generated, /^  pull-requests: write$/m);
 
   const outputFile = join(directory, "sha-output");
@@ -938,14 +969,21 @@ test("workflow independently retains the required result and optional diagnostic
   assert.match(diagnosticsStep, /^\s+if-no-files-found: ignore$/m);
 });
 
-test("hosted workflows request issue-comment history and write permissions", () => {
+test("hosted workflows require only pull-request write permission", () => {
   const source = readFileSync(workflow, "utf8");
-  assert.match(source, /^  issues: write$/m);
+  assert.doesNotMatch(source, /^  issues: write$/m);
   assert.match(source, /^  pull-requests: write$/m);
   assert.match(
     source,
-    /permissions: \{ contents: "read", issues: "write", pull_requests: "write" \}/,
+    /permissions: \{ contents: "read", pull_requests: "write" \}/,
   );
+});
+
+test("hosted poster crash fallback delegates publication validation and derivation to the trusted result owner", () => {
+  const source = readFileSync(workflow, "utf8");
+  assert.match(source, /node "\$REVIEW_RESULT_HELPER" validate "\$REVIEW_PUBLICATION_FILE"/);
+  assert.match(source, /node "\$REVIEW_RESULT_HELPER" failure "\$REVIEW_PUBLICATION_FILE"/);
+  assert.doesNotMatch(source, /node - "\$REVIEW_PUBLICATION_FILE"/);
 });
 
 test("early hosted setup failure without a publication uses target fallback defaults", (t) => {
@@ -978,6 +1016,7 @@ writeFileSync(process.env.UNTRUSTED_POSTER_MARKER, "executed");
     "REVIEW_RUNNER",
     "REVIEW_STRIPPER",
     "REVIEW_POSTER",
+    "REVIEW_RESULT_HELPER",
     "REVIEW_MODE",
     "POST_COMMENT",
     "SUPPRESS_WRITES",
@@ -1028,6 +1067,8 @@ test("behind-base poster no-result fallback pairs with the trusted merge-base pu
   const publicationFile = join(directory, "review-publication.json");
   mkdirSync(dirname(trustedPoster), { recursive: true });
   writeFileSync(trustedPoster, 'import "./missing-trusted-dependency.mjs";\n');
+  copyFileSync(resultCli, join(directory, "scripts", "review-result.mjs"));
+  copyFileSync(join(dirname(resultCli), "lib-findings.mjs"), join(directory, "scripts", "lib-findings.mjs"));
 
   const baseSha = "1111111111111111111111111111111111111111";
   const targetBaseSha = "3333333333333333333333333333333333333333";
@@ -1042,6 +1083,7 @@ test("behind-base poster no-result fallback pairs with the trusted merge-base pu
     TRUSTED_DATA_ROOT: directory,
     REVIEW_POSTER: trustedPoster,
     REVIEW_PUBLICATION_FILE: publicationFile,
+    REVIEW_RESULT_HELPER: join(directory, "scripts", "review-result.mjs"),
     REVIEW_MODE: "summary",
     POST_COMMENT: "false",
     SUPPRESS_WRITES: "true",
@@ -1077,11 +1119,16 @@ test("behind-base poster no-result fallback pairs with the trusted merge-base pu
   );
   assertFinalResultSummary(readFileSync(summaryFile, "utf8"), expectedResult);
 
+  const crashFindings = [
+    finding("Publication blocker", { severity: "Critical" }),
+    finding("Publication warning"),
+  ];
   const configurationFingerprint = "a".repeat(64);
   const trustedScopeHash = writeTrustedPublication({
     baseSha,
     configurationFingerprint,
     completedPasses: ["general", "correctness", "boundaries"],
+    findings: crashFindings,
     headSha,
     publicationFile: publicationFile,
     requestedPasses: ["general", "correctness", "boundaries"],
@@ -1105,12 +1152,21 @@ test("behind-base poster no-result fallback pairs with the trusted merge-base pu
     passesRequested: 3,
     passesCompleted: 3,
     scopeHash: trustedScopeHash,
+    mergeState: "blocked",
+    sampleState: "findings",
+    currentCounts: { Critical: 1, High: 0, Medium: 1 },
   });
 
   assert.equal(killedBeforeResult.status, 47, killedBeforeResult.stderr);
+  assert.doesNotMatch(
+    killedBeforeResult.stderr,
+    /trusted review publication is invalid/,
+    killedBeforeResult.stderr,
+  );
   assert.deepEqual(
     JSON.parse(readFileSync(killedResultFile, "utf8")),
     expectedKilledResult,
+    killedBeforeResult.stderr,
   );
   assert.deepEqual(
     envFileValues(killedOutput),
@@ -1247,6 +1303,8 @@ import { writeFileSync } from "node:fs";
 writeFileSync(process.env.REVIEW_RESULT_FILE, process.env.EMITTED_RESULT);
 process.exit(41);
 `);
+  copyFileSync(resultCli, join(directory, "scripts", "review-result.mjs"));
+  copyFileSync(join(dirname(resultCli), "lib-findings.mjs"), join(directory, "scripts", "lib-findings.mjs"));
 
   const baseSha = "1111111111111111111111111111111111111111";
   const headSha = "2222222222222222222222222222222222222222";
@@ -1261,6 +1319,7 @@ process.exit(41);
     BASE_SHA: baseSha,
     TRUSTED_DATA_ROOT: directory,
     REVIEW_POSTER: trustedPoster,
+    REVIEW_RESULT_HELPER: join(directory, "scripts", "review-result.mjs"),
     REVIEW_PUBLICATION_FILE: publicationFile,
     REVIEW_MODE: "summary",
     POST_COMMENT: "false",
@@ -1396,6 +1455,8 @@ import { writeFileSync } from "node:fs";
 writeFileSync(process.env.REVIEW_RESULT_FILE, process.env.EMITTED_RESULT);
 process.exit(37);
 `);
+  copyFileSync(resultCli, join(directory, "scripts", "review-result.mjs"));
+  copyFileSync(join(dirname(resultCli), "lib-findings.mjs"), join(directory, "scripts", "lib-findings.mjs"));
 
   const baseSha = "1111111111111111111111111111111111111111";
   const headSha = "2222222222222222222222222222222222222222";
@@ -1436,6 +1497,7 @@ process.exit(37);
       BASE_SHA: baseSha,
       TRUSTED_DATA_ROOT: directory,
       REVIEW_POSTER: trustedPoster,
+      REVIEW_RESULT_HELPER: join(directory, "scripts", "review-result.mjs"),
       REVIEW_PUBLICATION_FILE: publicationFile,
       REVIEW_RESULT_FILE: resultFile,
       GITHUB_OUTPUT: outputFile,
@@ -1481,6 +1543,8 @@ import { writeFileSync } from "node:fs";
 writeFileSync(process.env.REVIEW_RESULT_FILE, process.env.EMITTED_RESULT);
 process.exit(31);
 `);
+  copyFileSync(resultCli, join(directory, "scripts", "review-result.mjs"));
+  copyFileSync(join(dirname(resultCli), "lib-findings.mjs"), join(directory, "scripts", "lib-findings.mjs"));
 
   const baseSha = "1111111111111111111111111111111111111111";
   const headSha = "2222222222222222222222222222222222222222";
@@ -1674,6 +1738,7 @@ process.exit(31);
         BASE_SHA: baseSha,
         TRUSTED_DATA_ROOT: directory,
         REVIEW_POSTER: trustedPoster,
+        REVIEW_RESULT_HELPER: join(directory, "scripts", "review-result.mjs"),
         REVIEW_PUBLICATION_FILE: publicationFile,
         REVIEW_MODE: "summary",
         POST_COMMENT: "false",
@@ -1862,6 +1927,7 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
   const support = envFileValues(supportEnvFile);
   assert.equal(support.REVIEW_RUNNER, runner);
   assert.equal(support.REVIEW_POSTER, poster);
+  assert.equal(support.REVIEW_RESULT_HELPER, resultCli);
   assert.equal(support.TRUSTED_DATA_ROOT, trustedRoot);
 
   const selfSupportEnvFile = join(fixture.directory, "self-support.env");
@@ -1896,6 +1962,7 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
   assert.equal(selfSupport.TRUSTED_DATA_ROOT, trustedRoot);
   assert.equal(selfSupport.REVIEW_RUNNER, runner);
   assert.equal(selfSupport.REVIEW_POSTER, poster);
+  assert.equal(selfSupport.REVIEW_RESULT_HELPER, resultCli);
 
   for (const path of ["/tmp/prompt-body.md", "/tmp/skill.md", "/tmp/one-skill.md"]) {
     rmSync(path, { force: true });
@@ -2008,6 +2075,9 @@ globalThis.fetch = async (url, options = {}) => {
   if (String(url).endsWith("/graphql") && body.includes("reviewThreads")) {
     return { ok: true, status: 200, json: async () => ({ data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } }), text: async () => "" };
   }
+  if (String(url).includes("/pulls/17/reviews") && method === "GET") {
+    return { ok: true, status: 200, json: async () => [], text: async () => "" };
+  }
   if (String(url).includes("/issues/17/comments") && method === "GET") {
     return { ok: true, status: 200, json: async () => [], text: async () => "" };
   }
@@ -2066,7 +2136,7 @@ globalThis.fetch = async (url, options = {}) => {
   assert.match(readFileSync(summaryFile, "utf8"), /\| Passes \| `3 requested \/ 3 completed` \|/);
   assert.equal(JSON.parse(readFileSync(resultFile, "utf8")).merge_state, "blocked");
   const githubRequests = readFileSync(githubLogFile, "utf8").trim().split("\n").map(JSON.parse);
-  assert.equal(githubRequests.length, 3);
+  assert.equal(githubRequests.length, 4);
   assert.equal(
     githubRequests.some(({ url, method }) => url.includes("/comments") && method !== "GET"),
     false,
@@ -2667,16 +2737,21 @@ test("concurrent runners atomically publish findings, metadata, and scope for on
   const publicationFile = join(fixture.directory, "shared-publication.json");
   const gateFile = join(fixture.directory, "publication-a-ready");
   const releaseFile = join(fixture.directory, "release-publication-a");
-  const mv = join(fixture.bin, "mv");
-  writeFileSync(mv, `#!/usr/bin/env bash
-destination="\${@: -1}"
-if [ "\${PUBLICATION_RUN:-}" = "a" ] && [ "$destination" = "\${PUBLICATION_OUT}" ]; then
-  touch "\${PUBLICATION_GATE}"
-  while [ ! -e "\${PUBLICATION_RELEASE}" ]; do sleep 0.01; done
-fi
-PATH="\${PATH#*:}" exec mv "$@"
+  const preload = join(fixture.directory, "gate-publication-rename.cjs");
+  writeFileSync(preload, `
+const fs = require("node:fs");
+const originalRenameSync = fs.renameSync;
+const sleeper = new Int32Array(new SharedArrayBuffer(4));
+fs.renameSync = (from, to) => {
+  if (process.env.PUBLICATION_RUN === "a" && to === process.env.PUBLICATION_OUT) {
+    fs.writeFileSync(process.env.PUBLICATION_GATE, "");
+    while (!fs.existsSync(process.env.PUBLICATION_RELEASE)) {
+      Atomics.wait(sleeper, 0, 0, 10);
+    }
+  }
+  return originalRenameSync(from, to);
+};
 `);
-  chmodSync(mv, 0o755);
 
   const start = (name) => {
     const state = join(fixture.directory, `state-${name}`);
@@ -2704,6 +2779,7 @@ PATH="\${PATH#*:}" exec mv "$@"
         ...process.env,
         OPENROUTER_API_KEY: "sk-or-runner-test",
         PATH: `${fixture.bin}:${process.env.PATH}`,
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${preload}`.trim(),
         FAKE_OMP_PLAN: planFile,
         FAKE_OMP_LOG: log,
         FAKE_OMP_STATE: state,
@@ -2865,6 +2941,45 @@ test("symlink artifact destinations are rejected before model work without repla
       /symlink.*(?:--out|--publication-out)|(?:--out|--publication-out).*symlink/i,
     );
   }
+});
+
+test("publication staging never follows a predictable user-destination temp symlink", (t) => {
+  const plan = {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  };
+  let victim;
+  let publicationDestination;
+  let bashEnv;
+  const stale = "operator-owned data\n";
+  const run = runReview(t, plan, {
+    outputPaths: ({ directory, findingsFile, publicationFile }) => {
+      victim = join(directory, "temp-symlink-victim");
+      publicationDestination = publicationFile;
+      bashEnv = join(directory, "attack-bash-env");
+      writeFileSync(victim, stale);
+      writeFileSync(bashEnv, [
+        'if [ ! -e "$ATTACK_MARKER" ]; then',
+        '  : > "$ATTACK_MARKER"',
+        '  ln -s -- "$ATTACK_VICTIM" "$ATTACK_PUBLICATION.tmp.$$"',
+        "fi",
+        "",
+      ].join("\n"));
+      return { findingsFile, publicationFile };
+    },
+    env: {
+      get BASH_ENV() { return bashEnv; },
+      get ATTACK_MARKER() { return `${bashEnv}.ran`; },
+      get ATTACK_PUBLICATION() { return publicationDestination; },
+      get ATTACK_VICTIM() { return victim; },
+    },
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.equal(readFileSync(victim, "utf8"), stale);
+  assert.equal(lstatSync(run.publicationFile).isSymbolicLink(), false);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
 });
 
 test("branch and staged reviews stay pinned when the source changes after worktree creation", (t) => {

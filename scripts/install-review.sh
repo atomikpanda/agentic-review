@@ -210,12 +210,11 @@ on:
   pull_request_target:
     types: [opened, reopened, ready_for_review, synchronize]
 
-# A called workflow cannot grant itself more than the caller has. Without this
-# block a repository whose default GITHUB_TOKEN is read-only would run the
-# review and then fail at the moment it tried to post the result.
+# A called workflow cannot grant itself more than the caller has. Without
+# pull-request write access a read-only default token could review successfully
+# and then fail at the moment it tried to post the result.
 permissions:
   contents: read
-  issues: write
   pull-requests: write
 
 jobs:

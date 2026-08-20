@@ -21,7 +21,7 @@
 //   REVIEW_PUBLICATION_FILE atomic findings, run metadata, and reviewed scope (required)
 //   GITHUB_REPO           owner/name                           (required except RENDER)
 //   PR_NUMBER             pull request number                  (required except RENDER)
-//   GH_TOKEN              token with pull-requests/issues: write (required except RENDER)
+//   GH_TOKEN              token with pull-requests: write (required except RENDER)
 //   REVIEW_MODE           "summary" | "inline" | "suggest"     (default suggest)
 //   DRY_RUN               "1" reads and reconciles but does not write
 //   SUPPRESS_WRITES       "true" reads and reconciles but does not write
@@ -44,7 +44,11 @@ import {
   SIMILARITY_DEFAULT,
   tokenSet,
 } from "./lib-findings.mjs";
-import { deriveReviewState, enrichRunMetadata, validateReviewPublication } from "./review-result.mjs";
+import {
+  derivePublicationFailureResult,
+  deriveReviewState,
+  enrichRunMetadata,
+} from "./review-result.mjs";
 import {
   GIT_DIFF_MAX_BUFFER_BYTES,
   changeIsConfirmed,
@@ -196,7 +200,9 @@ export function selectSummaryHistory(comments, { botLogin } = {}) {
   const candidates = (Array.isArray(comments) ? comments : [])
     .filter((comment) => isBotComment(comment, botLogin) && SUMMARY_MARKER_PRESENT_RE.test(String(comment.body ?? "")))
     .sort((left, right) => {
-      const byTime = String(right.created_at ?? "").localeCompare(String(left.created_at ?? ""));
+      const leftTime = String(left.submitted_at ?? left.created_at ?? "");
+      const rightTime = String(right.submitted_at ?? right.created_at ?? "");
+      const byTime = rightTime.localeCompare(leftTime);
       return byTime || Number(right.id ?? 0) - Number(left.id ?? 0);
     });
   if (candidates.length === 0) {
@@ -891,39 +897,57 @@ export async function fetchSummaryComments({ repo, pr, token, fetchImpl = fetch 
   }
 }
 
-export async function upsertSummaryComment({
+export async function fetchSummaryReviews({ repo, pr, token, fetchImpl = fetch }) {
+  const reviews = [];
+  for (let page = 1; ; page += 1) {
+    const res = await fetchImpl(
+      `https://api.github.com/repos/${repo}/pulls/${pr}/reviews?per_page=100&page=${page}`,
+      {
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: "application/vnd.github+json",
+          "x-github-api-version": "2022-11-28",
+        },
+      },
+    );
+    if (!res.ok) throw new Error(`GET pull request reviews ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const pageReviews = await res.json();
+    if (!Array.isArray(pageReviews)) throw new Error("GET pull request reviews returned a non-array response");
+    reviews.push(...pageReviews);
+    if (pageReviews.length < 100) return reviews;
+  }
+}
+
+export async function postSummaryReview({
   repo,
   pr,
   token,
-  existingComment,
+  headSha,
+  hasHistory,
   body,
   hasFindings,
   writesEnabled,
   fetchImpl = fetch,
 }) {
-  if (!existingComment && !hasFindings) return "skipped";
+  if (!hasHistory && !hasFindings) return "skipped";
   if (!writesEnabled) return "suppressed";
   if (Buffer.byteLength(body) > GITHUB_COMMENT_MAX_BYTES) {
-    throw new RangeError("summary comment exceeds GitHub comment limit");
+    throw new RangeError("summary review exceeds GitHub comment limit");
   }
-  const updating = Boolean(existingComment);
-  const url = updating
-    ? `https://api.github.com/repos/${repo}/issues/comments/${existingComment.id}`
-    : `https://api.github.com/repos/${repo}/issues/${pr}/comments`;
-  const res = await fetchImpl(url, {
-    method: updating ? "PATCH" : "POST",
+  const res = await fetchImpl(`https://api.github.com/repos/${repo}/pulls/${pr}/reviews`, {
+    method: "POST",
     headers: {
       authorization: `Bearer ${token}`,
       accept: "application/vnd.github+json",
       "content-type": "application/json",
       "x-github-api-version": "2022-11-28",
     },
-    body: JSON.stringify({ body }),
+    body: JSON.stringify({ body, commit_id: headSha, event: "COMMENT" }),
   });
   if (!res.ok) {
-    throw new Error(`${updating ? "PATCH" : "POST"} summary comment ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    throw new Error(`POST summary review ${res.status}: ${(await res.text()).slice(0, 200)}`);
   }
-  return updating ? "updated" : "created";
+  return "posted";
 }
 
 // Only threads authored by the authenticated token identity are ever touched.
@@ -1269,7 +1293,8 @@ async function loadReconciliationHistory({ repo, pr, token, botLogin, identityKn
   const summary = { comment: null, findings: [], headSha: null, reconciliationKnown: identityKnown };
   if (!identityKnown) return { summary, threads: [], threadsKnown: false };
 
-  const [summaryResult, threadsResult] = await Promise.allSettled([
+  const [reviewsResult, legacyCommentsResult, threadsResult] = await Promise.allSettled([
+    fetchSummaryReviews({ repo, pr, token }),
     fetchSummaryComments({ repo, pr, token }),
     (() => {
       const [owner, name] = repo.split("/");
@@ -1278,12 +1303,20 @@ async function loadReconciliationHistory({ repo, pr, token, botLogin, identityKn
   ]);
 
   let selectedSummary = summary;
-  if (summaryResult.status === "fulfilled") {
-    selectedSummary = selectSummaryHistory(summaryResult.value, { botLogin });
+  if (reviewsResult.status === "fulfilled") {
+    const records = [...reviewsResult.value];
+    if (legacyCommentsResult.status === "fulfilled") {
+      records.push(...legacyCommentsResult.value);
+    } else {
+      console.log(
+        `::notice::legacy issue-comment summary history is unavailable (${legacyCommentsResult.reason?.message ?? legacyCommentsResult.reason})`,
+      );
+    }
+    selectedSummary = selectSummaryHistory(records, { botLogin });
   } else {
     selectedSummary = { comment: null, findings: [], headSha: null, reconciliationKnown: false };
     console.log(
-      `::warning::could not read standing summary comment (${summaryResult.reason?.message ?? summaryResult.reason})`,
+      `::warning::could not read pull-request review summary history (${reviewsResult.reason?.message ?? reviewsResult.reason})`,
     );
   }
 
@@ -1363,7 +1396,7 @@ export async function reconcileHostedFindings({ metadata, findings, history, wri
     metadata,
     findings: summaryReconciled.current,
     standing,
-    dismissed,
+    dismissed: history.summary.reconciliationKnown ? dismissed : [],
     matchedDismissed,
     resolveStale: env("RESOLVE_STALE", "true") === "true",
     writesEnabled: writesEnabled && reconciliationKnownBeforeInline,
@@ -1419,18 +1452,19 @@ export async function runSummaryMode({ metadata, findings, repo, pr, token, botL
 
   emitState(metadata, state, { reconciliationKnown });
   if (reconciliationKnown) {
-    const action = await upsertSummaryComment({
+    const action = await postSummaryReview({
       repo,
       pr,
       token,
-      existingComment: history.summary.comment,
+      headSha: metadata.head_sha,
+      hasHistory: Boolean(history.summary.comment),
       body,
       hasFindings: current.length + unresolved.length > 0,
       writesEnabled: WRITES_ENABLED,
     });
-    console.log(`  summary comment ${action}`);
+    console.log(`  summary review ${action}`);
   } else {
-    console.log("::warning::reconciliation is unknown; standing summary comment was not changed");
+    console.log("::warning::reconciliation is unknown; summary review was not changed");
   }
   if (DRY_RUN && env("SUPPRESS_WRITES", "") !== "true" && env("POST_COMMENT", "true") !== "false") {
     process.stdout.write(`${body}\n`);
@@ -1641,16 +1675,24 @@ function emitHardFailureResult() {
 
 async function main() {
   const publicationPath = required("REVIEW_PUBLICATION_FILE");
-  const { findings: publishedFindings, metadata } = validateReviewPublication(
-    JSON.parse(readFileSync(publicationPath, "utf8")),
-  );
-  const expectedHeadSha = env("HEAD_SHA", "");
-  if (expectedHeadSha && metadata.head_sha !== expectedHeadSha) {
-    throw new TypeError("publication head_sha must match HEAD_SHA");
-  }
+  const publication = JSON.parse(readFileSync(publicationPath, "utf8"));
+  const expectedHeadSha = env("HEAD_SHA", "") || publication?.metadata?.head_sha;
+  const failureResult = derivePublicationFailureResult(publication, {
+    expectedHeadSha,
+    blockSeverities: blockSeverities(),
+  });
+  const { findings: publishedFindings, metadata } = publication;
   activeMetadata = metadata;
   const findings = publishedFindings.map(projectPublicFinding);
-  lastTrustworthyState = deriveState(metadata, findings, [], false);
+  lastTrustworthyState = {
+    analysis_state: failureResult.analysis_state,
+    merge_state: failureResult.merge_state,
+    sample_state: failureResult.sample_state,
+    bounded_converged: failureResult.bounded_converged,
+    converged: failureResult.converged,
+    current_counts: failureResult.current_counts,
+    unresolved_counts: failureResult.unresolved_counts,
+  };
   lastReconciliationKnown = false;
   const mode = env("REVIEW_MODE", "suggest");
   if (!["summary", "inline", "suggest"].includes(mode)) {
