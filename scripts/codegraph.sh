@@ -42,9 +42,9 @@ out="$(mktemp)"
 trap 'rm -f "$list" "$out"' EXIT
 
 if [ "${STAGED:-}" = "1" ]; then
-  git diff --cached --name-only --diff-filter=d > "$list"
+  git diff --no-ext-diff --no-textconv --cached --name-only --diff-filter=d > "$list"
 else
-  git diff --name-only --diff-filter=d "$BASE_SHA" "$HEAD_SHA" > "$list"
+  git diff --no-ext-diff --no-textconv --name-only --diff-filter=d "$BASE_SHA" "$HEAD_SHA" > "$list"
 fi
 total="$(grep -c . "$list" || true)"
 [ "${total:-0}" -gt 0 ] || exit 0

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -10,12 +11,22 @@ import {
   readlinkSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
+import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
+
+import {
+  createReviewPublication,
+  deriveTrustedScopeMetadata,
+  enrichRunMetadata,
+  scopeHash,
+} from "./review-result.mjs";
 
 const runner = fileURLToPath(new URL("./run-review.sh", import.meta.url));
 const resultCli = fileURLToPath(new URL("./review-result.mjs", import.meta.url));
@@ -24,6 +35,7 @@ const poster = fileURLToPath(new URL("./post-review.mjs", import.meta.url));
 const workflow = fileURLToPath(new URL("../.github/workflows/agentic-review.yml", import.meta.url));
 const installer = fileURLToPath(new URL("./install-review.sh", import.meta.url));
 const trustedRoot = dirname(dirname(runner));
+const stagedTargetRefPrefix = "refs/agentic-review/staged-targets/";
 
 function workflowRunStep(name) {
   const lines = readFileSync(workflow, "utf8").split("\n");
@@ -45,6 +57,119 @@ function envFileValues(path) {
     const separator = line.indexOf("=");
     return [line.slice(0, separator), line.slice(separator + 1)];
   }));
+}
+
+function assertFinalResultSummary(summary, result) {
+  const counts = (value) => `Critical: ${value.Critical} · High: ${value.High} · Medium: ${value.Medium}`;
+  for (const row of [
+    `| Analysis | \`${result.analysis_state}\` |`,
+    `| Merge gate | \`${result.merge_state}\` |`,
+    `| Sample | \`${result.sample_state}\` |`,
+    `| Bounded convergence | \`${result.bounded_converged ? "yes" : "no"}\` |`,
+    `| Reviewed head | \`${result.reviewed_head}\` |`,
+    `| Scope hash | \`${result.scope_hash}\` |`,
+    `| Coverage | \`${result.coverage}\` |`,
+    `| Remaining analysis | \`${JSON.stringify(result.remaining_analysis)}\` |`,
+    `| Converged | \`${result.converged}\` |`,
+    `| Base SHA | \`${result.base_sha}\` |`,
+    `| Head SHA | \`${result.head_sha}\` |`,
+    `| Configuration fingerprint | \`${result.configuration_fingerprint}\` |`,
+    `| Passes | \`${result.passes_requested} requested / ${result.passes_completed} completed\` |`,
+    `| Current findings | \`${counts(result.current_counts)}\` |`,
+    `| Held/unresolved findings | \`${counts(result.unresolved_counts)}\` |`,
+  ]) {
+    assert.ok(summary.includes(row), row);
+  }
+}
+
+function expectedExecutionFailureResult(baseSha, headSha, evidence = {}) {
+  const remainingAnalysis = evidence.remainingAnalysis ?? [];
+  return {
+    analysis_state: "inconclusive",
+    merge_state: evidence.mergeState ?? "ready",
+    sample_state: evidence.sampleState ?? "unknown",
+    bounded_converged: false,
+    base_sha: baseSha,
+    head_sha: headSha,
+    configuration_fingerprint: evidence.configurationFingerprint ?? "",
+    passes_requested: evidence.passesRequested ?? 0,
+    passes_completed: evidence.passesCompleted ?? 0,
+    current_counts: evidence.currentCounts ?? { Critical: 0, High: 0, Medium: 0 },
+    unresolved_counts: { Critical: 0, High: 0, Medium: 0 },
+    reviewed_head: headSha,
+    scope_hash: evidence.scopeHash ?? "",
+    coverage: "unknown",
+    remaining_analysis: [
+      ...remainingAnalysis,
+      ...(evidence.scopeHash ? ["reconciliation_unknown"] : []),
+      "execution_failed",
+    ],
+    converged: false,
+  };
+}
+
+function writeTrustedPublication({
+  analysisState = "complete",
+  baseSha,
+  configurationFingerprint,
+  completedPasses,
+  coverage = "bounded",
+  findings = [],
+  headSha,
+  publicationFile,
+  requestedPasses,
+  remainingAnalysis = [],
+}) {
+  const diffTruncated = remainingAnalysis.includes("diff_truncated");
+  const findingCapReached = remainingAnalysis.includes("finding_cap_reached");
+  const scope = {
+    base_sha: baseSha,
+    bytes: diffTruncated ? 1 : 0,
+    configuration_fingerprint: configurationFingerprint,
+    diff_base64: diffTruncated ? Buffer.from("x").toString("base64") : "",
+    head_sha: headSha,
+    included_bytes: 0,
+  };
+  const trustedScopeHash = deriveTrustedScopeMetadata(scope).scope_hash;
+  const completed = new Set(completedPasses);
+  const run = {
+    schema_version: 1,
+    base_sha: baseSha,
+    head_sha: headSha,
+    configuration_fingerprint: configurationFingerprint,
+    snapshot_immutable: !remainingAnalysis.includes("snapshot_mutable"),
+    diff: {
+      bytes: scope.bytes,
+      included_bytes: scope.included_bytes,
+      truncated: diffTruncated,
+    },
+    finding_cap: 20,
+    min_votes: remainingAnalysis.includes("vote_threshold_applied") ? 2 : 1,
+    merge_succeeded: !remainingAnalysis.includes("merge_failed"),
+    passes: {
+      requested: requestedPasses,
+      completed: completedPasses,
+      results: requestedPasses.map((id, index) => ({
+        id,
+        status: completed.has(id) ? "valid" : "failed",
+        attempts: completed.has(id) ? 1 : 2,
+        finding_count: findingCapReached && index === 0 ? 20 : findings.length,
+        capped: findingCapReached && index === 0,
+        base_sha: baseSha,
+        head_sha: headSha,
+        configuration_fingerprint: configurationFingerprint,
+      })),
+    },
+  };
+  const metadata = enrichRunMetadata(run, { scopeHash: trustedScopeHash });
+  assert.equal(metadata.analysis_state, analysisState);
+  assert.equal(metadata.coverage, coverage);
+  assert.deepEqual(metadata.remaining_analysis, remainingAnalysis);
+  writeFileSync(
+    publicationFile,
+    `${JSON.stringify(createReviewPublication(metadata, scope, findings))}\n`,
+  );
+  return trustedScopeHash;
 }
 
 function finding(title, overrides = {}) {
@@ -71,7 +196,8 @@ if (process.argv.includes("--version")) {
 const promptArgument = process.argv.slice(2).find((argument) => argument.startsWith("@"));
 if (!promptArgument) process.exit(2);
 const promptPath = promptArgument.slice(1);
-const prompt = readFileSync(promptPath, "utf8");
+const promptBytes = readFileSync(promptPath);
+const prompt = promptBytes.toString("utf8");
 const skillArgument = process.argv.slice(2).find((argument) => argument.startsWith("--append-system-prompt="));
 const skill = skillArgument ? readFileSync(skillArgument.slice("--append-system-prompt=".length), "utf8") : "";
 const instructions = prompt.split("## Changed files", 1)[0];
@@ -109,6 +235,7 @@ appendFileSync(process.env.FAKE_OMP_LOG, JSON.stringify({
   attempt,
   promptPath,
   prompt,
+  prompt_base64: promptBytes.toString("base64"),
   skill,
   cwd: reviewCwd,
   reviewedAlpha,
@@ -243,7 +370,7 @@ function runReview(t, plan, {
   targetSymlinks = {},
   staged = false,
   includeOutputs = true,
-  metadataViaEnv = false,
+  publicationViaEnv = false,
   noState = true,
   noFail = true,
   failMerge = false,
@@ -271,13 +398,15 @@ function runReview(t, plan, {
   const codegraphLogFile = join(fixture.directory, "codegraph.log");
   const bunxLogFile = join(fixture.directory, "bunx.log");
   let findingsFile = join(fixture.directory, "findings.json");
-  let metadataFile = join(fixture.directory, "metadata.json");
+  let publicationFile = join(fixture.directory, "publication.json");
   if (outputPaths) {
-    ({ findingsFile, metadataFile } = outputPaths({
+    const outputFiles = outputPaths({
       ...fixture,
       findingsFile,
-      metadataFile,
-    }));
+      publicationFile,
+    });
+    findingsFile = outputFiles.findingsFile;
+    publicationFile = outputFiles.publicationFile;
   }
   writeFileSync(planFile, JSON.stringify(plan));
   const runnerArgs = [
@@ -289,7 +418,7 @@ function runReview(t, plan, {
     ...(includeOutputs
       ? [
           "--out", findingsFile,
-          ...(metadataViaEnv ? [] : ["--metadata-out", metadataFile]),
+          ...(publicationViaEnv ? [] : ["--publication-out", publicationFile]),
         ]
       : []),
     ...args,
@@ -363,7 +492,7 @@ printf '%s\\n' '1.3.14'
       AGENTIC_REVIEW_LENSES: "",
       AGENTIC_REVIEW_MAX_DIFF_BYTES: "",
       AGENTIC_REVIEW_MAX_FINDINGS: "",
-      AGENTIC_REVIEW_METADATA_OUT: "",
+      AGENTIC_REVIEW_PUBLICATION_OUT: "",
       AGENTIC_REVIEW_PASSES: "",
       AGENTIC_REVIEW_PROMPT: "",
       AGENTIC_REVIEW_SKILL: "",
@@ -376,7 +505,7 @@ printf '%s\\n' '1.3.14'
       FAKE_CODEGRAPH_LOG: codegraphLogFile,
       FAKE_BUNX_LOG: bunxLogFile,
       REAL_NODE: process.execPath,
-      ...(metadataViaEnv ? { AGENTIC_REVIEW_METADATA_OUT: metadataFile } : {}),
+      ...(publicationViaEnv ? { AGENTIC_REVIEW_PUBLICATION_OUT: publicationFile } : {}),
       ...env,
     },
   });
@@ -386,21 +515,30 @@ printf '%s\\n' '1.3.14'
   const codegraphLogs = existsSync(codegraphLogFile)
     ? readFileSync(codegraphLogFile, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse)
     : [];
+  const publication = existsSync(publicationFile)
+    ? JSON.parse(readFileSync(publicationFile, "utf8"))
+    : null;
   return {
     ...fixture,
     result,
     logs,
     codegraphLogs,
     findingsFile,
-    metadataFile,
+    publicationFile,
     bunxLogFile,
     findings: existsSync(findingsFile) ? JSON.parse(readFileSync(findingsFile, "utf8")) : null,
-    metadata: existsSync(metadataFile) ? JSON.parse(readFileSync(metadataFile, "utf8")) : null,
+    publication,
+    metadata: publication?.metadata ?? null,
+    scope: publication?.scope ?? null,
   };
 }
 
-function validateMetadata(metadataFile) {
-  return spawnSync(process.execPath, [resultCli, "validate", metadataFile], { encoding: "utf8" });
+function validatePublication(publicationFile) {
+  return spawnSync(
+    process.execPath,
+    [resultCli, "validate", publicationFile],
+    { encoding: "utf8" },
+  );
 }
 
 function runWorkflowConfig(t, overrides = {}) {
@@ -572,6 +710,7 @@ exit 1
   assert.match(generated, new RegExp(`uses: atomikpanda/agentic-review/.github/workflows/agentic-review.yml@${sha}`));
   assert.match(generated, new RegExp(`central_ref: ${sha}`));
   assert.match(generated, /extra_omp_args: --print-thoughts --no-title/);
+  assert.match(generated, /^  pull-requests: write$/m);
 
   const outputFile = join(directory, "sha-output");
   const resolved = spawnSync("bash", ["-c", workflowRunStep("resolve trusted central ref")], {
@@ -626,6 +765,31 @@ test("runner rejects CR or LF in finding titles before merge or posting", (t) =>
     assert.notEqual(run.result.status, 0);
     assert.match(run.result.stderr, /every configured pass failed/);
     assert.equal(run.logs.length, 2);
+  }
+});
+
+test("every-pass failure atomically creates or replaces --out with validated conservative findings", (t) => {
+  const staleFinding = finding("Stale finding", { file: "alpha.txt" });
+  const malformedFinding = finding("Invalid\nfinding", { file: "alpha.txt" });
+  for (const initialFindings of [null, [staleFinding]]) {
+    const run = runReview(t, {
+      general: [{ findings: [malformedFinding] }, { findings: [malformedFinding] }],
+    }, {
+      args: ["--passes", "1", "--lenses", "", "--json"],
+      outputPaths: ({ directory, publicationFile }) => {
+        const findingsFile = join(directory, "findings.json");
+        if (initialFindings) {
+          writeFileSync(findingsFile, JSON.stringify({ findings: initialFindings }));
+        }
+        return { findingsFile, publicationFile };
+      },
+    });
+
+    assert.notEqual(run.result.status, 0);
+    assert.match(run.result.stderr, /every configured pass failed/);
+    assert.deepEqual(run.findings, { findings: [] });
+    assert.equal(run.publication?.metadata.analysis_state, "inconclusive");
+    assert.equal(run.publication?.metadata.remaining_analysis.includes("execution_failed"), true);
   }
 });
 
@@ -685,6 +849,7 @@ test("the default profile runs general, correctness, and boundaries into one val
   );
   assert.equal(run.findings.findings.find(({ title }) => title === repeated.title).votes, 2);
   assert.deepEqual(JSON.parse(run.result.stdout), run.findings);
+  assert.deepEqual(run.publication.findings, run.findings.findings);
   assert.equal(existsSync(join(run.repository, ".git", "agentic-review")), false);
 
   assert.deepEqual(run.metadata.passes.requested, ["general", "correctness", "boundaries"]);
@@ -693,7 +858,38 @@ test("the default profile runs general, correctness, and boundaries into one val
   assert.equal(run.metadata.head_sha, run.headSha);
   assert.equal(run.metadata.analysis_state, "complete");
   assert.equal(run.metadata.snapshot_immutable, true);
+  assert.equal(run.metadata.reviewed_head, run.headSha);
+  assert.match(run.metadata.scope_hash, /^[a-f0-9]{64}$/);
+  assert.equal(run.metadata.coverage, "bounded");
+  assert.deepEqual(run.metadata.remaining_analysis, []);
   assert.equal(new Set(run.metadata.passes.results.map((pass) => pass.configuration_fingerprint)).size, 1);
+  const canonicalDiff = execFileSync(
+    "git",
+    ["diff", "--no-color", run.baseSha, run.headSha],
+    { cwd: run.repository },
+  );
+  assert.deepEqual(Buffer.from(run.scope.diff_base64, "base64"), canonicalDiff);
+  assert.equal(canonicalDiff.at(-1), 10);
+  assert.equal(run.scope.bytes, canonicalDiff.length);
+  assert.equal(run.scope.included_bytes, canonicalDiff.length);
+  assert.deepEqual(run.metadata.diff, {
+    bytes: Buffer.byteLength(canonicalDiff),
+    included_bytes: Buffer.byteLength(canonicalDiff),
+    truncated: false,
+  });
+  assert.deepEqual(
+    {
+      base_sha: run.scope.base_sha,
+      configuration_fingerprint: run.scope.configuration_fingerprint,
+      head_sha: run.scope.head_sha,
+    },
+    {
+      base_sha: run.metadata.base_sha,
+      configuration_fingerprint: run.metadata.configuration_fingerprint,
+      head_sha: run.metadata.head_sha,
+    },
+  );
+  assert.equal(deriveTrustedScopeMetadata(run.scope).scope_hash, run.metadata.scope_hash);
   for (const pass of run.metadata.passes.results) {
     assert.equal(pass.base_sha, run.baseSha);
     assert.equal(pass.head_sha, run.headSha);
@@ -702,9 +898,956 @@ test("the default profile runs general, correctness, and boundaries into one val
     assert.equal(pass.attempts, 1);
     assert.equal(pass.capped, false);
   }
-  const validation = validateMetadata(run.metadataFile);
+  const validation = validatePublication(run.publicationFile);
   assert.equal(validation.status, 0, validation.stderr);
   assert.deepEqual(JSON.parse(validation.stdout), run.metadata);
+});
+
+test("workflow exposes and always retains the additive final result contract", () => {
+  const source = readFileSync(workflow, "utf8");
+  for (const field of [
+    "reviewed_head",
+    "scope_hash",
+    "coverage",
+    "remaining_analysis",
+    "converged",
+  ]) {
+    assert.match(source, new RegExp(`^      ${field}:`, "m"));
+    assert.match(source, new RegExp(`^      ${field}: \\$\\{\\{ steps\\.poster\\.outputs\\.${field} \\}\\}`, "m"));
+  }
+  assert.match(source, /\/tmp\/review-result\.json/);
+});
+
+test("workflow skips the write-capable poster after cancellation but not ordinary failure", () => {
+  const source = readFileSync(workflow, "utf8");
+  const posterStep = source.match(
+    /^      - name: post review\n[\s\S]*?(?=^      - (?:name:|uses:))/m,
+  )?.[0];
+
+  assert.ok(posterStep);
+  assert.match(posterStep, /^\s+GH_TOKEN:/m);
+  assert.match(posterStep, /^\s+if: \$\{\{ !cancelled\(\) \}\}$/m);
+});
+
+test("workflow independently retains the required result and optional diagnostics", () => {
+  const source = readFileSync(workflow, "utf8");
+  const resultStep = source.match(
+    /^      - name: upload review result\n[\s\S]*?(?=^      - name:)/m,
+  )?.[0];
+  const diagnosticsStep = source.match(
+    /^      - name: upload optional review diagnostics\n[\s\S]*$/m,
+  )?.[0];
+
+  assert.match(source, /^\s+REVIEW_PUBLICATION_FILE: \/tmp\/review-publication\.json$/m);
+  assert.doesNotMatch(source, /AGENTIC_REVIEW_SCOPE_OUT|review-scope\.json/);
+  assert.ok(resultStep);
+  assert.match(
+    resultStep,
+    /^\s+if: \$\{\{ !cancelled\(\) && steps\.target\.outputs\.eligible != 'false' \}\}$/m,
+  );
+  assert.match(resultStep, /^\s+path: \/tmp\/review-result\.json$/m);
+  assert.match(resultStep, /^\s+if-no-files-found: error$/m);
+  assert.doesNotMatch(
+    resultStep,
+    /\/tmp\/review(?:\.md|-publication\.json|-runner\.(?:out|err))/,
+  );
+
+  assert.ok(diagnosticsStep);
+  assert.match(
+    diagnosticsStep,
+    /^\s+if: \$\{\{ !cancelled\(\) && steps\.target\.outputs\.eligible == 'true' \}\}$/m,
+  );
+  for (const path of [
+    "/tmp/review.md",
+    "/tmp/review-publication.json",
+    "/tmp/review-runner.out",
+    "/tmp/review-runner.err",
+  ]) {
+    assert.match(diagnosticsStep, new RegExp(`^\\s+${path.replaceAll(".", "\\.")}$`, "m"));
+  }
+  assert.doesNotMatch(diagnosticsStep, /^\s+\/tmp\/review-result\.json$/m);
+  assert.match(diagnosticsStep, /^\s+if-no-files-found: ignore$/m);
+});
+
+test("hosted workflows require only pull-request write permission", () => {
+  const source = readFileSync(workflow, "utf8");
+  assert.doesNotMatch(source, /^  issues: write$/m);
+  assert.match(source, /^  pull-requests: write$/m);
+  assert.match(
+    source,
+    /permissions: \{ contents: "read", pull_requests: "write" \}/,
+  );
+});
+
+test("hosted poster crash fallback delegates publication validation and derivation to the trusted result owner", () => {
+  const source = readFileSync(workflow, "utf8");
+  assert.match(source, /node "\$REVIEW_RESULT_HELPER" validate "\$REVIEW_PUBLICATION_FILE"/);
+  assert.match(source, /node "\$REVIEW_RESULT_HELPER" failure "\$REVIEW_PUBLICATION_FILE"/);
+  assert.doesNotMatch(source, /node - "\$REVIEW_PUBLICATION_FILE"/);
+});
+
+test("early hosted setup failure without a publication uses target fallback defaults", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hosted-finalizer-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const outputFile = join(directory, "github-output");
+  const resultFile = join(directory, "review-result.json");
+  const summaryFile = join(directory, "step-summary");
+  const untrustedPosterMarker = join(directory, "untrusted-poster-ran");
+  mkdirSync(join(directory, "scripts"));
+  writeFileSync(join(directory, "scripts", "post-review.mjs"), `
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.UNTRUSTED_POSTER_MARKER, "executed");
+`);
+
+  const env = {
+    ...process.env,
+    TARGET_ELIGIBLE: "true",
+    PR_NUMBER: "7",
+    GITHUB_REPO: "example/repository",
+    HEAD_SHA: "2222222222222222222222222222222222222222",
+    BASE_SHA: "1111111111111111111111111111111111111111",
+    GITHUB_OUTPUT: outputFile,
+    REVIEW_RESULT_FILE: resultFile,
+    GITHUB_STEP_SUMMARY: summaryFile,
+    UNTRUSTED_POSTER_MARKER: untrustedPosterMarker,
+  };
+  for (const name of [
+    "TRUSTED_DATA_ROOT",
+    "REVIEW_RUNNER",
+    "REVIEW_STRIPPER",
+    "REVIEW_POSTER",
+    "REVIEW_RESULT_HELPER",
+    "REVIEW_MODE",
+    "POST_COMMENT",
+    "SUPPRESS_WRITES",
+    "RESOLVE_STALE",
+    "MAX_FINDINGS",
+    "FAIL_ON_FINDINGS",
+    "BLOCK_SEVERITIES",
+  ]) {
+    delete env[name];
+  }
+
+  const finalized = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env,
+  });
+
+  assert.equal(finalized.status, 1, finalized.stderr);
+  assert.equal(existsSync(untrustedPosterMarker), false);
+  const outputs = envFileValues(outputFile);
+  const result = JSON.parse(readFileSync(resultFile, "utf8"));
+  assert.deepEqual(result, expectedExecutionFailureResult(env.BASE_SHA, env.HEAD_SHA));
+  assert.equal(outputs.analysis_state, "inconclusive");
+  assert.equal(outputs.sample_state, "unknown");
+  assert.equal(outputs.bounded_converged, "false");
+  assert.equal(outputs.coverage, "unknown");
+  assert.equal(outputs.converged, "false");
+  assert.deepEqual(
+    outputs,
+    Object.fromEntries(Object.entries(result).map(([name, value]) => [
+      name,
+      typeof value === "object" ? JSON.stringify(value) : String(value),
+    ])),
+  );
+  assertFinalResultSummary(readFileSync(summaryFile, "utf8"), result);
+
+  const source = readFileSync(workflow, "utf8");
+  for (const field of ["analysis_state", "sample_state", "bounded_converged", "coverage", "converged"]) {
+    assert.match(source, new RegExp(`^        value: \\$\\{\\{ jobs\\.review\\.outputs\\.${field} \\}\\}`, "m"));
+    assert.match(source, new RegExp(`^      ${field}: \\$\\{\\{ steps\\.poster\\.outputs\\.${field} \\}\\}`, "m"));
+  }
+});
+
+test("behind-base poster no-result fallback pairs with the trusted merge-base publication", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hosted-poster-load-failure-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const trustedPoster = join(directory, "scripts", "post-review.mjs");
+  const publicationFile = join(directory, "review-publication.json");
+  mkdirSync(dirname(trustedPoster), { recursive: true });
+  writeFileSync(trustedPoster, 'import "./missing-trusted-dependency.mjs";\n');
+  copyFileSync(resultCli, join(directory, "scripts", "review-result.mjs"));
+  copyFileSync(join(dirname(resultCli), "lib-findings.mjs"), join(directory, "scripts", "lib-findings.mjs"));
+
+  const baseSha = "1111111111111111111111111111111111111111";
+  const targetBaseSha = "3333333333333333333333333333333333333333";
+  const headSha = "2222222222222222222222222222222222222222";
+  const env = {
+    ...process.env,
+    TARGET_ELIGIBLE: "true",
+    PR_NUMBER: "7",
+    GITHUB_REPO: "example/repository",
+    HEAD_SHA: headSha,
+    BASE_SHA: targetBaseSha,
+    TRUSTED_DATA_ROOT: directory,
+    REVIEW_POSTER: trustedPoster,
+    REVIEW_PUBLICATION_FILE: publicationFile,
+    REVIEW_RESULT_HELPER: join(directory, "scripts", "review-result.mjs"),
+    REVIEW_MODE: "summary",
+    POST_COMMENT: "false",
+    SUPPRESS_WRITES: "true",
+    RESOLVE_STALE: "false",
+    MAX_FINDINGS: "20",
+    FAIL_ON_FINDINGS: "false",
+    BLOCK_SEVERITIES: "Critical,High",
+  };
+  const outputFile = join(directory, "failure-output");
+  const resultFile = join(directory, "failure-result.json");
+  const summaryFile = join(directory, "failure-summary");
+  const failedLoad = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...env,
+      GITHUB_OUTPUT: outputFile,
+      REVIEW_RESULT_FILE: resultFile,
+      GITHUB_STEP_SUMMARY: summaryFile,
+    },
+  });
+
+  assert.notEqual(failedLoad.status, 0);
+  assert.match(failedLoad.stderr, /ERR_MODULE_NOT_FOUND|Cannot find module/);
+  const expectedResult = expectedExecutionFailureResult(targetBaseSha, headSha);
+  assert.deepEqual(JSON.parse(readFileSync(resultFile, "utf8")), expectedResult);
+  assert.deepEqual(
+    envFileValues(outputFile),
+    Object.fromEntries(Object.entries(expectedResult).map(([name, value]) => [
+      name,
+      typeof value === "object" ? JSON.stringify(value) : String(value),
+    ])),
+  );
+  assertFinalResultSummary(readFileSync(summaryFile, "utf8"), expectedResult);
+
+  const crashFindings = [
+    finding("Publication blocker", { severity: "Critical" }),
+    finding("Publication warning"),
+  ];
+  const configurationFingerprint = "a".repeat(64);
+  const trustedScopeHash = writeTrustedPublication({
+    baseSha,
+    configurationFingerprint,
+    completedPasses: ["general", "correctness", "boundaries"],
+    findings: crashFindings,
+    headSha,
+    publicationFile: publicationFile,
+    requestedPasses: ["general", "correctness", "boundaries"],
+  });
+  writeFileSync(trustedPoster, "process.exit(47);\n");
+  const killedOutput = join(directory, "killed-output");
+  const killedResultFile = join(directory, "killed-result.json");
+  const killedSummary = join(directory, "killed-summary");
+  const killedBeforeResult = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...env,
+      GITHUB_OUTPUT: killedOutput,
+      REVIEW_RESULT_FILE: killedResultFile,
+      GITHUB_STEP_SUMMARY: killedSummary,
+    },
+  });
+  const expectedKilledResult = expectedExecutionFailureResult(baseSha, headSha, {
+    configurationFingerprint,
+    passesRequested: 3,
+    passesCompleted: 3,
+    scopeHash: trustedScopeHash,
+    mergeState: "blocked",
+    sampleState: "findings",
+    currentCounts: { Critical: 1, High: 0, Medium: 1 },
+  });
+
+  assert.equal(killedBeforeResult.status, 47, killedBeforeResult.stderr);
+  assert.doesNotMatch(
+    killedBeforeResult.stderr,
+    /trusted review publication is invalid/,
+    killedBeforeResult.stderr,
+  );
+  assert.deepEqual(
+    JSON.parse(readFileSync(killedResultFile, "utf8")),
+    expectedKilledResult,
+    killedBeforeResult.stderr,
+  );
+  assert.deepEqual(
+    envFileValues(killedOutput),
+    Object.fromEntries(Object.entries(expectedKilledResult).map(([name, value]) => [
+      name,
+      typeof value === "object" ? JSON.stringify(value) : String(value),
+    ])),
+  );
+  assertFinalResultSummary(readFileSync(killedSummary, "utf8"), expectedKilledResult);
+
+  const emittedResult = {
+    ...expectedExecutionFailureResult(baseSha, headSha),
+    analysis_state: "complete",
+    configuration_fingerprint: configurationFingerprint,
+    passes_requested: 3,
+    passes_completed: 3,
+    sample_state: "clean",
+    bounded_converged: true,
+    coverage: "bounded",
+    remaining_analysis: [],
+    scope_hash: trustedScopeHash,
+    converged: true,
+  };
+  const emittedResultText = `${JSON.stringify(emittedResult, null, 2)}\n`;
+  const emittedOutput = "analysis_state=complete\n";
+  const emittedSummary = "## Agentic review\n\n| Result | Value |\n| --- | --- |\n| Analysis | `complete` |\n";
+  writeFileSync(trustedPoster, `
+import { appendFileSync, writeFileSync } from "node:fs";
+writeFileSync(process.env.REVIEW_RESULT_FILE, process.env.EMITTED_RESULT);
+appendFileSync(process.env.GITHUB_OUTPUT, process.env.EMITTED_OUTPUT);
+appendFileSync(process.env.GITHUB_STEP_SUMMARY, process.env.EMITTED_SUMMARY);
+process.exit(23);
+`);
+  const preservedOutput = join(directory, "preserved-output");
+  const preservedResult = join(directory, "preserved-result.json");
+  const preservedSummary = join(directory, "preserved-summary");
+  const failedAfterResult = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...env,
+      GITHUB_OUTPUT: preservedOutput,
+      REVIEW_RESULT_FILE: preservedResult,
+      GITHUB_STEP_SUMMARY: preservedSummary,
+      EMITTED_RESULT: emittedResultText,
+      EMITTED_OUTPUT: emittedOutput,
+      EMITTED_SUMMARY: emittedSummary,
+    },
+  });
+
+  assert.equal(failedAfterResult.status, 23, failedAfterResult.stderr);
+  assert.equal(readFileSync(preservedResult, "utf8"), emittedResultText);
+  assert.deepEqual(
+    envFileValues(preservedOutput),
+    Object.fromEntries(Object.entries(emittedResult).map(([name, value]) => [
+      name,
+      typeof value === "object" ? JSON.stringify(value) : String(value),
+    ])),
+  );
+  const completedSummary = readFileSync(preservedSummary, "utf8");
+  assert.ok(completedSummary.startsWith(emittedSummary));
+  assertFinalResultSummary(completedSummary, emittedResult);
+
+  writeFileSync(trustedPoster, `
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.REVIEW_RESULT_FILE, process.env.EMITTED_RESULT);
+process.exit(29);
+`);
+  const repairedOutput = join(directory, "repaired-output");
+  const preservedPartialResult = join(directory, "preserved-partial-result.json");
+  const repairedSummary = join(directory, "repaired-summary");
+  const failedAfterResultOnly = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...env,
+      GITHUB_OUTPUT: repairedOutput,
+      REVIEW_RESULT_FILE: preservedPartialResult,
+      GITHUB_STEP_SUMMARY: repairedSummary,
+      EMITTED_RESULT: emittedResultText,
+    },
+  });
+
+  assert.equal(failedAfterResultOnly.status, 29, failedAfterResultOnly.stderr);
+  assert.equal(readFileSync(preservedPartialResult, "utf8"), emittedResultText);
+  assert.deepEqual(
+    envFileValues(repairedOutput),
+    Object.fromEntries(Object.entries(emittedResult).map(([name, value]) => [
+      name,
+      typeof value === "object" ? JSON.stringify(value) : String(value),
+    ])),
+  );
+  assertFinalResultSummary(readFileSync(repairedSummary, "utf8"), emittedResult);
+
+  const mismatchedResult = {
+    ...emittedResult,
+    base_sha: targetBaseSha,
+  };
+  const mismatchedOutput = join(directory, "mismatched-output");
+  const mismatchedResultFile = join(directory, "mismatched-result.json");
+  const mismatchedSummary = join(directory, "mismatched-summary");
+  const failedWithMismatchedBase = spawnSync(
+    "bash",
+    ["-c", workflowRunStep("post review")],
+    {
+      cwd: directory,
+      encoding: "utf8",
+      env: {
+        ...env,
+        GITHUB_OUTPUT: mismatchedOutput,
+        REVIEW_RESULT_FILE: mismatchedResultFile,
+        GITHUB_STEP_SUMMARY: mismatchedSummary,
+        EMITTED_RESULT: `${JSON.stringify(mismatchedResult, null, 2)}\n`,
+      },
+    },
+  );
+
+  assert.equal(failedWithMismatchedBase.status, 29, failedWithMismatchedBase.stderr);
+  assert.match(failedWithMismatchedBase.stderr, /result target must match the trusted review scope/);
+  assert.deepEqual(
+    JSON.parse(readFileSync(mismatchedResultFile, "utf8")),
+    expectedKilledResult,
+  );
+});
+
+test("workflow failure fallback is bounded by trusted runner analysis", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hosted-result-analysis-boundary-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const trustedPoster = join(directory, "scripts", "post-review.mjs");
+  const publicationFile = join(directory, "review-publication.json");
+  mkdirSync(dirname(trustedPoster), { recursive: true });
+  writeFileSync(trustedPoster, `
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.REVIEW_RESULT_FILE, process.env.EMITTED_RESULT);
+process.exit(41);
+`);
+  copyFileSync(resultCli, join(directory, "scripts", "review-result.mjs"));
+  copyFileSync(join(dirname(resultCli), "lib-findings.mjs"), join(directory, "scripts", "lib-findings.mjs"));
+
+  const baseSha = "1111111111111111111111111111111111111111";
+  const headSha = "2222222222222222222222222222222222222222";
+  const configurationFingerprint = "a".repeat(64);
+  const requestedPasses = ["general", "correctness", "boundaries"];
+  const env = {
+    ...process.env,
+    TARGET_ELIGIBLE: "true",
+    PR_NUMBER: "7",
+    GITHUB_REPO: "example/repository",
+    HEAD_SHA: headSha,
+    BASE_SHA: baseSha,
+    TRUSTED_DATA_ROOT: directory,
+    REVIEW_POSTER: trustedPoster,
+    REVIEW_RESULT_HELPER: join(directory, "scripts", "review-result.mjs"),
+    REVIEW_PUBLICATION_FILE: publicationFile,
+    REVIEW_MODE: "summary",
+    POST_COMMENT: "false",
+    SUPPRESS_WRITES: "true",
+    RESOLVE_STALE: "false",
+    MAX_FINDINGS: "20",
+    FAIL_ON_FINDINGS: "false",
+    BLOCK_SEVERITIES: "Critical,High",
+  };
+  const incompleteRuns = [
+    ["truncated diff", ["diff_truncated"]],
+    ["finding cap", ["finding_cap_reached"]],
+    ["mutable snapshot", ["snapshot_mutable"]],
+    ["vote threshold", ["vote_threshold_applied"]],
+    ["merge failure", ["merge_failed"]],
+  ];
+
+  for (const [name, remainingAnalysis] of incompleteRuns) {
+    const trustedScopeHash = writeTrustedPublication({
+      analysisState: "inconclusive",
+      baseSha,
+      configurationFingerprint,
+      completedPasses: requestedPasses,
+      coverage: "unknown",
+      headSha,
+      publicationFile: publicationFile,
+      remainingAnalysis,
+      requestedPasses,
+    });
+    const expectedResult = expectedExecutionFailureResult(baseSha, headSha, {
+      configurationFingerprint,
+      passesRequested: requestedPasses.length,
+      passesCompleted: requestedPasses.length,
+      scopeHash: trustedScopeHash,
+      remainingAnalysis,
+    });
+    const strongerResult = {
+      ...expectedResult,
+      analysis_state: "complete",
+      configuration_fingerprint: configurationFingerprint,
+      passes_requested: requestedPasses.length,
+      passes_completed: requestedPasses.length,
+      sample_state: "clean",
+      bounded_converged: true,
+      coverage: "bounded",
+      remaining_analysis: [],
+      scope_hash: trustedScopeHash,
+      converged: true,
+    };
+    const suffix = name.replaceAll(" ", "-");
+    const outputFile = join(directory, `${suffix}-output`);
+    const resultFile = join(directory, `${suffix}-result.json`);
+    const summaryFile = join(directory, `${suffix}-summary`);
+    const finalized = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+      cwd: directory,
+      encoding: "utf8",
+      env: {
+        ...env,
+        GITHUB_OUTPUT: outputFile,
+        REVIEW_RESULT_FILE: resultFile,
+        GITHUB_STEP_SUMMARY: summaryFile,
+        EMITTED_RESULT: `${JSON.stringify(strongerResult, null, 2)}\n`,
+      },
+    });
+
+    assert.equal(finalized.status, 41, finalized.stderr);
+    assert.match(finalized.stderr, /must not strengthen trusted review metadata/);
+    assert.deepEqual(JSON.parse(readFileSync(resultFile, "utf8")), expectedResult);
+    assertFinalResultSummary(readFileSync(summaryFile, "utf8"), expectedResult);
+  }
+
+  const trustedScopeHash = writeTrustedPublication({
+    baseSha,
+    configurationFingerprint,
+    completedPasses: requestedPasses,
+    headSha,
+    publicationFile: publicationFile,
+    requestedPasses,
+  });
+  const reconciledResult = {
+    ...expectedExecutionFailureResult(baseSha, headSha, {
+      configurationFingerprint,
+      passesRequested: requestedPasses.length,
+      passesCompleted: requestedPasses.length,
+      scopeHash: trustedScopeHash,
+    }),
+    analysis_state: "complete",
+    merge_state: "blocked",
+    sample_state: "findings",
+    configuration_fingerprint: configurationFingerprint,
+    passes_requested: requestedPasses.length,
+    passes_completed: requestedPasses.length,
+    unresolved_counts: { Critical: 0, High: 1, Medium: 0 },
+    scope_hash: trustedScopeHash,
+    remaining_analysis: ["reconciliation_unknown"],
+  };
+  const reconciledResultText = `${JSON.stringify(reconciledResult, null, 2)}\n`;
+  const reconciledOutput = join(directory, "reconciled-output");
+  const reconciledResultFile = join(directory, "reconciled-result.json");
+  const reconciledSummary = join(directory, "reconciled-summary");
+  const finalized = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...env,
+      GITHUB_OUTPUT: reconciledOutput,
+      REVIEW_RESULT_FILE: reconciledResultFile,
+      GITHUB_STEP_SUMMARY: reconciledSummary,
+      EMITTED_RESULT: reconciledResultText,
+    },
+  });
+
+  assert.equal(finalized.status, 41, finalized.stderr);
+  assert.equal(readFileSync(reconciledResultFile, "utf8"), reconciledResultText);
+  assert.deepEqual(
+    envFileValues(reconciledOutput),
+    Object.fromEntries(Object.entries(reconciledResult).map(([name, value]) => [
+      name,
+      typeof value === "object" ? JSON.stringify(value) : String(value),
+    ])),
+  );
+  assertFinalResultSummary(readFileSync(reconciledSummary, "utf8"), reconciledResult);
+});
+
+test("workflow boundary rejects a valid poster result for another trusted scope", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hosted-result-scope-mismatch-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const trustedPoster = join(directory, "scripts", "post-review.mjs");
+  const publicationFile = join(directory, "review-publication.json");
+  mkdirSync(dirname(trustedPoster), { recursive: true });
+  writeFileSync(trustedPoster, `
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.REVIEW_RESULT_FILE, process.env.EMITTED_RESULT);
+process.exit(37);
+`);
+  copyFileSync(resultCli, join(directory, "scripts", "review-result.mjs"));
+  copyFileSync(join(dirname(resultCli), "lib-findings.mjs"), join(directory, "scripts", "lib-findings.mjs"));
+
+  const baseSha = "1111111111111111111111111111111111111111";
+  const headSha = "2222222222222222222222222222222222222222";
+  const configurationFingerprint = "a".repeat(64);
+  const trustedScopeHash = writeTrustedPublication({
+    baseSha,
+    configurationFingerprint,
+    completedPasses: ["general", "correctness", "boundaries"],
+    headSha,
+    publicationFile: publicationFile,
+    requestedPasses: ["general", "correctness", "boundaries"],
+  });
+  const validResultForAnotherScope = {
+    ...expectedExecutionFailureResult(baseSha, headSha),
+    analysis_state: "complete",
+    configuration_fingerprint: configurationFingerprint,
+    passes_requested: 3,
+    passes_completed: 3,
+    sample_state: "clean",
+    bounded_converged: true,
+    coverage: "bounded",
+    remaining_analysis: [],
+    scope_hash: "c".repeat(64),
+    converged: true,
+  };
+  const resultFile = join(directory, "review-result.json");
+  const outputFile = join(directory, "github-output");
+  const summaryFile = join(directory, "step-summary");
+  const finalized = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      TARGET_ELIGIBLE: "true",
+      PR_NUMBER: "7",
+      GITHUB_REPO: "example/repository",
+      HEAD_SHA: headSha,
+      BASE_SHA: baseSha,
+      TRUSTED_DATA_ROOT: directory,
+      REVIEW_POSTER: trustedPoster,
+      REVIEW_RESULT_HELPER: join(directory, "scripts", "review-result.mjs"),
+      REVIEW_PUBLICATION_FILE: publicationFile,
+      REVIEW_RESULT_FILE: resultFile,
+      GITHUB_OUTPUT: outputFile,
+      GITHUB_STEP_SUMMARY: summaryFile,
+      REVIEW_MODE: "summary",
+      POST_COMMENT: "false",
+      SUPPRESS_WRITES: "true",
+      RESOLVE_STALE: "false",
+      MAX_FINDINGS: "20",
+      FAIL_ON_FINDINGS: "false",
+      BLOCK_SEVERITIES: "Critical,High",
+      EMITTED_RESULT: `${JSON.stringify(validResultForAnotherScope, null, 2)}\n`,
+    },
+  });
+
+  const expectedResult = expectedExecutionFailureResult(baseSha, headSha, {
+    configurationFingerprint,
+    passesRequested: 3,
+    passesCompleted: 3,
+    scopeHash: trustedScopeHash,
+  });
+  assert.equal(finalized.status, 37, finalized.stderr);
+  assert.match(finalized.stderr, /scope_hash must match the trusted review scope/);
+  assert.deepEqual(JSON.parse(readFileSync(resultFile, "utf8")), expectedResult);
+  assert.deepEqual(
+    envFileValues(outputFile),
+    Object.fromEntries(Object.entries(expectedResult).map(([name, value]) => [
+      name,
+      typeof value === "object" ? JSON.stringify(value) : String(value),
+    ])),
+  );
+  assertFinalResultSummary(readFileSync(summaryFile, "utf8"), expectedResult);
+});
+
+test("workflow boundary replaces key-complete semantically invalid poster results", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hosted-invalid-result-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const trustedPoster = join(directory, "scripts", "post-review.mjs");
+  const publicationFile = join(directory, "review-publication.json");
+  mkdirSync(dirname(trustedPoster), { recursive: true });
+  writeFileSync(trustedPoster, `
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.REVIEW_RESULT_FILE, process.env.EMITTED_RESULT);
+process.exit(31);
+`);
+  copyFileSync(resultCli, join(directory, "scripts", "review-result.mjs"));
+  copyFileSync(join(dirname(resultCli), "lib-findings.mjs"), join(directory, "scripts", "lib-findings.mjs"));
+
+  const baseSha = "1111111111111111111111111111111111111111";
+  const headSha = "2222222222222222222222222222222222222222";
+  const configurationFingerprint = "a".repeat(64);
+  const trustedScopeHash = writeTrustedPublication({
+    baseSha,
+    configurationFingerprint,
+    completedPasses: ["general"],
+    headSha,
+    publicationFile: publicationFile,
+    requestedPasses: ["general"],
+  });
+  const expectedResult = expectedExecutionFailureResult(baseSha, headSha, {
+    configurationFingerprint,
+    passesRequested: 1,
+    passesCompleted: 1,
+    scopeHash: trustedScopeHash,
+  });
+  const validResult = {
+    ...expectedResult,
+    configuration_fingerprint: configurationFingerprint,
+    passes_requested: 1,
+    passes_completed: 1,
+    scope_hash: trustedScopeHash,
+  };
+  const invalidResults = [
+    ["string boolean", { ...validResult, bounded_converged: "false" }],
+    ["string pass count", { ...validResult, passes_requested: "0" }],
+    [
+      "completed passes exceed requested",
+      { ...validResult, passes_requested: 1, passes_completed: 2 },
+    ],
+    [
+      "invalid configuration fingerprint",
+      { ...validResult, configuration_fingerprint: "A".repeat(64) },
+    ],
+    [
+      "different valid configuration fingerprint",
+      { ...validResult, configuration_fingerprint: "b".repeat(64) },
+      /configuration_fingerprint must match trusted review metadata/,
+    ],
+    [
+      "different requested pass count",
+      { ...validResult, passes_requested: 2 },
+      /pass counts must match trusted review metadata/,
+    ],
+    [
+      "different completed pass count",
+      { ...validResult, passes_completed: 0 },
+      /pass counts must match trusted review metadata/,
+    ],
+    ["invalid scope hash", { ...validResult, scope_hash: "f".repeat(63) }],
+    [
+      "complete result with zero passes and empty identity",
+      {
+        ...validResult,
+        configuration_fingerprint: "",
+        passes_requested: 0,
+        passes_completed: 0,
+        analysis_state: "complete",
+        sample_state: "clean",
+        bounded_converged: true,
+        coverage: "bounded",
+        remaining_analysis: [],
+        converged: true,
+      },
+    ],
+    [
+      "complete findings result with diff truncated",
+      {
+        ...validResult,
+        analysis_state: "complete",
+        passes_requested: 1,
+        passes_completed: 1,
+        configuration_fingerprint: "a".repeat(64),
+        current_counts: { Critical: 0, High: 0, Medium: 1 },
+        sample_state: "findings",
+        scope_hash: trustedScopeHash,
+        remaining_analysis: ["diff_truncated"],
+      },
+    ],
+    [
+      "complete result with execution failure",
+      {
+        ...validResult,
+        analysis_state: "complete",
+        passes_requested: 1,
+        passes_completed: 1,
+        configuration_fingerprint: "a".repeat(64),
+        scope_hash: trustedScopeHash,
+      },
+    ],
+    ["array count map", { ...validResult, current_counts: [] }],
+    [
+      "invalid count values",
+      { ...validResult, unresolved_counts: { Critical: 0, High: -1, Medium: 0 } },
+    ],
+    [
+      "stale target",
+      {
+        ...validResult,
+        base_sha: "3333333333333333333333333333333333333333",
+        head_sha: "4444444444444444444444444444444444444444",
+        reviewed_head: "4444444444444444444444444444444444444444",
+      },
+    ],
+    [
+      "mismatched reviewed head",
+      { ...validResult, reviewed_head: "3333333333333333333333333333333333333333" },
+    ],
+    [
+      "clean result with findings",
+      {
+        ...validResult,
+        sample_state: "clean",
+        current_counts: { Critical: 0, High: 0, Medium: 1 },
+      },
+    ],
+    ["findings result without counts", { ...validResult, sample_state: "findings" }],
+    ["clean execution failure without counts", { ...validResult, sample_state: "clean" }],
+    ["blocked result without findings", { ...validResult, merge_state: "blocked" }],
+    [
+      "ready result with configured blocking findings",
+      {
+        ...validResult,
+        unresolved_counts: { Critical: 0, High: 1, Medium: 0 },
+        sample_state: "findings",
+      },
+      /merge_state must agree with configured blocking severity counts/,
+    ],
+    [
+      "blocked result without configured blockers",
+      {
+        ...validResult,
+        merge_state: "blocked",
+        current_counts: { Critical: 0, High: 0, Medium: 1 },
+        sample_state: "findings",
+      },
+      /merge_state must agree with configured blocking severity counts/,
+    ],
+    ["unsupported remaining reason", { ...validResult, remaining_analysis: ["unsupported"] }],
+    [
+      "duplicate remaining reasons",
+      { ...validResult, remaining_analysis: ["execution_failed", "execution_failed"] },
+    ],
+    [
+      "remaining reasons outside canonical order",
+      { ...validResult, remaining_analysis: ["execution_failed", "diff_truncated"] },
+      /remaining_analysis must contain unique canonical ordered reason strings/,
+    ],
+    [
+      "inconclusive result with reconciliation only",
+      { ...validResult, remaining_analysis: ["reconciliation_unknown"] },
+    ],
+    [
+      "incorrect convergence",
+      { ...validResult, bounded_converged: true, converged: true },
+    ],
+    [
+      "bounded coverage for incomplete unknown result",
+      { ...validResult, coverage: "bounded", remaining_analysis: [] },
+    ],
+    [
+      "unknown coverage for complete known result",
+      {
+        ...validResult,
+        analysis_state: "complete",
+        sample_state: "clean",
+        bounded_converged: true,
+        coverage: "unknown",
+        remaining_analysis: [],
+        converged: true,
+      },
+    ],
+  ];
+
+  for (const [name, invalidResult, expectedDiagnostic] of invalidResults) {
+    const suffix = name.replaceAll(" ", "-");
+    const outputFile = join(directory, `${suffix}-output`);
+    const resultFile = join(directory, `${suffix}-result.json`);
+    const summaryFile = join(directory, `${suffix}-summary`);
+    const finalized = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+      cwd: directory,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        TARGET_ELIGIBLE: "true",
+        PR_NUMBER: "7",
+        GITHUB_REPO: "example/repository",
+        HEAD_SHA: headSha,
+        BASE_SHA: baseSha,
+        TRUSTED_DATA_ROOT: directory,
+        REVIEW_POSTER: trustedPoster,
+        REVIEW_RESULT_HELPER: join(directory, "scripts", "review-result.mjs"),
+        REVIEW_PUBLICATION_FILE: publicationFile,
+        REVIEW_MODE: "summary",
+        POST_COMMENT: "false",
+        SUPPRESS_WRITES: "true",
+        RESOLVE_STALE: "false",
+        MAX_FINDINGS: "20",
+        FAIL_ON_FINDINGS: "false",
+        BLOCK_SEVERITIES: "Critical,High",
+        GITHUB_OUTPUT: outputFile,
+        REVIEW_RESULT_FILE: resultFile,
+        GITHUB_STEP_SUMMARY: summaryFile,
+        EMITTED_RESULT: JSON.stringify(invalidResult),
+      },
+    });
+
+    assert.equal(finalized.status, 31, `${name}: ${finalized.stderr}`);
+    assert.match(
+      finalized.stderr,
+      /review poster left an invalid result; replacing it conservatively/,
+      name,
+    );
+    if (expectedDiagnostic) assert.match(finalized.stderr, expectedDiagnostic, name);
+    assert.deepEqual(JSON.parse(readFileSync(resultFile, "utf8")), expectedResult, name);
+    assert.deepEqual(
+      envFileValues(outputFile),
+      Object.fromEntries(Object.entries(expectedResult).map(([field, value]) => [
+        field,
+        typeof value === "object" ? JSON.stringify(value) : String(value),
+      ])),
+      name,
+    );
+    const summary = readFileSync(summaryFile, "utf8");
+    assertFinalResultSummary(summary, expectedResult);
+    assert.doesNotMatch(summary, /undefined|Bounded convergence \| `yes`/, name);
+  }
+});
+
+test("target resolution failure finalizes conservatively while explicit ineligibility remains skipped", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hosted-target-failure-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const markerFile = join(directory, "target-poster-ran");
+  const targetPoster = join(directory, "scripts", "post-review.mjs");
+  mkdirSync(dirname(targetPoster), { recursive: true });
+  writeFileSync(targetPoster, `
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.TARGET_POSTER_MARKER, "executed");
+`);
+
+  const env = {
+    ...process.env,
+    TRUSTED_DATA_ROOT: directory,
+    REVIEW_POSTER: targetPoster,
+    REVIEW_MODE: "summary",
+    POST_COMMENT: "false",
+    SUPPRESS_WRITES: "true",
+    RESOLVE_STALE: "false",
+    MAX_FINDINGS: "20",
+    FAIL_ON_FINDINGS: "false",
+    BLOCK_SEVERITIES: "Critical,High",
+    TARGET_POSTER_MARKER: markerFile,
+  };
+  for (const name of ["TARGET_ELIGIBLE", "PR_NUMBER", "GITHUB_REPO", "HEAD_SHA", "BASE_SHA"]) {
+    delete env[name];
+  }
+
+  const failureOutput = join(directory, "failure-output");
+  const failureResult = join(directory, "failure-result.json");
+  const failureSummary = join(directory, "failure-summary");
+  const failedResolution = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...env,
+      GITHUB_OUTPUT: failureOutput,
+      REVIEW_RESULT_FILE: failureResult,
+      GITHUB_STEP_SUMMARY: failureSummary,
+    },
+  });
+
+  assert.equal(failedResolution.status, 1, failedResolution.stderr);
+  assert.equal(existsSync(markerFile), false);
+  const expectedResult = expectedExecutionFailureResult("", "");
+  assert.deepEqual(JSON.parse(readFileSync(failureResult, "utf8")), expectedResult);
+  assert.deepEqual(
+    envFileValues(failureOutput),
+    Object.fromEntries(Object.entries(expectedResult).map(([name, value]) => [
+      name,
+      typeof value === "object" ? JSON.stringify(value) : String(value),
+    ])),
+  );
+  assertFinalResultSummary(readFileSync(failureSummary, "utf8"), expectedResult);
+
+  const skippedOutput = join(directory, "skipped-output");
+  const skippedResult = join(directory, "skipped-result.json");
+  const skipped = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...env,
+      TARGET_ELIGIBLE: "false",
+      GITHUB_OUTPUT: skippedOutput,
+      REVIEW_RESULT_FILE: skippedResult,
+    },
+  });
+
+  assert.equal(skipped.status, 0, skipped.stderr);
+  assert.equal(existsSync(skippedOutput), false);
+  assert.equal(existsSync(skippedResult), false);
+  assert.equal(existsSync(markerFile), false);
 });
 
 test("hosted contract runs one trusted ensemble and one suppressed poster gate", (t) => {
@@ -784,6 +1927,7 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
   const support = envFileValues(supportEnvFile);
   assert.equal(support.REVIEW_RUNNER, runner);
   assert.equal(support.REVIEW_POSTER, poster);
+  assert.equal(support.REVIEW_RESULT_HELPER, resultCli);
   assert.equal(support.TRUSTED_DATA_ROOT, trustedRoot);
 
   const selfSupportEnvFile = join(fixture.directory, "self-support.env");
@@ -818,6 +1962,7 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
   assert.equal(selfSupport.TRUSTED_DATA_ROOT, trustedRoot);
   assert.equal(selfSupport.REVIEW_RUNNER, runner);
   assert.equal(selfSupport.REVIEW_POSTER, poster);
+  assert.equal(selfSupport.REVIEW_RESULT_HELPER, resultCli);
 
   for (const path of ["/tmp/prompt-body.md", "/tmp/skill.md", "/tmp/one-skill.md"]) {
     rmSync(path, { force: true });
@@ -844,10 +1989,10 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
   assert.equal(readFileSync(promptSupport.SKILL_FILE, "utf8").includes(targetDataMarker), false);
 
   const findingsFile = "/tmp/review.md";
-  const metadataFile = "/tmp/review-meta.json";
+  const publicationFile = "/tmp/review-publication.json";
   const runnerOutFile = "/tmp/review-runner.out";
   const runnerErrFile = "/tmp/review-runner.err";
-  for (const path of [findingsFile, metadataFile, runnerOutFile, runnerErrFile]) {
+  for (const path of [findingsFile, publicationFile, runnerOutFile, runnerErrFile]) {
     rmSync(path, { force: true });
     t.after(() => rmSync(path, { force: true }));
   }
@@ -881,8 +2026,8 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
   assert.equal(reviewResult.status, 0, reviewResult.stderr);
 
   const logs = readFileSync(logFile, "utf8").trim().split("\n").map(JSON.parse);
-  const findings = JSON.parse(readFileSync(findingsFile, "utf8"));
-  const metadata = JSON.parse(readFileSync(metadataFile, "utf8"));
+  const findingsDocument = JSON.parse(readFileSync(findingsFile, "utf8"));
+  const { findings, metadata } = JSON.parse(readFileSync(publicationFile, "utf8"));
   assert.equal(logs.length, 3);
   assert.deepEqual(logs.map(({ id }) => id), ["general", "correctness", "boundaries"]);
   assert.ok(logs.every(({ attempt }) => attempt === 1));
@@ -892,30 +2037,46 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
   assert.ok(logs.every(({ skill }) => !skill.includes(targetDataMarker)));
   assert.equal(existsSync(maliciousExecutableMarker), false);
   assert.equal(existsSync(findingsFile), true);
-  assert.equal(existsSync(metadataFile), true);
+  assert.equal(existsSync(publicationFile), true);
   assert.deepEqual(metadata.passes.requested, ["general", "correctness", "boundaries"]);
   assert.deepEqual(metadata.passes.completed, ["general", "correctness", "boundaries"]);
   assert.equal(metadata.analysis_state, "complete");
+  assert.equal(metadata.reviewed_head, fixture.headSha);
+  assert.match(metadata.scope_hash, /^[a-f0-9]{64}$/);
+  assert.equal(metadata.coverage, "bounded");
+  assert.deepEqual(metadata.remaining_analysis, []);
   assert.deepEqual(
-    findings.findings.map(({ title }) => title).sort(),
+    findings.map(({ title }) => title).sort(),
     ["Correctness hosted defect", "Shared hosted defect"],
   );
-  assert.equal(findings.findings.find(({ title }) => title === shared.title).votes, 2);
+  assert.equal(findings.find(({ title }) => title === shared.title).votes, 2);
+  assert.deepEqual(findings, findingsDocument.findings);
 
   const githubLogFile = join(fixture.directory, "github.log");
   const posterCallsFile = join(fixture.directory, "poster-calls.log");
   const outputFile = join(fixture.directory, "poster-output");
   const summaryFile = join(fixture.directory, "poster-summary");
+  const resultFile = join(fixture.directory, "poster-result.json");
   const preloadFile = join(fixture.directory, "fake-github.mjs");
   writeFileSync(preloadFile, `
 import { appendFileSync } from "node:fs";
-appendFileSync(process.env.FAKE_POSTER_CALLS, "poster\\n");
+let posterRecorded = false;
 globalThis.fetch = async (url, options = {}) => {
+  if (!posterRecorded) {
+    appendFileSync(process.env.FAKE_POSTER_CALLS, "poster\\n");
+    posterRecorded = true;
+  }
   const method = options.method ?? "GET";
   const body = String(options.body ?? "");
   appendFileSync(process.env.FAKE_GITHUB_LOG, JSON.stringify({ url: String(url), method, body }) + "\\n");
   if (String(url).endsWith("/graphql") && body.includes("viewer")) {
     return { ok: true, status: 200, json: async () => ({ data: { viewer: { login: "review-app[bot]" } } }), text: async () => "" };
+  }
+  if (String(url).endsWith("/graphql") && body.includes("reviewThreads")) {
+    return { ok: true, status: 200, json: async () => ({ data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } }), text: async () => "" };
+  }
+  if (String(url).includes("/pulls/17/reviews") && method === "GET") {
+    return { ok: true, status: 200, json: async () => [], text: async () => "" };
   }
   if (String(url).includes("/issues/17/comments") && method === "GET") {
     return { ok: true, status: 200, json: async () => [], text: async () => "" };
@@ -933,14 +2094,14 @@ globalThis.fetch = async (url, options = {}) => {
       FAKE_GITHUB_LOG: githubLogFile,
       FAKE_POSTER_CALLS: posterCallsFile,
       GH_TOKEN: "installation-token",
-      FINDINGS_FILE: findingsFile,
-      REVIEW_METADATA_FILE: metadataFile,
+      REVIEW_PUBLICATION_FILE: publicationFile,
       GITHUB_REPO: "outside/target",
       PR_NUMBER: "17",
       HEAD_SHA: fixture.headSha,
       BASE_SHA: fixture.baseSha,
       TARGET_REPO: "outside/target",
       PR: "17",
+      TARGET_ELIGIBLE: "true",
       BASE: fixture.baseSha,
       HEAD: fixture.headSha,
       REVIEW_MODE: "summary",
@@ -952,6 +2113,7 @@ globalThis.fetch = async (url, options = {}) => {
       BLOCK_SEVERITIES: "Critical,High",
       GITHUB_OUTPUT: outputFile,
       GITHUB_STEP_SUMMARY: summaryFile,
+      REVIEW_RESULT_FILE: resultFile,
     },
   });
   assert.equal(posterResult.status, 1, posterResult.stderr);
@@ -962,13 +2124,19 @@ globalThis.fetch = async (url, options = {}) => {
   assert.equal(outputs.merge_state, "blocked");
   assert.equal(outputs.sample_state, "findings");
   assert.equal(outputs.bounded_converged, "false");
+  assert.equal(outputs.reviewed_head, fixture.headSha);
+  assert.equal(outputs.scope_hash, metadata.scope_hash);
+  assert.equal(outputs.coverage, "bounded");
+  assert.deepEqual(JSON.parse(outputs.remaining_analysis), []);
+  assert.equal(outputs.converged, "false");
   assert.equal(outputs.passes_requested, "3");
   assert.equal(outputs.passes_completed, "3");
   assert.deepEqual(JSON.parse(outputs.current_counts), { Critical: 0, High: 1, Medium: 1 });
   assert.deepEqual(JSON.parse(outputs.unresolved_counts), { Critical: 0, High: 0, Medium: 0 });
   assert.match(readFileSync(summaryFile, "utf8"), /\| Passes \| `3 requested \/ 3 completed` \|/);
+  assert.equal(JSON.parse(readFileSync(resultFile, "utf8")).merge_state, "blocked");
   const githubRequests = readFileSync(githubLogFile, "utf8").trim().split("\n").map(JSON.parse);
-  assert.equal(githubRequests.length, 2);
+  assert.equal(githubRequests.length, 4);
   assert.equal(
     githubRequests.some(({ url, method }) => url.includes("/comments") && method !== "GET"),
     false,
@@ -1272,6 +2440,8 @@ test("a permanently malformed pass is failed while valid pass findings survive t
   assert.equal(run.result.status, 0, run.result.stderr);
   assert.deepEqual(run.metadata.passes.completed, ["general", "boundaries"]);
   assert.equal(run.metadata.analysis_state, "inconclusive");
+  assert.equal(run.metadata.coverage, "unknown");
+  assert.deepEqual(run.metadata.remaining_analysis, ["pass_failed"]);
   assert.deepEqual(
     run.metadata.passes.results.map(({ id, status, attempts, finding_count }) => ({
       id, status, attempts, finding_count,
@@ -1286,10 +2456,10 @@ test("a permanently malformed pass is failed while valid pass findings survive t
     run.findings.findings.map(({ title }) => title).sort(),
     [boundaries.title, general.title],
   );
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
 });
 
-test("all-pass failure writes valid diagnostic metadata before exiting nonzero", (t) => {
+test("all-pass failure writes validated findings and publication diagnostics before exiting nonzero", (t) => {
   const run = runReview(t, {
     general: ["bad", "bad again"],
     correctness: ["bad", "bad again"],
@@ -1297,8 +2467,11 @@ test("all-pass failure writes valid diagnostic metadata before exiting nonzero",
   });
 
   assert.notEqual(run.result.status, 0);
-  assert.equal(run.findings, null);
+  assert.deepEqual(run.findings, { findings: [] });
+  assert.deepEqual(run.publication.findings, []);
   assert.equal(run.metadata.analysis_state, "inconclusive");
+  assert.equal(run.metadata.coverage, "unknown");
+  assert.deepEqual(run.metadata.remaining_analysis, ["pass_failed", "execution_failed"]);
   assert.deepEqual(run.metadata.passes.completed, []);
   assert.deepEqual(
     run.metadata.passes.results.map(({ status, attempts, finding_count, capped }) => ({
@@ -1308,7 +2481,7 @@ test("all-pass failure writes valid diagnostic metadata before exiting nonzero",
       status: "failed", attempts: 2, finding_count: 0, capped: false,
     })),
   );
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
   assert.doesNotMatch(run.result.stdout, /No findings/);
 });
 
@@ -1323,6 +2496,8 @@ test("a raw finding count equal to the nonzero cap is capped and inconclusive", 
 
   assert.equal(run.result.status, 0, run.result.stderr);
   assert.equal(run.metadata.analysis_state, "inconclusive");
+  assert.equal(run.metadata.coverage, "unknown");
+  assert.deepEqual(run.metadata.remaining_analysis, ["finding_cap_reached"]);
   assert.equal(run.metadata.finding_cap, 1);
   assert.deepEqual(
     run.metadata.passes.results.map(({ finding_count, capped }) => ({ finding_count, capped })),
@@ -1332,7 +2507,7 @@ test("a raw finding count equal to the nonzero cap is capped and inconclusive", 
       { finding_count: 0, capped: false },
     ],
   );
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
 });
 
 test("diff truncation is recorded and makes an otherwise valid run inconclusive", (t) => {
@@ -1346,13 +2521,27 @@ test("diff truncation is recorded and makes an otherwise valid run inconclusive"
 
   assert.equal(run.result.status, 0, run.result.stderr);
   assert.equal(run.metadata.analysis_state, "inconclusive");
+  assert.equal(run.metadata.coverage, "unknown");
+  assert.deepEqual(run.metadata.remaining_analysis, ["diff_truncated"]);
   assert.equal(run.metadata.diff.truncated, true);
   assert.ok(run.metadata.diff.bytes > run.metadata.diff.included_bytes);
   assert.equal(run.metadata.diff.included_bytes, 80);
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  const trustedDiffBytes = run.scope.bytes;
+  assert.equal(run.scope.included_bytes, 80);
+  const expectedFullDiff = execFileSync("git", ["diff", "--no-color", "main", "HEAD"], {
+    cwd: run.repository,
+  });
+  assert.deepEqual(Buffer.from(run.scope.diff_base64, "base64"), expectedFullDiff);
+  assert.equal(run.scope.bytes, expectedFullDiff.length);
+  assert.deepEqual(run.metadata.diff, {
+    bytes: trustedDiffBytes,
+    included_bytes: run.scope.included_bytes,
+    truncated: true,
+  });
+  assert.equal(validatePublication(run.publicationFile).status, 0);
 });
 
-test("diff metadata counts UTF-8 bytes rather than shell characters", (t) => {
+test("diff metadata and canonical scope preserve the exact UTF-8 git diff bytes", (t) => {
   const run = runReview(t, {
     general: [{ findings: [] }],
     correctness: [{ findings: [] }],
@@ -1363,13 +2552,145 @@ test("diff metadata counts UTF-8 bytes rather than shell characters", (t) => {
   });
 
   assert.equal(run.result.status, 0, run.result.stderr);
-  let expectedDiff = execFileSync("git", ["diff", "--no-color", "main", "HEAD"], {
+  const expectedDiff = execFileSync("git", ["diff", "--no-color", "main", "HEAD"], {
     cwd: run.repository,
   });
-  while (expectedDiff.at(-1) === 10) expectedDiff = expectedDiff.subarray(0, -1);
+  assert.equal(expectedDiff.at(-1), 10);
+  assert.deepEqual(Buffer.from(run.scope.diff_base64, "base64"), expectedDiff);
+  assert.equal(run.scope.bytes, expectedDiff.length);
   assert.equal(run.metadata.diff.bytes, expectedDiff.length);
   assert.equal(run.metadata.diff.included_bytes, expectedDiff.length);
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
+});
+
+test("scope hashes distinguish invalid UTF-8 diff bytes while the raw review run validates", (t) => {
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    env: { AGENTIC_REVIEW_MAX_DIFF_BYTES: "0" },
+    baseFiles: { "invalid-utf8.txt": Buffer.from([0x61, 0x80, 0x0a]) },
+    targetFiles: { "invalid-utf8.txt": Buffer.from([0x62, 0x80, 0x0a]) },
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  const expectedDiff = execFileSync("git", ["diff", "--no-color", "main", "HEAD"], {
+    cwd: run.repository,
+  });
+  const collidingUnderUtf8Decode = Buffer.from(
+    expectedDiff.map((byte) => byte === 0x80 ? 0x81 : byte),
+  );
+  assert.equal(expectedDiff.includes(0x80), true);
+  assert.equal(expectedDiff.toString("utf8"), collidingUnderUtf8Decode.toString("utf8"));
+  assert.deepEqual(Buffer.from(run.scope.diff_base64, "base64"), expectedDiff);
+  assert.equal(run.scope.bytes, expectedDiff.length);
+  assert.equal(run.scope.included_bytes, expectedDiff.length);
+  assert.deepEqual(run.metadata.diff, {
+    bytes: expectedDiff.length,
+    included_bytes: expectedDiff.length,
+    truncated: false,
+  });
+  const alternateScopeHash = scopeHash({
+    base_sha: run.scope.base_sha,
+    configuration_fingerprint: run.scope.configuration_fingerprint,
+    diff_base64: collidingUnderUtf8Decode.toString("base64"),
+    head_sha: run.scope.head_sha,
+  });
+  assert.notEqual(run.metadata.scope_hash, alternateScopeHash);
+  assert.equal(Buffer.from(run.logs[0].prompt_base64, "base64").includes(expectedDiff), true);
+  for (const log of run.logs) {
+    assert.equal(Buffer.from(log.prompt_base64, "base64").includes(0x80), true);
+  }
+  assert.equal(run.metadata.analysis_state, "complete");
+  assert.equal(run.metadata.coverage, "bounded");
+  assert.equal(validatePublication(run.publicationFile).status, 0);
+});
+
+
+test("external diff and textconv helpers cannot replace trusted diff evidence", (t) => {
+  const fixture = createFixture(t, {
+    baseFiles: { ".gitattributes": "*.txt diff=empty\n" },
+  });
+  const externalDiff = join(fixture.directory, "empty-diff");
+  const externalDiffLog = join(fixture.directory, "empty-diff.log");
+  writeFileSync(externalDiff, `#!/usr/bin/env bash
+touch "\${EXTERNAL_DIFF_LOG}"
+exit 0
+`);
+  chmodSync(externalDiff, 0o755);
+  git(fixture.repository, "config", "diff.external", externalDiff);
+  const textconv = join(fixture.directory, "empty-textconv");
+  const textconvLog = join(fixture.directory, "empty-textconv.log");
+  writeFileSync(textconv, `#!/usr/bin/env bash
+touch "\${TEXTCONV_LOG}"
+exit 0
+`);
+  chmodSync(textconv, 0o755);
+  git(fixture.repository, "config", "diff.empty.textconv", textconv);
+
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    env: {
+      EXTERNAL_DIFF_LOG: externalDiffLog,
+      GIT_EXTERNAL_DIFF: externalDiff,
+      TEXTCONV_LOG: textconvLog,
+    },
+    existingFixture: fixture,
+    fakeCodegraph: true,
+    untrackedCodegraph: true,
+  });
+  const expectedDiff = execFileSync(
+    "git",
+    ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "main", "HEAD"],
+    { cwd: fixture.repository },
+  );
+
+  assert.ok(expectedDiff.length > 0);
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.equal(existsSync(externalDiffLog), false);
+  assert.equal(existsSync(textconvLog), false);
+  assert.deepEqual(Buffer.from(run.scope.diff_base64, "base64"), expectedDiff);
+  assert.equal(run.metadata.scope_hash, scopeHash({
+    base_sha: run.scope.base_sha,
+    configuration_fingerprint: run.scope.configuration_fingerprint,
+    diff_base64: run.scope.diff_base64,
+    head_sha: run.scope.head_sha,
+  }));
+  assert.equal(run.logs.length, 3);
+  for (const log of run.logs) {
+    assert.match(log.prompt, /\+alpha head/);
+    assert.match(log.prompt, /\+beta head/);
+    assert.match(log.prompt, /\+gamma head/);
+  }
+  assert.ok(run.codegraphLogs.some(({ operation }) => operation === "query"));
+  assert.equal(validatePublication(run.publicationFile).status, 0);
+});
+
+test("canonical diff rendering failures stop before model work", (t) => {
+  const fixture = createFixture(t);
+  const gitWrapper = join(fixture.bin, "git");
+  writeFileSync(gitWrapper, `#!/usr/bin/env bash
+if [ "\${1:-}" = "diff" ]; then
+  for argument in "$@"; do
+    [ "$argument" = "--no-color" ] && exit 73
+  done
+fi
+PATH="\${PATH#*:}" exec git "$@"
+`);
+  chmodSync(gitWrapper, 0o755);
+
+  const run = runReview(t, {}, {
+    existingFixture: fixture,
+    includeOutputs: false,
+  });
+
+  assert.notEqual(run.result.status, 0);
+  assert.match(run.result.stderr, /could not render canonical diff/);
+  assert.equal(run.logs.length, 0);
 });
 
 test("each pass receives the complete available diff in deterministic rotated file order", (t) => {
@@ -1410,7 +2731,146 @@ test("every rotated pass includes deletions and unusual filenames", (t) => {
   }
 });
 
-test("findings and metadata destinations cannot resolve to the same file", (t) => {
+test("concurrent runners atomically publish findings, metadata, and scope for one run", async (t) => {
+  const fixture = createFixture(t);
+  const findingsFile = join(fixture.directory, "shared-findings.json");
+  const publicationFile = join(fixture.directory, "shared-publication.json");
+  const gateFile = join(fixture.directory, "publication-a-ready");
+  const releaseFile = join(fixture.directory, "release-publication-a");
+  const preload = join(fixture.directory, "gate-publication-rename.cjs");
+  writeFileSync(preload, `
+const fs = require("node:fs");
+const originalRenameSync = fs.renameSync;
+const sleeper = new Int32Array(new SharedArrayBuffer(4));
+fs.renameSync = (from, to) => {
+  if (process.env.PUBLICATION_RUN === "a" && to === process.env.PUBLICATION_OUT) {
+    fs.writeFileSync(process.env.PUBLICATION_GATE, "");
+    while (!fs.existsSync(process.env.PUBLICATION_RELEASE)) {
+      Atomics.wait(sleeper, 0, 0, 10);
+    }
+  }
+  return originalRenameSync(from, to);
+};
+`);
+
+  const start = (name) => {
+    const state = join(fixture.directory, `state-${name}`);
+    const log = join(fixture.directory, `omp-${name}.log`);
+    const planFile = join(fixture.directory, `plan-${name}.json`);
+    writeFileSync(planFile, JSON.stringify({
+      general: [{ findings: [finding(`Publication ${name.toUpperCase()} finding`)] }],
+      correctness: [{ findings: [] }],
+      boundaries: [{ findings: [] }],
+    }));
+    mkdirSync(state);
+    const child = spawn("bash", [
+      runner,
+      "--base", "main",
+      "--model", `openrouter/example-${name}`,
+      "--no-codegraph",
+      "--no-state",
+      "--no-fail",
+      "--out", findingsFile,
+      "--publication-out", publicationFile,
+      "--json",
+    ], {
+      cwd: fixture.repository,
+      env: {
+        ...process.env,
+        OPENROUTER_API_KEY: "sk-or-runner-test",
+        PATH: `${fixture.bin}:${process.env.PATH}`,
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${preload}`.trim(),
+        FAKE_OMP_PLAN: planFile,
+        FAKE_OMP_LOG: log,
+        FAKE_OMP_STATE: state,
+        PUBLICATION_GATE: gateFile,
+        PUBLICATION_OUT: publicationFile,
+        PUBLICATION_RELEASE: releaseFile,
+        PUBLICATION_RUN: name,
+      },
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.stdout.resume();
+    return {
+      child,
+      done: once(child, "close").then(([status]) => ({ status, stderr })),
+    };
+  };
+
+  const render = (name, publication) => {
+    const snapshot = join(fixture.directory, `publication-${name}.json`);
+    writeFileSync(snapshot, JSON.stringify(publication));
+    return spawnSync(process.execPath, [poster], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HEAD_SHA: publication.metadata.head_sha,
+        REVIEW_PUBLICATION_FILE: snapshot,
+        RENDER: "1",
+        REVIEW_MODE: "summary",
+      },
+    });
+  };
+
+  const first = start("a");
+  for (let attempt = 0; attempt < 1000 && !existsSync(gateFile); attempt += 1) {
+    await delay(10);
+  }
+  assert.equal(existsSync(gateFile), true, "first runner did not reach publication gate");
+
+  const second = start("b");
+  const secondResult = await second.done;
+  const secondBytes = existsSync(publicationFile)
+    ? readFileSync(publicationFile, "utf8")
+    : null;
+  const secondValidation = secondBytes === null ? null : validatePublication(publicationFile);
+
+  writeFileSync(releaseFile, "");
+  const firstResult = await first.done;
+  assert.equal(secondResult.status, 0, secondResult.stderr);
+  assert.notEqual(secondBytes, null, "second runner did not publish an evidence set");
+  assert.equal(secondValidation.status, 0, secondValidation.stderr);
+  const secondPublication = JSON.parse(secondBytes);
+  assert.equal(firstResult.status, 0, firstResult.stderr);
+  const firstPublication = JSON.parse(readFileSync(publicationFile, "utf8"));
+  const standaloneFindings = JSON.parse(readFileSync(findingsFile, "utf8")).findings;
+
+  const firstValidation = validatePublication(publicationFile);
+  assert.equal(firstValidation.status, 0, firstValidation.stderr);
+  assert.notEqual(
+    firstPublication.metadata.configuration_fingerprint,
+    secondPublication.metadata.configuration_fingerprint,
+  );
+  assert.equal(firstPublication.findings[0].title, "Publication A finding");
+  assert.equal(secondPublication.findings[0].title, "Publication B finding");
+  assert.equal(
+    standaloneFindings[0].title,
+    "Publication B finding",
+    "the schedule must leave the human-readable output from a different run",
+  );
+  for (const publication of [secondPublication, firstPublication]) {
+    assert.equal(
+      publication.metadata.configuration_fingerprint,
+      publication.scope.configuration_fingerprint,
+    );
+    assert.equal(
+      publication.metadata.scope_hash,
+      deriveTrustedScopeMetadata(publication.scope).scope_hash,
+    );
+  }
+
+  const renderedSecond = render("b", secondPublication);
+  assert.equal(renderedSecond.status, 0, renderedSecond.stderr);
+  assert.match(renderedSecond.stdout, /Publication B finding/);
+  assert.doesNotMatch(renderedSecond.stdout, /Publication A finding/);
+  const renderedFirst = render("a", firstPublication);
+  assert.equal(renderedFirst.status, 0, renderedFirst.stderr);
+  assert.match(renderedFirst.stdout, /Publication A finding/);
+  assert.doesNotMatch(renderedFirst.stdout, /Publication B finding/);
+});
+
+test("findings and publication destinations cannot resolve to the same file", (t) => {
   const plan = {
     general: [{ findings: [] }],
     correctness: [{ findings: [] }],
@@ -1419,12 +2879,12 @@ test("findings and metadata destinations cannot resolve to the same file", (t) =
   const dotAlias = runReview(t, plan, {
     outputPaths: ({ directory }) => ({
       findingsFile: join(directory, "same.json"),
-      metadataFile: `${directory}/./same.json`,
+      publicationFile: `${directory}/./same.json`,
     }),
   });
   assert.notEqual(dotAlias.result.status, 0);
   assert.equal(dotAlias.logs.length, 0);
-  assert.match(dotAlias.result.stderr, /--out.*--metadata-out|same destination/);
+  assert.match(dotAlias.result.stderr, /--out.*--publication-out|same destination/);
 
   const symlinkAlias = runReview(t, plan, {
     outputPaths: ({ directory }) => {
@@ -1434,47 +2894,92 @@ test("findings and metadata destinations cannot resolve to the same file", (t) =
       symlinkSync(realDirectory, aliasDirectory, "dir");
       return {
         findingsFile: join(realDirectory, "result.json"),
-        metadataFile: join(aliasDirectory, "result.json"),
+        publicationFile: join(aliasDirectory, "result.json"),
       };
     },
   });
   assert.notEqual(symlinkAlias.result.status, 0);
   assert.equal(symlinkAlias.logs.length, 0);
-  assert.match(symlinkAlias.result.stderr, /--out.*--metadata-out|same destination/);
+  assert.match(symlinkAlias.result.stderr, /--out.*--publication-out|same destination/);
 });
 
-test("symlink artifact destinations are rejected before model work without replacing either output", (t) => {
+test("symlink artifact destinations are rejected before model work without replacing outputs", (t) => {
   const plan = {
     general: [{ findings: [] }],
     correctness: [{ findings: [] }],
     boundaries: [{ findings: [] }],
   };
-  for (const selected of ["findings", "metadata"]) {
+  for (const selected of ["findings", "publication"]) {
     let staleTarget;
     let otherOutput;
     const stale = selected === "findings"
       ? '{"findings":[{"title":"stale"}]}\n'
       : '{"analysis_state":"stale"}\n';
     const run = runReview(t, plan, {
-      outputPaths: ({ directory, findingsFile, metadataFile }) => {
+      outputPaths: ({ directory, findingsFile, publicationFile }) => {
         staleTarget = join(directory, `${selected}-stale-target.json`);
         writeFileSync(staleTarget, stale);
         const symlink = join(directory, `${selected}-artifact.json`);
         symlinkSync(staleTarget, symlink);
-        otherOutput = selected === "findings" ? metadataFile : findingsFile;
+        otherOutput = selected === "findings" ? publicationFile : findingsFile;
         return selected === "findings"
-          ? { findingsFile: symlink, metadataFile }
-          : { findingsFile, metadataFile: symlink };
+          ? { findingsFile: symlink, publicationFile }
+          : { findingsFile, publicationFile: symlink };
       },
     });
 
     assert.notEqual(run.result.status, 0, `${selected}: ${run.result.stderr}`);
     assert.equal(run.logs.length, 0, selected);
-    assert.equal(lstatSync(selected === "findings" ? run.findingsFile : run.metadataFile).isSymbolicLink(), true);
+    const selectedOutput = selected === "findings"
+      ? run.findingsFile
+      : run.publicationFile;
+    assert.equal(lstatSync(selectedOutput).isSymbolicLink(), true);
     assert.equal(readFileSync(staleTarget, "utf8"), stale);
     assert.equal(existsSync(otherOutput), false, `${selected}: other artifact was partially written`);
-    assert.match(run.result.stderr, /symlink.*(?:--out|--metadata-out)|(?:--out|--metadata-out).*symlink/i);
+    assert.match(
+      run.result.stderr,
+      /symlink.*(?:--out|--publication-out)|(?:--out|--publication-out).*symlink/i,
+    );
   }
+});
+
+test("publication staging never follows a predictable user-destination temp symlink", (t) => {
+  const plan = {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  };
+  let victim;
+  let publicationDestination;
+  let bashEnv;
+  const stale = "operator-owned data\n";
+  const run = runReview(t, plan, {
+    outputPaths: ({ directory, findingsFile, publicationFile }) => {
+      victim = join(directory, "temp-symlink-victim");
+      publicationDestination = publicationFile;
+      bashEnv = join(directory, "attack-bash-env");
+      writeFileSync(victim, stale);
+      writeFileSync(bashEnv, [
+        'if [ ! -e "$ATTACK_MARKER" ]; then',
+        '  : > "$ATTACK_MARKER"',
+        '  ln -s -- "$ATTACK_VICTIM" "$ATTACK_PUBLICATION.tmp.$$"',
+        "fi",
+        "",
+      ].join("\n"));
+      return { findingsFile, publicationFile };
+    },
+    env: {
+      get BASH_ENV() { return bashEnv; },
+      get ATTACK_MARKER() { return `${bashEnv}.ran`; },
+      get ATTACK_PUBLICATION() { return publicationDestination; },
+      get ATTACK_VICTIM() { return victim; },
+    },
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.equal(readFileSync(victim, "utf8"), stale);
+  assert.equal(lstatSync(run.publicationFile).isSymbolicLink(), false);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
 });
 
 test("branch and staged reviews stay pinned when the source changes after worktree creation", (t) => {
@@ -1504,6 +3009,1021 @@ test("branch and staged reviews stay pinned when the source changes after worktr
   }
 });
 
+test("staged review uses an internal synthetic commit without configured Git identity", (t) => {
+  const fixture = createFixture(t, { staged: true });
+  git(fixture.repository, "config", "--local", "--unset-all", "user.name");
+  git(fixture.repository, "config", "--local", "--unset-all", "user.email");
+  const gitConfigHome = join(fixture.directory, "git-config-home");
+  const xdgConfigHome = join(gitConfigHome, "xdg");
+  mkdirSync(xdgConfigHome, { recursive: true });
+  const identitylessEnv = {
+    HOME: gitConfigHome,
+    XDG_CONFIG_HOME: xdgConfigHome,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: join(gitConfigHome, "global-config"),
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "user.useConfigOnly",
+    GIT_CONFIG_VALUE_0: "true",
+    GIT_AUTHOR_NAME: "",
+    GIT_AUTHOR_EMAIL: "",
+    GIT_COMMITTER_NAME: "",
+    GIT_COMMITTER_EMAIL: "",
+  };
+  for (const key of ["user.name", "user.email"]) {
+    const configured = spawnSync("git", ["config", "--get", key], {
+      cwd: fixture.repository,
+      encoding: "utf8",
+      env: { ...process.env, ...identitylessEnv },
+    });
+    assert.equal(configured.status, 1, `${key} unexpectedly configured: ${configured.stdout}`);
+  }
+  const localConfigBefore = git(fixture.repository, "config", "--local", "--list");
+  const refsBefore = git(
+    fixture.repository,
+    "for-each-ref",
+    "--format=%(refname) %(objectname)",
+  );
+
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    env: identitylessEnv,
+    existingFixture: fixture,
+    staged: true,
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.equal(run.logs.length, 3);
+  assert.equal(git(run.repository, "rev-parse", "HEAD"), fixture.baseSha);
+  assert.equal(
+    git(run.repository, "show", "-s", "--format=%an|%ae|%cn|%ce", run.metadata.head_sha),
+    "agentic-review|agentic-review@localhost|agentic-review|agentic-review@localhost",
+  );
+  assert.equal(
+    git(run.repository, "for-each-ref", "--format=%(refname)", "--contains", run.metadata.head_sha),
+    "",
+    "synthetic staged commit must not be published through a Git ref",
+  );
+  assert.equal(
+    git(run.repository, "for-each-ref", "--format=%(refname) %(objectname)"),
+    refsBefore,
+  );
+  assert.equal(
+    git(run.repository, "config", "--local", "--list"),
+    localConfigBefore,
+    "staged review must not persist synthetic commit identity",
+  );
+});
+
+test("staged review state keeps its synthetic target reachable for later reconciliation", (t) => {
+  const reported = finding("Fixed staged defect", {
+    file: "alpha.txt",
+    start_line: 1,
+    end_line: 1,
+  });
+  const first = runReview(t, {
+    general: [{ findings: [reported] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    staged: true,
+    noState: false,
+  });
+  assert.equal(first.result.status, 0, first.result.stderr);
+
+  const statePath = join(first.repository, ".git", "agentic-review", "state.json");
+  const [stored] = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  assert.equal(stored.lastCommit, first.metadata.head_sha);
+  assert.equal(stored.stagedTarget, true);
+  assert.notEqual(stored.lastCommit, git(first.repository, "rev-parse", "HEAD"));
+  const retainingRefs = git(
+    first.repository,
+    "for-each-ref",
+    "--format=%(refname)",
+    "--contains",
+    stored.lastCommit,
+  ).split("\n").filter(Boolean);
+  assert.ok(retainingRefs.length > 0, "stored staged target must have a durable Git ref");
+
+  git(first.repository, "reflog", "expire", "--expire=now", "--all");
+  git(first.repository, "prune", "--expire=now");
+  const retainedTarget = spawnSync(
+    "git",
+    ["cat-file", "-e", `${stored.lastCommit}^{commit}`],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.equal(retainedTarget.status, 0, "stored staged target must survive Git pruning");
+
+  writeFileSync(join(first.repository, "alpha.txt"), "alpha fixed\n");
+  git(first.repository, "add", "alpha.txt");
+  const fixed = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    existingFixture: first,
+    staged: true,
+    noState: false,
+  });
+
+  assert.equal(fixed.result.status, 0, fixed.result.stderr);
+  assert.match(fixed.result.stdout, /\| Sample \| `clean` \|/);
+  const [retired] = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  assert.equal(retired.status, "gone");
+  assert.equal(retired.stagedTarget, true);
+});
+
+test("concurrent local-state updates cannot prune a staged ref owned by final state", async (t) => {
+  const fixture = createFixture(t);
+  const head = git(fixture.repository, "rev-parse", "HEAD");
+  const stagedTarget = git(
+    fixture.repository,
+    "commit-tree",
+    `${head}^{tree}`,
+    "-p",
+    head,
+    "-m",
+    "synthetic staged target",
+  );
+  const ordinaryFinding = finding("Concurrent ordinary finding", { file: "beta.txt" });
+  const stagedFinding = finding("Concurrent staged finding", { file: "alpha.txt" });
+  const ordinaryFile = join(fixture.directory, "ordinary-findings.json");
+  const stagedFile = join(fixture.directory, "staged-findings.json");
+  writeFileSync(ordinaryFile, JSON.stringify({ findings: [ordinaryFinding] }));
+  writeFileSync(stagedFile, JSON.stringify({ findings: [stagedFinding] }));
+
+  const wrapper = join(fixture.bin, "git");
+  const firstPruneReady = join(fixture.directory, "first-prune-ready");
+  const releaseFirstPrune = join(fixture.directory, "release-first-prune");
+  const secondStarted = join(fixture.directory, "second-started");
+  const secondPruneReady = join(fixture.directory, "second-prune-ready");
+  writeFileSync(wrapper, `#!/usr/bin/env node
+import { existsSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+const args = process.argv.slice(2);
+if (
+  process.env.PROCESS_READY
+  && args[0] === "rev-parse"
+  && args[1] === "--git-common-dir"
+) writeFileSync(process.env.PROCESS_READY, "ready");
+if (
+  process.env.PRUNE_READY
+  && args[0] === "for-each-ref"
+  && args.at(-1) === "${stagedTargetRefPrefix}"
+) {
+  writeFileSync(process.env.PRUNE_READY, "ready");
+  while (process.env.RELEASE_PRUNE && !existsSync(process.env.RELEASE_PRUNE)) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+}
+const result = spawnSync("git", args, {
+  encoding: "utf8",
+  env: { ...process.env, PATH: process.env.REAL_GIT_PATH },
+});
+if (result.stdout) process.stdout.write(result.stdout);
+if (result.stderr) process.stderr.write(result.stderr);
+process.exit(result.status ?? 1);
+`);
+  chmodSync(wrapper, 0o755);
+
+  const commonEnv = {
+    ...process.env,
+    PATH: `${fixture.bin}:${process.env.PATH}`,
+    REAL_GIT_PATH: process.env.PATH,
+  };
+  const firstProcess = spawn(
+    process.execPath,
+    [localState, "record", ordinaryFile, fixture.baseSha, head, "inconclusive"],
+    {
+      cwd: fixture.repository,
+      env: {
+        ...commonEnv,
+        PRUNE_READY: firstPruneReady,
+        RELEASE_PRUNE: releaseFirstPrune,
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    },
+  );
+  const firstDone = once(firstProcess, "close");
+  let firstError = "";
+  firstProcess.stderr.setEncoding("utf8");
+  firstProcess.stderr.on("data", (chunk) => { firstError += chunk; });
+  t.after(() => { if (firstProcess.exitCode === null) firstProcess.kill("SIGKILL"); });
+
+  const firstDeadline = Date.now() + 5_000;
+  while (!existsSync(firstPruneReady)) {
+    assert.equal(firstProcess.exitCode, null, firstError);
+    assert.ok(Date.now() < firstDeadline, "first process did not reach staged-ref pruning");
+    await delay(10);
+  }
+  const readWhileLocked = spawnSync(process.execPath, [localState, "export-open"], {
+    cwd: fixture.repository,
+    encoding: "utf8",
+  });
+  assert.equal(readWhileLocked.status, 0, readWhileLocked.stderr);
+  assert.deepEqual(
+    JSON.parse(readWhileLocked.stdout).findings.map(({ title }) => title),
+    [ordinaryFinding.title],
+    "read-only commands remain available while a mutation owns the lock",
+  );
+
+  const secondProcess = spawn(
+    process.execPath,
+    [localState, "record", stagedFile, fixture.baseSha, stagedTarget, "inconclusive"],
+    {
+      cwd: fixture.repository,
+      env: {
+        ...commonEnv,
+        AGENTIC_REVIEW_STAGED_TARGET: stagedTarget,
+        PROCESS_READY: secondStarted,
+        PRUNE_READY: secondPruneReady,
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    },
+  );
+  const secondDone = once(secondProcess, "close");
+  let secondError = "";
+  secondProcess.stderr.setEncoding("utf8");
+  secondProcess.stderr.on("data", (chunk) => { secondError += chunk; });
+  t.after(() => { if (secondProcess.exitCode === null) secondProcess.kill("SIGKILL"); });
+
+  const secondDeadline = Date.now() + 5_000;
+  while (!existsSync(secondStarted)) {
+    assert.equal(secondProcess.exitCode, null, secondError);
+    assert.ok(Date.now() < secondDeadline, "second process did not start its state update");
+    await delay(10);
+  }
+  const lockPath = join(fixture.repository, ".git", "agentic-review", "state.lock");
+  if (existsSync(lockPath)) {
+    await delay(50);
+  } else {
+    while (!existsSync(secondPruneReady)) {
+      assert.equal(secondProcess.exitCode, null, secondError);
+      assert.ok(Date.now() < secondDeadline, "second process did not reach staged-ref pruning");
+      await delay(10);
+    }
+  }
+  writeFileSync(releaseFirstPrune, "release");
+
+  const [[firstStatus], [secondStatus]] = await Promise.all([firstDone, secondDone]);
+  assert.equal(firstStatus, 0, firstError);
+  assert.equal(secondStatus, 0, secondError);
+  const state = JSON.parse(readFileSync(
+    join(fixture.repository, ".git", "agentic-review", "state.json"),
+    "utf8",
+  ));
+  const stored = state.findings.find(({ title }) => title === stagedFinding.title);
+  assert.ok(stored, "the final state must retain the staged finding");
+  assert.equal(stored.status, "open");
+  assert.equal(stored.stagedTarget, true);
+  assert.equal(stored.lastCommit, stagedTarget);
+  assert.equal(
+    git(fixture.repository, "rev-parse", `${stagedTargetRefPrefix}${stagedTarget}`),
+    stagedTarget,
+  );
+  assert.equal(existsSync(lockPath), false, "successful mutations must release the state lock");
+});
+
+test("lock-free state readers see complete snapshots while JSON files are published", async (t) => {
+  for (const publication of ["state", "run"]) {
+    const fixture = createFixture(t);
+    const head = git(fixture.repository, "rev-parse", "HEAD");
+    const baselineFinding = finding(`Baseline ${publication} publication finding`, { file: "alpha.txt" });
+    const replacementFinding = finding(`Replacement ${publication} publication finding`, { file: "beta.txt" });
+    const baselineFile = join(fixture.directory, "baseline-findings.json");
+    const replacementFile = join(fixture.directory, "replacement-findings.json");
+    const epoch = 1_755_600_000_000;
+    writeFileSync(baselineFile, JSON.stringify({ findings: [baselineFinding] }));
+    writeFileSync(replacementFile, JSON.stringify({ findings: [replacementFinding] }));
+
+    const baseline = spawnSync(
+      process.execPath,
+      [localState, "record", baselineFile, fixture.baseSha, head, "inconclusive"],
+      {
+        cwd: fixture.repository,
+        encoding: "utf8",
+        env: { ...process.env, RUN_EPOCH: String(epoch) },
+      },
+    );
+    assert.equal(baseline.status, 0, baseline.stderr);
+
+    const stateDirectory = join(fixture.repository, ".git", "agentic-review");
+    const statePath = join(stateDirectory, "state.json");
+    const stamp = new Date(epoch).toISOString().replace(/[:.]/g, "-");
+    const runPrefix = join(stateDirectory, "runs", stamp);
+    const publicationPath = publication === "state" ? statePath : runPrefix;
+    const ready = join(fixture.directory, `${publication}-publication-ready`);
+    const release = join(fixture.directory, `${publication}-publication-release`);
+    const preload = join(fixture.directory, `${publication}-publication.cjs`);
+    writeFileSync(preload, `
+const fs = require("node:fs");
+const { syncBuiltinESMExports } = require("node:module");
+const { resolve } = require("node:path");
+const originalCloseSync = fs.closeSync;
+const originalExistsSync = fs.existsSync;
+const originalOpenSync = fs.openSync;
+const originalRenameSync = fs.renameSync;
+const originalWriteFileSync = fs.writeFileSync;
+const sleeper = new Int32Array(new SharedArrayBuffer(4));
+const target = resolve(process.env.PUBLICATION_PATH);
+const samePath = (path) => {
+  if (typeof path !== "string") return false;
+  const resolved = resolve(path);
+  return process.env.PUBLICATION_IS_RUN === "1"
+    ? resolved.startsWith(target + "~") && resolved.endsWith(".json")
+    : resolved === target;
+};
+const holdPublication = () => {
+  originalWriteFileSync(process.env.PUBLICATION_READY, "ready");
+  while (!originalExistsSync(process.env.PUBLICATION_RELEASE)) {
+    Atomics.wait(sleeper, 0, 0, 10);
+  }
+};
+fs.writeFileSync = (path, ...args) => {
+  if (samePath(path)) {
+    originalCloseSync(originalOpenSync(path, "w"));
+    holdPublication();
+  }
+  return originalWriteFileSync(path, ...args);
+};
+fs.renameSync = (from, to) => {
+  if (
+    samePath(to)
+    && typeof from === "string"
+    && typeof to === "string"
+    && resolve(from).startsWith(resolve(to) + ".pending-")
+  ) holdPublication();
+  return originalRenameSync(from, to);
+};
+syncBuiltinESMExports();
+`);
+
+    const writer = spawn(
+      process.execPath,
+      [localState, "record", replacementFile, fixture.baseSha, head, "inconclusive"],
+      {
+        cwd: fixture.repository,
+        env: {
+          ...process.env,
+          NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${preload}`.trim(),
+          PUBLICATION_PATH: publicationPath,
+          PUBLICATION_READY: ready,
+          PUBLICATION_IS_RUN: publication === "run" ? "1" : "0",
+          PUBLICATION_RELEASE: release,
+          RUN_EPOCH: String(epoch),
+        },
+        stdio: ["ignore", "ignore", "pipe"],
+      },
+    );
+    const writerDone = once(writer, "close");
+    let writerError = "";
+    writer.stderr.setEncoding("utf8");
+    writer.stderr.on("data", (chunk) => { writerError += chunk; });
+    t.after(() => { if (writer.exitCode === null) writer.kill("SIGKILL"); });
+
+    const deadline = Date.now() + 5_000;
+    while (!existsSync(ready)) {
+      assert.equal(writer.exitCode, null, writerError);
+      assert.ok(Date.now() < deadline, `${publication} writer did not reach publication`);
+      await delay(10);
+    }
+
+    const exported = spawnSync(process.execPath, [localState, "export-open"], {
+      cwd: fixture.repository,
+      encoding: "utf8",
+    });
+    const listed = spawnSync(process.execPath, [localState, "list"], {
+      cwd: fixture.repository,
+      encoding: "utf8",
+    });
+    const runs = spawnSync(process.execPath, [localState, "runs"], {
+      cwd: fixture.repository,
+      encoding: "utf8",
+    });
+    assert.equal(exported.status, 0, `${publication}: ${exported.stderr}`);
+    assert.deepEqual(
+      JSON.parse(exported.stdout).findings.map(({ title }) => title),
+      [baselineFinding.title],
+      `${publication}: export-open must read the prior complete state snapshot`,
+    );
+    assert.equal(listed.status, 0, `${publication}: ${listed.stderr}`);
+    assert.match(listed.stdout, new RegExp(baselineFinding.title));
+    assert.doesNotMatch(listed.stdout, new RegExp(replacementFinding.title));
+    assert.equal(runs.status, 0, `${publication}: ${runs.stderr}`);
+    assert.match(runs.stdout, /1 findings/);
+
+    writeFileSync(release, "release");
+    const [writerStatus] = await writerDone;
+    assert.equal(writerStatus, 0, writerError);
+  }
+});
+
+test("a stale lock is reclaimed when its PID belongs to a newer process instance", (t) => {
+  const fixture = createFixture(t);
+  const head = git(fixture.repository, "rev-parse", "HEAD");
+  const reported = finding("PID reuse finding", { file: "alpha.txt" });
+  const findingsFile = join(fixture.directory, "pid-reuse-findings.json");
+  writeFileSync(findingsFile, JSON.stringify({ findings: [reported] }));
+  const recorded = spawnSync(
+    process.execPath,
+    [localState, "record", findingsFile, fixture.baseSha, head, "inconclusive"],
+    { cwd: fixture.repository, encoding: "utf8" },
+  );
+  assert.equal(recorded.status, 0, recorded.stderr);
+
+  const stateDirectory = join(fixture.repository, ".git", "agentic-review");
+  const statePath = join(stateDirectory, "state.json");
+  const lockPath = join(stateDirectory, "state.lock");
+  const [stored] = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  mkdirSync(lockPath);
+  writeFileSync(join(lockPath, "owner.json"), JSON.stringify({
+    pid: process.pid,
+    token: "reused-pid-owner",
+    processIdentity: "a different process instance",
+  }));
+  const preload = join(fixture.directory, "pid-reuse-timeout.cjs");
+  writeFileSync(preload, `
+const realNow = Date.now;
+let calls = 0;
+Date.now = () => realNow() + (calls++ === 0 ? 0 : 60_000);
+`);
+
+  const dismissed = spawnSync(process.execPath, [localState, "dismiss", stored.id], {
+    cwd: fixture.repository,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${preload}`.trim(),
+    },
+  });
+  assert.equal(dismissed.status, 0, dismissed.stderr);
+  assert.equal(existsSync(lockPath), false);
+  assert.equal(JSON.parse(readFileSync(statePath, "utf8")).findings[0].status, "dismissed");
+});
+
+test("a creator cannot mutate after an ownerless lock is reaped during publication", async (t) => {
+  const fixture = createFixture(t);
+  const head = git(fixture.repository, "rev-parse", "HEAD");
+  const creatorFile = join(fixture.directory, "creator-findings.json");
+  const reaperFile = join(fixture.directory, "reaper-findings.json");
+  const creatorFinding = finding("Creator publication finding", { file: "alpha.txt" });
+  const reaperFinding = finding("Reaper replacement finding", { file: "beta.txt" });
+  writeFileSync(creatorFile, JSON.stringify({ findings: [creatorFinding] }));
+  writeFileSync(reaperFile, JSON.stringify({ findings: [reaperFinding] }));
+
+  const lockPath = join(fixture.repository, ".git", "agentic-review", "state.lock");
+  const ownerPath = join(lockPath, "owner.json");
+  const runsPath = join(fixture.repository, ".git", "agentic-review", "runs");
+  const creatorReady = join(fixture.directory, "creator-ready");
+  const reaperReady = join(fixture.directory, "reaper-ready");
+  const creatorOwnerPublished = join(fixture.directory, "creator-owner-published");
+  const creatorRetried = join(fixture.directory, "creator-retried");
+  const creatorActionStarted = join(fixture.directory, "creator-action-started");
+  const replacementOwnerPublished = join(fixture.directory, "replacement-owner-published");
+  const releaseReplacement = join(fixture.directory, "release-replacement");
+  const creatorPreload = join(fixture.directory, "creator-lock-race.cjs");
+  const reaperPreload = join(fixture.directory, "reaper-lock-race.cjs");
+
+  writeFileSync(creatorPreload, `
+const fs = require("node:fs");
+const { syncBuiltinESMExports } = require("node:module");
+const { resolve } = require("node:path");
+const originalExistsSync = fs.existsSync;
+const originalMkdirSync = fs.mkdirSync;
+const originalRenameSync = fs.renameSync;
+const originalWriteFileSync = fs.writeFileSync;
+const sleeper = new Int32Array(new SharedArrayBuffer(4));
+const samePath = (left, right) => typeof left === "string" && resolve(left) === resolve(right);
+const pendingLockPrefix = resolve(process.env.LOCK_PATH) + ".pending-";
+const isCreatedLock = (path) => (
+  samePath(path, process.env.LOCK_PATH)
+  || (typeof path === "string" && resolve(path).startsWith(pendingLockPrefix))
+);
+const isOwner = (path) => (
+  samePath(path, process.env.OWNER_PATH)
+  || (
+    typeof path === "string"
+    && resolve(path).startsWith(pendingLockPrefix)
+    && resolve(path).endsWith("/owner.json")
+  )
+);
+const waitFor = (path) => {
+  while (!originalExistsSync(path)) Atomics.wait(sleeper, 0, 0, 10);
+};
+let lockMkdirAttempts = 0;
+fs.mkdirSync = (path, ...args) => {
+  if (isCreatedLock(path)) {
+    lockMkdirAttempts += 1;
+    if (lockMkdirAttempts > 1) originalWriteFileSync(process.env.CREATOR_RETRIED, "retried");
+  }
+  const result = originalMkdirSync(path, ...args);
+  if (isCreatedLock(path) && lockMkdirAttempts === 1) {
+    originalWriteFileSync(process.env.CREATOR_READY, "ready");
+    waitFor(process.env.REAPER_READY);
+  }
+  return result;
+};
+fs.existsSync = (path) => {
+  const result = originalExistsSync(path);
+  if (
+    result
+    && samePath(path, process.env.LOCK_PATH)
+    && originalExistsSync(process.env.REPLACEMENT_OWNER_PUBLISHED)
+  ) originalWriteFileSync(process.env.CREATOR_RETRIED, "retried");
+  return result;
+};
+fs.renameSync = (from, to) => {
+  if (
+    samePath(to, process.env.LOCK_PATH)
+    && originalExistsSync(process.env.REPLACEMENT_OWNER_PUBLISHED)
+  ) originalWriteFileSync(process.env.CREATOR_RETRIED, "retried");
+  return originalRenameSync(from, to);
+};
+fs.writeFileSync = (path, ...args) => {
+  const result = originalWriteFileSync(path, ...args);
+  if (isOwner(path) && !originalExistsSync(process.env.CREATOR_OWNER_PUBLISHED)) {
+    originalWriteFileSync(process.env.CREATOR_OWNER_PUBLISHED, "published");
+    waitFor(process.env.REPLACEMENT_OWNER_PUBLISHED);
+  }
+  if (
+    typeof path === "string"
+    && resolve(path).startsWith(resolve(process.env.RUNS_PATH) + "/")
+    && !originalExistsSync(process.env.CREATOR_ACTION_STARTED)
+  ) originalWriteFileSync(process.env.CREATOR_ACTION_STARTED, "started");
+  return result;
+};
+syncBuiltinESMExports();
+`);
+  writeFileSync(reaperPreload, `
+const fs = require("node:fs");
+const { syncBuiltinESMExports } = require("node:module");
+const { resolve } = require("node:path");
+const originalExistsSync = fs.existsSync;
+const originalRenameSync = fs.renameSync;
+const originalRmSync = fs.rmSync;
+const originalWriteFileSync = fs.writeFileSync;
+const sleeper = new Int32Array(new SharedArrayBuffer(4));
+const samePath = (left, right) => typeof left === "string" && resolve(left) === resolve(right);
+const contenderAdvanced = () => (
+  originalExistsSync(process.env.CREATOR_OWNER_PUBLISHED)
+  || originalExistsSync(process.env.CREATOR_RETRIED)
+);
+const holdReplacement = () => {
+  originalWriteFileSync(process.env.REPLACEMENT_OWNER_PUBLISHED, "published");
+  while (!originalExistsSync(process.env.RELEASE_REPLACEMENT)) {
+    Atomics.wait(sleeper, 0, 0, 10);
+  }
+};
+fs.renameSync = (from, to) => {
+  const result = originalRenameSync(from, to);
+  if (
+    samePath(to, process.env.LOCK_PATH)
+    && !originalExistsSync(process.env.REPLACEMENT_OWNER_PUBLISHED)
+  ) {
+    originalWriteFileSync(process.env.REAPER_READY, "ready");
+    holdReplacement();
+  }
+  return result;
+};
+fs.rmSync = (path, ...args) => {
+  if (samePath(path, process.env.LOCK_PATH) && !originalExistsSync(process.env.REAPER_READY)) {
+    originalWriteFileSync(process.env.REAPER_READY, "ready");
+    while (!contenderAdvanced()) Atomics.wait(sleeper, 0, 0, 10);
+  }
+  return originalRmSync(path, ...args);
+};
+fs.writeFileSync = (path, ...args) => {
+  const result = originalWriteFileSync(path, ...args);
+  if (
+    samePath(path, process.env.OWNER_PATH)
+    && originalExistsSync(process.env.REAPER_READY)
+    && !originalExistsSync(process.env.REPLACEMENT_OWNER_PUBLISHED)
+  ) holdReplacement();
+  return result;
+};
+syncBuiltinESMExports();
+`);
+
+  const raceEnv = {
+    ...process.env,
+    LOCK_PATH: lockPath,
+    OWNER_PATH: ownerPath,
+    RUNS_PATH: runsPath,
+    CREATOR_READY: creatorReady,
+    REAPER_READY: reaperReady,
+    CREATOR_OWNER_PUBLISHED: creatorOwnerPublished,
+    CREATOR_RETRIED: creatorRetried,
+    CREATOR_ACTION_STARTED: creatorActionStarted,
+    REPLACEMENT_OWNER_PUBLISHED: replacementOwnerPublished,
+    RELEASE_REPLACEMENT: releaseReplacement,
+  };
+  const creator = spawn(
+    process.execPath,
+    [localState, "record", creatorFile, fixture.baseSha, head, "inconclusive"],
+    {
+      cwd: fixture.repository,
+      env: {
+        ...raceEnv,
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${creatorPreload}`.trim(),
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    },
+  );
+  const creatorDone = once(creator, "close");
+  let creatorError = "";
+  creator.stderr.setEncoding("utf8");
+  creator.stderr.on("data", (chunk) => { creatorError += chunk; });
+  t.after(() => { if (creator.exitCode === null) creator.kill("SIGKILL"); });
+
+  const creatorReadyDeadline = Date.now() + 5_000;
+  while (!existsSync(creatorReady)) {
+    assert.equal(creator.exitCode, null, creatorError);
+    assert.ok(Date.now() < creatorReadyDeadline, "creator did not pause after creating the lock directory");
+    await delay(10);
+  }
+  if (existsSync(lockPath)) utimesSync(lockPath, new Date(0), new Date(0));
+
+  const reaper = spawn(
+    process.execPath,
+    [localState, "record", reaperFile, fixture.baseSha, head, "inconclusive"],
+    {
+      cwd: fixture.repository,
+      env: {
+        ...raceEnv,
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${reaperPreload}`.trim(),
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    },
+  );
+  const reaperDone = once(reaper, "close");
+  let reaperError = "";
+  reaper.stderr.setEncoding("utf8");
+  reaper.stderr.on("data", (chunk) => { reaperError += chunk; });
+  t.after(() => { if (reaper.exitCode === null) reaper.kill("SIGKILL"); });
+
+  const replacementDeadline = Date.now() + 5_000;
+  while (!existsSync(replacementOwnerPublished)) {
+    assert.equal(creator.exitCode, null, creatorError);
+    assert.equal(reaper.exitCode, null, reaperError);
+    assert.ok(Date.now() < replacementDeadline, "reaper did not publish its replacement lock owner");
+    await delay(10);
+  }
+  while (!existsSync(creatorRetried) && !existsSync(creatorActionStarted)) {
+    assert.equal(creator.exitCode, null, creatorError);
+    assert.ok(Date.now() < replacementDeadline, "creator neither retried acquisition nor entered mutation");
+    await delay(10);
+  }
+
+  assert.equal(
+    existsSync(creatorActionStarted),
+    false,
+    "creator must not enter mutation after its lock directory was replaced",
+  );
+  assert.equal(existsSync(creatorRetried), true, "creator must retry acquisition after losing publication");
+  assert.equal(
+    JSON.parse(readFileSync(ownerPath, "utf8")).pid,
+    reaper.pid,
+    "losing creator must not remove the replacement owner's lock",
+  );
+  writeFileSync(releaseReplacement, "release");
+
+  const [[creatorStatus], [reaperStatus]] = await Promise.all([creatorDone, reaperDone]);
+  assert.equal(creatorStatus, 0, creatorError);
+  assert.equal(reaperStatus, 0, reaperError);
+  assert.equal(existsSync(creatorActionStarted), true, "creator must mutate after acquiring a later lock");
+  assert.equal(existsSync(lockPath), false, "both serialized mutations must release the state lock");
+  const titles = JSON.parse(readFileSync(
+    join(fixture.repository, ".git", "agentic-review", "state.json"),
+    "utf8",
+  )).findings.map(({ title }) => title).sort();
+  assert.deepEqual(titles, [creatorFinding.title, reaperFinding.title].sort());
+});
+
+test("ordinary gone findings can reopen after their historical commit is pruned", (t) => {
+  const reported = finding("Reopened branch defect", {
+    file: "alpha.txt",
+    start_line: 1,
+    end_line: 1,
+  });
+  const first = runReview(t, {
+    general: [{ findings: [reported] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    noState: false,
+  });
+  assert.equal(first.result.status, 0, first.result.stderr);
+
+  const statePath = join(first.repository, ".git", "agentic-review", "state.json");
+  const [stored] = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  assert.equal(stored.stagedTarget, false);
+
+  writeFileSync(join(first.repository, "alpha.txt"), "alpha fixed\n");
+  git(first.repository, "add", "alpha.txt");
+  git(first.repository, "commit", "-m", "fix ordinary finding");
+  const fixed = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    existingFixture: first,
+    noState: false,
+  });
+  assert.equal(fixed.result.status, 0, fixed.result.stderr);
+  assert.equal(JSON.parse(readFileSync(statePath, "utf8")).findings[0].status, "gone");
+
+  git(first.repository, "reset", "--hard", first.baseSha);
+  writeFileSync(join(first.repository, "alpha.txt"), "replacement history\n");
+  git(first.repository, "add", "alpha.txt");
+  git(first.repository, "commit", "-m", "replace ordinary history");
+  git(first.repository, "reflog", "expire", "--expire=now", "--all");
+  git(first.repository, "prune", "--expire=now");
+  const unavailableHistory = spawnSync(
+    "git",
+    ["cat-file", "-e", `${stored.lastCommit}^{commit}`],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.notEqual(unavailableHistory.status, 0, "ordinary historical commit must be pruned");
+
+  const reopened = spawnSync(process.execPath, [localState, "reopen", stored.id], {
+    cwd: first.repository,
+    encoding: "utf8",
+  });
+  assert.equal(reopened.status, 0, reopened.stderr);
+  assert.equal(JSON.parse(readFileSync(statePath, "utf8")).findings[0].status, "open");
+  const stagedTarget = spawnSync(
+    "git",
+    ["show-ref", "--verify", "--quiet", `${stagedTargetRefPrefix}${stored.lastCommit}`],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.notEqual(stagedTarget.status, 0, "ordinary history must not gain a staged-target ref");
+});
+
+test("reopening a gone staged finding restores ownership before later pruning", (t) => {
+  const reported = finding("Reopened staged defect", {
+    file: "alpha.txt",
+    start_line: 1,
+    end_line: 1,
+  });
+  const first = runReview(t, {
+    general: [{ findings: [reported] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    staged: true,
+    noState: false,
+  });
+  assert.equal(first.result.status, 0, first.result.stderr);
+
+  const statePath = join(first.repository, ".git", "agentic-review", "state.json");
+  const [stored] = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  assert.equal(stored.stagedTarget, true);
+  const stagedTargetRef = `${stagedTargetRefPrefix}${stored.lastCommit}`;
+  const temporaryRef = "refs/agentic-review/test-reopen-target";
+  git(first.repository, "update-ref", temporaryRef, stored.lastCommit);
+
+  writeFileSync(join(first.repository, "alpha.txt"), "alpha fixed\n");
+  git(first.repository, "add", "alpha.txt");
+  const fixed = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    existingFixture: first,
+    staged: true,
+    noState: false,
+  });
+  assert.equal(fixed.result.status, 0, fixed.result.stderr);
+
+  const [gone] = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  assert.equal(gone.status, "gone");
+  assert.equal(gone.stagedTarget, true);
+  assert.equal(git(first.repository, "rev-parse", temporaryRef), stored.lastCommit);
+  const released = spawnSync(
+    "git",
+    ["show-ref", "--verify", "--quiet", stagedTargetRef],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.notEqual(released.status, 0, "gone staged finding must release its private ref");
+
+  const reopened = spawnSync(process.execPath, [localState, "reopen", stored.id], {
+    cwd: first.repository,
+    encoding: "utf8",
+  });
+  assert.equal(reopened.status, 0, reopened.stderr);
+  assert.equal(JSON.parse(readFileSync(statePath, "utf8")).findings[0].status, "open");
+  assert.equal(git(first.repository, "rev-parse", stagedTargetRef), stored.lastCommit);
+
+  git(first.repository, "update-ref", "-d", temporaryRef);
+  git(first.repository, "reflog", "expire", "--expire=now", "--all");
+  git(first.repository, "prune", "--expire=now");
+  const retainedTarget = spawnSync(
+    "git",
+    ["cat-file", "-e", `${stored.lastCommit}^{commit}`],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.equal(retainedTarget.status, 0, "reopened staged target must survive Git pruning");
+});
+
+test("unavailable staged targets block reopen atomically but not dismissal", (t) => {
+  const reported = finding("Unavailable staged defect", {
+    file: "alpha.txt",
+    start_line: 1,
+    end_line: 1,
+  });
+  const first = runReview(t, {
+    general: [{ findings: [reported] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    staged: true,
+    noState: false,
+  });
+  assert.equal(first.result.status, 0, first.result.stderr);
+
+  const statePath = join(first.repository, ".git", "agentic-review", "state.json");
+  const [stored] = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  assert.equal(stored.stagedTarget, true);
+  const stagedTargetRef = `${stagedTargetRefPrefix}${stored.lastCommit}`;
+
+  writeFileSync(join(first.repository, "alpha.txt"), "alpha fixed\n");
+  git(first.repository, "add", "alpha.txt");
+  const fixed = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    existingFixture: first,
+    staged: true,
+    noState: false,
+  });
+  assert.equal(fixed.result.status, 0, fixed.result.stderr);
+  assert.equal(JSON.parse(readFileSync(statePath, "utf8")).findings[0].status, "gone");
+  assert.equal(JSON.parse(readFileSync(statePath, "utf8")).findings[0].stagedTarget, true);
+  const released = spawnSync(
+    "git",
+    ["show-ref", "--verify", "--quiet", stagedTargetRef],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.notEqual(released.status, 0, "gone staged finding must release its private ref");
+
+  git(first.repository, "reflog", "expire", "--expire=now", "--all");
+  git(first.repository, "prune", "--expire=now");
+  const unavailableTarget = spawnSync(
+    "git",
+    ["cat-file", "-e", `${stored.lastCommit}^{commit}`],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.notEqual(unavailableTarget.status, 0, "pruning must make the released target unavailable");
+  const goneState = readFileSync(statePath, "utf8");
+
+  const reopened = spawnSync(process.execPath, [localState, "reopen", stored.id], {
+    cwd: first.repository,
+    encoding: "utf8",
+  });
+  assert.notEqual(reopened.status, 0, "reopen must fail when its target cannot be retained");
+  assert.equal(readFileSync(statePath, "utf8"), goneState);
+  const lockPath = join(first.repository, ".git", "agentic-review", "state.lock");
+  assert.equal(existsSync(lockPath), false, "failed mutations must release the state lock");
+  const exitedOwner = spawnSync(process.execPath, ["-e", ""]);
+  assert.equal(exitedOwner.status, 0);
+  mkdirSync(lockPath);
+  writeFileSync(
+    join(lockPath, "owner.json"),
+    JSON.stringify({ pid: exitedOwner.pid, token: "exited-test-owner" }),
+  );
+
+  const dismissed = spawnSync(process.execPath, [localState, "dismiss", stored.id], {
+    cwd: first.repository,
+    encoding: "utf8",
+  });
+  assert.equal(dismissed.status, 0, dismissed.stderr);
+  assert.equal(existsSync(lockPath), false, "the next mutation must reclaim the stale state lock");
+  assert.equal(JSON.parse(readFileSync(statePath, "utf8")).findings[0].status, "dismissed");
+  const retained = spawnSync(
+    "git",
+    ["show-ref", "--verify", "--quiet", stagedTargetRef],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.notEqual(retained.status, 0, "dismissing a gone finding must not retain its target");
+});
+
+test("multi-ID reopen validates every gone staged target before mutating state or refs", (t) => {
+  const reachableFinding = finding("Reachable staged defect", {
+    file: "alpha.txt",
+    start_line: 1,
+    end_line: 1,
+  });
+  const first = runReview(t, {
+    general: [{ findings: [reachableFinding] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    staged: true,
+    noState: false,
+  });
+  assert.equal(first.result.status, 0, first.result.stderr);
+
+  const statePath = join(first.repository, ".git", "agentic-review", "state.json");
+  const reachableTarget = first.metadata.head_sha;
+  const temporaryRef = "refs/agentic-review/test-multi-reopen-target";
+  git(first.repository, "update-ref", temporaryRef, reachableTarget);
+
+  writeFileSync(join(first.repository, "alpha.txt"), "alpha fixed\n");
+  writeFileSync(join(first.repository, "beta.txt"), "beta second defect\n");
+  git(first.repository, "add", "alpha.txt", "beta.txt");
+  const prunedFinding = finding("Pruned staged defect", {
+    file: "beta.txt",
+    start_line: 1,
+    end_line: 1,
+  });
+  const second = runReview(t, {
+    general: [{ findings: [prunedFinding] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    existingFixture: first,
+    staged: true,
+    noState: false,
+  });
+  assert.equal(second.result.status, 0, second.result.stderr);
+  const prunedTarget = second.metadata.head_sha;
+  assert.notEqual(prunedTarget, reachableTarget);
+
+  writeFileSync(join(first.repository, "beta.txt"), "beta fixed\n");
+  git(first.repository, "add", "beta.txt");
+  const retired = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    existingFixture: first,
+    staged: true,
+    noState: false,
+  });
+  assert.equal(retired.result.status, 0, retired.result.stderr);
+
+  const goneFindings = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  const reachable = goneFindings.find(({ title }) => title === reachableFinding.title);
+  const pruned = goneFindings.find(({ title }) => title === prunedFinding.title);
+  assert.equal(reachable.status, "gone");
+  assert.equal(reachable.stagedTarget, true);
+  assert.equal(reachable.lastCommit, reachableTarget);
+  assert.equal(pruned.status, "gone");
+  assert.equal(pruned.stagedTarget, true);
+  assert.equal(pruned.lastCommit, prunedTarget);
+
+  git(first.repository, "reflog", "expire", "--expire=now", "--all");
+  git(first.repository, "prune", "--expire=now");
+  const reachableObject = spawnSync(
+    "git",
+    ["cat-file", "-e", `${reachableTarget}^{commit}`],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.equal(reachableObject.status, 0, "the first target must remain available for partial mutation");
+  const unavailableObject = spawnSync(
+    "git",
+    ["cat-file", "-e", `${prunedTarget}^{commit}`],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.notEqual(unavailableObject.status, 0, "the later target must be pruned");
+
+  const stateBefore = readFileSync(statePath);
+  const refsBefore = git(
+    first.repository,
+    "for-each-ref",
+    "--format=%(refname) %(objectname)",
+    stagedTargetRefPrefix,
+  );
+  const reopened = spawnSync(
+    process.execPath,
+    [localState, "reopen", reachable.id, pruned.id],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+
+  assert.notEqual(reopened.status, 0, "one unavailable target must fail the whole reopen");
+  assert.deepEqual(readFileSync(statePath), stateBefore);
+  assert.equal(git(
+    first.repository,
+    "for-each-ref",
+    "--format=%(refname) %(objectname)",
+    stagedTargetRefPrefix,
+  ), refsBefore);
+});
+
 test("legacy live-checkout fallback is explicitly mutable and inconclusive", (t) => {
   const run = runReview(t, {
     general: [{ findings: [] }],
@@ -1517,7 +4037,9 @@ test("legacy live-checkout fallback is explicitly mutable and inconclusive", (t)
   assert.ok(run.logs.every(({ cwd }) => cwd === run.repository));
   assert.equal(run.metadata.snapshot_immutable, false);
   assert.equal(run.metadata.analysis_state, "inconclusive");
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  assert.equal(run.metadata.coverage, "unknown");
+  assert.deepEqual(run.metadata.remaining_analysis, ["snapshot_mutable"]);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
 });
 
 test("codegraph context comes only from the pinned review snapshot", (t) => {
@@ -1777,13 +4299,13 @@ test("legacy relative project data and local state remain available unless expli
     args: ["--prompt", "project-prompt.md", "--json"],
     targetFiles: { "project-prompt.md": "PROJECT_PROMPT_MARKER\\n" },
     noState: false,
-    metadataViaEnv: true,
+    publicationViaEnv: true,
   });
 
   assert.equal(run.result.status, 0, run.result.stderr);
   assert.ok(run.logs.every(({ prompt }) => prompt.includes("PROJECT_PROMPT_MARKER")));
   assert.ok(existsSync(join(run.repository, ".git", "agentic-review", "state.json")));
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
 });
 
 test("configuration fingerprint is shared before passes and excludes credentials", (t) => {
@@ -1855,12 +4377,16 @@ test("min-votes filtering cannot hide one-pass blocking evidence or report conve
   assert.equal(run.result.status, 0, run.result.stderr);
   assert.deepEqual(run.findings.findings.map(({ title }) => title), [blocker.title]);
   assert.equal(run.metadata.analysis_state, "inconclusive");
+  assert.equal(run.metadata.min_votes, 2);
+  assert.equal(run.metadata.merge_succeeded, true);
+  assert.deepEqual(run.metadata.remaining_analysis, ["vote_threshold_applied"]);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
   const rendered = spawnSync(process.execPath, [poster], {
     encoding: "utf8",
     env: {
       ...process.env,
-      FINDINGS_FILE: run.findingsFile,
-      REVIEW_METADATA_FILE: run.metadataFile,
+      HEAD_SHA: run.headSha,
+      REVIEW_PUBLICATION_FILE: run.publicationFile,
       RENDER: "1",
       REVIEW_MODE: "inline",
       FAIL_ON_FINDINGS: "true",
@@ -1870,6 +4396,9 @@ test("min-votes filtering cannot hide one-pass blocking evidence or report conve
   assert.match(rendered.stdout, /\| Analysis \| `inconclusive` \|/);
   assert.match(rendered.stdout, /\| Merge gate \| `blocked` \|/);
   assert.match(rendered.stdout, /\| Bounded convergence \| `no` \|/);
+  assert.match(rendered.stdout, /\| Coverage \| `unknown` \|/);
+  assert.match(rendered.stdout, /\| Remaining analysis \| `\["vote_threshold_applied"\]` \|/);
+  assert.match(rendered.stdout, /\| Converged \| `false` \|/);
   assert.match(rendered.stdout, /Single-pass blocker/);
 });
 
@@ -1887,5 +4416,7 @@ test("merge failure preserves a structured valid-pass artifact but is never comp
   assert.deepEqual(run.findings.findings.map(({ title }) => title), [general.title]);
   assert.equal(run.metadata.analysis_state, "inconclusive");
   assert.equal(run.metadata.merge_succeeded, false);
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  assert.equal(run.metadata.coverage, "unknown");
+  assert.deepEqual(run.metadata.remaining_analysis, ["merge_failed"]);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
 });

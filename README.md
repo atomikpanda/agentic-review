@@ -73,19 +73,28 @@ export OPENROUTER_API_KEY=sk-or-v1-yourkeyhere   # or see OPENROUTER_API_KEY_FIL
 ./scripts/run-review.sh --staged                 # only what's staged
 ./scripts/run-review.sh --review-mode suggest    # with the fixes it would offer
 ./scripts/run-review.sh --json | jq '.findings[].file'
-./scripts/run-review.sh --out review.json --metadata-out review-meta.json
+./scripts/run-review.sh --out review.json --publication-out review-publication.json
 ./scripts/run-review.sh --no-state               # leave local history unchanged
 ```
 
-`--out FILE` atomically writes the validated structured findings result.
+`--out FILE` atomically writes a validated structured findings document for
+people and local tooling. It is not an authoritative input to the poster.
 Normally it is the union of every valid pass. If union fails, the runner
-preserves the first valid structured pass and marks the separate schema-v1
-metadata inconclusive rather than presenting the fallback as merged.
-`--metadata-out FILE` writes that bounded-run metadata: immutable base and head
-SHAs, the configuration fingerprint, diff and cap status, requested/completed
-pass identifiers, per-pass status, and `analysis_state`. Both outputs reject a
-symlink destination before model work, and the paths must resolve to different
-destinations. `--no-state` still reads existing history for the
+preserves the first valid structured pass and marks the publication metadata
+inconclusive rather than presenting the fallback as merged.
+`--publication-out FILE` atomically writes the authoritative schema-v2
+publication: the merged findings, bounded-run metadata, and exact raw-byte
+review scope in one object. The poster reads findings and run evidence only
+from this publication, so concurrent runners sharing fixed output paths cannot
+pair findings, metadata, or scope from different runs. The metadata includes
+immutable base and head SHAs, the configuration fingerprint and configured vote
+threshold, diff and cap status, requested/completed pass identifiers, per-pass
+status, merge success, and `analysis_state`. Both outputs reject a symlink
+destination before model work, and the paths must resolve to different
+destinations. Publication staging lives only inside the run's private temporary
+directory and is atomically renamed onto the checked destination; predictable
+destination-adjacent temp files are never opened. `--no-state` still reads
+existing history for the
 rendered state and exit status but never mutates it. Advanced local experiments
 can change the ensemble with `--passes N`, `--lenses a,b,c`, and
 `--min-votes N`; pass/lens changes appear in the metadata identifiers, and all
@@ -126,7 +135,7 @@ human reviewer, not a wall of prose at the bottom of the PR.
 |---|---|
 | `suggest` (default) | Inline comments anchored to the offending lines, each with a ready-to-commit fix where the agent could produce a complete one |
 | `inline` | The same inline comments, explanation only, no fixes |
-| `summary` | One standing issue comment rendered from the structured findings result and metadata — no line anchoring |
+| `summary` | One bot-authored pull-request review body rendered from the structured findings result and metadata — no line anchoring |
 
 This is a different mechanism, not a different format. A suggestion has to be
 an inline review comment attached to a line range **inside the pull request's
@@ -160,7 +169,7 @@ Every valid pass contributes to one union with `min_votes=1`, so a finding seen
 by only one pass survives. One result is rendered or posted: the union, or an
 explicitly inconclusive first-valid structured fallback if union fails.
 
-The result separates four operator-visible values:
+The result separates four primary operator-visible values:
 
 | Output | Values | Meaning |
 |---|---|---|
@@ -168,6 +177,33 @@ The result separates four operator-visible values:
 | `merge_state` | `ready`, `blocked` | Whether any current or held finding has a severity in `block_severities` |
 | `sample_state` | `clean`, `findings`, `unknown` | Whether actionable evidence remains; `clean` additionally requires complete analysis and known reconciliation |
 | `bounded_converged` | `true`, `false` | `true` exactly when `analysis_state=complete` **and** `sample_state=clean` |
+
+The additive final-result contract also exposes:
+
+- `reviewed_head`, which is exactly `head_sha`;
+- `scope_hash`, the SHA-256 of canonical JSON
+  `{base_sha, configuration_fingerprint, diff_base64, head_sha}`, where
+  `diff_base64` is strict canonical base64 of the exact raw full-diff bytes;
+- `coverage`, which is `bounded` only when the configured execution completed
+  against its immutable snapshot, and otherwise `unknown`;
+- `remaining_analysis`, a JSON reason-code array; and
+- `converged`, an exact alias of `bounded_converged`.
+
+A successful configured execution using the default union policy has
+`remaining_analysis=[]`. Otherwise reason codes appear once in this
+deterministic order:
+
+| Reason code | Meaning |
+|---|---|
+| `diff_truncated` | The configured diff byte limit omitted part of the diff |
+| `finding_cap_reached` | At least one pass reached its finding cap |
+| `pass_failed` | A configured pass did not return valid structured output |
+| `snapshot_mutable` | The reviewed snapshot was not immutable |
+| `pass_scope_mismatch` | Passes did not share the same base, head, or configuration |
+| `vote_threshold_applied` | A configured vote threshold above one deliberately keeps analysis inconclusive |
+| `merge_failed` | Valid pass results could not be merged |
+| `reconciliation_unknown` | Prior finding state could not be reconciled safely |
+| `execution_failed` | Hosted execution or final-result construction failed |
 
 In short, `complete` qualifies execution, `ready` applies the configured
 severity policy, `clean` describes the reconciled bounded sample, and bounded
@@ -181,29 +217,46 @@ reconciled evidence contain no actionable finding; it does not claim exhaustive
 repository coverage.
 
 A mutable snapshot, failed pass after its retry, base/head/configuration
-mismatch, truncated diff, findings cap, or failed union makes analysis
-`inconclusive`. Known findings still produce `sample_state=findings`; no known
-finding produces `sample_state=unknown`, never `clean`. None of those runs can
-set `bounded_converged=true`.
+mismatch, truncated diff, findings cap, vote threshold above one, or failed
+merge makes analysis `inconclusive`. Known findings still produce
+`sample_state=findings`; no known finding produces `sample_state=unknown`, never
+`clean`. None of those runs can set `bounded_converged=true`.
 
 `fail_on_findings: true` fails the hosted job only when
 `merge_state=blocked`. Without it, job success means execution succeeded, not
 that the sample was clean or converged.
 
+Hard execution failures still run the hosted poster. Missing or invalid review
+artifacts are never posted to the pull request and produce a conservative
+zero-count final result. If the poster crashes after the runner atomically
+published a valid schema-v2 publication for the target head, the fallback keeps
+that publication's finding counts, blocking severity, immutable review identity,
+and scope while forcing `analysis_state=inconclusive`, `coverage=unknown`, both
+convergence fields `false`, and `remaining_analysis` retaining every runner
+reason followed by `reconciliation_unknown` and `execution_failed` in canonical
+order. The step exits nonzero so an earlier failure cannot be
+hidden.
+
 The reusable workflow exposes these exact outputs:
 
 | Output | Content |
 |---|---|
-| `analysis_state`, `merge_state`, `sample_state`, `bounded_converged` | The four result values above |
+| `analysis_state`, `merge_state`, `sample_state`, `bounded_converged` | The four primary result values above |
+| `reviewed_head`, `scope_hash`, `coverage`, `remaining_analysis`, `converged` | Immutable reviewed head and scope plus bounded coverage, outstanding reason codes, and the convergence alias |
 | `base_sha`, `head_sha`, `configuration_fingerprint` | The immutable review identity |
 | `passes_requested`, `passes_completed` | Counts of configured and valid passes |
 | `current_counts`, `unresolved_counts` | JSON severity maps for current and held findings |
 
 The same values appear in the review body and GitHub job summary. The hosted
-`agentic-review` artifact retains the structured findings result (`review.md`),
-bounded-run metadata (`review-meta.json`), and runner stdout and stderr for
-seven days. Locally, `--out` and `--metadata-out` write the first two artifacts
-directly.
+`agentic-review` artifact always retains the required final result
+(`review-result.json`) for seven days. When available, the separate
+`agentic-review-diagnostics` artifact retains the human-readable structured
+findings (`review.md`), the authoritative atomic findings-metadata-scope
+publication (`review-publication.json`), and runner stdout and stderr. Missing
+optional diagnostics never prevent upload of the final result. The poster writes
+that result at `/tmp/review-result.json` before artifact upload. Locally, `--out`
+and `--publication-out` write the human-readable findings and authoritative
+publication artifacts directly.
 
 ### Standing summaries and finding history
 
@@ -211,27 +264,33 @@ Summary mode does not ask the model for Markdown. It deterministically renders
 the same structured findings result and metadata used by inline and suggest
 modes.
 
-When findings exist, summary mode maintains one bot-authored standing issue
-comment with an embedded state marker and edits it on later runs instead of
-appending another. A no-findings run creates no empty comment, but updates an
-existing standing comment when prior findings can be retired. Deleting that
-comment explicitly resets summary-mode history.
+When findings exist, summary mode appends a bot-authored pull-request review
+body with an embedded state marker. Later runs read the newest marked review and
+append its replacement state; a no-findings run creates no empty review unless
+prior summary state must be retired. This transport uses the same
+`pull-requests: write` permission as inline and suggest mode, so existing caller
+workflows do not need `issues` permission.
 
-Because the standing summary is an issue comment, it has no per-finding GitHub
+For migration, marked legacy issue comments are read opportunistically and
+compete by timestamp with marked review bodies. Missing issue-comment permission
+does not make reconciliation unknown and never suppresses current review writes.
+Pull-request review history remains authoritative; if it cannot be read,
+reconciliation is unknown. Summary bodies have no per-finding GitHub
 resolved-thread signal; use `inline` or `suggest` when that signal is required.
 
 A prior finding omitted by a later stochastic sample remains held while the run
 is inconclusive or its original span is unchanged or indeterminate, and still
 affects `merge_state`/`sample_state`. It is retired only when a complete run
 confirms that span changed. Suppressed-write runs read and reconcile the standing
-state for outputs and gating but do not edit it. If identity lookup or
-reconciliation fails, the comment is left untouched and the result cannot be
+state for outputs and gating but do not append a review. If identity lookup,
+pull-request review history, or reconciliation fails, summary-derived
+dismissals are not applied, the state is not changed, and the result cannot be
 clean or converged.
 
 Only the currently authenticated **Bot** identity can own standing state. A
 human user's manual PAT or an unrecognized viewer makes identity unknown; the
 poster emits conservative outputs and gate state but suppresses every PR write.
-It neither trusts nor edits a marker in a human or attacker-authored comment.
+It never trusts a marker in a human or attacker-authored review or comment.
 
 Inline and suggest modes use bot-authored fingerprinted threads. A recurring
 finding stays silent while its thread is open and is not repeated in a new

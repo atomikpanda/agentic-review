@@ -30,8 +30,9 @@
 #   --review-mode M     summary|inline|suggest        $AGENTIC_REVIEW_MODE
 #                       suggest prints the fixes it would offer on a PR
 #   --omp-version V     npm version or dist-tag       $AGENTIC_REVIEW_OMP_VERSION
-#   --out FILE          write the review here
-#   --metadata-out FILE write bounded-run metadata here $AGENTIC_REVIEW_METADATA_OUT
+#   --out FILE          write a human-readable findings document here
+#   --publication-out FILE atomically write findings, metadata, and reviewed scope here
+#                                                     $AGENTIC_REVIEW_PUBLICATION_OUT
 #   --no-state          do not update local review history
 #   --open              list findings still open from previous runs
 #   --all               list every tracked finding, including dismissed
@@ -97,7 +98,7 @@ PASSES="${AGENTIC_REVIEW_PASSES:-1}"
 # The bounded default is one general review plus two additive specialist passes.
 LENSES="${AGENTIC_REVIEW_LENSES:-correctness,boundaries}"
 MIN_VOTES="${AGENTIC_REVIEW_MIN_VOTES:-1}"
-METADATA_OUT="${AGENTIC_REVIEW_METADATA_OUT:-}"
+PUBLICATION_OUT="${AGENTIC_REVIEW_PUBLICATION_OUT:-}"
 TRUSTED_DATA_ROOT="${AGENTIC_REVIEW_TRUSTED_DATA_ROOT:-}"
 STAGED=0; OUT=""; FAIL_ON_FINDINGS=1; AS_JSON=0; USE_CODEGRAPH=1; VIEW=""; TRUST_REPO="${TRUST_REPO:-0}"; RECORD_STATE=1
 PASSTHRU=()
@@ -118,7 +119,7 @@ while [ $# -gt 0 ]; do
     --min-votes)    MIN_VOTES="${2:-}"; shift 2 ;;
     --omp-version)  OMP_VERSION="${2:-}"; shift 2 ;;
     --out)          OUT="${2:-}"; shift 2 ;;
-    --metadata-out) METADATA_OUT="${2:-}"; shift 2 ;;
+    --publication-out) PUBLICATION_OUT="${2:-}"; shift 2 ;;
     --staged)       STAGED=1; shift ;;
     --no-fail)      FAIL_ON_FINDINGS=0; shift ;;
     --no-codegraph) USE_CODEGRAPH=0; shift ;;
@@ -261,16 +262,20 @@ destination_identity() {
 if [ -n "$OUT" ] && [ -L "$OUT" ]; then
   die "--out cannot be a symlink destination"
 fi
-if [ -n "$METADATA_OUT" ] && [ -L "$METADATA_OUT" ]; then
-  die "--metadata-out cannot be a symlink destination"
+if [ -n "$PUBLICATION_OUT" ] && [ -L "$PUBLICATION_OUT" ]; then
+  die "--publication-out cannot be a symlink destination"
 fi
 
-if [ -n "$OUT" ] && [ -n "$METADATA_OUT" ]; then
+if [ -n "$OUT" ]; then
   OUT_IDENTITY="$(destination_identity "$OUT")"
-  METADATA_IDENTITY="$(destination_identity "$METADATA_OUT")"
-  if [ "$OUT_IDENTITY" = "$METADATA_IDENTITY" ]; then
-    die "--out and --metadata-out resolve to the same destination"
-  fi
+fi
+if [ -n "$PUBLICATION_OUT" ]; then
+  PUBLICATION_IDENTITY="$(destination_identity "$PUBLICATION_OUT")"
+fi
+
+if [ -n "$OUT" ] && [ -n "$PUBLICATION_OUT" ] \
+   && [ "$OUT_IDENTITY" = "$PUBLICATION_IDENTITY" ]; then
+  die "--out and --publication-out resolve to the same destination"
 fi
 
 step "Checking prerequisites"
@@ -382,12 +387,14 @@ cleanup_worktree() {
 trap cleanup_worktree EXIT
 
 step "Working out what changed"
+STAGED_TARGET_SHA=""
 if [ "$STAGED" = 1 ]; then
   # Capture the parent and index tree once, then represent that exact pair as a
   # dangling commit. Later restaging cannot change the review target.
   SOURCE_BASE_SHA="$(git rev-parse --verify 'HEAD^{commit}')"
   SOURCE_INDEX_TREE="$(git write-tree)"
-  SOURCE_TARGET_SHA="$(git commit-tree "$SOURCE_INDEX_TREE" -p "$SOURCE_BASE_SHA" -m 'agentic-review: staged state')"
+  SOURCE_TARGET_SHA="$(GIT_AUTHOR_NAME=agentic-review GIT_AUTHOR_EMAIL=agentic-review@localhost GIT_COMMITTER_NAME=agentic-review GIT_COMMITTER_EMAIL=agentic-review@localhost git commit-tree "$SOURCE_INDEX_TREE" -p "$SOURCE_BASE_SHA" -m 'agentic-review: staged state')"
+  STAGED_TARGET_SHA="$SOURCE_TARGET_SHA"
   RANGE="--staged"
   INTENT=""
 else
@@ -407,10 +414,12 @@ else
   RANGE="$BASE"
 fi
 
-git diff --quiet "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" \
+git diff --no-ext-diff --no-textconv --quiet "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" \
   && die "$([ "$STAGED" = 1 ] && printf 'nothing staged' || printf 'no changes vs %s' "$BASE")"
-DIFFSTAT="$(git diff --stat "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA")"
-DIFFTEXT="$(git diff --no-color "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA")"
+DIFFSTAT="$(git diff --no-ext-diff --no-textconv --stat "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA")"
+DIFFTEXT="$(git diff --no-ext-diff --no-textconv --no-color "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" && printf x)" \
+  || die "could not render canonical diff"
+DIFFTEXT="${DIFFTEXT%x}"
 ok "reviewing against $RANGE"
 printf '%s\n' "$DIFFSTAT" | sed 's/^/    /' >&2
 SOURCE_CODEGRAPH_OPT_IN=0
@@ -456,7 +465,8 @@ fi
 ordered_diff() {
   local pass="$1" rotation
   if [ "$pass" -le 1 ] || [ "$TRUNCATED" = 1 ] || [ "$CHANGED_PATH_COUNT" -le 1 ]; then
-    printf '%s\n' "$DIFFTEXT"
+    printf '%s' "$DIFFTEXT"
+    case "$DIFFTEXT" in *$'\n') ;; *) printf '\n' ;; esac
     return 0
   fi
   rotation=$(( (pass - 1) % CHANGED_PATH_COUNT ))
@@ -475,7 +485,7 @@ ordered_diff() {
     process.stdout.write(Buffer.concat(rotated.flatMap((path) => [path, Buffer.from([0])])));
   ' "$CHANGED_PATHS_FILE" "$rotation" \
   | while IFS= read -r -d '' path; do
-      git --literal-pathspecs diff --no-color "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" -- "$path"
+      git --literal-pathspecs diff --no-ext-diff --no-textconv --no-color "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" -- "$path"
     done
 }
 
@@ -541,7 +551,7 @@ if [ "$SOURCE_CODEGRAPH_OPT_IN" = 1 ] && [ "$SNAPSHOT_IMMUTABLE" = 1 ] \
   fi
 fi
 CHANGED_PATHS_FILE="$RUN_TMP/changed-paths"
-git diff --name-only -z "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" > "$CHANGED_PATHS_FILE"
+git diff --no-ext-diff --no-textconv --name-only -z "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" > "$CHANGED_PATHS_FILE"
 CHANGED_PATH_COUNT="$(node -e '
   const fs = require("node:fs");
   const bytes = fs.readFileSync(process.argv[1]);
@@ -562,7 +572,6 @@ if [ "$MAX_DIFF_BYTES" != "0" ] && [ "$DIFF_BYTES" -gt "$MAX_DIFF_BYTES" ]; then
   TRUNCATED=1
 fi
 printf '%s' "$DIFFTEXT" > "$RUN_TMP/diff.included"
-INCLUDED_DIFF_BYTES="$(wc -c < "$RUN_TMP/diff.included" | tr -d ' ')"
 
 BASE_SHA="$SOURCE_BASE_SHA"
 HEAD_SHA="$SOURCE_TARGET_SHA"
@@ -626,7 +635,7 @@ prepare_skill() {
   done
   if [ "$select" = 1 ] && [ -s "$destination" ] \
      && SEL="$(support_exec scripts/select-skills.mjs)"; then
-    changed="$(git diff --name-only "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA")"
+    changed="$(git diff --no-ext-diff --no-textconv --name-only "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA")"
     selected="${destination}.selected"
     if CHANGED_FILES="$changed" SKILL_FILES="$destination" node "$SEL" > "$selected" 2>"${destination}.log" \
        && [ -s "$selected" ]; then
@@ -749,6 +758,22 @@ PROMPT_FILE="$PROMPT_FILE" FORMAT_FILE="$FORMAT_FILE" node -e '
 ' "$CONFIG_FILE" "$RUN_TMP" "${PASSTHRU[@]+"${PASSTHRU[@]}"}"
 CONFIGURATION_FINGERPRINT="$(node "$RESULT_HELPER" fingerprint "$CONFIG_FILE")" \
   || die "could not fingerprint review configuration"
+SCOPE_FILE="$RUN_TMP/scope.json"
+BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" \
+CONFIGURATION_FINGERPRINT="$CONFIGURATION_FINGERPRINT" node -e '
+  const fs = require("node:fs");
+  const fullDiff = fs.readFileSync(process.argv[1]);
+  fs.writeFileSync(process.argv[3], JSON.stringify({
+    base_sha: process.env.BASE_SHA,
+    bytes: fullDiff.length,
+    configuration_fingerprint: process.env.CONFIGURATION_FINGERPRINT,
+    diff_base64: fullDiff.toString("base64"),
+    head_sha: process.env.HEAD_SHA,
+    included_bytes: fs.statSync(process.argv[2]).size,
+  }));
+' "$RUN_TMP/diff.full" "$RUN_TMP/diff.included" "$SCOPE_FILE"
+node "$RESULT_HELPER" scope "$SCOPE_FILE" >/dev/null \
+  || die "could not validate review scope"
 
 step "Reviewing with $MODEL"
 say "read-only tools: $TOOLS${THINKING:+ | thinking: $THINKING} | passes: ${#PASS_IDS[@]}"
@@ -813,8 +838,9 @@ for ((i = 0; i < ${#PASS_IDS[@]}; i++)); do
   fi
 done
 
-write_metadata() {
-  local merge_succeeded="$1" records="$RUN_TMP/pass-records" raw="$RUN_TMP/metadata.raw.json"
+TMP_OUT="$RUN_TMP/merged.json"
+write_publication() {
+  local merge_succeeded="$1" execution_failed="${2:-0}" records="$RUN_TMP/pass-records"
   : > "$records"
   for ((j = 0; j < ${#PASS_IDS[@]}; j++)); do
     printf '%s\t%s\t%s\t%s\t%s\n' \
@@ -822,10 +848,20 @@ write_metadata() {
       "${PASS_COUNTS[j]}" "${PASS_CAPPED[j]}" >> "$records"
   done
   BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" CONFIGURATION_FINGERPRINT="$CONFIGURATION_FINGERPRINT" \
-  SNAPSHOT_IMMUTABLE="$SNAPSHOT_IMMUTABLE" DIFF_BYTES="$DIFF_BYTES" \
-  INCLUDED_DIFF_BYTES="$INCLUDED_DIFF_BYTES" TRUNCATED="$TRUNCATED" \
-  MAX_FINDINGS="$MAX_FINDINGS" MERGE_SUCCEEDED="$merge_succeeded" node -e '
-    const fs = require("node:fs");
+  SNAPSHOT_IMMUTABLE="$SNAPSHOT_IMMUTABLE" \
+  MAX_FINDINGS="$MAX_FINDINGS" MIN_VOTES="$MIN_VOTES" \
+  MERGE_SUCCEEDED="$merge_succeeded" EXECUTION_FAILED="$execution_failed" \
+  node --input-type=module -e '
+    import fs from "node:fs";
+    import { pathToFileURL } from "node:url";
+
+    const {
+      createReviewPublication,
+      deriveTrustedScopeMetadata,
+      enrichRunMetadata,
+    } = await import(pathToFileURL(process.argv[3]).href);
+    const trustedScope = JSON.parse(fs.readFileSync(process.argv[4], "utf8"));
+    const trustedMetadata = deriveTrustedScopeMetadata(trustedScope);
     const results = fs.readFileSync(process.argv[1], "utf8").trimEnd().split("\n").filter(Boolean)
       .map((line) => {
         const [id, status, attempts, finding_count, capped] = line.split("\t");
@@ -840,56 +876,78 @@ write_metadata() {
           configuration_fingerprint: process.env.CONFIGURATION_FINGERPRINT,
         };
       });
-    const metadata = {
+    const run = {
       schema_version: 1,
       base_sha: process.env.BASE_SHA,
       head_sha: process.env.HEAD_SHA,
       configuration_fingerprint: process.env.CONFIGURATION_FINGERPRINT,
       snapshot_immutable: process.env.SNAPSHOT_IMMUTABLE === "1",
-      analysis_state: "inconclusive",
-      diff: {
-        bytes: Number(process.env.DIFF_BYTES),
-        included_bytes: Number(process.env.INCLUDED_DIFF_BYTES),
-        truncated: process.env.TRUNCATED === "1",
-      },
+      diff: trustedMetadata.diff,
       finding_cap: Number(process.env.MAX_FINDINGS),
+      min_votes: Number(process.env.MIN_VOTES),
       passes: {
         requested: results.map(({ id }) => id),
         completed: results.filter(({ status }) => status === "valid").map(({ id }) => id),
         results,
       },
     };
-    if (process.env.MERGE_SUCCEEDED === "false") metadata.merge_succeeded = false;
-    fs.writeFileSync(process.argv[2], JSON.stringify(metadata));
-  ' "$records" "$raw"
-  ANALYSIS_STATE="$(node "$RESULT_HELPER" analysis "$raw")" \
-    || die "could not derive review analysis state"
-  ANALYSIS_STATE="$ANALYSIS_STATE" node -e '
-    const fs = require("node:fs");
-    const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-    value.analysis_state = process.env.ANALYSIS_STATE;
-    fs.writeFileSync(process.argv[2], JSON.stringify(value, null, 2));
-  ' "$raw" "$RUN_TMP/metadata.json"
-  node "$RESULT_HELPER" validate "$RUN_TMP/metadata.json" >/dev/null \
-    || die "generated review metadata failed validation"
-  if [ -n "$METADATA_OUT" ]; then
-    metadata_tmp="${METADATA_OUT}.tmp.$$"
-    cp "$RUN_TMP/metadata.json" "$metadata_tmp" || die "could not write metadata beside $METADATA_OUT"
-    if ! node "$RESULT_HELPER" validate "$metadata_tmp" >/dev/null; then
-      rm -f "$metadata_tmp"
-      die "metadata at $metadata_tmp failed validation"
+    if (process.env.MERGE_SUCCEEDED === "true") run.merge_succeeded = true;
+    if (process.env.MERGE_SUCCEEDED === "false") run.merge_succeeded = false;
+    const metadata = enrichRunMetadata(run, {
+      scopeHash: trustedMetadata.scope_hash,
+      executionFailed: process.env.EXECUTION_FAILED === "1" ? true : undefined,
+    });
+    const findings = JSON.parse(fs.readFileSync(process.argv[5], "utf8")).findings;
+    const publication = createReviewPublication(metadata, trustedScope, findings);
+    fs.writeFileSync(process.argv[2], JSON.stringify(metadata, null, 2));
+    fs.writeFileSync(process.argv[6], JSON.stringify(publication, null, 2));
+  ' "$records" "$RUN_TMP/metadata.json" "$RESULT_HELPER" "$SCOPE_FILE" "$TMP_OUT" "$RUN_TMP/publication.json" \
+    || die "could not derive review publication"
+  node "$RESULT_HELPER" validate "$RUN_TMP/publication.json" >/dev/null \
+    || die "generated review publication failed validation"
+  if [ -n "$PUBLICATION_OUT" ]; then
+    local publication_tmp="$RUN_TMP/publication-out.json"
+    if ! cp "$RUN_TMP/publication.json" "$publication_tmp"; then
+      rm -f "$publication_tmp"
+      die "could not stage review publication for $PUBLICATION_OUT"
     fi
-    mv -f "$metadata_tmp" "$METADATA_OUT"
-    ok "metadata written to $METADATA_OUT"
+    if ! node "$RESULT_HELPER" validate "$publication_tmp" >/dev/null; then
+      rm -f "$publication_tmp"
+      die "staged review publication failed validation"
+    fi
+    node -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' \
+      "$publication_tmp" "$PUBLICATION_OUT" || {
+      rm -f "$publication_tmp"
+      die "could not atomically publish review publication at $PUBLICATION_OUT"
+    }
+    ok "publication written to $PUBLICATION_OUT"
+  fi
+}
+
+publish_findings() {
+  node "$MERGE" --check "$TMP_OUT" 2>/dev/null \
+    || die "review result is not a structured findings document"
+  if [ -n "$OUT" ]; then
+    local out_tmp="${OUT}.tmp.$$"
+    cp "$TMP_OUT" "$out_tmp" || die "could not write review beside $OUT"
+    if ! node "$MERGE" --check "$out_tmp" 2>/dev/null; then
+      rm -f "$out_tmp"
+      die "structured review at $out_tmp failed validation"
+    fi
+    mv -f "$out_tmp" "$OUT" || {
+      rm -f "$out_tmp"
+      die "could not publish review at $OUT"
+    }
+    ok "written to $OUT"
   fi
 }
 
 if [ ${#VALID_OUTS[@]} -eq 0 ]; then
-  write_metadata not-run
+  printf '%s\n' '{"findings":[]}' > "$TMP_OUT"
+  write_publication not-run 1
+  publish_findings
   die "every configured pass failed"
 fi
-
-TMP_OUT="$RUN_TMP/merged.json"
 UNION_OUT="$RUN_TMP/union.json"
 MERGE_SUCCEEDED=true
 if ! node "$MERGE" --min-votes 1 "${VALID_OUTS[@]}" > "$UNION_OUT" \
@@ -900,7 +958,6 @@ if ! node "$MERGE" --min-votes 1 "${VALID_OUTS[@]}" > "$UNION_OUT" \
 elif [ "$MIN_VOTES" = 1 ]; then
   mv "$UNION_OUT" "$TMP_OUT"
 else
-  MERGE_SUCCEEDED=false
   if node "$MERGE" --min-votes "$MIN_VOTES" "${VALID_OUTS[@]}" > "$TMP_OUT" \
      && node "$MERGE" --check "$TMP_OUT" 2>/dev/null; then
     if ! cmp -s "$UNION_OUT" "$TMP_OUT"; then
@@ -908,24 +965,13 @@ else
       mv -f "$UNION_OUT" "$TMP_OUT"
     fi
   else
+    MERGE_SUCCEEDED=false
     say "min-votes $MIN_VOTES merge failed — preserving the union"
     mv -f "$UNION_OUT" "$TMP_OUT"
   fi
 fi
-node "$MERGE" --check "$TMP_OUT" 2>/dev/null \
-  || die "review result is not a structured findings document"
-
-if [ -n "$OUT" ]; then
-  out_tmp="${OUT}.tmp.$$"
-  cp "$TMP_OUT" "$out_tmp" || die "could not write review beside $OUT"
-  if ! node "$MERGE" --check "$out_tmp" 2>/dev/null; then
-    rm -f "$out_tmp"
-    die "structured review at $out_tmp failed validation"
-  fi
-  mv -f "$out_tmp" "$OUT"
-  ok "written to $OUT"
-fi
-write_metadata "$MERGE_SUCCEEDED"
+publish_findings
+write_publication "$MERGE_SUCCEEDED"
 ANALYSIS_STATE="$(node "$RESULT_HELPER" analysis "$RUN_TMP/metadata.json")" \
   || die "could not derive validated analysis state"
 
@@ -936,7 +982,8 @@ local_unresolved_tmp="$LOCAL_UNRESOLVED_FILE.tmp"
 if ST="$(support_exec scripts/local-state.mjs)"; then
   state_ready=1
   if [ "$RECORD_STATE" = 1 ]; then
-    if _delta="$(node "$ST" record "$TMP_OUT" "$BASE_SHA" "$HEAD_SHA" "$ANALYSIS_STATE" 2>/dev/null)"; then
+    if _delta="$(AGENTIC_REVIEW_STAGED_TARGET="$STAGED_TARGET_SHA" \
+      node "$ST" record "$TMP_OUT" "$BASE_SHA" "$HEAD_SHA" "$ANALYSIS_STATE" 2>/dev/null)"; then
       say "state: $_delta"
     else
       state_ready=0
@@ -967,7 +1014,7 @@ fi
 if [ "$AS_JSON" = 1 ]; then
   cat "$TMP_OUT"
 elif RENDERER="$(support_exec scripts/post-review.mjs)"; then
-  FINDINGS_FILE="$TMP_OUT" REVIEW_METADATA_FILE="$RUN_TMP/metadata.json" \
+  HEAD_SHA="$HEAD_SHA" REVIEW_PUBLICATION_FILE="$RUN_TMP/publication.json" \
     UNRESOLVED_FINDINGS_FILE="$LOCAL_UNRESOLVED_FILE" \
     RECONCILIATION_KNOWN="$LOCAL_RECONCILIATION_KNOWN" \
     REVIEW_MODE="$REVIEW_MODE" RENDER=1 node "$RENDERER" || cat "$TMP_OUT"

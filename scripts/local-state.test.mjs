@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,12 +22,16 @@ function git(directory, ...args) {
   return execFileSync("git", args, { cwd: directory, encoding: "utf8" }).trim();
 }
 
-function run(directory, ...args) {
+function runAtEpoch(directory, epoch, ...args) {
   return spawnSync(process.execPath, [localState, ...args], {
     cwd: directory,
     encoding: "utf8",
-    env: { ...process.env, RUN_EPOCH: "1755600000000" },
+    env: { ...process.env, RUN_EPOCH: String(epoch) },
   });
+}
+
+function run(directory, ...args) {
+  return runAtEpoch(directory, 1755600000000, ...args);
 }
 
 function createRepository(t, prefix) {
@@ -31,9 +45,18 @@ function createRepository(t, prefix) {
 
 test("open export uses the latest confirmed inclusive span for conservative retirement", (t) => {
   const repository = createRepository(t, "local-state-");
+  const textconv = join(repository, "empty-textconv");
+  const textconvLog = join(repository, "textconv.log");
+  writeFileSync(textconv, `#!/usr/bin/env bash
+touch "${textconvLog}"
+exit 0
+`);
+  chmodSync(textconv, 0o755);
+  git(repository, "config", "diff.empty.textconv", textconv);
+  writeFileSync(join(repository, ".gitattributes"), "*.txt diff=empty\n");
   const lines = Array.from({ length: 24 }, (_, index) => `line ${index + 1}`);
   writeFileSync(join(repository, "alpha.txt"), `${lines.join("\n")}\n`);
-  git(repository, "add", "alpha.txt");
+  git(repository, "add", ".gitattributes", "alpha.txt");
   git(repository, "commit", "-m", "base");
   const base = git(repository, "rev-parse", "HEAD");
   git(repository, "checkout", "-b", "feature");
@@ -83,6 +106,7 @@ test("open export uses the latest confirmed inclusive span for conservative reti
   const overlapping = run(repository, "export-open");
   assert.equal(overlapping.status, 0, overlapping.stderr);
   assert.deepEqual(JSON.parse(overlapping.stdout), { findings: [] });
+  assert.equal(existsSync(textconvLog), false);
 });
 
 test("inconclusive records retain omitted evidence until a complete overlapping review retires it", (t) => {
@@ -326,4 +350,230 @@ test("legacy state defaults the end span and latest commit without mutating on e
     suggestion: null,
   }] });
   assert.equal(readFileSync(stateFile, "utf8"), legacy);
+});
+
+test("an abandoned stale-lock reaper does not permanently block mutations", (t) => {
+  const repository = createRepository(t, "local-state-abandoned-reaper-");
+  const stateDirectory = join(repository, ".git", "agentic-review");
+  const lockDirectory = join(stateDirectory, "state.lock");
+  mkdirSync(lockDirectory, { recursive: true });
+  writeFileSync(join(stateDirectory, "state.json"), JSON.stringify({ findings: [] }));
+  writeFileSync(join(lockDirectory, "owner.json"), JSON.stringify({
+    pid: 2_147_483_647,
+    token: "abandoned-lock",
+    processIdentity: "linux:abandoned-lock",
+  }));
+  const abandonedReaper = join(lockDirectory, "reaper");
+  writeFileSync(abandonedReaper, "abandoned-reaper");
+  utimesSync(abandonedReaper, new Date(0), new Date(0));
+
+  const mutation = spawnSync(process.execPath, [localState, "dismiss", "missing"], {
+    cwd: repository,
+    encoding: "utf8",
+    timeout: 1_000,
+  });
+  assert.equal(mutation.status, 0, mutation.error?.message ?? mutation.stderr);
+  assert.equal(existsSync(lockDirectory), false);
+});
+
+test("an aged empty legacy reaper marker does not permanently block mutations", (t) => {
+  const repository = createRepository(t, "local-state-empty-reaper-");
+  const stateDirectory = join(repository, ".git", "agentic-review");
+  const lockDirectory = join(stateDirectory, "state.lock");
+  mkdirSync(lockDirectory, { recursive: true });
+  writeFileSync(join(stateDirectory, "state.json"), JSON.stringify({ findings: [] }));
+  writeFileSync(join(lockDirectory, "owner.json"), JSON.stringify({
+    pid: 2_147_483_647,
+    token: "abandoned-lock",
+    processIdentity: "linux:abandoned-lock",
+  }));
+  const emptyReaper = join(lockDirectory, "reaper");
+  writeFileSync(emptyReaper, "");
+  utimesSync(emptyReaper, new Date(0), new Date(0));
+
+  const mutation = spawnSync(process.execPath, [localState, "dismiss", "missing"], {
+    cwd: repository,
+    encoding: "utf8",
+    timeout: 1_000,
+  });
+  assert.equal(mutation.status, 0, mutation.error?.message ?? mutation.stderr);
+  assert.equal(existsSync(lockDirectory), false);
+});
+
+test("an aged malformed JSON reaper marker does not permanently block mutations", (t) => {
+  const repository = createRepository(t, "local-state-malformed-json-reaper-");
+  const stateDirectory = join(repository, ".git", "agentic-review");
+  const lockDirectory = join(stateDirectory, "state.lock");
+  mkdirSync(lockDirectory, { recursive: true });
+  writeFileSync(join(stateDirectory, "state.json"), JSON.stringify({ findings: [] }));
+  writeFileSync(join(lockDirectory, "owner.json"), JSON.stringify({
+    pid: 2_147_483_647,
+    token: "abandoned-lock",
+    processIdentity: "linux:abandoned-lock",
+  }));
+  const malformedReaper = join(lockDirectory, "reaper");
+  writeFileSync(malformedReaper, "{}");
+  utimesSync(malformedReaper, new Date(0), new Date(0));
+
+  const mutation = spawnSync(process.execPath, [localState, "dismiss", "missing"], {
+    cwd: repository,
+    encoding: "utf8",
+    timeout: 1_000,
+  });
+  assert.equal(mutation.status, 0, mutation.error?.message ?? mutation.stderr);
+  assert.equal(existsSync(lockDirectory), false);
+});
+
+test("a live stale-lock reaper is not displaced by another mutation", (t) => {
+  const repository = createRepository(t, "local-state-live-reaper-");
+  const stateDirectory = join(repository, ".git", "agentic-review");
+  const lockDirectory = join(stateDirectory, "state.lock");
+  mkdirSync(lockDirectory, { recursive: true });
+  writeFileSync(join(stateDirectory, "state.json"), JSON.stringify({ findings: [] }));
+  writeFileSync(join(lockDirectory, "owner.json"), JSON.stringify({
+    pid: 2_147_483_647,
+    token: "abandoned-lock",
+    processIdentity: "linux:abandoned-lock",
+  }));
+  const liveReaper = JSON.stringify({ pid: process.pid, token: "live-reaper" });
+  writeFileSync(join(lockDirectory, "reaper"), liveReaper);
+
+  const mutation = spawnSync(process.execPath, [localState, "dismiss", "missing"], {
+    cwd: repository,
+    encoding: "utf8",
+    timeout: 500,
+  });
+  assert.equal(mutation.status, null);
+  assert.equal(mutation.error?.code, "ETIMEDOUT");
+  assert.equal(readFileSync(join(lockDirectory, "reaper"), "utf8"), liveReaper);
+});
+
+test("a young empty legacy reaper marker is not displaced", (t) => {
+  const repository = createRepository(t, "local-state-young-empty-reaper-");
+  const stateDirectory = join(repository, ".git", "agentic-review");
+  const lockDirectory = join(stateDirectory, "state.lock");
+  mkdirSync(lockDirectory, { recursive: true });
+  writeFileSync(join(stateDirectory, "state.json"), JSON.stringify({ findings: [] }));
+  writeFileSync(join(lockDirectory, "owner.json"), JSON.stringify({
+    pid: 2_147_483_647,
+    token: "abandoned-lock",
+    processIdentity: "linux:abandoned-lock",
+  }));
+  const emptyReaper = join(lockDirectory, "reaper");
+  writeFileSync(emptyReaper, "");
+
+  const mutation = spawnSync(process.execPath, [localState, "dismiss", "missing"], {
+    cwd: repository,
+    encoding: "utf8",
+    timeout: 500,
+  });
+  assert.equal(mutation.status, null);
+  assert.equal(mutation.error?.code, "ETIMEDOUT");
+  assert.equal(readFileSync(emptyReaper, "utf8"), "");
+});
+
+test("a young malformed JSON reaper marker is not displaced", (t) => {
+  const repository = createRepository(t, "local-state-young-malformed-json-reaper-");
+  const stateDirectory = join(repository, ".git", "agentic-review");
+  const lockDirectory = join(stateDirectory, "state.lock");
+  mkdirSync(lockDirectory, { recursive: true });
+  writeFileSync(join(stateDirectory, "state.json"), JSON.stringify({ findings: [] }));
+  writeFileSync(join(lockDirectory, "owner.json"), JSON.stringify({
+    pid: 2_147_483_647,
+    token: "abandoned-lock",
+    processIdentity: "linux:abandoned-lock",
+  }));
+  const malformedReaper = join(lockDirectory, "reaper");
+  const marker = "{\n  \"token\": \"missing-pid\"\n}\n";
+  writeFileSync(malformedReaper, marker);
+
+  const mutation = spawnSync(process.execPath, [localState, "dismiss", "missing"], {
+    cwd: repository,
+    encoding: "utf8",
+    timeout: 500,
+  });
+  assert.equal(mutation.status, null);
+  assert.equal(mutation.error?.code, "ETIMEDOUT");
+  assert.equal(readFileSync(malformedReaper, "utf8"), marker);
+});
+
+test("runs with equal timestamps retain immutable history and list newest first", (t) => {
+  const repository = createRepository(t, "local-state-run-history-");
+  writeFileSync(join(repository, "alpha.txt"), "first\n");
+  git(repository, "add", "alpha.txt");
+  git(repository, "commit", "-m", "first");
+  const firstHead = git(repository, "rev-parse", "HEAD");
+  const findingsFile = join(repository, "findings.json");
+  writeFileSync(findingsFile, JSON.stringify({ findings: [] }));
+
+  const sharedEpoch = 1755600000000;
+  const recordedFirst = runAtEpoch(
+    repository,
+    sharedEpoch,
+    "record",
+    findingsFile,
+    firstHead,
+    firstHead,
+    "complete",
+  );
+  assert.equal(recordedFirst.status, 0, recordedFirst.stderr);
+
+  writeFileSync(join(repository, "alpha.txt"), "second\n");
+  git(repository, "commit", "-am", "second");
+  const secondHead = git(repository, "rev-parse", "HEAD");
+  const recordedSecond = runAtEpoch(
+    repository,
+    sharedEpoch,
+    "record",
+    findingsFile,
+    firstHead,
+    secondHead,
+    "complete",
+  );
+  assert.equal(recordedSecond.status, 0, recordedSecond.stderr);
+
+  writeFileSync(join(repository, "alpha.txt"), "third\n");
+  git(repository, "commit", "-am", "third");
+  const latestHead = git(repository, "rev-parse", "HEAD");
+  const recordedLater = runAtEpoch(
+    repository,
+    sharedEpoch + 1,
+    "record",
+    findingsFile,
+    firstHead,
+    latestHead,
+    "complete",
+  );
+  assert.equal(recordedLater.status, 0, recordedLater.stderr);
+
+  const runsDirectory = join(repository, ".git", "agentic-review", "runs");
+  const historyFiles = readdirSync(runsDirectory);
+  assert.equal(historyFiles.length, 3);
+  assert.ok(historyFiles.every((file) => file.endsWith(".json")));
+  const history = historyFiles.map((file) =>
+    JSON.parse(readFileSync(join(runsDirectory, file), "utf8")));
+  assert.deepEqual(
+    history.map((record) => record.at).sort(),
+    [
+      new Date(sharedEpoch).toISOString(),
+      new Date(sharedEpoch).toISOString(),
+      new Date(sharedEpoch + 1).toISOString(),
+    ],
+  );
+  assert.deepEqual(
+    history
+      .filter((record) => record.at === new Date(sharedEpoch).toISOString())
+      .map((record) => record.head)
+      .sort(),
+    [firstHead, secondHead].sort(),
+  );
+
+  const listed = run(repository, "runs");
+  assert.equal(listed.status, 0, listed.stderr);
+  const lines = listed.stdout.trim().split("\n");
+  assert.equal(lines.length, 3);
+  assert.match(lines[0], new RegExp(`${new Date(sharedEpoch + 1).toISOString()}.*${latestHead.slice(0, 8)}$`));
+  assert.match(lines[1], new RegExp(`${new Date(sharedEpoch).toISOString()}.*${secondHead.slice(0, 8)}$`));
+  assert.match(lines[2], new RegExp(`${new Date(sharedEpoch).toISOString()}.*${firstHead.slice(0, 8)}$`));
+  assert.equal(run(repository, "runs").stdout, listed.stdout);
 });

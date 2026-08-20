@@ -42,6 +42,21 @@ on:
       bounded_converged:
         description: True exactly when analysis is complete and the sample is clean.
         value: ${{ jobs.review.outputs.bounded_converged }}
+      reviewed_head:
+        description: Immutable head SHA recorded in the final review result.
+        value: ${{ jobs.review.outputs.reviewed_head }}
+      scope_hash:
+        description: SHA-256 identity of the immutable review scope.
+        value: ${{ jobs.review.outputs.scope_hash }}
+      coverage:
+        description: Whether the configured immutable bounded execution completed.
+        value: ${{ jobs.review.outputs.coverage }}
+      remaining_analysis:
+        description: JSON array of deterministic reason codes for incomplete analysis.
+        value: ${{ jobs.review.outputs.remaining_analysis }}
+      converged:
+        description: Alias of bounded_converged.
+        value: ${{ jobs.review.outputs.converged }}
       base_sha:
         description: Immutable base SHA reviewed by every pass.
         value: ${{ jobs.review.outputs.base_sha }}
@@ -130,7 +145,7 @@ on:
           suggest — inline review comments with committable ```suggestion blocks
           where the agent can produce a complete fix (default).
           inline — the same inline comments, explanations only, no fixes.
-          summary — one issue comment with everything in it, no line anchoring.
+          summary — one pull-request review body with everything in it, no line anchoring.
         type: string
         default: suggest
       resolve_stale:
@@ -292,6 +307,11 @@ jobs:
       merge_state: ${{ steps.poster.outputs.merge_state }}
       sample_state: ${{ steps.poster.outputs.sample_state }}
       bounded_converged: ${{ steps.poster.outputs.bounded_converged }}
+      reviewed_head: ${{ steps.poster.outputs.reviewed_head }}
+      scope_hash: ${{ steps.poster.outputs.scope_hash }}
+      coverage: ${{ steps.poster.outputs.coverage }}
+      remaining_analysis: ${{ steps.poster.outputs.remaining_analysis }}
+      converged: ${{ steps.poster.outputs.converged }}
       base_sha: ${{ steps.poster.outputs.base_sha }}
       head_sha: ${{ steps.poster.outputs.head_sha }}
       configuration_fingerprint: ${{ steps.poster.outputs.configuration_fingerprint }}
@@ -387,8 +407,8 @@ jobs:
           const tok = await api(inst.access_tokens_url, {
             method: "POST",
             headers: { "content-type": "application/json" },
-            // Scope the token to the one repository and the two permissions the
-            // review actually uses. The App may be installed far more widely;
+            // Scope the token to the one repository and the three permissions
+            // the review actually uses. The App may be installed far more widely;
             // this token must not be.
             body: JSON.stringify({
               repositories: [repo.split("/")[1]],
@@ -681,8 +701,9 @@ jobs:
 
           REVIEW_RUNNER="$SUPPORT_ROOT/scripts/run-review.sh"
           REVIEW_POSTER="$SUPPORT_ROOT/scripts/post-review.mjs"
+          REVIEW_RESULT_HELPER="$SUPPORT_ROOT/scripts/review-result.mjs"
           REVIEW_STRIPPER="$SUPPORT_ROOT/scripts/strip-agent-config.sh"
-          for file in "$REVIEW_RUNNER" "$REVIEW_POSTER" "$REVIEW_STRIPPER"; do
+          for file in "$REVIEW_RUNNER" "$REVIEW_POSTER" "$REVIEW_RESULT_HELPER" "$REVIEW_STRIPPER"; do
             [ -f "$file" ] || {
               echo "::error::trusted support file is missing: $file"
               exit 1
@@ -693,6 +714,7 @@ jobs:
             echo "TRUSTED_DATA_ROOT=$SUPPORT_ROOT"
             echo "REVIEW_RUNNER=$REVIEW_RUNNER"
             echo "REVIEW_POSTER=$REVIEW_POSTER"
+            echo "REVIEW_RESULT_HELPER=$REVIEW_RESULT_HELPER"
             echo "REVIEW_STRIPPER=$REVIEW_STRIPPER"
           } >> "$GITHUB_ENV"
 
@@ -849,7 +871,7 @@ jobs:
             --review-mode "$REVIEW_MODE"
             --omp-version "$OMP_VERSION"
             --out /tmp/review.md
-            --metadata-out /tmp/review-meta.json
+            --publication-out /tmp/review-publication.json
             --no-state
             --no-fail
             --json
@@ -876,23 +898,467 @@ jobs:
           fi
           cat /tmp/review-runner.err >&2
           echo "  review result: $(wc -c < /tmp/review.md) bytes"
-          echo "  metadata: $(wc -c < /tmp/review-meta.json) bytes"
+          echo "  publication: $(wc -c < /tmp/review-publication.json) bytes"
 
       - name: post review
         id: poster
-        # A failed/all-pass-empty runner must never post partial output.
-        if: success() && steps.target.outputs.eligible == 'true' && steps.target.outputs.pr != ''
+        # Run after runner failure so the poster or this boundary can emit a
+        # conservative result without posting missing or invalid artifacts.
+        if: ${{ !cancelled() }}
         env:
           # The write-capable credential is confined to this presentation step.
-          GH_TOKEN: ${{ steps.target.outputs.token || github.token }}
-          FINDINGS_FILE: /tmp/review.md
-          REVIEW_METADATA_FILE: /tmp/review-meta.json
+          GH_TOKEN: ${{ steps.target.outputs.eligible == 'true' && (steps.target.outputs.token || github.token) || '' }}
+          TARGET_ELIGIBLE: ${{ steps.target.outputs.eligible }}
+          REVIEW_PUBLICATION_FILE: /tmp/review-publication.json
+          REVIEW_RESULT_FILE: /tmp/review-result.json
           GITHUB_REPO: ${{ steps.target.outputs.repo }}
           PR_NUMBER: ${{ steps.target.outputs.pr }}
           HEAD_SHA: ${{ steps.target.outputs.head }}
           BASE_SHA: ${{ steps.target.outputs.base }}
         run: |
+          if [ "${TARGET_ELIGIBLE:-}" = "false" ]; then
+            exit 0
+          fi
           set -euo pipefail
+
+          finalize_missing_surfaces() {
+            node <<'NODE'
+          const {
+            appendFileSync,
+            existsSync,
+            readFileSync,
+            writeFileSync,
+          } = require("node:fs");
+
+          const baseSha = process.env.BASE_SHA ?? "";
+          const headSha = process.env.HEAD_SHA ?? "";
+          const resultFile = process.env.REVIEW_RESULT_FILE || "/tmp/review-result.json";
+          let trustedMetadata = null;
+          let trustedFailureResult = null;
+          try {
+            trustedMetadata = JSON.parse(process.env.TRUSTED_METADATA ?? "");
+            trustedFailureResult = JSON.parse(process.env.TRUSTED_FAILURE_RESULT ?? "");
+          } catch {
+            // Missing or invalid trusted evidence keeps the zero-valued fallback.
+          }
+          const trustedBaseSha = trustedFailureResult?.base_sha ?? "";
+          const trustedHeadSha = trustedFailureResult?.head_sha ?? "";
+          const trustedScopeHash = trustedFailureResult?.scope_hash ?? "";
+          const trustedConfigurationFingerprint = (
+            trustedFailureResult?.configuration_fingerprint ?? ""
+          );
+          const trustedPassesRequested = trustedFailureResult?.passes_requested ?? 0;
+          const trustedPassesCompleted = trustedFailureResult?.passes_completed ?? 0;
+          const trustedAnalysisState = trustedMetadata?.analysis_state ?? "";
+          const trustedCoverage = trustedMetadata?.coverage ?? "";
+          const trustedRemainingAnalysis = Array.isArray(trustedMetadata?.remaining_analysis)
+            ? trustedMetadata.remaining_analysis
+            : null;
+          const conservativeResult = trustedFailureResult ?? {
+            analysis_state: "inconclusive",
+            merge_state: "ready",
+            sample_state: "unknown",
+            bounded_converged: false,
+            base_sha: baseSha,
+            head_sha: headSha,
+            configuration_fingerprint: "",
+            passes_requested: 0,
+            passes_completed: 0,
+            current_counts: { Critical: 0, High: 0, Medium: 0 },
+            unresolved_counts: { Critical: 0, High: 0, Medium: 0 },
+            reviewed_head: headSha,
+            scope_hash: "",
+            coverage: "unknown",
+            remaining_analysis: ["execution_failed"],
+            converged: false,
+          };
+          const requiredFields = Object.keys(conservativeResult);
+          const isPlainObject = (value) => (
+            value !== null
+            && typeof value === "object"
+            && !Array.isArray(value)
+          );
+          const stateValues = {
+            analysis_state: new Set(["complete", "inconclusive"]),
+            merge_state: new Set(["blocked", "ready"]),
+            sample_state: new Set(["clean", "findings", "unknown"]),
+            coverage: new Set(["bounded", "unknown"]),
+          };
+          const stringFields = [
+            "base_sha",
+            "head_sha",
+            "configuration_fingerprint",
+            "reviewed_head",
+            "scope_hash",
+          ];
+          const booleanFields = ["bounded_converged", "converged"];
+          const integerFields = ["passes_requested", "passes_completed"];
+          const severities = ["Critical", "High", "Medium"];
+          const blockingSeverities = new Set(
+            (process.env.BLOCK_SEVERITIES ?? "Critical,High")
+              .split(",")
+              .map((severity) => severity.trim())
+              .filter(Boolean),
+          );
+          const fingerprintPattern = /^[0-9a-f]{64}$/;
+          const remainingAnalysisReasons = [
+            "diff_truncated",
+            "finding_cap_reached",
+            "pass_failed",
+            "snapshot_mutable",
+            "pass_scope_mismatch",
+            "vote_threshold_applied",
+            "merge_failed",
+            "reconciliation_unknown",
+            "execution_failed",
+          ];
+          const remainingAnalysisReasonSet = new Set(remainingAnalysisReasons);
+          const posterOwnedRemainingAnalysisReasons = new Set([
+            "reconciliation_unknown",
+            "execution_failed",
+          ]);
+
+          function validateFinalResult(candidate) {
+            if (
+              !isPlainObject(candidate)
+              || requiredFields.some((field) => !Object.hasOwn(candidate, field))
+            ) {
+              throw new TypeError("result is missing required final-result fields");
+            }
+            for (const [field, allowed] of Object.entries(stateValues)) {
+              if (!allowed.has(candidate[field])) {
+                throw new TypeError(`${field} has an invalid value`);
+              }
+            }
+            for (const field of stringFields) {
+              if (typeof candidate[field] !== "string") {
+                throw new TypeError(`${field} must be a string`);
+              }
+            }
+            for (const field of ["configuration_fingerprint", "scope_hash"]) {
+              if (candidate[field] !== "" && !fingerprintPattern.test(candidate[field])) {
+                throw new TypeError(`${field} must be empty or lowercase 64-hex`);
+              }
+            }
+            if (
+              !fingerprintPattern.test(trustedScopeHash)
+              || candidate.scope_hash !== trustedScopeHash
+            ) {
+              throw new TypeError("scope_hash must match the trusted review scope");
+            }
+            if (
+              candidate.base_sha !== (trustedBaseSha || baseSha)
+              || candidate.head_sha !== headSha
+              || candidate.reviewed_head !== candidate.head_sha
+            ) {
+              throw new TypeError("result target must match the trusted review scope");
+            }
+            for (const field of booleanFields) {
+              if (typeof candidate[field] !== "boolean") {
+                throw new TypeError(`${field} must be a boolean`);
+              }
+            }
+            for (const field of integerFields) {
+              if (!Number.isSafeInteger(candidate[field]) || candidate[field] < 0) {
+                throw new TypeError(`${field} must be a non-negative integer`);
+              }
+            }
+            if (candidate.passes_completed > candidate.passes_requested) {
+              throw new TypeError("passes_completed must not exceed passes_requested");
+            }
+            if (
+              candidate.analysis_state === "complete"
+              && (
+                candidate.passes_requested === 0
+                || candidate.passes_completed !== candidate.passes_requested
+                || candidate.configuration_fingerprint === ""
+                || candidate.scope_hash === ""
+              )
+            ) {
+              throw new TypeError(
+                "complete analysis requires all passes and nonempty review identity",
+              );
+            }
+            const aggregateCounts = Object.fromEntries(
+              severities.map((severity) => [severity, 0]),
+            );
+            for (const field of ["current_counts", "unresolved_counts"]) {
+              const counts = candidate[field];
+              if (
+                !isPlainObject(counts)
+                || Object.keys(counts).length !== severities.length
+                || severities.some(
+                  (severity) => (
+                    !Object.hasOwn(counts, severity)
+                    || !Number.isSafeInteger(counts[severity])
+                    || counts[severity] < 0
+                  ),
+                )
+              ) {
+                throw new TypeError(`${field} must contain non-negative integer severity counts`);
+              }
+              for (const severity of severities) {
+                aggregateCounts[severity] += counts[severity];
+              }
+            }
+            const findingCount = severities.reduce(
+              (total, severity) => total + aggregateCounts[severity],
+              0,
+            );
+            const expectedMergeState = severities.some(
+              (severity) => (
+                blockingSeverities.has(severity)
+                && aggregateCounts[severity] > 0
+              ),
+            ) ? "blocked" : "ready";
+            if (candidate.merge_state !== expectedMergeState) {
+              throw new TypeError(
+                "merge_state must agree with configured blocking severity counts",
+              );
+            }
+            const expectedSampleState = findingCount > 0
+              ? "findings"
+              : candidate.analysis_state === "complete" && candidate.coverage === "bounded"
+                ? "clean"
+                : "unknown";
+            if (candidate.sample_state !== expectedSampleState) {
+              throw new TypeError("sample_state must agree with counts, analysis, and coverage");
+            }
+            if (
+              !Array.isArray(candidate.remaining_analysis)
+              || candidate.remaining_analysis.some(
+                (reason) => (
+                  typeof reason !== "string"
+                  || !remainingAnalysisReasonSet.has(reason)
+                ),
+              )
+              || new Set(candidate.remaining_analysis).size !== candidate.remaining_analysis.length
+              || candidate.remaining_analysis.some(
+                (reason, index) => (
+                  index > 0
+                  && remainingAnalysisReasons.indexOf(reason)
+                    < remainingAnalysisReasons.indexOf(candidate.remaining_analysis[index - 1])
+                ),
+              )
+            ) {
+              throw new TypeError(
+                "remaining_analysis must contain unique canonical ordered reason strings",
+              );
+            }
+            if (
+              !stateValues.analysis_state.has(trustedAnalysisState)
+              || !stateValues.coverage.has(trustedCoverage)
+              || trustedRemainingAnalysis === null
+            ) {
+              throw new TypeError("trusted review analysis metadata is unavailable");
+            }
+            if (
+              (candidate.analysis_state === "complete" && trustedAnalysisState !== "complete")
+              || (candidate.coverage === "bounded" && trustedCoverage !== "bounded")
+              || trustedRemainingAnalysis.some(
+                (reason) => !candidate.remaining_analysis.includes(reason),
+              )
+              || candidate.remaining_analysis.some(
+                (reason) => (
+                  !trustedRemainingAnalysis.includes(reason)
+                  && !posterOwnedRemainingAnalysisReasons.has(reason)
+                ),
+              )
+            ) {
+              throw new TypeError("final result must not strengthen trusted review metadata");
+            }
+            if (
+              candidate.analysis_state === "complete"
+              && candidate.remaining_analysis.some(
+                (reason) => reason !== "reconciliation_unknown",
+              )
+            ) {
+              throw new TypeError(
+                "complete analysis may only retain reconciliation_unknown",
+              );
+            }
+            if (
+              candidate.analysis_state === "inconclusive"
+              && !candidate.remaining_analysis.some(
+                (reason) => reason !== "reconciliation_unknown",
+              )
+            ) {
+              throw new TypeError(
+                "inconclusive analysis requires a base or execution failure reason",
+              );
+            }
+            const expectedBoundedCoverage = (
+              candidate.analysis_state === "complete"
+              && candidate.sample_state !== "unknown"
+              && candidate.remaining_analysis.length === 0
+            );
+            if (
+              (candidate.coverage === "bounded") !== expectedBoundedCoverage
+              || (!expectedBoundedCoverage && candidate.remaining_analysis.length === 0)
+            ) {
+              throw new TypeError(
+                "coverage and remaining_analysis must agree with analysis_state and sample_state",
+              );
+            }
+            const expectedConvergence = (
+              candidate.analysis_state === "complete"
+              && candidate.sample_state === "clean"
+            );
+            if (
+              candidate.bounded_converged !== expectedConvergence
+              || candidate.converged !== expectedConvergence
+            ) {
+              throw new TypeError("convergence must agree with analysis_state and sample_state");
+            }
+            if (candidate.configuration_fingerprint !== trustedConfigurationFingerprint) {
+              throw new TypeError(
+                "configuration_fingerprint must match trusted review metadata",
+              );
+            }
+            if (
+              candidate.passes_requested !== trustedPassesRequested
+              || candidate.passes_completed !== trustedPassesCompleted
+            ) {
+              throw new TypeError("pass counts must match trusted review metadata");
+            }
+          }
+
+          let result = conservativeResult;
+          let preserveResult = false;
+          const existingResult = existsSync(resultFile) ? readFileSync(resultFile, "utf8") : "";
+          if (existingResult.length > 0) {
+            try {
+              const candidate = JSON.parse(existingResult);
+              validateFinalResult(candidate);
+              result = candidate;
+              preserveResult = true;
+            } catch (error) {
+              console.error(`::warning::review poster left an invalid result; replacing it conservatively: ${error.message}`);
+            }
+          }
+          if (!preserveResult) {
+            writeFileSync(resultFile, `${JSON.stringify(result, null, 2)}\n`);
+          }
+
+          const outputLines = [
+            `analysis_state=${result.analysis_state}`,
+            `merge_state=${result.merge_state}`,
+            `sample_state=${result.sample_state}`,
+            `bounded_converged=${result.bounded_converged}`,
+            `base_sha=${result.base_sha}`,
+            `head_sha=${result.head_sha}`,
+            `configuration_fingerprint=${result.configuration_fingerprint}`,
+            `passes_requested=${result.passes_requested}`,
+            `passes_completed=${result.passes_completed}`,
+            `current_counts=${JSON.stringify(result.current_counts)}`,
+            `unresolved_counts=${JSON.stringify(result.unresolved_counts)}`,
+            `reviewed_head=${result.reviewed_head}`,
+            `scope_hash=${result.scope_hash}`,
+            `coverage=${result.coverage}`,
+            `remaining_analysis=${JSON.stringify(result.remaining_analysis)}`,
+            `converged=${result.converged}`,
+          ];
+          if (process.env.GITHUB_OUTPUT) {
+            const existingOutput = existsSync(process.env.GITHUB_OUTPUT)
+              ? readFileSync(process.env.GITHUB_OUTPUT, "utf8")
+              : "";
+            const existingOutputLines = new Set(existingOutput.split("\n"));
+            if (!outputLines.every((line) => existingOutputLines.has(line))) {
+              appendFileSync(
+                process.env.GITHUB_OUTPUT,
+                `${existingOutput.length > 0 && !existingOutput.endsWith("\n") ? "\n" : ""}${outputLines.join("\n")}\n`,
+              );
+            }
+          }
+
+          const summaryLines = [
+            "## Agentic review",
+            "| Result | Value |",
+            "| --- | --- |",
+            `| Analysis | \`${result.analysis_state}\` |`,
+            `| Merge gate | \`${result.merge_state}\` |`,
+            `| Sample | \`${result.sample_state}\` |`,
+            `| Bounded convergence | \`${result.bounded_converged ? "yes" : "no"}\` |`,
+            `| Reviewed head | \`${result.reviewed_head}\` |`,
+            `| Scope hash | \`${result.scope_hash}\` |`,
+            `| Coverage | \`${result.coverage}\` |`,
+            `| Remaining analysis | \`${JSON.stringify(result.remaining_analysis)}\` |`,
+            `| Converged | \`${result.converged}\` |`,
+            `| Base SHA | \`${result.base_sha}\` |`,
+            `| Head SHA | \`${result.head_sha}\` |`,
+            `| Configuration fingerprint | \`${result.configuration_fingerprint}\` |`,
+            `| Passes | \`${result.passes_requested} requested / ${result.passes_completed} completed\` |`,
+            `| Current findings | \`Critical: ${result.current_counts.Critical} · High: ${result.current_counts.High} · Medium: ${result.current_counts.Medium}\` |`,
+            `| Held/unresolved findings | \`Critical: ${result.unresolved_counts.Critical} · High: ${result.unresolved_counts.High} · Medium: ${result.unresolved_counts.Medium}\` |`,
+          ];
+          if (process.env.GITHUB_STEP_SUMMARY) {
+            const existingSummary = existsSync(process.env.GITHUB_STEP_SUMMARY)
+              ? readFileSync(process.env.GITHUB_STEP_SUMMARY, "utf8")
+              : "";
+            const existingSummaryLines = new Set(existingSummary.split("\n"));
+            if (!summaryLines.every((line) => existingSummaryLines.has(line))) {
+              const separator = existingSummary.length === 0
+                ? ""
+                : existingSummary.endsWith("\n") ? "\n" : "\n\n";
+              appendFileSync(
+                process.env.GITHUB_STEP_SUMMARY,
+                `${separator}${summaryLines[0]}\n\n${summaryLines.slice(1).join("\n")}\n`,
+              );
+            }
+          }
+          NODE
+          }
+          export TRUSTED_METADATA=""
+          export TRUSTED_FAILURE_RESULT=""
+
+          poster_configured=true
+          for name in REVIEW_MODE POST_COMMENT SUPPRESS_WRITES RESOLVE_STALE \
+                      MAX_FINDINGS FAIL_ON_FINDINGS BLOCK_SEVERITIES; do
+            if [ -z "${!name+x}" ]; then
+              poster_configured=false
+              break
+            fi
+          done
+          if [ "${TARGET_ELIGIBLE:-}" != "true" ] \
+            || [ -z "${GITHUB_REPO:-}" ] \
+            || [ -z "${PR_NUMBER:-}" ] \
+            || [ -z "${HEAD_SHA:-}" ] \
+            || [ -z "${BASE_SHA:-}" ] \
+            || [ "$poster_configured" != "true" ] \
+            || [ -z "${TRUSTED_DATA_ROOT:-}" ] \
+            || [ -z "${REVIEW_RESULT_HELPER:-}" ] \
+            || [[ "${TRUSTED_DATA_ROOT:-}" != /* ]] \
+            || [ "${REVIEW_POSTER:-}" != "${TRUSTED_DATA_ROOT:-}/scripts/post-review.mjs" ] \
+            || [ "${REVIEW_RESULT_HELPER:-}" != "${TRUSTED_DATA_ROOT:-}/scripts/review-result.mjs" ] \
+            || [ ! -f "${REVIEW_POSTER:-}" ] \
+            || [ ! -f "${REVIEW_RESULT_HELPER:-}" ]; then
+            echo "::warning::review setup is incomplete; emitting a conservative result"
+            # Target resolution and the support checkout are both upstream of
+            # this always() step, so the fallback cannot import either one.
+            finalize_missing_surfaces
+            exit 1
+          fi
+
+          # Snapshot the validated publication before presentation. The shared
+          # result owner derives the crash fallback as well as the metadata used
+          # to reject any invalid or strengthened result left by the poster.
+          if [ -s "${REVIEW_PUBLICATION_FILE:-}" ]; then
+            if TRUSTED_METADATA="$(
+              node "$REVIEW_RESULT_HELPER" validate "$REVIEW_PUBLICATION_FILE"
+            )" && TRUSTED_FAILURE_RESULT="$(
+              HEAD_SHA="$HEAD_SHA" BLOCK_SEVERITIES="$BLOCK_SEVERITIES" \
+                node "$REVIEW_RESULT_HELPER" failure "$REVIEW_PUBLICATION_FILE"
+            )"; then
+              export TRUSTED_METADATA
+              export TRUSTED_FAILURE_RESULT
+            else
+              export TRUSTED_METADATA=""
+              export TRUSTED_FAILURE_RESULT=""
+              echo "::warning::trusted review publication is invalid or does not match the target head"
+            fi
+          fi
+
+          poster_status=0
           REVIEW_MODE="$REVIEW_MODE" \
           POST_COMMENT="$POST_COMMENT" \
           SUPPRESS_WRITES="$SUPPRESS_WRITES" \
@@ -900,19 +1366,33 @@ jobs:
           MAX_FINDINGS="$MAX_FINDINGS" \
           FAIL_ON_FINDINGS="$FAIL_ON_FINDINGS" \
           BLOCK_SEVERITIES="$BLOCK_SEVERITIES" \
-            node "$REVIEW_POSTER"
+            node "$REVIEW_POSTER" || poster_status=$?
+          if [ "$poster_status" -ne 0 ]; then
+            if [ ! -s "${REVIEW_RESULT_FILE:-/tmp/review-result.json}" ]; then
+              echo "::warning::review poster failed before emitting a final result; emitting a conservative result"
+            fi
+            finalize_missing_surfaces
+            exit "$poster_status"
+          fi
 
-      - uses: actions/upload-artifact@v4
-        if: always() && steps.target.outputs.eligible == 'true'
+      - name: upload review result
+        if: ${{ !cancelled() && steps.target.outputs.eligible != 'false' }}
+        uses: actions/upload-artifact@v4
         with:
           name: agentic-review
+          path: /tmp/review-result.json
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: upload optional review diagnostics
+        if: ${{ !cancelled() && steps.target.outputs.eligible == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentic-review-diagnostics
           path: |
             /tmp/review.md
-            /tmp/review-meta.json
+            /tmp/review-publication.json
             /tmp/review-runner.out
             /tmp/review-runner.err
           retention-days: 7
-          # This step is `always()`, so it also runs when the review failed
-          # before either file existed. Without this the real error is followed
-          # by a "No files were found" warning that reads like a second fault.
           if-no-files-found: ignore
