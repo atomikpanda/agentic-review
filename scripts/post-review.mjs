@@ -227,6 +227,74 @@ function summaryFindingSimilarity(left, right) {
   );
 }
 
+function maximumSummaryFindingMatching(current, prior) {
+  const rowCount = current.length;
+  const columnCount = prior.length + rowCount;
+  const costs = current.map((candidate) => [
+    ...prior.map((previous) => {
+      const score = summaryFindingSimilarity(candidate, previous);
+      return score >= SIMILARITY ? -score : Number.POSITIVE_INFINITY;
+    }),
+    ...Array(rowCount).fill(0),
+  ]);
+  const rowPotential = Array(rowCount + 1).fill(0);
+  const columnPotential = Array(columnCount + 1).fill(0);
+  const assignedRow = Array(columnCount + 1).fill(0);
+  const previousColumn = Array(columnCount + 1).fill(0);
+
+  // Hungarian assignment is global rather than candidate-greedy. Strict
+  // comparisons retain current order, then prior order, across equal optima.
+  for (let row = 1; row <= rowCount; row += 1) {
+    assignedRow[0] = row;
+    const minimum = Array(columnCount + 1).fill(Number.POSITIVE_INFINITY);
+    const visited = Array(columnCount + 1).fill(false);
+    let column = 0;
+    do {
+      visited[column] = true;
+      const assigned = assignedRow[column];
+      let delta = Number.POSITIVE_INFINITY;
+      let nextColumn = 0;
+      for (let candidateColumn = 1; candidateColumn <= columnCount; candidateColumn += 1) {
+        if (visited[candidateColumn]) continue;
+        const reducedCost = costs[assigned - 1][candidateColumn - 1]
+          - rowPotential[assigned] - columnPotential[candidateColumn];
+        if (reducedCost < minimum[candidateColumn]) {
+          minimum[candidateColumn] = reducedCost;
+          previousColumn[candidateColumn] = column;
+        }
+        if (minimum[candidateColumn] < delta) {
+          delta = minimum[candidateColumn];
+          nextColumn = candidateColumn;
+        }
+      }
+      for (let candidateColumn = 0; candidateColumn <= columnCount; candidateColumn += 1) {
+        if (visited[candidateColumn]) {
+          rowPotential[assignedRow[candidateColumn]] += delta;
+          columnPotential[candidateColumn] -= delta;
+        } else {
+          minimum[candidateColumn] -= delta;
+        }
+      }
+      column = nextColumn;
+    } while (assignedRow[column] !== 0);
+
+    do {
+      const preceding = previousColumn[column];
+      assignedRow[column] = assignedRow[preceding];
+      column = preceding;
+    } while (column !== 0);
+  }
+
+  const matchedPrior = Array(rowCount).fill(null);
+  for (let column = 1; column <= prior.length; column += 1) {
+    const row = assignedRow[column];
+    if (row !== 0 && Number.isFinite(costs[row - 1][column - 1])) {
+      matchedPrior[row - 1] = column - 1;
+    }
+  }
+  return matchedPrior;
+}
+
 export async function reconcileSummaryFindings({
   analysisState,
   current,
@@ -235,26 +303,16 @@ export async function reconcileSummaryFindings({
   headSha,
   spanChanged,
 }) {
-  const matchedPrior = new Set();
-  const reconciledCurrent = [];
-  for (const candidate of current) {
-    let bestIndex = null;
-    let bestScore = -1;
-    for (const [index, previous] of prior.entries()) {
-      if (matchedPrior.has(index)) continue;
-      const score = summaryFindingSimilarity(candidate, previous);
-      if (score >= SIMILARITY && (bestIndex === null || score > bestScore)) {
-        bestIndex = index;
-        bestScore = score;
-      }
-    }
-    if (bestIndex === null) {
-      reconciledCurrent.push(candidate);
-    } else {
-      matchedPrior.add(bestIndex);
-      reconciledCurrent.push(withStrongestSeverity(candidate, prior[bestIndex]));
-    }
-  }
+  const matchedPriorByCurrent = maximumSummaryFindingMatching(current, prior);
+  const matchedPrior = new Set(
+    matchedPriorByCurrent.filter((index) => index !== null),
+  );
+  const reconciledCurrent = current.map((candidate, index) => {
+    const priorIndex = matchedPriorByCurrent[index];
+    return priorIndex === null
+      ? candidate
+      : withStrongestSeverity(candidate, prior[priorIndex]);
+  });
 
   const held = [];
   const retired = [];
@@ -349,7 +407,7 @@ function extractJson(text) {
 function commentableRanges(baseSha, headSha) {
   const diff = execFileSync(
     "git",
-    ["diff", "--unified=3", "--no-color", `${baseSha}`, `${headSha}`],
+    ["diff", "--no-ext-diff", "--unified=3", "--no-color", `${baseSha}`, `${headSha}`],
     { encoding: "utf8", maxBuffer: GIT_DIFF_MAX_BUFFER_BYTES },
   );
 
@@ -956,7 +1014,7 @@ function fileChangedSince(t, head) {
   }
 
   try {
-    execFileSync("git", ["diff", "--quiet", t.origOid, head, "--", literalPathspec(t.path)], { stdio: "ignore" });
+    execFileSync("git", ["diff", "--no-ext-diff", "--quiet", t.origOid, head, "--", literalPathspec(t.path)], { stdio: "ignore" });
     return false;
   } catch (e) {
     return e.status === 1 ? true : null;

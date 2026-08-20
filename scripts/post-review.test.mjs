@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -201,30 +201,37 @@ function runPosterWithHistory({
   writesEnabled = false,
   suppressWrites = false,
   changedOpenFinding = null,
+  coordinateLessChangedDismissedFinding = null,
+  externalDiff = false,
   gitFinding = null,
 }) {
   const dir = mkdtempSync(join(tmpdir(), "post-review-history-"));
   let runtimeMetadata = metadata();
   let runtimeThreads = threads;
-  const changedSpan = changedOpenFinding ?? gitFinding;
+  const changedThreadFinding = changedOpenFinding ?? coordinateLessChangedDismissedFinding;
+  const changedSpan = changedThreadFinding ?? gitFinding;
   if (changedSpan) {
     const { originalSha, headSha } = commitChangedFindingSpan(dir, changedSpan);
     runtimeMetadata = metadata({ base_sha: originalSha, head_sha: headSha });
   }
-  if (changedOpenFinding) {
+  if (changedThreadFinding) {
     const originalSha = runtimeMetadata.base_sha;
     const body = poster.buildReviewComments(
-      [changedOpenFinding],
-      new Map([[changedOpenFinding.file, [[changedOpenFinding.start_line, changedOpenFinding.end_line]]]]),
+      [changedThreadFinding],
+      new Map([[changedThreadFinding.file, [[changedThreadFinding.start_line, changedThreadFinding.end_line]]]]),
       { mode: "inline" },
     ).comments[0].body;
     runtimeThreads = [...threads, {
       id: "changed-open-thread",
-      isResolved: false,
+      isResolved: Boolean(coordinateLessChangedDismissedFinding),
       isOutdated: false,
-      path: changedOpenFinding.file,
-      originalStartLine: changedOpenFinding.start_line,
-      originalLine: changedOpenFinding.end_line,
+      path: changedThreadFinding.file,
+      ...(changedOpenFinding
+        ? {
+            originalStartLine: changedThreadFinding.start_line,
+            originalLine: changedThreadFinding.end_line,
+          }
+        : {}),
       comments: {
         nodes: [{
           databaseId: 901,
@@ -234,6 +241,17 @@ function runPosterWithHistory({
         }],
       },
     }];
+  }
+  const externalDiffLog = join(dir, "external-diff.log");
+  const externalDiffHelper = join(dir, "external-diff");
+  if (externalDiff) {
+    writeFileSync(externalDiffHelper, `#!/usr/bin/env bash
+touch "\${EXTERNAL_DIFF_LOG}"
+exit 0
+`);
+    chmodSync(externalDiffHelper, 0o755);
+    runGit(dir, ["config", "diff.external", externalDiffHelper]);
+    runGit(dir, ["config", "diff.trustExitCode", "true"]);
   }
   const findingsFile = join(dir, "findings.json");
   const metadataFile = join(dir, "metadata.json");
@@ -327,14 +345,22 @@ globalThis.fetch = async (url, options = {}) => {
         POST_COMMENT: "true",
         RESOLVE_STALE: "true",
         FAIL_ON_FINDINGS: "true",
+        ...(externalDiff
+          ? {
+              EXTERNAL_DIFF_LOG: externalDiffLog,
+              GIT_EXTERNAL_DIFF: externalDiffHelper,
+              GIT_EXTERNAL_DIFF_TRUST_EXIT_CODE: "true",
+            }
+          : {}),
       },
     },
   );
   const workflowOutput = readFileSync(outputFile, "utf8");
   const jobSummary = existsSync(summaryFile) ? readFileSync(summaryFile, "utf8") : "";
   const finalResult = existsSync(resultFile) ? JSON.parse(readFileSync(resultFile, "utf8")) : null;
+  const externalDiffExecuted = existsSync(externalDiffLog);
   rmSync(dir, { recursive: true, force: true });
-  return { ...result, workflowOutput, jobSummary, finalResult };
+  return { ...result, workflowOutput, jobSummary, finalResult, externalDiffExecuted };
 }
 
 test("summary marker round-trips only normalized carry-forward fields", () => {
@@ -869,6 +895,22 @@ test("summary mode retires an omitted changed inline finding when writes are ena
   assert.match(result.workflowOutput, /converged=true/);
 });
 
+test("poster ignores external diff helpers for anchoring and changed-file reconciliation", () => {
+  const prior = finding({ suggestion: null });
+  const result = runPosterWithHistory({
+    mode: "inline",
+    currentFindings: [prior],
+    coordinateLessChangedDismissedFinding: prior,
+    externalDiff: true,
+    writesEnabled: true,
+  });
+
+  assert.equal(result.status, 1, `${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
+  assert.equal(result.externalDiffExecuted, false);
+  assert.match(result.stdout, /1 finding\(s\): 1 anchored, 0 summary-only, 0 already open/);
+  assert.match(result.stdout, /\[test\] hosted mutation review/);
+});
+
 test("summary mode holds changed inline evidence when writes are dry, suppressed, or history is unknown", () => {
   const prior = finding({ suggestion: null });
   const cases = [
@@ -1223,6 +1265,74 @@ test("one current fuzzy match consumes only one prior summary finding", async ()
     decodeSummaryMarker(body).findings.map(({ title }) => title),
     [current.title, unmatched.title],
   );
+});
+
+test("summary history maximizes total similarity across ambiguous findings", async () => {
+  const firstPrior = finding({
+    severity: "Critical",
+    title: "First prior",
+    identity_tokens: ["a", "b", "x", "y"],
+  });
+  const secondPrior = finding({
+    severity: "High",
+    title: "Second prior",
+    identity_tokens: ["c", "e", "u", "v"],
+  });
+  const ambiguousCurrent = finding({
+    severity: "Medium",
+    title: "Ambiguous current",
+    identity_tokens: ["a", "b", "c", "e"],
+  });
+  const exactCurrent = finding({
+    severity: "Medium",
+    title: "Exact current",
+    identity_tokens: ["a", "b", "x", "y"],
+  });
+
+  const reconciled = await reconcileSummaryFindings({
+    analysisState: "complete",
+    current: [ambiguousCurrent, exactCurrent],
+    prior: [firstPrior, secondPrior],
+    priorHeadSha: PRIOR_HEAD_SHA,
+    headSha: HEAD_SHA,
+    spanChanged: async () => assert.fail("re-reported priors must not be checked as stale"),
+  });
+
+  assert.deepEqual(reconciled.current.map(({ severity }) => severity), ["High", "Critical"]);
+  assert.deepEqual(reconciled.held, []);
+  assert.deepEqual(reconciled.retired, []);
+  const reviewState = deriveReviewState({
+    analysisState: "complete",
+    current: reconciled.current,
+    unresolved: reconciled.held,
+    reconciliationKnown: reconciled.reconciliationKnown,
+    blockSeverities: ["Critical", "High"],
+  });
+  assert.deepEqual(reviewState.unresolved_counts, EMPTY_COUNTS);
+});
+
+test("summary history keeps prior-order tie-breaking across equal global optima", async () => {
+  const identityTokens = ["cache", "entry", "stale"];
+  const current = [
+    finding({ severity: "Medium", title: "First current", identity_tokens: identityTokens }),
+    finding({ severity: "Medium", title: "Second current", identity_tokens: identityTokens }),
+  ];
+  const prior = [
+    finding({ severity: "High", title: "First prior", identity_tokens: identityTokens }),
+    finding({ severity: "Critical", title: "Second prior", identity_tokens: identityTokens }),
+  ];
+
+  const reconciled = await reconcileSummaryFindings({
+    analysisState: "complete",
+    current,
+    prior,
+    priorHeadSha: PRIOR_HEAD_SHA,
+    headSha: HEAD_SHA,
+    spanChanged: async () => assert.fail("matched priors must not be checked as stale"),
+  });
+
+  assert.deepEqual(reconciled.current.map(({ severity }) => severity), ["High", "Critical"]);
+  assert.deepEqual(reconciled.held, []);
 });
 
 for (const [label, changed] of [["unchanged", false], ["indeterminate", null]]) {

@@ -2279,14 +2279,65 @@ test("scope hashes distinguish invalid UTF-8 diff bytes while the raw review run
 });
 
 
+test("external diff helpers cannot replace the trusted diff or skip model review", (t) => {
+  const fixture = createFixture(t);
+  const externalDiff = join(fixture.directory, "empty-diff");
+  const externalDiffLog = join(fixture.directory, "empty-diff.log");
+  writeFileSync(externalDiff, `#!/usr/bin/env bash
+touch "\${EXTERNAL_DIFF_LOG}"
+exit 0
+`);
+  chmodSync(externalDiff, 0o755);
+  git(fixture.repository, "config", "diff.external", externalDiff);
+
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    env: {
+      EXTERNAL_DIFF_LOG: externalDiffLog,
+      GIT_EXTERNAL_DIFF: externalDiff,
+    },
+    existingFixture: fixture,
+  });
+  const expectedDiff = execFileSync(
+    "git",
+    ["diff", "--no-ext-diff", "--no-color", "main", "HEAD"],
+    { cwd: fixture.repository },
+  );
+
+  assert.ok(expectedDiff.length > 0);
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.equal(existsSync(externalDiffLog), false);
+  assert.deepEqual(Buffer.from(run.scope.diff_base64, "base64"), expectedDiff);
+  assert.equal(run.metadata.scope_hash, scopeHash({
+    base_sha: run.scope.base_sha,
+    configuration_fingerprint: run.scope.configuration_fingerprint,
+    diff_base64: run.scope.diff_base64,
+    head_sha: run.scope.head_sha,
+  }));
+  assert.equal(run.logs.length, 3);
+  for (const log of run.logs) {
+    assert.match(log.prompt, /\+alpha head/);
+  }
+  assert.equal(validateMetadata(run.metadataFile).status, 0);
+});
+
 test("canonical diff rendering failures stop before model work", (t) => {
   const fixture = createFixture(t);
-  const failingDiff = join(fixture.directory, "fail-diff");
-  writeFileSync(failingDiff, "#!/usr/bin/env bash\nexit 73\n");
-  chmodSync(failingDiff, 0o755);
+  const gitWrapper = join(fixture.bin, "git");
+  writeFileSync(gitWrapper, `#!/usr/bin/env bash
+if [ "\${1:-}" = "diff" ]; then
+  for argument in "$@"; do
+    [ "$argument" = "--no-color" ] && exit 73
+  done
+fi
+PATH="\${PATH#*:}" exec git "$@"
+`);
+  chmodSync(gitWrapper, 0o755);
 
   const run = runReview(t, {}, {
-    env: { GIT_EXTERNAL_DIFF: failingDiff },
     existingFixture: fixture,
     includeOutputs: false,
   });

@@ -23,6 +23,7 @@ import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
+  linkSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -66,12 +67,16 @@ try {
 }
 
 
-function readStateLockOwner() {
+function parseProcessOwner(text) {
+  const owner = JSON.parse(text);
+  return Number.isInteger(owner?.pid) && owner.pid > 0 && typeof owner.token === "string"
+    ? owner
+    : null;
+}
+
+function readProcessOwner(path) {
   try {
-    const owner = JSON.parse(readFileSync(STATE_LOCK_OWNER, "utf8"));
-    return Number.isInteger(owner?.pid) && owner.pid > 0 && typeof owner.token === "string"
-      ? owner
-      : null;
+    return parseProcessOwner(readFileSync(path, "utf8"));
   } catch (error) {
     if (error?.code === "ENOENT" || error instanceof SyntaxError) return null;
     throw error;
@@ -80,7 +85,13 @@ function readStateLockOwner() {
 
 function readStateLockReaper() {
   try {
-    return readFileSync(STATE_LOCK_REAPER, "utf8");
+    const marker = readFileSync(STATE_LOCK_REAPER, "utf8");
+    try {
+      return parseProcessOwner(marker);
+    } catch (error) {
+      if (error instanceof SyntaxError && marker.length > 0) return { token: marker };
+      throw error;
+    }
   } catch (error) {
     if (error?.code === "ENOENT") return null;
     throw error;
@@ -88,7 +99,7 @@ function readStateLockReaper() {
 }
 
 function removeStateLockReaper(token) {
-  if (readStateLockReaper() !== token) return false;
+  if (readStateLockReaper()?.token !== token) return false;
   try {
     unlinkSync(STATE_LOCK_REAPER);
     return true;
@@ -139,7 +150,7 @@ function processIdentity(pid) {
   }
 }
 
-function processOwnsStateLock(owner) {
+function processOwnsLock(owner) {
   if (typeof owner.processIdentity === "string") {
     const currentIdentity = processIdentity(owner.pid);
     if (currentIdentity !== undefined) return currentIdentity === owner.processIdentity;
@@ -149,10 +160,10 @@ function processOwnsStateLock(owner) {
 
 
 function reapStaleStateLock(token) {
-  const observedOwner = readStateLockOwner();
+  const observedOwner = readProcessOwner(STATE_LOCK_OWNER);
   let ownerlessLockIsStale = false;
   if (observedOwner) {
-    if (processOwnsStateLock(observedOwner)) return false;
+    if (processOwnsLock(observedOwner)) return false;
   } else {
     try {
       ownerlessLockIsStale = Date.now() - statSync(STATE_LOCK_DIR).mtimeMs >= OWNERLESS_LOCK_STALE_MS;
@@ -163,16 +174,39 @@ function reapStaleStateLock(token) {
     if (!ownerlessLockIsStale) return false;
   }
 
+  const pendingReaper = `${STATE_LOCK_REAPER}.pending-${token}`;
+  const reaperIdentity = processIdentity(process.pid);
   try {
-    writeFileSync(STATE_LOCK_REAPER, token, { flag: "wx" });
+    writeFileSync(pendingReaper, JSON.stringify({
+      pid: process.pid,
+      token,
+      acquiredAt: new Date().toISOString(),
+      ...(typeof reaperIdentity === "string" ? { processIdentity: reaperIdentity } : {}),
+    }), { flag: "wx" });
+    linkSync(pendingReaper, STATE_LOCK_REAPER);
   } catch (error) {
-    if (error?.code === "EEXIST" || error?.code === "ENOENT") return false;
-    throw error;
+    if (error?.code === "ENOENT") return false;
+    if (error?.code !== "EEXIST") throw error;
+    const observedReaper = readStateLockReaper();
+    let reaperIsStale = false;
+    if (Number.isInteger(observedReaper?.pid)) {
+      reaperIsStale = !processOwnsLock(observedReaper);
+    } else if (observedReaper) {
+      try {
+        reaperIsStale = Date.now() - statSync(STATE_LOCK_REAPER).mtimeMs >= OWNERLESS_LOCK_STALE_MS;
+      } catch (statError) {
+        if (statError?.code !== "ENOENT") throw statError;
+      }
+    }
+    if (reaperIsStale) removeStateLockReaper(observedReaper.token);
+    return false;
+  } finally {
+    rmSync(pendingReaper, { force: true });
   }
 
-  const currentOwner = readStateLockOwner();
+  const currentOwner = readProcessOwner(STATE_LOCK_OWNER);
   if (
-    (currentOwner && processOwnsStateLock(currentOwner))
+    (currentOwner && processOwnsLock(currentOwner))
     || (observedOwner && currentOwner?.token !== observedOwner.token)
   ) {
     removeStateLockReaper(token);
@@ -224,7 +258,7 @@ function withStateMutation(action) {
   try {
     return action(token);
   } finally {
-    const owner = readStateLockOwner();
+    const owner = readProcessOwner(STATE_LOCK_OWNER);
     if (owner?.token === token) rmSync(STATE_LOCK_DIR, { recursive: true, force: true });
   }
 }

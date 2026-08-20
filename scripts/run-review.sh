@@ -428,10 +428,10 @@ else
   RANGE="$BASE"
 fi
 
-git diff --quiet "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" \
+git diff --no-ext-diff --quiet "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" \
   && die "$([ "$STAGED" = 1 ] && printf 'nothing staged' || printf 'no changes vs %s' "$BASE")"
-DIFFSTAT="$(git diff --stat "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA")"
-DIFFTEXT="$(git diff --no-color "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" && printf x)" \
+DIFFSTAT="$(git diff --no-ext-diff --stat "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA")"
+DIFFTEXT="$(git diff --no-ext-diff --no-color "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" && printf x)" \
   || die "could not render canonical diff"
 DIFFTEXT="${DIFFTEXT%x}"
 ok "reviewing against $RANGE"
@@ -499,7 +499,7 @@ ordered_diff() {
     process.stdout.write(Buffer.concat(rotated.flatMap((path) => [path, Buffer.from([0])])));
   ' "$CHANGED_PATHS_FILE" "$rotation" \
   | while IFS= read -r -d '' path; do
-      git --literal-pathspecs diff --no-color "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" -- "$path"
+      git --literal-pathspecs diff --no-ext-diff --no-color "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" -- "$path"
     done
 }
 
@@ -565,7 +565,7 @@ if [ "$SOURCE_CODEGRAPH_OPT_IN" = 1 ] && [ "$SNAPSHOT_IMMUTABLE" = 1 ] \
   fi
 fi
 CHANGED_PATHS_FILE="$RUN_TMP/changed-paths"
-git diff --name-only -z "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" > "$CHANGED_PATHS_FILE"
+git diff --no-ext-diff --name-only -z "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" > "$CHANGED_PATHS_FILE"
 CHANGED_PATH_COUNT="$(node -e '
   const fs = require("node:fs");
   const bytes = fs.readFileSync(process.argv[1]);
@@ -649,7 +649,7 @@ prepare_skill() {
   done
   if [ "$select" = 1 ] && [ -s "$destination" ] \
      && SEL="$(support_exec scripts/select-skills.mjs)"; then
-    changed="$(git diff --name-only "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA")"
+    changed="$(git diff --no-ext-diff --name-only "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA")"
     selected="${destination}.selected"
     if CHANGED_FILES="$changed" SKILL_FILES="$destination" node "$SEL" > "$selected" 2>"${destination}.log" \
        && [ -s "$selected" ]; then
