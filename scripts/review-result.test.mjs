@@ -28,12 +28,18 @@ const DIFF = [
   "+new",
   "",
 ].join("\n");
+const DIFF_BYTES = Buffer.byteLength(DIFF);
 const SCOPE_HASH = "0012d7453c71630d2e70e36517ba3482fb1e190611543c94b1955dd9a8083ebb";
-const TRUSTED_SCOPE = {
+const CANONICAL_SCOPE = {
   base_sha: BASE_SHA,
   configuration_fingerprint: FINGERPRINT,
   diff: DIFF,
   head_sha: HEAD_SHA,
+};
+const TRUSTED_SCOPE = {
+  ...CANONICAL_SCOPE,
+  bytes: DIFF_BYTES,
+  included_bytes: DIFF_BYTES,
 };
 const EMPTY_COUNTS = { Critical: 0, High: 0, Medium: 0 };
 
@@ -61,7 +67,7 @@ function completeRun(overrides = {}) {
     scope_hash: SCOPE_HASH,
     coverage: "bounded",
     remaining_analysis: [],
-    diff: { bytes: 100, included_bytes: 100, truncated: false },
+    diff: { bytes: DIFF_BYTES, included_bytes: DIFF_BYTES, truncated: false },
     finding_cap: 20,
     min_votes: 1,
     merge_succeeded: true,
@@ -349,6 +355,70 @@ test("run metadata validation rejects a valid-looking noncanonical scope hash", 
   );
 });
 
+test("run metadata validation binds diff coverage to the trusted reviewed bytes", () => {
+  const includedBytes = Math.floor(DIFF_BYTES / 2);
+  const trustedScope = {
+    bytes: DIFF_BYTES,
+    ...CANONICAL_SCOPE,
+    included_bytes: includedBytes,
+  };
+  const metadata = {
+    schema_version: REVIEW_RESULT_SCHEMA_VERSION,
+    ...completeRun({
+      coverage: "unknown",
+      remaining_analysis: ["diff_truncated"],
+      diff: {
+        bytes: DIFF_BYTES,
+        included_bytes: includedBytes,
+        truncated: true,
+      },
+    }),
+    analysis_state: "inconclusive",
+  };
+
+  assert.equal(validateRunMetadata(metadata, trustedScope), metadata);
+
+  const forgedComplete = {
+    schema_version: REVIEW_RESULT_SCHEMA_VERSION,
+    ...completeRun(),
+    analysis_state: "complete",
+  };
+  assert.throws(
+    () => validateRunMetadata(forgedComplete, trustedScope),
+    /diff\.truncated must match the trusted reviewed bytes/i,
+  );
+
+  for (const [mutate, message] of [
+    [(value) => { value.diff.bytes += 1; }, /diff\.bytes must match the trusted reviewed bytes/i],
+    [(value) => { value.diff.included_bytes += 1; }, /diff\.included_bytes must match the trusted reviewed bytes/i],
+  ]) {
+    const forged = structuredClone(metadata);
+    mutate(forged);
+    assert.throws(() => validateRunMetadata(forged, trustedScope), message);
+  }
+});
+
+test("run metadata validation fails closed without trusted reviewed-byte coverage", () => {
+  const metadata = {
+    schema_version: REVIEW_RESULT_SCHEMA_VERSION,
+    ...completeRun(),
+    analysis_state: "complete",
+  };
+
+  assert.throws(
+    () => validateRunMetadata(metadata, CANONICAL_SCOPE),
+    /included_bytes/i,
+  );
+  assert.throws(
+    () => validateRunMetadata(metadata, {
+      ...CANONICAL_SCOPE,
+      bytes: DIFF_BYTES,
+      included_bytes: DIFF_BYTES + 1,
+    }),
+    /included_bytes must not exceed/i,
+  );
+});
+
 test("run metadata validation rejects target, fingerprint, pass, and derived-state inconsistencies", () => {
   const metadata = {
     schema_version: REVIEW_RESULT_SCHEMA_VERSION,
@@ -403,7 +473,6 @@ test("run metadata validation preserves the additive contract and stable reason 
       value.coverage = "unknown";
       value.remaining_analysis = ["pass_failed", "diff_truncated"];
       value.analysis_state = "inconclusive";
-      value.diff = { bytes: 101, included_bytes: 100, truncated: true };
       value.passes.completed = [];
       value.passes.results = value.passes.results.map((pass) => ({
         ...pass,
@@ -465,6 +534,11 @@ test("scope hashes are exact, canonical, and sensitive to the full diff and conf
     diff: DIFF,
     head_sha: HEAD_SHA,
     base_sha: BASE_SHA,
+  }), SCOPE_HASH);
+  assert.equal(hash({
+    bytes: DIFF_BYTES,
+    ...scope,
+    included_bytes: DIFF_BYTES,
   }), SCOPE_HASH);
   assert.notEqual(hash({ ...scope, diff: `${DIFF}+another line\n` }), SCOPE_HASH);
   assert.notEqual(hash({ ...scope, configuration_fingerprint: "4".repeat(64) }), SCOPE_HASH);

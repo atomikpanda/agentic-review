@@ -953,24 +953,190 @@ jobs:
             converged: false,
           };
           const requiredFields = Object.keys(conservativeResult);
+          const isPlainObject = (value) => (
+            value !== null
+            && typeof value === "object"
+            && !Array.isArray(value)
+          );
+          const stateValues = {
+            analysis_state: new Set(["complete", "inconclusive"]),
+            merge_state: new Set(["blocked", "ready"]),
+            sample_state: new Set(["clean", "findings", "unknown"]),
+            coverage: new Set(["bounded", "unknown"]),
+          };
+          const stringFields = [
+            "base_sha",
+            "head_sha",
+            "configuration_fingerprint",
+            "reviewed_head",
+            "scope_hash",
+          ];
+          const booleanFields = ["bounded_converged", "converged"];
+          const integerFields = ["passes_requested", "passes_completed"];
+          const severities = ["Critical", "High", "Medium"];
+          const fingerprintPattern = /^[0-9a-f]{64}$/;
+          const remainingAnalysisReasons = new Set([
+            "diff_truncated",
+            "finding_cap_reached",
+            "pass_failed",
+            "snapshot_mutable",
+            "pass_scope_mismatch",
+            "vote_threshold_applied",
+            "merge_failed",
+            "reconciliation_unknown",
+            "execution_failed",
+          ]);
+
+          function validateFinalResult(candidate) {
+            if (
+              !isPlainObject(candidate)
+              || requiredFields.some((field) => !Object.hasOwn(candidate, field))
+            ) {
+              throw new TypeError("result is missing required final-result fields");
+            }
+            for (const [field, allowed] of Object.entries(stateValues)) {
+              if (!allowed.has(candidate[field])) {
+                throw new TypeError(`${field} has an invalid value`);
+              }
+            }
+            for (const field of stringFields) {
+              if (typeof candidate[field] !== "string") {
+                throw new TypeError(`${field} must be a string`);
+              }
+            }
+            for (const field of ["configuration_fingerprint", "scope_hash"]) {
+              if (candidate[field] !== "" && !fingerprintPattern.test(candidate[field])) {
+                throw new TypeError(`${field} must be empty or lowercase 64-hex`);
+              }
+            }
+            if (
+              candidate.base_sha !== baseSha
+              || candidate.head_sha !== headSha
+              || candidate.reviewed_head !== candidate.head_sha
+            ) {
+              throw new TypeError("result target must match the resolved review target");
+            }
+            for (const field of booleanFields) {
+              if (typeof candidate[field] !== "boolean") {
+                throw new TypeError(`${field} must be a boolean`);
+              }
+            }
+            for (const field of integerFields) {
+              if (!Number.isSafeInteger(candidate[field]) || candidate[field] < 0) {
+                throw new TypeError(`${field} must be a non-negative integer`);
+              }
+            }
+            if (candidate.passes_completed > candidate.passes_requested) {
+              throw new TypeError("passes_completed must not exceed passes_requested");
+            }
+            if (
+              candidate.analysis_state === "complete"
+              && (
+                candidate.passes_requested === 0
+                || candidate.passes_completed !== candidate.passes_requested
+                || candidate.configuration_fingerprint === ""
+                || candidate.scope_hash === ""
+              )
+            ) {
+              throw new TypeError(
+                "complete analysis requires all passes and nonempty review identity",
+              );
+            }
+            let findingCount = 0;
+            for (const field of ["current_counts", "unresolved_counts"]) {
+              const counts = candidate[field];
+              if (
+                !isPlainObject(counts)
+                || Object.keys(counts).length !== severities.length
+                || severities.some(
+                  (severity) => (
+                    !Object.hasOwn(counts, severity)
+                    || !Number.isSafeInteger(counts[severity])
+                    || counts[severity] < 0
+                  ),
+                )
+              ) {
+                throw new TypeError(`${field} must contain non-negative integer severity counts`);
+              }
+              findingCount += severities.reduce((total, severity) => total + counts[severity], 0);
+            }
+            if (findingCount === 0 && candidate.merge_state !== "ready") {
+              throw new TypeError("merge_state must be ready when there are no findings");
+            }
+            const expectedSampleState = findingCount > 0
+              ? "findings"
+              : candidate.analysis_state === "complete" && candidate.coverage === "bounded"
+                ? "clean"
+                : "unknown";
+            if (candidate.sample_state !== expectedSampleState) {
+              throw new TypeError("sample_state must agree with counts, analysis, and coverage");
+            }
+            if (
+              !Array.isArray(candidate.remaining_analysis)
+              || candidate.remaining_analysis.some(
+                (reason) => (
+                  typeof reason !== "string"
+                  || !remainingAnalysisReasons.has(reason)
+                ),
+              )
+              || new Set(candidate.remaining_analysis).size !== candidate.remaining_analysis.length
+            ) {
+              throw new TypeError(
+                "remaining_analysis must contain unique canonical reason strings",
+              );
+            }
+            if (
+              candidate.analysis_state === "complete"
+              && candidate.remaining_analysis.some(
+                (reason) => reason !== "reconciliation_unknown",
+              )
+            ) {
+              throw new TypeError(
+                "complete analysis may only retain reconciliation_unknown",
+              );
+            }
+            if (
+              candidate.analysis_state === "inconclusive"
+              && !candidate.remaining_analysis.some(
+                (reason) => reason !== "reconciliation_unknown",
+              )
+            ) {
+              throw new TypeError(
+                "inconclusive analysis requires a base or execution failure reason",
+              );
+            }
+            const expectedBoundedCoverage = (
+              candidate.analysis_state === "complete"
+              && candidate.sample_state !== "unknown"
+              && candidate.remaining_analysis.length === 0
+            );
+            if (
+              (candidate.coverage === "bounded") !== expectedBoundedCoverage
+              || (!expectedBoundedCoverage && candidate.remaining_analysis.length === 0)
+            ) {
+              throw new TypeError(
+                "coverage and remaining_analysis must agree with analysis_state and sample_state",
+              );
+            }
+            const expectedConvergence = (
+              candidate.analysis_state === "complete"
+              && candidate.sample_state === "clean"
+            );
+            if (
+              candidate.bounded_converged !== expectedConvergence
+              || candidate.converged !== expectedConvergence
+            ) {
+              throw new TypeError("convergence must agree with analysis_state and sample_state");
+            }
+          }
+
           let result = conservativeResult;
           let preserveResult = false;
           const existingResult = existsSync(resultFile) ? readFileSync(resultFile, "utf8") : "";
           if (existingResult.length > 0) {
             try {
               const candidate = JSON.parse(existingResult);
-              if (
-                candidate === null
-                || typeof candidate !== "object"
-                || Array.isArray(candidate)
-                || requiredFields.some((field) => !Object.hasOwn(candidate, field))
-                || typeof candidate.current_counts !== "object"
-                || candidate.current_counts === null
-                || typeof candidate.unresolved_counts !== "object"
-                || candidate.unresolved_counts === null
-              ) {
-                throw new TypeError("result is missing required final-result fields");
-              }
+              validateFinalResult(candidate);
               result = candidate;
               preserveResult = true;
             } catch (error) {

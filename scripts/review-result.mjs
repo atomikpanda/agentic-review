@@ -124,6 +124,46 @@ export function scopeHash(scope) {
   }, "scope")).digest("hex");
 }
 
+export function deriveTrustedScopeMetadata(trustedScope) {
+  requirePlainObject(trustedScope, "trusted scope");
+  const expectedKeys = [
+    "base_sha",
+    "bytes",
+    "configuration_fingerprint",
+    "diff",
+    "head_sha",
+    "included_bytes",
+  ];
+  if (!arraysEqual(Object.keys(trustedScope).sort(), expectedKeys)) {
+    throw new TypeError(`trusted scope must contain exactly ${expectedKeys.join(", ")}`);
+  }
+
+  const canonicalScope = {
+    base_sha: trustedScope.base_sha,
+    configuration_fingerprint: trustedScope.configuration_fingerprint,
+    diff: trustedScope.diff,
+    head_sha: trustedScope.head_sha,
+  };
+  const computedScopeHash = scopeHash(canonicalScope);
+  requireInteger(trustedScope.bytes, "trusted scope bytes");
+  requireInteger(trustedScope.included_bytes, "trusted scope included_bytes");
+  if (trustedScope.included_bytes > trustedScope.bytes) {
+    throw new TypeError("trusted scope included_bytes must not exceed trusted scope bytes");
+  }
+
+  return {
+    base_sha: trustedScope.base_sha,
+    configuration_fingerprint: trustedScope.configuration_fingerprint,
+    head_sha: trustedScope.head_sha,
+    scope_hash: computedScopeHash,
+    diff: {
+      bytes: trustedScope.bytes,
+      included_bytes: trustedScope.included_bytes,
+      truncated: trustedScope.included_bytes < trustedScope.bytes,
+    },
+  };
+}
+
 function requirePlainObject(value, path) {
   if (!isPlainObject(value)) throw new TypeError(`${path} must be an object`);
 }
@@ -455,13 +495,18 @@ export function validateRunMetadata(value, trustedScope) {
   if (trustedScope === undefined) {
     throw new TypeError("trusted scope is required to validate run metadata");
   }
-  const expectedScopeHash = scopeHash(trustedScope);
+  const trustedMetadata = deriveTrustedScopeMetadata(trustedScope);
+  for (const field of ["truncated", "bytes", "included_bytes"]) {
+    if (trustedMetadata.diff[field] !== value.diff[field]) {
+      throw new TypeError(`diff.${field} must match the trusted reviewed bytes`);
+    }
+  }
   for (const field of ["base_sha", "configuration_fingerprint", "head_sha"]) {
-    if (trustedScope[field] !== value[field]) {
+    if (trustedMetadata[field] !== value[field]) {
       throw new TypeError(`trusted scope ${field} must match metadata ${field}`);
     }
   }
-  if (value.scope_hash !== expectedScopeHash) {
+  if (value.scope_hash !== trustedMetadata.scope_hash) {
     throw new TypeError("scope_hash must match the trusted canonical scope");
   }
   if (value.diff.truncated === false && value.diff.included_bytes !== value.diff.bytes) {
@@ -541,7 +586,11 @@ function runCli(argv) {
   }
   const value = readJson(source);
   if (command === "fingerprint") return configurationFingerprint(value);
-  if (command === "scope") return scopeHash(value);
+  if (command === "scope") {
+    return Object.hasOwn(value, "included_bytes")
+      ? deriveTrustedScopeMetadata(value).scope_hash
+      : scopeHash(value);
+  }
   if (command === "analysis") return deriveAnalysisState(value);
   return JSON.stringify(validateRunMetadata(value, readJson(scopeSource)));
 }

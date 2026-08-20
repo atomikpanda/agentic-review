@@ -222,7 +222,7 @@ function acquireStateLock() {
 function withStateMutation(action) {
   const token = acquireStateLock();
   try {
-    return action();
+    return action(token);
   } finally {
     const owner = readStateLockOwner();
     if (owner?.token === token) rmSync(STATE_LOCK_DIR, { recursive: true, force: true });
@@ -417,7 +417,7 @@ if (cmd === "record") {
     return projected;
   });
 
-  const summary = withStateMutation(() => {
+  const summary = withStateMutation((mutationToken) => {
     const state = load();
     // new Date(undefined) is Invalid Date, not "now" — the || undefined idiom
     // that works for numbers does not work for this constructor.
@@ -468,7 +468,13 @@ if (cmd === "record") {
 
     mkdirSync(RUNS_DIR, { recursive: true });
     const stamp = now.replace(/[:.]/g, "-");
-    publishJson(join(RUNS_DIR, `${stamp}.json`), {
+    const runSequencePattern = new RegExp(`^${stamp}~(\\d+)\\.json$`);
+    const latestRunSequence = readdirSync(RUNS_DIR).reduce((latest, file) => {
+      const sequence = Number(runSequencePattern.exec(file)?.[1] ?? 0);
+      return Number.isSafeInteger(sequence) && sequence > latest ? sequence : latest;
+    }, 0);
+    const runSequence = String(latestRunSequence + 1).padStart(16, "0");
+    publishJson(join(RUNS_DIR, `${stamp}~${runSequence}.json`), {
       at: now,
       base,
       head,

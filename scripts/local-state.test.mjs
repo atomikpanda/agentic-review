@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,12 +12,16 @@ function git(directory, ...args) {
   return execFileSync("git", args, { cwd: directory, encoding: "utf8" }).trim();
 }
 
-function run(directory, ...args) {
+function runAtEpoch(directory, epoch, ...args) {
   return spawnSync(process.execPath, [localState, ...args], {
     cwd: directory,
     encoding: "utf8",
-    env: { ...process.env, RUN_EPOCH: "1755600000000" },
+    env: { ...process.env, RUN_EPOCH: String(epoch) },
   });
+}
+
+function run(directory, ...args) {
+  return runAtEpoch(directory, 1755600000000, ...args);
 }
 
 function createRepository(t, prefix) {
@@ -326,4 +330,85 @@ test("legacy state defaults the end span and latest commit without mutating on e
     suggestion: null,
   }] });
   assert.equal(readFileSync(stateFile, "utf8"), legacy);
+});
+
+test("runs with equal timestamps retain immutable history and list newest first", (t) => {
+  const repository = createRepository(t, "local-state-run-history-");
+  writeFileSync(join(repository, "alpha.txt"), "first\n");
+  git(repository, "add", "alpha.txt");
+  git(repository, "commit", "-m", "first");
+  const firstHead = git(repository, "rev-parse", "HEAD");
+  const findingsFile = join(repository, "findings.json");
+  writeFileSync(findingsFile, JSON.stringify({ findings: [] }));
+
+  const sharedEpoch = 1755600000000;
+  const recordedFirst = runAtEpoch(
+    repository,
+    sharedEpoch,
+    "record",
+    findingsFile,
+    firstHead,
+    firstHead,
+    "complete",
+  );
+  assert.equal(recordedFirst.status, 0, recordedFirst.stderr);
+
+  writeFileSync(join(repository, "alpha.txt"), "second\n");
+  git(repository, "commit", "-am", "second");
+  const secondHead = git(repository, "rev-parse", "HEAD");
+  const recordedSecond = runAtEpoch(
+    repository,
+    sharedEpoch,
+    "record",
+    findingsFile,
+    firstHead,
+    secondHead,
+    "complete",
+  );
+  assert.equal(recordedSecond.status, 0, recordedSecond.stderr);
+
+  writeFileSync(join(repository, "alpha.txt"), "third\n");
+  git(repository, "commit", "-am", "third");
+  const latestHead = git(repository, "rev-parse", "HEAD");
+  const recordedLater = runAtEpoch(
+    repository,
+    sharedEpoch + 1,
+    "record",
+    findingsFile,
+    firstHead,
+    latestHead,
+    "complete",
+  );
+  assert.equal(recordedLater.status, 0, recordedLater.stderr);
+
+  const runsDirectory = join(repository, ".git", "agentic-review", "runs");
+  const historyFiles = readdirSync(runsDirectory);
+  assert.equal(historyFiles.length, 3);
+  assert.ok(historyFiles.every((file) => file.endsWith(".json")));
+  const history = historyFiles.map((file) =>
+    JSON.parse(readFileSync(join(runsDirectory, file), "utf8")));
+  assert.deepEqual(
+    history.map((record) => record.at).sort(),
+    [
+      new Date(sharedEpoch).toISOString(),
+      new Date(sharedEpoch).toISOString(),
+      new Date(sharedEpoch + 1).toISOString(),
+    ],
+  );
+  assert.deepEqual(
+    history
+      .filter((record) => record.at === new Date(sharedEpoch).toISOString())
+      .map((record) => record.head)
+      .sort(),
+    [firstHead, secondHead].sort(),
+  );
+
+  const listed = run(repository, "runs");
+  assert.equal(listed.status, 0, listed.stderr);
+  const lines = listed.stdout.trim().split("\n");
+  assert.equal(lines.length, 3);
+  assert.match(lines[0], new RegExp(`${new Date(sharedEpoch + 1).toISOString()}.*${latestHead.slice(0, 8)}$`));
+  assert.match(lines[1], new RegExp(`${new Date(sharedEpoch).toISOString()}.*${secondHead.slice(0, 8)}$`));
+  assert.match(lines[2], new RegExp(`${new Date(sharedEpoch).toISOString()}.*${firstHead.slice(0, 8)}$`));
+  assert.equal(run(repository, "runs").stdout, listed.stdout);
 });

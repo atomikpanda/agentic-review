@@ -56,7 +56,11 @@ function reviewScope(run = {}) {
 
 function writeReviewScope(dir, run = {}) {
   const scopeFile = join(dir, "review-scope.json");
-  writeFileSync(scopeFile, JSON.stringify(reviewScope(run)));
+  writeFileSync(scopeFile, JSON.stringify({
+    ...reviewScope(run),
+    bytes: Buffer.byteLength(REVIEW_DIFF),
+    included_bytes: Buffer.byteLength(REVIEW_DIFF),
+  }));
   return scopeFile;
 }
 

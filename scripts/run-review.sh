@@ -265,13 +265,31 @@ fi
 if [ -n "$METADATA_OUT" ] && [ -L "$METADATA_OUT" ]; then
   die "--metadata-out cannot be a symlink destination"
 fi
+if [ -n "$SCOPE_OUT" ] && [ -L "$SCOPE_OUT" ]; then
+  die "AGENTIC_REVIEW_SCOPE_OUT cannot be a symlink destination"
+fi
 
-if [ -n "$OUT" ] && [ -n "$METADATA_OUT" ]; then
+if [ -n "$OUT" ]; then
   OUT_IDENTITY="$(destination_identity "$OUT")"
+fi
+if [ -n "$METADATA_OUT" ]; then
   METADATA_IDENTITY="$(destination_identity "$METADATA_OUT")"
-  if [ "$OUT_IDENTITY" = "$METADATA_IDENTITY" ]; then
-    die "--out and --metadata-out resolve to the same destination"
-  fi
+fi
+if [ -n "$SCOPE_OUT" ]; then
+  SCOPE_IDENTITY="$(destination_identity "$SCOPE_OUT")"
+fi
+
+if [ -n "$OUT" ] && [ -n "$METADATA_OUT" ] \
+   && [ "$OUT_IDENTITY" = "$METADATA_IDENTITY" ]; then
+  die "--out and --metadata-out resolve to the same destination"
+fi
+if [ -n "$OUT" ] && [ -n "$SCOPE_OUT" ] \
+   && [ "$OUT_IDENTITY" = "$SCOPE_IDENTITY" ]; then
+  die "--out and AGENTIC_REVIEW_SCOPE_OUT resolve to the same destination"
+fi
+if [ -n "$METADATA_OUT" ] && [ -n "$SCOPE_OUT" ] \
+   && [ "$METADATA_IDENTITY" = "$SCOPE_IDENTITY" ]; then
+  die "--metadata-out and AGENTIC_REVIEW_SCOPE_OUT resolve to the same destination"
 fi
 
 step "Checking prerequisites"
@@ -568,7 +586,6 @@ if [ "$MAX_DIFF_BYTES" != "0" ] && [ "$DIFF_BYTES" -gt "$MAX_DIFF_BYTES" ]; then
   TRUNCATED=1
 fi
 printf '%s' "$DIFFTEXT" > "$RUN_TMP/diff.included"
-INCLUDED_DIFF_BYTES="$(wc -c < "$RUN_TMP/diff.included" | tr -d ' ')"
 
 BASE_SHA="$SOURCE_BASE_SHA"
 HEAD_SHA="$SOURCE_TARGET_SHA"
@@ -759,15 +776,17 @@ SCOPE_FILE="$RUN_TMP/scope.json"
 BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" \
 CONFIGURATION_FINGERPRINT="$CONFIGURATION_FINGERPRINT" node -e '
   const fs = require("node:fs");
-  fs.writeFileSync(process.argv[2], JSON.stringify({
+  fs.writeFileSync(process.argv[3], JSON.stringify({
     base_sha: process.env.BASE_SHA,
+    bytes: fs.statSync(process.argv[1]).size,
     configuration_fingerprint: process.env.CONFIGURATION_FINGERPRINT,
     diff: fs.readFileSync(process.argv[1], "utf8"),
     head_sha: process.env.HEAD_SHA,
+    included_bytes: fs.statSync(process.argv[2]).size,
   }));
-' "$RUN_TMP/diff.full" "$SCOPE_FILE"
-SCOPE_HASH="$(node "$RESULT_HELPER" scope "$SCOPE_FILE")" \
-  || die "could not hash review scope"
+' "$RUN_TMP/diff.full" "$RUN_TMP/diff.included" "$SCOPE_FILE"
+node "$RESULT_HELPER" scope "$SCOPE_FILE" >/dev/null \
+  || die "could not validate review scope"
 
 step "Reviewing with $MODEL"
 say "read-only tools: $TOOLS${THINKING:+ | thinking: $THINKING} | passes: ${#PASS_IDS[@]}"
@@ -841,15 +860,17 @@ write_metadata() {
       "${PASS_COUNTS[j]}" "${PASS_CAPPED[j]}" >> "$records"
   done
   BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" CONFIGURATION_FINGERPRINT="$CONFIGURATION_FINGERPRINT" \
-  SCOPE_HASH="$SCOPE_HASH" SNAPSHOT_IMMUTABLE="$SNAPSHOT_IMMUTABLE" \
-  DIFF_BYTES="$DIFF_BYTES" INCLUDED_DIFF_BYTES="$INCLUDED_DIFF_BYTES" \
-  TRUNCATED="$TRUNCATED" MAX_FINDINGS="$MAX_FINDINGS" MIN_VOTES="$MIN_VOTES" \
+  SNAPSHOT_IMMUTABLE="$SNAPSHOT_IMMUTABLE" \
+  MAX_FINDINGS="$MAX_FINDINGS" MIN_VOTES="$MIN_VOTES" \
   MERGE_SUCCEEDED="$merge_succeeded" EXECUTION_FAILED="$execution_failed" \
   node --input-type=module -e '
     import fs from "node:fs";
     import { pathToFileURL } from "node:url";
 
-    const { enrichRunMetadata } = await import(pathToFileURL(process.argv[3]).href);
+    const { deriveTrustedScopeMetadata, enrichRunMetadata } = await import(pathToFileURL(process.argv[3]).href);
+    const trustedMetadata = deriveTrustedScopeMetadata(
+      JSON.parse(fs.readFileSync(process.argv[4], "utf8")),
+    );
     const results = fs.readFileSync(process.argv[1], "utf8").trimEnd().split("\n").filter(Boolean)
       .map((line) => {
         const [id, status, attempts, finding_count, capped] = line.split("\t");
@@ -870,11 +891,7 @@ write_metadata() {
       head_sha: process.env.HEAD_SHA,
       configuration_fingerprint: process.env.CONFIGURATION_FINGERPRINT,
       snapshot_immutable: process.env.SNAPSHOT_IMMUTABLE === "1",
-      diff: {
-        bytes: Number(process.env.DIFF_BYTES),
-        included_bytes: Number(process.env.INCLUDED_DIFF_BYTES),
-        truncated: process.env.TRUNCATED === "1",
-      },
+      diff: trustedMetadata.diff,
       finding_cap: Number(process.env.MAX_FINDINGS),
       min_votes: Number(process.env.MIN_VOTES),
       passes: {
@@ -886,11 +903,11 @@ write_metadata() {
     if (process.env.MERGE_SUCCEEDED === "true") run.merge_succeeded = true;
     if (process.env.MERGE_SUCCEEDED === "false") run.merge_succeeded = false;
     const metadata = enrichRunMetadata(run, {
-      scopeHash: process.env.SCOPE_HASH,
+      scopeHash: trustedMetadata.scope_hash,
       executionFailed: process.env.EXECUTION_FAILED === "1" ? true : undefined,
     });
     fs.writeFileSync(process.argv[2], JSON.stringify(metadata, null, 2));
-  ' "$records" "$RUN_TMP/metadata.json" "$RESULT_HELPER" \
+  ' "$records" "$RUN_TMP/metadata.json" "$RESULT_HELPER" "$SCOPE_FILE" \
     || die "could not derive review metadata"
   node "$RESULT_HELPER" validate "$RUN_TMP/metadata.json" "$SCOPE_FILE" >/dev/null \
     || die "generated review metadata failed validation"

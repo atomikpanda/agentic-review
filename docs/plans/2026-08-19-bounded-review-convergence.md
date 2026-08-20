@@ -352,7 +352,7 @@ Run:
 ```bash
 node --test scripts/post-review.test.mjs scripts/review-result.test.mjs scripts/thread-change.test.mjs
 node --check scripts/post-review.mjs scripts/review-result.mjs
-FINDINGS_FILE=<fixture-findings> REVIEW_METADATA_FILE=<fixture-metadata> RENDER=1 REVIEW_MODE=summary node scripts/post-review.mjs
+FINDINGS_FILE=<fixture-findings> REVIEW_METADATA_FILE=<fixture-metadata> REVIEW_SCOPE_FILE=<fixture-scope> RENDER=1 REVIEW_MODE=summary node scripts/post-review.mjs
 ```
 
 Expected: suites pass; the smoke output contains one summary with explicit states and no exhaustive claim.

@@ -320,14 +320,18 @@ function runReview(t, plan, {
   const bunxLogFile = join(fixture.directory, "bunx.log");
   let findingsFile = join(fixture.directory, "findings.json");
   let metadataFile = join(fixture.directory, "metadata.json");
+  let scopeFile = `${metadataFile}.scope`;
   if (outputPaths) {
-    ({ findingsFile, metadataFile } = outputPaths({
+    const outputFiles = outputPaths({
       ...fixture,
       findingsFile,
       metadataFile,
-    }));
+      scopeFile,
+    });
+    findingsFile = outputFiles.findingsFile;
+    metadataFile = outputFiles.metadataFile;
+    scopeFile = outputFiles.scopeFile ?? `${metadataFile}.scope`;
   }
-  const scopeFile = `${metadataFile}.scope`;
   writeFileSync(planFile, JSON.stringify(plan));
   const runnerArgs = [
     runner,
@@ -761,6 +765,13 @@ test("the default profile runs general, correctness, and boundaries into one val
   );
   assert.equal(run.scope.diff, canonicalDiff);
   assert.equal(run.scope.diff.endsWith("\n"), true);
+  assert.equal(run.scope.bytes, Buffer.byteLength(canonicalDiff));
+  assert.equal(run.scope.included_bytes, Buffer.byteLength(canonicalDiff));
+  assert.deepEqual(run.metadata.diff, {
+    bytes: Buffer.byteLength(canonicalDiff),
+    included_bytes: Buffer.byteLength(canonicalDiff),
+    truncated: false,
+  });
   assert.deepEqual(
     {
       base_sha: run.scope.base_sha,
@@ -983,10 +994,14 @@ test("workflow boundary completes every final surface without replacing trustwor
   const emittedResult = {
     ...expectedResult,
     analysis_state: "complete",
-    sample_state: "no_findings",
+    configuration_fingerprint: "a".repeat(64),
+    passes_requested: 3,
+    passes_completed: 3,
+    sample_state: "clean",
     bounded_converged: true,
     coverage: "bounded",
     remaining_analysis: [],
+    scope_hash: "b".repeat(64),
     converged: true,
   };
   const emittedResultText = `${JSON.stringify(emittedResult, null, 2)}\n`;
@@ -1059,6 +1074,181 @@ process.exit(29);
     ])),
   );
   assertFinalResultSummary(readFileSync(repairedSummary, "utf8"), emittedResult);
+});
+
+test("workflow boundary replaces key-complete semantically invalid poster results", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hosted-invalid-result-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const trustedPoster = join(directory, "scripts", "post-review.mjs");
+  mkdirSync(dirname(trustedPoster), { recursive: true });
+  writeFileSync(trustedPoster, `
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.REVIEW_RESULT_FILE, process.env.EMITTED_RESULT);
+process.exit(31);
+`);
+
+  const baseSha = "1111111111111111111111111111111111111111";
+  const headSha = "2222222222222222222222222222222222222222";
+  const validResult = expectedExecutionFailureResult(baseSha, headSha);
+  const invalidResults = [
+    ["string boolean", { ...validResult, bounded_converged: "false" }],
+    ["string pass count", { ...validResult, passes_requested: "0" }],
+    [
+      "completed passes exceed requested",
+      { ...validResult, passes_requested: 1, passes_completed: 2 },
+    ],
+    [
+      "invalid configuration fingerprint",
+      { ...validResult, configuration_fingerprint: "A".repeat(64) },
+    ],
+    ["invalid scope hash", { ...validResult, scope_hash: "f".repeat(63) }],
+    [
+      "complete result with zero passes and empty identity",
+      {
+        ...validResult,
+        analysis_state: "complete",
+        sample_state: "clean",
+        bounded_converged: true,
+        coverage: "bounded",
+        remaining_analysis: [],
+        converged: true,
+      },
+    ],
+    [
+      "complete findings result with diff truncated",
+      {
+        ...validResult,
+        analysis_state: "complete",
+        passes_requested: 1,
+        passes_completed: 1,
+        configuration_fingerprint: "a".repeat(64),
+        current_counts: { Critical: 0, High: 0, Medium: 1 },
+        sample_state: "findings",
+        scope_hash: "b".repeat(64),
+        remaining_analysis: ["diff_truncated"],
+      },
+    ],
+    [
+      "complete result with execution failure",
+      {
+        ...validResult,
+        analysis_state: "complete",
+        passes_requested: 1,
+        passes_completed: 1,
+        configuration_fingerprint: "a".repeat(64),
+        scope_hash: "b".repeat(64),
+      },
+    ],
+    ["array count map", { ...validResult, current_counts: [] }],
+    [
+      "invalid count values",
+      { ...validResult, unresolved_counts: { Critical: 0, High: -1, Medium: 0 } },
+    ],
+    [
+      "stale target",
+      {
+        ...validResult,
+        base_sha: "3333333333333333333333333333333333333333",
+        head_sha: "4444444444444444444444444444444444444444",
+        reviewed_head: "4444444444444444444444444444444444444444",
+      },
+    ],
+    [
+      "mismatched reviewed head",
+      { ...validResult, reviewed_head: "3333333333333333333333333333333333333333" },
+    ],
+    [
+      "clean result with findings",
+      {
+        ...validResult,
+        sample_state: "clean",
+        current_counts: { Critical: 0, High: 1, Medium: 0 },
+      },
+    ],
+    ["findings result without counts", { ...validResult, sample_state: "findings" }],
+    ["clean execution failure without counts", { ...validResult, sample_state: "clean" }],
+    ["blocked result without findings", { ...validResult, merge_state: "blocked" }],
+    ["unsupported remaining reason", { ...validResult, remaining_analysis: ["unsupported"] }],
+    [
+      "duplicate remaining reasons",
+      { ...validResult, remaining_analysis: ["execution_failed", "execution_failed"] },
+    ],
+    [
+      "inconclusive result with reconciliation only",
+      { ...validResult, remaining_analysis: ["reconciliation_unknown"] },
+    ],
+    [
+      "incorrect convergence",
+      { ...validResult, bounded_converged: true, converged: true },
+    ],
+    [
+      "bounded coverage for incomplete unknown result",
+      { ...validResult, coverage: "bounded", remaining_analysis: [] },
+    ],
+    [
+      "unknown coverage for complete known result",
+      {
+        ...validResult,
+        analysis_state: "complete",
+        sample_state: "clean",
+        bounded_converged: true,
+        coverage: "unknown",
+        remaining_analysis: [],
+        converged: true,
+      },
+    ],
+  ];
+
+  for (const [name, invalidResult] of invalidResults) {
+    const suffix = name.replaceAll(" ", "-");
+    const outputFile = join(directory, `${suffix}-output`);
+    const resultFile = join(directory, `${suffix}-result.json`);
+    const summaryFile = join(directory, `${suffix}-summary`);
+    const finalized = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+      cwd: directory,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        TARGET_ELIGIBLE: "true",
+        PR_NUMBER: "7",
+        GITHUB_REPO: "example/repository",
+        HEAD_SHA: headSha,
+        BASE_SHA: baseSha,
+        TRUSTED_DATA_ROOT: directory,
+        REVIEW_POSTER: trustedPoster,
+        REVIEW_MODE: "summary",
+        POST_COMMENT: "false",
+        SUPPRESS_WRITES: "true",
+        RESOLVE_STALE: "false",
+        MAX_FINDINGS: "20",
+        FAIL_ON_FINDINGS: "false",
+        BLOCK_SEVERITIES: "Critical,High",
+        GITHUB_OUTPUT: outputFile,
+        REVIEW_RESULT_FILE: resultFile,
+        GITHUB_STEP_SUMMARY: summaryFile,
+        EMITTED_RESULT: JSON.stringify(invalidResult),
+      },
+    });
+
+    assert.equal(finalized.status, 31, `${name}: ${finalized.stderr}`);
+    assert.match(
+      finalized.stderr,
+      /review poster left an invalid result; replacing it conservatively/,
+      name,
+    );
+    assert.deepEqual(JSON.parse(readFileSync(resultFile, "utf8")), validResult, name);
+    assert.deepEqual(
+      envFileValues(outputFile),
+      Object.fromEntries(Object.entries(validResult).map(([field, value]) => [
+        field,
+        typeof value === "object" ? JSON.stringify(value) : String(value),
+      ])),
+      name,
+    );
+    const summary = readFileSync(summaryFile, "utf8");
+    assertFinalResultSummary(summary, validResult);
+    assert.doesNotMatch(summary, /undefined|Bounded convergence \| `yes`/, name);
+  }
 });
 
 test("target resolution failure finalizes conservatively while explicit ineligibility remains skipped", (t) => {
@@ -1809,6 +1999,13 @@ test("diff truncation is recorded and makes an otherwise valid run inconclusive"
   assert.equal(run.metadata.diff.truncated, true);
   assert.ok(run.metadata.diff.bytes > run.metadata.diff.included_bytes);
   assert.equal(run.metadata.diff.included_bytes, 80);
+  const trustedDiffBytes = run.scope.bytes;
+  assert.equal(run.scope.included_bytes, 80);
+  assert.deepEqual(run.metadata.diff, {
+    bytes: trustedDiffBytes,
+    included_bytes: run.scope.included_bytes,
+    truncated: true,
+  });
   assert.equal(validateMetadata(run.metadataFile).status, 0);
 });
 
@@ -1828,10 +2025,41 @@ test("diff metadata and canonical scope preserve the exact UTF-8 git diff bytes"
   });
   assert.equal(expectedDiff.at(-1), 10);
   assert.equal(run.scope.diff, expectedDiff.toString("utf8"));
+  assert.equal(run.scope.bytes, expectedDiff.length);
   assert.equal(run.metadata.diff.bytes, expectedDiff.length);
   assert.equal(run.metadata.diff.included_bytes, expectedDiff.length);
   assert.equal(validateMetadata(run.metadataFile).status, 0);
 });
+
+test("trusted raw byte counts keep non-UTF-8 full diffs complete", (t) => {
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    env: { AGENTIC_REVIEW_MAX_DIFF_BYTES: "0" },
+    baseFiles: { "invalid-utf8.txt": Buffer.from([0x61, 0x80, 0x0a]) },
+    targetFiles: { "invalid-utf8.txt": Buffer.from([0x62, 0x80, 0x0a]) },
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  const expectedDiff = execFileSync("git", ["diff", "--no-color", "main", "HEAD"], {
+    cwd: run.repository,
+  });
+  assert.equal(expectedDiff.includes(0x80), true);
+  assert.notEqual(Buffer.byteLength(run.scope.diff), expectedDiff.length);
+  assert.equal(run.scope.bytes, expectedDiff.length);
+  assert.equal(run.scope.included_bytes, expectedDiff.length);
+  assert.deepEqual(run.metadata.diff, {
+    bytes: expectedDiff.length,
+    included_bytes: expectedDiff.length,
+    truncated: false,
+  });
+  assert.equal(run.metadata.analysis_state, "complete");
+  assert.equal(run.metadata.coverage, "bounded");
+  assert.equal(validateMetadata(run.metadataFile).status, 0);
+});
+
 
 test("canonical diff rendering failures stop before model work", (t) => {
   const fixture = createFixture(t);
@@ -1921,18 +2149,84 @@ test("findings and metadata destinations cannot resolve to the same file", (t) =
   assert.match(symlinkAlias.result.stderr, /--out.*--metadata-out|same destination/);
 });
 
-test("symlink artifact destinations are rejected before model work without replacing either output", (t) => {
+test("scope and findings destinations cannot resolve to the same file without replacing artifacts", (t) => {
+  const staleShared = '{"sentinel":"shared"}\n';
+  const staleMetadata = '{"sentinel":"metadata"}\n';
+  let sharedFile;
+  let metadataFile;
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    outputPaths: ({ directory, metadataFile: defaultMetadata }) => {
+      sharedFile = join(directory, "scope-findings.json");
+      metadataFile = defaultMetadata;
+      writeFileSync(sharedFile, staleShared);
+      writeFileSync(metadataFile, staleMetadata);
+      return {
+        findingsFile: sharedFile,
+        metadataFile,
+        scopeFile: `${directory}/./scope-findings.json`,
+      };
+    },
+  });
+
+  assert.notEqual(run.result.status, 0);
+  assert.equal(run.logs.length, 0);
+  assert.equal(readFileSync(sharedFile, "utf8"), staleShared);
+  assert.equal(readFileSync(metadataFile, "utf8"), staleMetadata);
+  assert.match(run.result.stderr, /--out.*AGENTIC_REVIEW_SCOPE_OUT|AGENTIC_REVIEW_SCOPE_OUT.*--out|same destination/);
+});
+
+test("scope and metadata destinations cannot resolve through symlinked directories without replacing artifacts", (t) => {
+  const staleFindings = '{"sentinel":"findings"}\n';
+  const staleShared = '{"sentinel":"shared"}\n';
+  let findingsFile;
+  let sharedFile;
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    outputPaths: ({ directory, findingsFile: defaultFindings }) => {
+      const realDirectory = join(directory, "real-scope-output");
+      const aliasDirectory = join(directory, "alias-scope-output");
+      mkdirSync(realDirectory);
+      symlinkSync(realDirectory, aliasDirectory, "dir");
+      findingsFile = defaultFindings;
+      sharedFile = join(realDirectory, "scope-metadata.json");
+      writeFileSync(findingsFile, staleFindings);
+      writeFileSync(sharedFile, staleShared);
+      return {
+        findingsFile,
+        metadataFile: sharedFile,
+        scopeFile: join(aliasDirectory, "scope-metadata.json"),
+      };
+    },
+  });
+
+  assert.notEqual(run.result.status, 0);
+  assert.equal(run.logs.length, 0);
+  assert.equal(readFileSync(findingsFile, "utf8"), staleFindings);
+  assert.equal(readFileSync(sharedFile, "utf8"), staleShared);
+  assert.match(run.result.stderr, /--metadata-out.*AGENTIC_REVIEW_SCOPE_OUT|AGENTIC_REVIEW_SCOPE_OUT.*--metadata-out|same destination/);
+});
+
+test("symlink artifact destinations are rejected before model work without replacing outputs", (t) => {
   const plan = {
     general: [{ findings: [] }],
     correctness: [{ findings: [] }],
     boundaries: [{ findings: [] }],
   };
-  for (const selected of ["findings", "metadata"]) {
+  for (const selected of ["findings", "metadata", "scope"]) {
     let staleTarget;
     let otherOutput;
     const stale = selected === "findings"
       ? '{"findings":[{"title":"stale"}]}\n'
-      : '{"analysis_state":"stale"}\n';
+      : selected === "metadata"
+        ? '{"analysis_state":"stale"}\n'
+        : '{"base_sha":"stale"}\n';
     const run = runReview(t, plan, {
       outputPaths: ({ directory, findingsFile, metadataFile }) => {
         staleTarget = join(directory, `${selected}-stale-target.json`);
@@ -1940,18 +2234,26 @@ test("symlink artifact destinations are rejected before model work without repla
         const symlink = join(directory, `${selected}-artifact.json`);
         symlinkSync(staleTarget, symlink);
         otherOutput = selected === "findings" ? metadataFile : findingsFile;
-        return selected === "findings"
-          ? { findingsFile: symlink, metadataFile }
-          : { findingsFile, metadataFile: symlink };
+        if (selected === "findings") return { findingsFile: symlink, metadataFile };
+        if (selected === "metadata") return { findingsFile, metadataFile: symlink };
+        return { findingsFile, metadataFile, scopeFile: symlink };
       },
     });
 
     assert.notEqual(run.result.status, 0, `${selected}: ${run.result.stderr}`);
     assert.equal(run.logs.length, 0, selected);
-    assert.equal(lstatSync(selected === "findings" ? run.findingsFile : run.metadataFile).isSymbolicLink(), true);
+    const selectedOutput = selected === "findings"
+      ? run.findingsFile
+      : selected === "metadata"
+        ? run.metadataFile
+        : run.scopeFile;
+    assert.equal(lstatSync(selectedOutput).isSymbolicLink(), true);
     assert.equal(readFileSync(staleTarget, "utf8"), stale);
     assert.equal(existsSync(otherOutput), false, `${selected}: other artifact was partially written`);
-    assert.match(run.result.stderr, /symlink.*(?:--out|--metadata-out)|(?:--out|--metadata-out).*symlink/i);
+    assert.match(
+      run.result.stderr,
+      /symlink.*(?:--out|--metadata-out|AGENTIC_REVIEW_SCOPE_OUT)|(?:--out|--metadata-out|AGENTIC_REVIEW_SCOPE_OUT).*symlink/i,
+    );
   }
 });
 
@@ -2219,8 +2521,8 @@ test("lock-free state readers see complete snapshots while JSON files are publis
     const stateDirectory = join(fixture.repository, ".git", "agentic-review");
     const statePath = join(stateDirectory, "state.json");
     const stamp = new Date(epoch).toISOString().replace(/[:.]/g, "-");
-    const runPath = join(stateDirectory, "runs", `${stamp}.json`);
-    const publicationPath = publication === "state" ? statePath : runPath;
+    const runPrefix = join(stateDirectory, "runs", stamp);
+    const publicationPath = publication === "state" ? statePath : runPrefix;
     const ready = join(fixture.directory, `${publication}-publication-ready`);
     const release = join(fixture.directory, `${publication}-publication-release`);
     const preload = join(fixture.directory, `${publication}-publication.cjs`);
@@ -2235,7 +2537,13 @@ const originalRenameSync = fs.renameSync;
 const originalWriteFileSync = fs.writeFileSync;
 const sleeper = new Int32Array(new SharedArrayBuffer(4));
 const target = resolve(process.env.PUBLICATION_PATH);
-const samePath = (path) => typeof path === "string" && resolve(path) === target;
+const samePath = (path) => {
+  if (typeof path !== "string") return false;
+  const resolved = resolve(path);
+  return process.env.PUBLICATION_IS_RUN === "1"
+    ? resolved.startsWith(target + "~") && resolved.endsWith(".json")
+    : resolved === target;
+};
 const holdPublication = () => {
   originalWriteFileSync(process.env.PUBLICATION_READY, "ready");
   while (!originalExistsSync(process.env.PUBLICATION_RELEASE)) {
@@ -2253,7 +2561,8 @@ fs.renameSync = (from, to) => {
   if (
     samePath(to)
     && typeof from === "string"
-    && resolve(from).startsWith(target + ".pending-")
+    && typeof to === "string"
+    && resolve(from).startsWith(resolve(to) + ".pending-")
   ) holdPublication();
   return originalRenameSync(from, to);
 };
@@ -2270,6 +2579,7 @@ syncBuiltinESMExports();
           NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${preload}`.trim(),
           PUBLICATION_PATH: publicationPath,
           PUBLICATION_READY: ready,
+          PUBLICATION_IS_RUN: publication === "run" ? "1" : "0",
           PUBLICATION_RELEASE: release,
           RUN_EPOCH: String(epoch),
         },
