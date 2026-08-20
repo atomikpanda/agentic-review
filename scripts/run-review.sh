@@ -98,6 +98,7 @@ PASSES="${AGENTIC_REVIEW_PASSES:-1}"
 LENSES="${AGENTIC_REVIEW_LENSES:-correctness,boundaries}"
 MIN_VOTES="${AGENTIC_REVIEW_MIN_VOTES:-1}"
 METADATA_OUT="${AGENTIC_REVIEW_METADATA_OUT:-}"
+SCOPE_OUT="${AGENTIC_REVIEW_SCOPE_OUT:-}"
 TRUSTED_DATA_ROOT="${AGENTIC_REVIEW_TRUSTED_DATA_ROOT:-}"
 STAGED=0; OUT=""; FAIL_ON_FINDINGS=1; AS_JSON=0; USE_CODEGRAPH=1; VIEW=""; TRUST_REPO="${TRUST_REPO:-0}"; RECORD_STATE=1
 PASSTHRU=()
@@ -412,7 +413,9 @@ fi
 git diff --quiet "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" \
   && die "$([ "$STAGED" = 1 ] && printf 'nothing staged' || printf 'no changes vs %s' "$BASE")"
 DIFFSTAT="$(git diff --stat "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA")"
-DIFFTEXT="$(git diff --no-color "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA")"
+DIFFTEXT="$(git diff --no-color "$SOURCE_BASE_SHA" "$SOURCE_TARGET_SHA" && printf x)" \
+  || die "could not render canonical diff"
+DIFFTEXT="${DIFFTEXT%x}"
 ok "reviewing against $RANGE"
 printf '%s\n' "$DIFFSTAT" | sed 's/^/    /' >&2
 SOURCE_CODEGRAPH_OPT_IN=0
@@ -458,7 +461,8 @@ fi
 ordered_diff() {
   local pass="$1" rotation
   if [ "$pass" -le 1 ] || [ "$TRUNCATED" = 1 ] || [ "$CHANGED_PATH_COUNT" -le 1 ]; then
-    printf '%s\n' "$DIFFTEXT"
+    printf '%s' "$DIFFTEXT"
+    case "$DIFFTEXT" in *$'\n') ;; *) printf '\n' ;; esac
     return 0
   fi
   rotation=$(( (pass - 1) % CHANGED_PATH_COUNT ))
@@ -888,12 +892,23 @@ write_metadata() {
     fs.writeFileSync(process.argv[2], JSON.stringify(metadata, null, 2));
   ' "$records" "$RUN_TMP/metadata.json" "$RESULT_HELPER" \
     || die "could not derive review metadata"
-  node "$RESULT_HELPER" validate "$RUN_TMP/metadata.json" >/dev/null \
+  node "$RESULT_HELPER" validate "$RUN_TMP/metadata.json" "$SCOPE_FILE" >/dev/null \
     || die "generated review metadata failed validation"
+  if [ -n "$SCOPE_OUT" ]; then
+    scope_tmp="${SCOPE_OUT}.tmp.$$"
+    if ! cp "$SCOPE_FILE" "$scope_tmp"; then
+      rm -f "$scope_tmp"
+      die "could not write scope beside $SCOPE_OUT"
+    fi
+    mv -f "$scope_tmp" "$SCOPE_OUT" || {
+      rm -f "$scope_tmp"
+      die "could not publish scope at $SCOPE_OUT"
+    }
+  fi
   if [ -n "$METADATA_OUT" ]; then
     metadata_tmp="${METADATA_OUT}.tmp.$$"
     cp "$RUN_TMP/metadata.json" "$metadata_tmp" || die "could not write metadata beside $METADATA_OUT"
-    if ! node "$RESULT_HELPER" validate "$metadata_tmp" >/dev/null; then
+    if ! node "$RESULT_HELPER" validate "$metadata_tmp" "$SCOPE_FILE" >/dev/null; then
       rm -f "$metadata_tmp"
       die "metadata at $metadata_tmp failed validation"
     fi
@@ -987,6 +1002,7 @@ if [ "$AS_JSON" = 1 ]; then
   cat "$TMP_OUT"
 elif RENDERER="$(support_exec scripts/post-review.mjs)"; then
   FINDINGS_FILE="$TMP_OUT" REVIEW_METADATA_FILE="$RUN_TMP/metadata.json" \
+    REVIEW_SCOPE_FILE="$SCOPE_FILE" \
     UNRESOLVED_FINDINGS_FILE="$LOCAL_UNRESOLVED_FILE" \
     RECONCILIATION_KNOWN="$LOCAL_RECONCILIATION_KNOWN" \
     REVIEW_MODE="$REVIEW_MODE" RENDER=1 node "$RENDERER" || cat "$TMP_OUT"

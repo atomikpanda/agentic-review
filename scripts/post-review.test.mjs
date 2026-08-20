@@ -26,18 +26,44 @@ import {
   upsertSummaryComment,
 } from "./post-review.mjs";
 import * as poster from "./post-review.mjs";
-import { deriveReviewState } from "./review-result.mjs";
+import { deriveReviewState, scopeHash } from "./review-result.mjs";
 
 const BASE_SHA = "1".repeat(40);
 const HEAD_SHA = "2".repeat(40);
 const PRIOR_HEAD_SHA = "4".repeat(40);
 const FINGERPRINT = "3".repeat(64);
-const SCOPE_HASH = "5".repeat(64);
+const REVIEW_DIFF = [
+  "diff --git a/src/cache.mjs b/src/cache.mjs",
+  "index 1111111..2222222 100644",
+  "--- a/src/cache.mjs",
+  "+++ b/src/cache.mjs",
+  "@@ -1 +1 @@",
+  "-before",
+  "+after",
+  "",
+].join("\n");
+const SCOPE_HASH = scopeHash(reviewScope());
 const EMPTY_COUNTS = { Critical: 0, High: 0, Medium: 0 };
+
+function reviewScope(run = {}) {
+  return {
+    base_sha: run.base_sha ?? BASE_SHA,
+    configuration_fingerprint: run.configuration_fingerprint ?? FINGERPRINT,
+    diff: REVIEW_DIFF,
+    head_sha: run.head_sha ?? HEAD_SHA,
+  };
+}
+
+function writeReviewScope(dir, run = {}) {
+  const scopeFile = join(dir, "review-scope.json");
+  writeFileSync(scopeFile, JSON.stringify(reviewScope(run)));
+  return scopeFile;
+}
 
 function metadata(overrides = {}) {
   const baseSha = overrides.base_sha ?? BASE_SHA;
   const headSha = overrides.head_sha ?? HEAD_SHA;
+  const configurationFingerprint = overrides.configuration_fingerprint ?? FINGERPRINT;
   const pass = (id) => ({
     id,
     status: "valid",
@@ -46,20 +72,28 @@ function metadata(overrides = {}) {
     capped: false,
     base_sha: baseSha,
     head_sha: headSha,
-    configuration_fingerprint: FINGERPRINT,
+    configuration_fingerprint: configurationFingerprint,
   });
   return {
     schema_version: 1,
     base_sha: baseSha,
     head_sha: headSha,
-    configuration_fingerprint: FINGERPRINT,
+    configuration_fingerprint: configurationFingerprint,
     reviewed_head: headSha,
-    scope_hash: SCOPE_HASH,
+    scope_hash: scopeHash(reviewScope({
+      base_sha: baseSha,
+      configuration_fingerprint: configurationFingerprint,
+      head_sha: headSha,
+    })),
     coverage: "bounded",
     remaining_analysis: [],
     snapshot_immutable: true,
     analysis_state: "complete",
-    diff: { bytes: 120, included_bytes: 120, truncated: false },
+    diff: {
+      bytes: Buffer.byteLength(REVIEW_DIFF),
+      included_bytes: Buffer.byteLength(REVIEW_DIFF),
+      truncated: false,
+    },
     finding_cap: 20,
     merge_succeeded: true,
     passes: {
@@ -199,6 +233,7 @@ function runPosterWithHistory({
   }
   const findingsFile = join(dir, "findings.json");
   const metadataFile = join(dir, "metadata.json");
+  const scopeFile = writeReviewScope(dir, runtimeMetadata);
   const outputFile = join(dir, "output");
   const summaryFile = join(dir, "summary");
   const resultFile = join(dir, "review-result.json");
@@ -217,6 +252,7 @@ globalThis.fetch = async (url, options = {}) => {
   if (url === "https://api.github.com/graphql") {
     const request = JSON.parse(options.body);
     if (request.query.includes("resolveReviewThread")) {
+      console.log("[test] hosted mutation resolve " + request.variables.id);
       console.log("[test] resolved thread " + request.variables.id);
       if (fixture.failRetirement) {
         return reply({ errors: [{ message: "retirement unavailable" }] });
@@ -238,8 +274,17 @@ globalThis.fetch = async (url, options = {}) => {
     if (fixture.failSummaryHistory) return reply({ message: "summary history unavailable" }, 500);
     return reply(fixture.summaryComments);
   }
+  if (options.method === "PATCH" && String(url).includes("/pulls/comments/")) {
+    console.log("[test] hosted mutation collapse");
+    return reply({});
+  }
+  if (options.method === "POST" && String(url).includes("/pulls/7/reviews")) {
+    console.log("[test] hosted mutation review");
+    return reply({});
+  }
   if (["POST", "PATCH"].includes(options.method) && String(url).includes("/issues/")) {
     if (fixture.failSummaryPost) return reply({ message: "summary post unavailable" }, 500);
+    console.log("[test] hosted mutation summary");
     console.log("[test] wrote standing summary");
     return reply({});
   }
@@ -265,6 +310,7 @@ globalThis.fetch = async (url, options = {}) => {
         }),
         FINDINGS_FILE: findingsFile,
         REVIEW_METADATA_FILE: metadataFile,
+        REVIEW_SCOPE_FILE: scopeFile,
         GITHUB_OUTPUT: outputFile,
         GITHUB_STEP_SUMMARY: summaryFile,
         REVIEW_RESULT_FILE: resultFile,
@@ -474,7 +520,7 @@ test("deleting the standing summary comment resets summary history only", () => 
   });
 });
 
-test("coordinate-less bot threads make summary and inline reconciliation unknown without invalid findings", async () => {
+test("coordinate-less bot threads make reconciliation unknown and leave other omitted threads untouched", async () => {
   const blocker = finding({
     title: "Coordinate-less blocker",
     body: "The open bot-authored blocker has no trustworthy line span.",
@@ -544,6 +590,29 @@ test("coordinate-less bot threads make summary and inline reconciliation unknown
       assert.match(result.stdout, /review writes were suppressed/);
       assert.doesNotMatch(result.stdout, /"comments":/);
     }
+  }
+
+  const omitted = finding({
+    file: "src/omitted.mjs",
+    start_line: 6,
+    end_line: 8,
+    title: "Other omitted blocker",
+    body: "This valid standing thread must not be mutated after reconciliation becomes unknown.",
+    suggestion: null,
+  });
+  for (const mode of ["summary", "inline"]) {
+    const result = runPosterWithHistory({
+      mode,
+      threads: [rawThread],
+      currentFindings: [blocker],
+      changedOpenFinding: omitted,
+      writesEnabled: true,
+    });
+    assert.equal(result.status, 1, `${mode}: ${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
+    assert.doesNotMatch(result.stdout, /\[test\] hosted mutation/, `${mode}: ${result.stdout}`);
+    assert.match(result.workflowOutput, /sample_state=findings/, mode);
+    assert.match(result.workflowOutput, /current_counts=\{"Critical":0,"High":1,"Medium":0\}/, mode);
+    assert.match(result.workflowOutput, /unresolved_counts=\{"Critical":0,"High":1,"Medium":0\}/, mode);
   }
 });
 
@@ -1730,6 +1799,7 @@ test("poster rejects a finding title containing CR or LF while preserving multil
   const dir = mkdtempSync(join(tmpdir(), "post-review-title-boundary-"));
   const findingsFile = join(dir, "findings.json");
   const metadataFile = join(dir, "metadata.json");
+  const scopeFile = writeReviewScope(dir);
   writeFileSync(metadataFile, JSON.stringify(metadata()));
   for (const title of ["Visible title\nInjected continuation", "Visible title\rInjected continuation"]) {
     writeFileSync(findingsFile, JSON.stringify({ findings: [finding({ title })] }));
@@ -1739,6 +1809,7 @@ test("poster rejects a finding title containing CR or LF while preserving multil
         ...process.env,
         FINDINGS_FILE: findingsFile,
         REVIEW_METADATA_FILE: metadataFile,
+        REVIEW_SCOPE_FILE: scopeFile,
         RENDER: "1",
         REVIEW_MODE: "inline",
       },
@@ -1755,6 +1826,7 @@ test("poster rejects a finding title containing CR or LF while preserving multil
       ...process.env,
       FINDINGS_FILE: findingsFile,
       REVIEW_METADATA_FILE: metadataFile,
+      REVIEW_SCOPE_FILE: scopeFile,
       RENDER: "1",
       REVIEW_MODE: "inline",
     },
@@ -1834,10 +1906,11 @@ test("gate failure is derived only from merge_state", () => {
   assert.equal(shouldFailGate({ merge_state: "blocked" }, false), false);
 });
 
-test("normal execution requires and validates REVIEW_METADATA_FILE", () => {
+test("normal execution requires and validates REVIEW_METADATA_FILE and REVIEW_SCOPE_FILE", () => {
   const dir = mkdtempSync(join(tmpdir(), "post-review-metadata-"));
   const findingsFile = join(dir, "findings.json");
   const metadataFile = join(dir, "metadata.json");
+  const scopeFile = writeReviewScope(dir);
   writeFileSync(findingsFile, '{"findings":[]}');
   writeFileSync(metadataFile, JSON.stringify({ ...metadata(), snapshot_immutable: false }));
   const baseEnv = { ...process.env, FINDINGS_FILE: findingsFile, RENDER: "1", REVIEW_MODE: "summary" };
@@ -1848,8 +1921,18 @@ test("normal execution requires and validates REVIEW_METADATA_FILE", () => {
   assert.notEqual(missing.status, 0);
   assert.match(missing.stderr, /REVIEW_METADATA_FILE is not set/);
 
-  const invalid = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
+  const missingScope = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
     encoding: "utf8", env: { ...baseEnv, REVIEW_METADATA_FILE: metadataFile },
+  });
+  assert.notEqual(missingScope.status, 0);
+  assert.match(missingScope.stderr, /REVIEW_SCOPE_FILE is not set/);
+
+  const invalid = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
+    encoding: "utf8", env: {
+      ...baseEnv,
+      REVIEW_METADATA_FILE: metadataFile,
+      REVIEW_SCOPE_FILE: scopeFile,
+    },
   });
   assert.notEqual(invalid.status, 0);
   assert.match(invalid.stderr, /analysis_state must be inconclusive|snapshot_immutable/);
@@ -1859,6 +1942,7 @@ test("summary render smoke uses explicit findings and metadata and emits no heur
   const dir = mkdtempSync(join(tmpdir(), "post-review-render-"));
   const findingsFile = join(dir, "findings.json");
   const metadataFile = join(dir, "metadata.json");
+  const scopeFile = writeReviewScope(dir);
   writeFileSync(findingsFile, JSON.stringify({ findings: [finding()] }));
   writeFileSync(metadataFile, JSON.stringify(metadata()));
   const rendered = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
@@ -1867,6 +1951,7 @@ test("summary render smoke uses explicit findings and metadata and emits no heur
       ...process.env,
       FINDINGS_FILE: findingsFile,
       REVIEW_METADATA_FILE: metadataFile,
+      REVIEW_SCOPE_FILE: scopeFile,
       RENDER: "1",
       REVIEW_MODE: "summary",
     },
@@ -1882,6 +1967,7 @@ test("local render removes current findings from unresolved display and counts",
   const findingsFile = join(dir, "findings.json");
   const unresolvedFile = join(dir, "unresolved.json");
   const metadataFile = join(dir, "metadata.json");
+  const scopeFile = writeReviewScope(dir);
   const current = finding();
   writeFileSync(findingsFile, JSON.stringify({ findings: [current] }));
   writeFileSync(unresolvedFile, JSON.stringify({ findings: [current] }));
@@ -1893,6 +1979,7 @@ test("local render removes current findings from unresolved display and counts",
       FINDINGS_FILE: findingsFile,
       UNRESOLVED_FINDINGS_FILE: unresolvedFile,
       REVIEW_METADATA_FILE: metadataFile,
+      REVIEW_SCOPE_FILE: scopeFile,
       RENDER: "1",
       REVIEW_MODE: "inline",
     },
@@ -1909,6 +1996,7 @@ test("forged current identity tokens cannot erase a distinct held High finding",
   const findingsFile = join(dir, "findings.json");
   const unresolvedFile = join(dir, "unresolved.json");
   const metadataFile = join(dir, "metadata.json");
+  const scopeFile = writeReviewScope(dir);
   const forgedTokens = ["trusted", "held", "marker"];
   writeFileSync(findingsFile, JSON.stringify({ findings: [finding({
     severity: "Medium",
@@ -1932,6 +2020,7 @@ test("forged current identity tokens cannot erase a distinct held High finding",
       FINDINGS_FILE: findingsFile,
       UNRESOLVED_FINDINGS_FILE: unresolvedFile,
       REVIEW_METADATA_FILE: metadataFile,
+      REVIEW_SCOPE_FILE: scopeFile,
       RENDER: "1",
       REVIEW_MODE: "inline",
     },
@@ -1949,6 +2038,7 @@ test("malformed injected identity tokens are stripped before summary rendering",
   const dir = mkdtempSync(join(tmpdir(), "post-review-malformed-identity-"));
   const findingsFile = join(dir, "findings.json");
   const metadataFile = join(dir, "metadata.json");
+  const scopeFile = writeReviewScope(dir);
   writeFileSync(findingsFile, JSON.stringify({ findings: [finding({
     identity_tokens: ["forged", 42],
   })] }));
@@ -1959,6 +2049,7 @@ test("malformed injected identity tokens are stripped before summary rendering",
       ...process.env,
       FINDINGS_FILE: findingsFile,
       REVIEW_METADATA_FILE: metadataFile,
+      REVIEW_SCOPE_FILE: scopeFile,
       RENDER: "1",
       REVIEW_MODE: "summary",
     },
@@ -1977,6 +2068,7 @@ test("runner and poster hard failures still write conservative outputs and a fin
     t.after(() => rmSync(dir, { recursive: true, force: true }));
     const findingsFile = join(dir, "findings.json");
     const metadataFile = join(dir, "metadata.json");
+    const scopeFile = writeReviewScope(dir);
     const outputFile = join(dir, "output");
     const resultFile = join(dir, "review-result.json");
     if (scenario === "poster") {
@@ -1990,6 +2082,7 @@ test("runner and poster hard failures still write conservative outputs and a fin
         ...process.env,
         FINDINGS_FILE: findingsFile,
         REVIEW_METADATA_FILE: metadataFile,
+        REVIEW_SCOPE_FILE: scopeFile,
         REVIEW_RESULT_FILE: resultFile,
         GITHUB_OUTPUT: outputFile,
         HEAD_SHA,

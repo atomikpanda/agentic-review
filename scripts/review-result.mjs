@@ -427,7 +427,7 @@ export function deriveReviewState({
   };
 }
 
-export function validateRunMetadata(value) {
+export function validateRunMetadata(value, trustedScope) {
   canonicalize(value, "metadata");
   requirePlainObject(value, "metadata");
   if (value.schema_version !== REVIEW_RESULT_SCHEMA_VERSION) {
@@ -452,6 +452,18 @@ export function validateRunMetadata(value) {
     }
   }
   inspectRun(value);
+  if (trustedScope === undefined) {
+    throw new TypeError("trusted scope is required to validate run metadata");
+  }
+  const expectedScopeHash = scopeHash(trustedScope);
+  for (const field of ["base_sha", "configuration_fingerprint", "head_sha"]) {
+    if (trustedScope[field] !== value[field]) {
+      throw new TypeError(`trusted scope ${field} must match metadata ${field}`);
+    }
+  }
+  if (value.scope_hash !== expectedScopeHash) {
+    throw new TypeError("scope_hash must match the trusted canonical scope");
+  }
   if (value.diff.truncated === false && value.diff.included_bytes !== value.diff.bytes) {
     throw new TypeError("diff.truncated must be true when included_bytes differs from bytes");
   }
@@ -516,16 +528,22 @@ function readJson(source) {
 }
 
 function runCli(argv) {
-  const [command, source, ...extra] = argv;
+  const [command, source, scopeSource, ...extra] = argv;
   const commands = ["fingerprint", "scope", "analysis", "validate"];
-  if (extra.length > 0 || !commands.includes(command)) {
-    throw new TypeError(`usage: review-result.mjs <${commands.join("|")}> [JSON_FILE|-]`);
+  const invalidSources = command === "validate"
+    ? source === undefined || scopeSource === undefined || scopeSource === "-"
+    : scopeSource !== undefined;
+  if (extra.length > 0 || !commands.includes(command) || invalidSources) {
+    throw new TypeError(
+      `usage: review-result.mjs <fingerprint|scope|analysis> [JSON_FILE|-]`
+      + " | review-result.mjs validate <METADATA_JSON_FILE|-> <SCOPE_JSON_FILE>",
+    );
   }
   const value = readJson(source);
   if (command === "fingerprint") return configurationFingerprint(value);
   if (command === "scope") return scopeHash(value);
   if (command === "analysis") return deriveAnalysisState(value);
-  return JSON.stringify(validateRunMetadata(value));
+  return JSON.stringify(validateRunMetadata(value, readJson(scopeSource)));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

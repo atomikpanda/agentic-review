@@ -327,6 +327,7 @@ function runReview(t, plan, {
       metadataFile,
     }));
   }
+  const scopeFile = `${metadataFile}.scope`;
   writeFileSync(planFile, JSON.stringify(plan));
   const runnerArgs = [
     runner,
@@ -412,6 +413,7 @@ printf '%s\\n' '1.3.14'
       AGENTIC_REVIEW_MAX_DIFF_BYTES: "",
       AGENTIC_REVIEW_MAX_FINDINGS: "",
       AGENTIC_REVIEW_METADATA_OUT: "",
+      AGENTIC_REVIEW_SCOPE_OUT: scopeFile,
       AGENTIC_REVIEW_PASSES: "",
       AGENTIC_REVIEW_PROMPT: "",
       AGENTIC_REVIEW_SKILL: "",
@@ -441,14 +443,20 @@ printf '%s\\n' '1.3.14'
     codegraphLogs,
     findingsFile,
     metadataFile,
+    scopeFile,
     bunxLogFile,
     findings: existsSync(findingsFile) ? JSON.parse(readFileSync(findingsFile, "utf8")) : null,
     metadata: existsSync(metadataFile) ? JSON.parse(readFileSync(metadataFile, "utf8")) : null,
+    scope: existsSync(scopeFile) ? JSON.parse(readFileSync(scopeFile, "utf8")) : null,
   };
 }
 
-function validateMetadata(metadataFile) {
-  return spawnSync(process.execPath, [resultCli, "validate", metadataFile], { encoding: "utf8" });
+function validateMetadata(metadataFile, scopeFile = `${metadataFile}.scope`) {
+  return spawnSync(
+    process.execPath,
+    [resultCli, "validate", metadataFile, scopeFile],
+    { encoding: "utf8" },
+  );
 }
 
 function runWorkflowConfig(t, overrides = {}) {
@@ -746,6 +754,29 @@ test("the default profile runs general, correctness, and boundaries into one val
   assert.equal(run.metadata.coverage, "bounded");
   assert.deepEqual(run.metadata.remaining_analysis, []);
   assert.equal(new Set(run.metadata.passes.results.map((pass) => pass.configuration_fingerprint)).size, 1);
+  const canonicalDiff = execFileSync(
+    "git",
+    ["diff", "--no-color", run.baseSha, run.headSha],
+    { cwd: run.repository, encoding: "utf8" },
+  );
+  assert.equal(run.scope.diff, canonicalDiff);
+  assert.equal(run.scope.diff.endsWith("\n"), true);
+  assert.deepEqual(
+    {
+      base_sha: run.scope.base_sha,
+      configuration_fingerprint: run.scope.configuration_fingerprint,
+      head_sha: run.scope.head_sha,
+    },
+    {
+      base_sha: run.metadata.base_sha,
+      configuration_fingerprint: run.metadata.configuration_fingerprint,
+      head_sha: run.metadata.head_sha,
+    },
+  );
+  assert.equal(
+    execFileSync(process.execPath, [resultCli, "scope", run.scopeFile], { encoding: "utf8" }).trim(),
+    run.metadata.scope_hash,
+  );
   for (const pass of run.metadata.passes.results) {
     assert.equal(pass.base_sha, run.baseSha);
     assert.equal(pass.head_sha, run.headSha);
@@ -785,19 +816,42 @@ test("workflow skips the write-capable poster after cancellation but not ordinar
   assert.match(posterStep, /^\s+if: \$\{\{ !cancelled\(\) \}\}$/m);
 });
 
-test("workflow uploads target-resolution fallback artifacts without publishing cancelled or ineligible runs", () => {
+test("workflow retains normal artifacts and uploads result-only target-resolution fallbacks", () => {
   const source = readFileSync(workflow, "utf8");
   const artifactStep = source.match(
-    /^      - uses: actions\/upload-artifact@v4\n[\s\S]*$/m,
+    /^      - name: upload review artifacts\n[\s\S]*?(?=^      - name:)/m,
+  )?.[0];
+  const fallbackArtifactStep = source.match(
+    /^      - name: upload target-resolution fallback result\n[\s\S]*$/m,
   )?.[0];
 
+  assert.match(source, /^\s+AGENTIC_REVIEW_SCOPE_OUT: \/tmp\/review-scope\.json$/m);
+  assert.match(source, /^\s+REVIEW_SCOPE_FILE: \/tmp\/review-scope\.json$/m);
   assert.ok(artifactStep);
   assert.match(
     artifactStep,
-    /^\s+if: \$\{\{ !cancelled\(\) && steps\.target\.outputs\.eligible != 'false' \}\}$/m,
+    /^\s+if: \$\{\{ !cancelled\(\) && steps\.target\.outputs\.eligible == 'true' \}\}$/m,
   );
-  assert.match(artifactStep, /^\s+\/tmp\/review-result\.json$/m);
+  for (const path of [
+    "/tmp/review.md",
+    "/tmp/review-meta.json",
+    "/tmp/review-runner.out",
+    "/tmp/review-runner.err",
+    "/tmp/review-result.json",
+    "/tmp/review-scope.json",
+  ]) {
+    assert.match(artifactStep, new RegExp(`^\\s+${path.replaceAll(".", "\\.")}$`, "m"));
+  }
   assert.match(artifactStep, /^\s+if-no-files-found: error$/m);
+
+  assert.ok(fallbackArtifactStep);
+  assert.match(
+    fallbackArtifactStep,
+    /^\s+if: \$\{\{ !cancelled\(\) && steps\.target\.outputs\.eligible == '' \}\}$/m,
+  );
+  assert.match(fallbackArtifactStep, /^\s+path: \/tmp\/review-result\.json$/m);
+  assert.doesNotMatch(fallbackArtifactStep, /\/tmp\/review(?:\.md|-meta\.json|-runner\.(?:out|err)|-scope\.json)/);
+  assert.match(fallbackArtifactStep, /^\s+if-no-files-found: error$/m);
 });
 
 test("early hosted setup failure emits the same conservative result everywhere", (t) => {
@@ -873,7 +927,7 @@ writeFileSync(process.env.UNTRUSTED_POSTER_MARKER, "executed");
   }
 });
 
-test("workflow boundary finalizes poster module-load failure without replacing poster-owned results", (t) => {
+test("workflow boundary completes every final surface without replacing trustworthy results", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "hosted-poster-load-failure-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const trustedPoster = join(directory, "scripts", "post-review.mjs");
@@ -937,7 +991,7 @@ test("workflow boundary finalizes poster module-load failure without replacing p
   };
   const emittedResultText = `${JSON.stringify(emittedResult, null, 2)}\n`;
   const emittedOutput = "analysis_state=complete\n";
-  const emittedSummary = "poster-owned summary\n";
+  const emittedSummary = "## Agentic review\n\n| Result | Value |\n| --- | --- |\n| Analysis | `complete` |\n";
   writeFileSync(trustedPoster, `
 import { appendFileSync, writeFileSync } from "node:fs";
 writeFileSync(process.env.REVIEW_RESULT_FILE, process.env.EMITTED_RESULT);
@@ -964,8 +1018,47 @@ process.exit(23);
 
   assert.equal(failedAfterResult.status, 23, failedAfterResult.stderr);
   assert.equal(readFileSync(preservedResult, "utf8"), emittedResultText);
-  assert.equal(readFileSync(preservedOutput, "utf8"), emittedOutput);
-  assert.equal(readFileSync(preservedSummary, "utf8"), emittedSummary);
+  assert.deepEqual(
+    envFileValues(preservedOutput),
+    Object.fromEntries(Object.entries(emittedResult).map(([name, value]) => [
+      name,
+      typeof value === "object" ? JSON.stringify(value) : String(value),
+    ])),
+  );
+  const completedSummary = readFileSync(preservedSummary, "utf8");
+  assert.ok(completedSummary.startsWith(emittedSummary));
+  assertFinalResultSummary(completedSummary, emittedResult);
+
+  writeFileSync(trustedPoster, `
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.REVIEW_RESULT_FILE, process.env.EMITTED_RESULT);
+process.exit(29);
+`);
+  const repairedOutput = join(directory, "repaired-output");
+  const preservedPartialResult = join(directory, "preserved-partial-result.json");
+  const repairedSummary = join(directory, "repaired-summary");
+  const failedAfterResultOnly = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...env,
+      GITHUB_OUTPUT: repairedOutput,
+      REVIEW_RESULT_FILE: preservedPartialResult,
+      GITHUB_STEP_SUMMARY: repairedSummary,
+      EMITTED_RESULT: emittedResultText,
+    },
+  });
+
+  assert.equal(failedAfterResultOnly.status, 29, failedAfterResultOnly.stderr);
+  assert.equal(readFileSync(preservedPartialResult, "utf8"), emittedResultText);
+  assert.deepEqual(
+    envFileValues(repairedOutput),
+    Object.fromEntries(Object.entries(emittedResult).map(([name, value]) => [
+      name,
+      typeof value === "object" ? JSON.stringify(value) : String(value),
+    ])),
+  );
+  assertFinalResultSummary(readFileSync(repairedSummary, "utf8"), emittedResult);
 });
 
 test("target resolution failure finalizes conservatively while explicit ineligibility remains skipped", (t) => {
@@ -1180,9 +1273,10 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
 
   const findingsFile = "/tmp/review.md";
   const metadataFile = "/tmp/review-meta.json";
+  const scopeFile = "/tmp/review-scope.json";
   const runnerOutFile = "/tmp/review-runner.out";
   const runnerErrFile = "/tmp/review-runner.err";
-  for (const path of [findingsFile, metadataFile, runnerOutFile, runnerErrFile]) {
+  for (const path of [findingsFile, metadataFile, scopeFile, runnerOutFile, runnerErrFile]) {
     rmSync(path, { force: true });
     t.after(() => rmSync(path, { force: true }));
   }
@@ -1210,6 +1304,7 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
       REVIEW_MODE: "summary",
       OMP_VERSION: "latest",
       EXTRA_ARGS: "--print-thoughts",
+      AGENTIC_REVIEW_SCOPE_OUT: scopeFile,
       CODEGRAPH: "false",
     },
   });
@@ -1228,6 +1323,7 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
   assert.equal(existsSync(maliciousExecutableMarker), false);
   assert.equal(existsSync(findingsFile), true);
   assert.equal(existsSync(metadataFile), true);
+  assert.equal(existsSync(scopeFile), true);
   assert.deepEqual(metadata.passes.requested, ["general", "correctness", "boundaries"]);
   assert.deepEqual(metadata.passes.completed, ["general", "correctness", "boundaries"]);
   assert.equal(metadata.analysis_state, "complete");
@@ -1249,8 +1345,12 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
   const preloadFile = join(fixture.directory, "fake-github.mjs");
   writeFileSync(preloadFile, `
 import { appendFileSync } from "node:fs";
-appendFileSync(process.env.FAKE_POSTER_CALLS, "poster\\n");
+let posterRecorded = false;
 globalThis.fetch = async (url, options = {}) => {
+  if (!posterRecorded) {
+    appendFileSync(process.env.FAKE_POSTER_CALLS, "poster\\n");
+    posterRecorded = true;
+  }
   const method = options.method ?? "GET";
   const body = String(options.body ?? "");
   appendFileSync(process.env.FAKE_GITHUB_LOG, JSON.stringify({ url: String(url), method, body }) + "\\n");
@@ -1278,6 +1378,7 @@ globalThis.fetch = async (url, options = {}) => {
       GH_TOKEN: "installation-token",
       FINDINGS_FILE: findingsFile,
       REVIEW_METADATA_FILE: metadataFile,
+      REVIEW_SCOPE_FILE: scopeFile,
       GITHUB_REPO: "outside/target",
       PR_NUMBER: "17",
       HEAD_SHA: fixture.headSha,
@@ -1711,7 +1812,7 @@ test("diff truncation is recorded and makes an otherwise valid run inconclusive"
   assert.equal(validateMetadata(run.metadataFile).status, 0);
 });
 
-test("diff metadata counts UTF-8 bytes rather than shell characters", (t) => {
+test("diff metadata and canonical scope preserve the exact UTF-8 git diff bytes", (t) => {
   const run = runReview(t, {
     general: [{ findings: [] }],
     correctness: [{ findings: [] }],
@@ -1722,13 +1823,31 @@ test("diff metadata counts UTF-8 bytes rather than shell characters", (t) => {
   });
 
   assert.equal(run.result.status, 0, run.result.stderr);
-  let expectedDiff = execFileSync("git", ["diff", "--no-color", "main", "HEAD"], {
+  const expectedDiff = execFileSync("git", ["diff", "--no-color", "main", "HEAD"], {
     cwd: run.repository,
   });
-  while (expectedDiff.at(-1) === 10) expectedDiff = expectedDiff.subarray(0, -1);
+  assert.equal(expectedDiff.at(-1), 10);
+  assert.equal(run.scope.diff, expectedDiff.toString("utf8"));
   assert.equal(run.metadata.diff.bytes, expectedDiff.length);
   assert.equal(run.metadata.diff.included_bytes, expectedDiff.length);
   assert.equal(validateMetadata(run.metadataFile).status, 0);
+});
+
+test("canonical diff rendering failures stop before model work", (t) => {
+  const fixture = createFixture(t);
+  const failingDiff = join(fixture.directory, "fail-diff");
+  writeFileSync(failingDiff, "#!/usr/bin/env bash\nexit 73\n");
+  chmodSync(failingDiff, 0o755);
+
+  const run = runReview(t, {}, {
+    env: { GIT_EXTERNAL_DIFF: failingDiff },
+    existingFixture: fixture,
+    includeOutputs: false,
+  });
+
+  assert.notEqual(run.result.status, 0);
+  assert.match(run.result.stderr, /could not render canonical diff/);
+  assert.equal(run.logs.length, 0);
 });
 
 test("each pass receives the complete available diff in deterministic rotated file order", (t) => {
@@ -2072,6 +2191,175 @@ process.exit(result.status ?? 1);
     stagedTarget,
   );
   assert.equal(existsSync(lockPath), false, "successful mutations must release the state lock");
+});
+
+test("lock-free state readers see complete snapshots while JSON files are published", async (t) => {
+  for (const publication of ["state", "run"]) {
+    const fixture = createFixture(t);
+    const head = git(fixture.repository, "rev-parse", "HEAD");
+    const baselineFinding = finding(`Baseline ${publication} publication finding`, { file: "alpha.txt" });
+    const replacementFinding = finding(`Replacement ${publication} publication finding`, { file: "beta.txt" });
+    const baselineFile = join(fixture.directory, "baseline-findings.json");
+    const replacementFile = join(fixture.directory, "replacement-findings.json");
+    const epoch = 1_755_600_000_000;
+    writeFileSync(baselineFile, JSON.stringify({ findings: [baselineFinding] }));
+    writeFileSync(replacementFile, JSON.stringify({ findings: [replacementFinding] }));
+
+    const baseline = spawnSync(
+      process.execPath,
+      [localState, "record", baselineFile, fixture.baseSha, head, "inconclusive"],
+      {
+        cwd: fixture.repository,
+        encoding: "utf8",
+        env: { ...process.env, RUN_EPOCH: String(epoch) },
+      },
+    );
+    assert.equal(baseline.status, 0, baseline.stderr);
+
+    const stateDirectory = join(fixture.repository, ".git", "agentic-review");
+    const statePath = join(stateDirectory, "state.json");
+    const stamp = new Date(epoch).toISOString().replace(/[:.]/g, "-");
+    const runPath = join(stateDirectory, "runs", `${stamp}.json`);
+    const publicationPath = publication === "state" ? statePath : runPath;
+    const ready = join(fixture.directory, `${publication}-publication-ready`);
+    const release = join(fixture.directory, `${publication}-publication-release`);
+    const preload = join(fixture.directory, `${publication}-publication.cjs`);
+    writeFileSync(preload, `
+const fs = require("node:fs");
+const { syncBuiltinESMExports } = require("node:module");
+const { resolve } = require("node:path");
+const originalCloseSync = fs.closeSync;
+const originalExistsSync = fs.existsSync;
+const originalOpenSync = fs.openSync;
+const originalRenameSync = fs.renameSync;
+const originalWriteFileSync = fs.writeFileSync;
+const sleeper = new Int32Array(new SharedArrayBuffer(4));
+const target = resolve(process.env.PUBLICATION_PATH);
+const samePath = (path) => typeof path === "string" && resolve(path) === target;
+const holdPublication = () => {
+  originalWriteFileSync(process.env.PUBLICATION_READY, "ready");
+  while (!originalExistsSync(process.env.PUBLICATION_RELEASE)) {
+    Atomics.wait(sleeper, 0, 0, 10);
+  }
+};
+fs.writeFileSync = (path, ...args) => {
+  if (samePath(path)) {
+    originalCloseSync(originalOpenSync(path, "w"));
+    holdPublication();
+  }
+  return originalWriteFileSync(path, ...args);
+};
+fs.renameSync = (from, to) => {
+  if (
+    samePath(to)
+    && typeof from === "string"
+    && resolve(from).startsWith(target + ".pending-")
+  ) holdPublication();
+  return originalRenameSync(from, to);
+};
+syncBuiltinESMExports();
+`);
+
+    const writer = spawn(
+      process.execPath,
+      [localState, "record", replacementFile, fixture.baseSha, head, "inconclusive"],
+      {
+        cwd: fixture.repository,
+        env: {
+          ...process.env,
+          NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${preload}`.trim(),
+          PUBLICATION_PATH: publicationPath,
+          PUBLICATION_READY: ready,
+          PUBLICATION_RELEASE: release,
+          RUN_EPOCH: String(epoch),
+        },
+        stdio: ["ignore", "ignore", "pipe"],
+      },
+    );
+    const writerDone = once(writer, "close");
+    let writerError = "";
+    writer.stderr.setEncoding("utf8");
+    writer.stderr.on("data", (chunk) => { writerError += chunk; });
+    t.after(() => { if (writer.exitCode === null) writer.kill("SIGKILL"); });
+
+    const deadline = Date.now() + 5_000;
+    while (!existsSync(ready)) {
+      assert.equal(writer.exitCode, null, writerError);
+      assert.ok(Date.now() < deadline, `${publication} writer did not reach publication`);
+      await delay(10);
+    }
+
+    const exported = spawnSync(process.execPath, [localState, "export-open"], {
+      cwd: fixture.repository,
+      encoding: "utf8",
+    });
+    const listed = spawnSync(process.execPath, [localState, "list"], {
+      cwd: fixture.repository,
+      encoding: "utf8",
+    });
+    const runs = spawnSync(process.execPath, [localState, "runs"], {
+      cwd: fixture.repository,
+      encoding: "utf8",
+    });
+    assert.equal(exported.status, 0, `${publication}: ${exported.stderr}`);
+    assert.deepEqual(
+      JSON.parse(exported.stdout).findings.map(({ title }) => title),
+      [baselineFinding.title],
+      `${publication}: export-open must read the prior complete state snapshot`,
+    );
+    assert.equal(listed.status, 0, `${publication}: ${listed.stderr}`);
+    assert.match(listed.stdout, new RegExp(baselineFinding.title));
+    assert.doesNotMatch(listed.stdout, new RegExp(replacementFinding.title));
+    assert.equal(runs.status, 0, `${publication}: ${runs.stderr}`);
+    assert.match(runs.stdout, /1 findings/);
+
+    writeFileSync(release, "release");
+    const [writerStatus] = await writerDone;
+    assert.equal(writerStatus, 0, writerError);
+  }
+});
+
+test("a stale lock is reclaimed when its PID belongs to a newer process instance", (t) => {
+  const fixture = createFixture(t);
+  const head = git(fixture.repository, "rev-parse", "HEAD");
+  const reported = finding("PID reuse finding", { file: "alpha.txt" });
+  const findingsFile = join(fixture.directory, "pid-reuse-findings.json");
+  writeFileSync(findingsFile, JSON.stringify({ findings: [reported] }));
+  const recorded = spawnSync(
+    process.execPath,
+    [localState, "record", findingsFile, fixture.baseSha, head, "inconclusive"],
+    { cwd: fixture.repository, encoding: "utf8" },
+  );
+  assert.equal(recorded.status, 0, recorded.stderr);
+
+  const stateDirectory = join(fixture.repository, ".git", "agentic-review");
+  const statePath = join(stateDirectory, "state.json");
+  const lockPath = join(stateDirectory, "state.lock");
+  const [stored] = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  mkdirSync(lockPath);
+  writeFileSync(join(lockPath, "owner.json"), JSON.stringify({
+    pid: process.pid,
+    token: "reused-pid-owner",
+    processIdentity: "a different process instance",
+  }));
+  const preload = join(fixture.directory, "pid-reuse-timeout.cjs");
+  writeFileSync(preload, `
+const realNow = Date.now;
+let calls = 0;
+Date.now = () => realNow() + (calls++ === 0 ? 0 : 60_000);
+`);
+
+  const dismissed = spawnSync(process.execPath, [localState, "dismiss", stored.id], {
+    cwd: fixture.repository,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${preload}`.trim(),
+    },
+  });
+  assert.equal(dismissed.status, 0, dismissed.stderr);
+  assert.equal(existsSync(lockPath), false);
+  assert.equal(JSON.parse(readFileSync(statePath, "utf8")).findings[0].status, "dismissed");
 });
 
 test("a creator cannot mutate after an ownerless lock is reaped during publication", async (t) => {
@@ -2996,6 +3284,7 @@ test("min-votes filtering cannot hide one-pass blocking evidence or report conve
       ...process.env,
       FINDINGS_FILE: run.findingsFile,
       REVIEW_METADATA_FILE: run.metadataFile,
+      REVIEW_SCOPE_FILE: run.scopeFile,
       RENDER: "1",
       REVIEW_MODE: "inline",
       FAIL_ON_FINDINGS: "true",

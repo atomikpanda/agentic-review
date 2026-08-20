@@ -29,6 +29,12 @@ const DIFF = [
   "",
 ].join("\n");
 const SCOPE_HASH = "0012d7453c71630d2e70e36517ba3482fb1e190611543c94b1955dd9a8083ebb";
+const TRUSTED_SCOPE = {
+  base_sha: BASE_SHA,
+  configuration_fingerprint: FINGERPRINT,
+  diff: DIFF,
+  head_sha: HEAD_SHA,
+};
 const EMPTY_COUNTS = { Critical: 0, High: 0, Medium: 0 };
 
 function passResult(id, overrides = {}) {
@@ -229,14 +235,14 @@ test("vote thresholds stay inconclusive without classifying a successful merge a
     }),
     analysis_state: "inconclusive",
   };
-  assert.equal(validateRunMetadata(successful), successful);
+  assert.equal(validateRunMetadata(successful, TRUSTED_SCOPE), successful);
 
   const failed = {
     ...structuredClone(successful),
     merge_succeeded: false,
     remaining_analysis: ["vote_threshold_applied", "merge_failed"],
   };
-  assert.equal(validateRunMetadata(failed), failed);
+  assert.equal(validateRunMetadata(failed, TRUSTED_SCOPE), failed);
 });
 
 test("configuration fingerprints are canonical and content-sensitive", () => {
@@ -323,7 +329,24 @@ test("run metadata validation accepts an internally consistent exact result", ()
     analysis_state: "complete",
   };
 
-  assert.equal(validateRunMetadata(metadata), metadata);
+  assert.equal(validateRunMetadata(metadata, TRUSTED_SCOPE), metadata);
+});
+
+test("run metadata validation rejects a valid-looking noncanonical scope hash", () => {
+  const metadata = {
+    schema_version: REVIEW_RESULT_SCHEMA_VERSION,
+    ...completeRun({ scope_hash: "f".repeat(64) }),
+    analysis_state: "complete",
+  };
+
+  assert.throws(
+    () => validateRunMetadata(metadata, TRUSTED_SCOPE),
+    /scope_hash must match the trusted canonical scope/i,
+  );
+  assert.throws(
+    () => validateRunMetadata({ ...metadata, scope_hash: SCOPE_HASH }),
+    /trusted scope is required/i,
+  );
 });
 
 test("run metadata validation rejects target, fingerprint, pass, and derived-state inconsistencies", () => {
@@ -335,32 +358,32 @@ test("run metadata validation rejects target, fingerprint, pass, and derived-sta
 
   const wrongTarget = structuredClone(metadata);
   wrongTarget.passes.results[0].base_sha = "4".repeat(40);
-  assert.throws(() => validateRunMetadata(wrongTarget), /base_sha.*general/i);
+  assert.throws(() => validateRunMetadata(wrongTarget, TRUSTED_SCOPE), /base_sha.*general/i);
 
   const wrongFingerprint = structuredClone(metadata);
   wrongFingerprint.passes.results[1].configuration_fingerprint = "5".repeat(64);
-  assert.throws(() => validateRunMetadata(wrongFingerprint), /configuration_fingerprint.*correctness/i);
+  assert.throws(() => validateRunMetadata(wrongFingerprint, TRUSTED_SCOPE), /configuration_fingerprint.*correctness/i);
 
   const wrongCompleted = structuredClone(metadata);
   wrongCompleted.passes.completed = ["general", "boundaries"];
-  assert.throws(() => validateRunMetadata(wrongCompleted), /passes\.completed/i);
+  assert.throws(() => validateRunMetadata(wrongCompleted, TRUSTED_SCOPE), /passes\.completed/i);
 
   const wrongAnalysis = structuredClone(metadata);
   wrongAnalysis.analysis_state = "inconclusive";
-  assert.throws(() => validateRunMetadata(wrongAnalysis), /analysis_state/i);
+  assert.throws(() => validateRunMetadata(wrongAnalysis, TRUSTED_SCOPE), /analysis_state/i);
 
   const mutableSnapshot = structuredClone(metadata);
   mutableSnapshot.snapshot_immutable = false;
   mutableSnapshot.analysis_state = "complete";
-  assert.throws(() => validateRunMetadata(mutableSnapshot), /analysis_state/i);
+  assert.throws(() => validateRunMetadata(mutableSnapshot, TRUSTED_SCOPE), /analysis_state/i);
 
   const missingSnapshotState = structuredClone(metadata);
   delete missingSnapshotState.snapshot_immutable;
-  assert.throws(() => validateRunMetadata(missingSnapshotState), /snapshot_immutable/i);
+  assert.throws(() => validateRunMetadata(missingSnapshotState, TRUSTED_SCOPE), /snapshot_immutable/i);
 
   const duplicatePass = structuredClone(metadata);
   duplicatePass.passes.requested = ["general", "general", "boundaries"];
-  assert.throws(() => validateRunMetadata(duplicatePass), /passes\.requested/i);
+  assert.throws(() => validateRunMetadata(duplicatePass, TRUSTED_SCOPE), /passes\.requested/i);
 });
 
 test("run metadata validation preserves the additive contract and stable reason vocabulary", () => {
@@ -369,7 +392,7 @@ test("run metadata validation preserves the additive contract and stable reason 
     ...completeRun(),
     analysis_state: "complete",
   };
-  assert.equal(validateRunMetadata(metadata), metadata);
+  assert.equal(validateRunMetadata(metadata, TRUSTED_SCOPE), metadata);
 
   for (const [mutate, message] of [
     [(value) => { value.reviewed_head = BASE_SHA; }, /reviewed_head/],
@@ -391,7 +414,7 @@ test("run metadata validation preserves the additive contract and stable reason 
   ]) {
     const malformed = structuredClone(metadata);
     mutate(malformed);
-    assert.throws(() => validateRunMetadata(malformed), message);
+    assert.throws(() => validateRunMetadata(malformed, TRUSTED_SCOPE), message);
   }
 });
 
@@ -415,7 +438,7 @@ test("run metadata validation rejects malformed values instead of coercing them"
   ]) {
     const malformed = structuredClone(metadata);
     mutate(malformed);
-    assert.throws(() => validateRunMetadata(malformed), message);
+    assert.throws(() => validateRunMetadata(malformed, TRUSTED_SCOPE), message);
   }
 });
 
@@ -460,8 +483,10 @@ test("the guarded CLI uses the importable fingerprint, analysis, and validation 
   try {
     const runFile = join(directory, "run.json");
     const metadataFile = join(directory, "metadata.json");
+    const scopeFile = join(directory, "scope.json");
     writeFileSync(runFile, JSON.stringify(completeRun()));
     writeFileSync(metadataFile, JSON.stringify(metadata));
+    writeFileSync(scopeFile, JSON.stringify(TRUSTED_SCOPE));
 
     const fingerprint = spawnSync(process.execPath, [script.pathname, "fingerprint", "-"], {
       input: JSON.stringify(config),
@@ -475,11 +500,15 @@ test("the guarded CLI uses the importable fingerprint, analysis, and validation 
       deriveAnalysisState(completeRun()),
     );
     assert.deepEqual(
-      JSON.parse(execFileSync(process.execPath, [script.pathname, "validate", metadataFile], { encoding: "utf8" })),
-      validateRunMetadata(metadata),
+      JSON.parse(execFileSync(
+        process.execPath,
+        [script.pathname, "validate", metadataFile, scopeFile],
+        { encoding: "utf8" },
+      )),
+      validateRunMetadata(metadata, TRUSTED_SCOPE),
     );
 
-    const malformed = spawnSync(process.execPath, [script.pathname, "validate", "-"], {
+    const malformed = spawnSync(process.execPath, [script.pathname, "validate", "-", scopeFile], {
       input: "{}",
       encoding: "utf8",
     });

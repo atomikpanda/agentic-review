@@ -20,6 +20,7 @@
 // Env:
 //   FINDINGS_FILE         merged structured findings          (required)
 //   REVIEW_METADATA_FILE validated schema-v1 run metadata     (required)
+//   REVIEW_SCOPE_FILE    canonical trusted review scope       (required)
 //   GITHUB_REPO           owner/name                           (required except RENDER)
 //   PR_NUMBER             pull request number                  (required except RENDER)
 //   GH_TOKEN              token with pull-requests: write      (required except RENDER)
@@ -1299,6 +1300,9 @@ export async function reconcileHostedFindings({ metadata, findings, history, wri
     })
     : { current: findings, held: [], retired: [], reconciliationKnown: false };
   const matchedDismissed = new Set();
+  const reconciliationKnownBeforeInline = history.summary.reconciliationKnown
+    && history.threadsKnown
+    && summaryReconciled.reconciliationKnown;
   const inlineReconciled = await reconcileInlineFindings({
     metadata,
     findings: summaryReconciled.current,
@@ -1306,7 +1310,7 @@ export async function reconcileHostedFindings({ metadata, findings, history, wri
     dismissed,
     matchedDismissed,
     resolveStale: env("RESOLVE_STALE", "true") === "true",
-    writesEnabled,
+    writesEnabled: writesEnabled && reconciliationKnownBeforeInline,
   });
   const summaryHeld = [];
   let suppressed = inlineReconciled.suppressed;
@@ -1332,9 +1336,7 @@ export async function reconcileHostedFindings({ metadata, findings, history, wri
       preferredHistoricalFinding,
     ),
     suppressed,
-    reconciliationKnown: history.summary.reconciliationKnown
-      && history.threadsKnown
-      && summaryReconciled.reconciliationKnown
+    reconciliationKnown: reconciliationKnownBeforeInline
       && inlineReconciled.reconciliationKnown,
   };
 }
@@ -1345,7 +1347,7 @@ export async function runSummaryMode({ metadata, findings, repo, pr, token, botL
     metadata,
     findings,
     history,
-    writesEnabled: WRITES_ENABLED && history.summary.reconciliationKnown && history.threadsKnown,
+    writesEnabled: WRITES_ENABLED,
   });
   if (suppressed) {
     console.log(`  ${suppressed} finding(s) previously resolved and unchanged — not re-raised`);
@@ -1391,17 +1393,23 @@ export async function reconcileInlineFindings({
   changedSince = fileChangedSince,
   retire = retireThread,
 }) {
+  const standingFindings = new Map();
+  let reconciliationKnown = true;
+  for (const thread of standing) {
+    const historical = findingFromThread(thread);
+    standingFindings.set(thread, historical);
+    if (!historical) reconciliationKnown = false;
+  }
   const current = [];
   const fresh = [];
   const matchedStanding = new Set();
   let suppressed = 0;
-  let reconciliationKnown = true;
 
   for (const finding of findings) {
     const match = findStandingMatch(finding, standing, matchedStanding);
     if (match) {
       matchedStanding.add(match);
-      const historical = findingFromThread(match);
+      const historical = standingFindings.get(match);
       if (historical) current.push(withStrongestSeverity(finding, historical));
       else {
         current.push(finding);
@@ -1435,7 +1443,7 @@ export async function reconcileInlineFindings({
     if (matchedStanding.has(thread)) continue;
     const changed = changedSince(thread, metadata.head_sha);
     if (metadata.analysis_state === "complete" && changeIsConfirmed(changed) && resolveStale) {
-      if (writesEnabled) {
+      if (writesEnabled && reconciliationKnown) {
         try {
           await retire(thread, metadata.head_sha);
           continue;
@@ -1447,7 +1455,7 @@ export async function reconcileInlineFindings({
         console.log(`  [suppressed] would retire thread ${thread.id}`);
       }
     }
-    const carried = findingFromThread(thread);
+    const carried = standingFindings.get(thread);
     if (carried) unresolved.push(carried);
     else reconciliationKnown = false;
   }
@@ -1476,7 +1484,7 @@ async function runInlineMode({ metadata, findings, repo, pr, token, botLogin, id
     metadata,
     findings,
     history,
-    writesEnabled: WRITES_ENABLED && history.summary.reconciliationKnown && history.threadsKnown,
+    writesEnabled: WRITES_ENABLED,
   });
   if (suppressed) {
     console.log(`  ${suppressed} finding(s) previously resolved and unchanged — not re-raised`);
@@ -1578,7 +1586,11 @@ function emitHardFailureResult() {
 async function main() {
   const findingsPath = required("FINDINGS_FILE");
   const metadataPath = required("REVIEW_METADATA_FILE");
-  const metadata = validateRunMetadata(JSON.parse(readFileSync(metadataPath, "utf8")));
+  const scopePath = required("REVIEW_SCOPE_FILE");
+  const metadata = validateRunMetadata(
+    JSON.parse(readFileSync(metadataPath, "utf8")),
+    JSON.parse(readFileSync(scopePath, "utf8")),
+  );
   activeMetadata = metadata;
   const parsed = extractJson(readFileSync(findingsPath, "utf8"));
   if (!parsed) throw new TypeError("findings artifact is not the requested structured JSON");

@@ -57,6 +57,14 @@ const STATE_LOCK_REAPER = join(STATE_LOCK_DIR, "reaper");
 const LOCK_RETRY_MS = 25;
 const OWNERLESS_LOCK_STALE_MS = 5_000;
 const LOCK_WAIT_TIMEOUT_MS = 30_000;
+const PROCESS_BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id";
+let processBootId;
+try {
+  processBootId = readFileSync(PROCESS_BOOT_ID_FILE, "utf8").trim() || undefined;
+} catch (error) {
+  if (error?.code !== "ENOENT" && error?.code !== "EACCES") throw error;
+}
+
 
 function readStateLockOwner() {
   try {
@@ -102,11 +110,49 @@ function processIsRunning(pid) {
   }
 }
 
+function processIdentity(pid) {
+  if (processBootId !== undefined) {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const commandEnd = stat.lastIndexOf(")");
+      const fields = commandEnd === -1 ? [] : stat.slice(commandEnd + 2).trim().split(/\s+/);
+      // Removing pid/comm makes Linux stat field 3 index 0; process start time is field 22.
+      const startedAt = fields[19];
+      if (startedAt) return `linux:${processBootId}:${startedAt}`;
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      if (error?.code !== "EACCES") throw error;
+    }
+  }
+
+  try {
+    const startedAt = execFileSync(
+      "ps",
+      ["-o", "lstart=", "-p", String(pid)],
+      { encoding: "utf8", env: { ...process.env, LC_ALL: "C" } },
+    ).trim();
+    return startedAt ? `ps:${startedAt}` : null;
+  } catch (error) {
+    if (error?.code === "ENOENT") return undefined;
+    if (Number.isInteger(error?.status)) return processIsRunning(pid) ? undefined : null;
+    throw error;
+  }
+}
+
+function processOwnsStateLock(owner) {
+  if (typeof owner.processIdentity === "string") {
+    const currentIdentity = processIdentity(owner.pid);
+    if (currentIdentity !== undefined) return currentIdentity === owner.processIdentity;
+  }
+  return processIsRunning(owner.pid);
+}
+
+
 function reapStaleStateLock(token) {
   const observedOwner = readStateLockOwner();
   let ownerlessLockIsStale = false;
   if (observedOwner) {
-    if (processIsRunning(observedOwner.pid)) return false;
+    if (processOwnsStateLock(observedOwner)) return false;
   } else {
     try {
       ownerlessLockIsStale = Date.now() - statSync(STATE_LOCK_DIR).mtimeMs >= OWNERLESS_LOCK_STALE_MS;
@@ -126,7 +172,7 @@ function reapStaleStateLock(token) {
 
   const currentOwner = readStateLockOwner();
   if (
-    (currentOwner && processIsRunning(currentOwner.pid))
+    (currentOwner && processOwnsStateLock(currentOwner))
     || (observedOwner && currentOwner?.token !== observedOwner.token)
   ) {
     removeStateLockReaper(token);
@@ -144,10 +190,12 @@ function acquireStateLock() {
   const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS;
   try {
     mkdirSync(pendingLockDir);
+    const ownerIdentity = processIdentity(process.pid);
     writeFileSync(pendingOwner, JSON.stringify({
       pid: process.pid,
       token,
       acquiredAt: new Date().toISOString(),
+      ...(typeof ownerIdentity === "string" ? { processIdentity: ownerIdentity } : {}),
     }), { flag: "wx" });
 
     while (true) {
@@ -264,6 +312,17 @@ function migrateAndValidateStoredFinding(finding, index) {
   }
 }
 
+function publishJson(path, value) {
+  const pendingPath = `${path}.pending-${randomUUID()}`;
+  try {
+    writeFileSync(pendingPath, JSON.stringify(value, null, 2), { flag: "wx" });
+    renameSync(pendingPath, path);
+  } finally {
+    rmSync(pendingPath, { force: true });
+  }
+}
+
+
 const load = () => {
   try {
     const state = JSON.parse(readFileSync(STATE_FILE, "utf8"));
@@ -279,7 +338,7 @@ const load = () => {
 };
 const save = (s) => {
   mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
+  publishJson(STATE_FILE, s);
 };
 
 // Short, stable, human-typeable — these are meant to be passed to `dismiss`.
@@ -409,8 +468,14 @@ if (cmd === "record") {
 
     mkdirSync(RUNS_DIR, { recursive: true });
     const stamp = now.replace(/[:.]/g, "-");
-    writeFileSync(join(RUNS_DIR, `${stamp}.json`), JSON.stringify(
-      { at: now, base, head, analysis_state: analysisState, branch: git(["rev-parse", "--abbrev-ref", "HEAD"]), findings }, null, 2));
+    publishJson(join(RUNS_DIR, `${stamp}.json`), {
+      at: now,
+      base,
+      head,
+      analysis_state: analysisState,
+      branch: git(["rev-parse", "--abbrev-ref", "HEAD"]),
+      findings,
+    });
     // A staged worktree may be the target's only other reachability. Add its ref
     // before persisting ownership, then prune only after the new state is durable.
     retainStagedTarget(state, stagedTarget);
@@ -494,7 +559,11 @@ if (cmd === "dismiss" || cmd === "reopen") {
 
 if (cmd === "runs") {
   if (!existsSync(RUNS_DIR)) { console.log("no runs recorded"); process.exit(0); }
-  const files = readdirSync(RUNS_DIR).sort().reverse().slice(0, 20);
+  const files = readdirSync(RUNS_DIR)
+    .filter((file) => file.endsWith(".json"))
+    .sort()
+    .reverse()
+    .slice(0, 20);
   for (const f of files) {
     try {
       const r = JSON.parse(readFileSync(join(RUNS_DIR, f), "utf8"));

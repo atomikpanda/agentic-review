@@ -850,6 +850,7 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           BASE: ${{ steps.target.outputs.base }}
           HEAD: ${{ steps.target.outputs.head }}
+          AGENTIC_REVIEW_SCOPE_OUT: /tmp/review-scope.json
         run: |
           set -euo pipefail
           actual_head="$(git rev-parse --verify 'HEAD^{commit}')"
@@ -909,6 +910,7 @@ jobs:
           TARGET_ELIGIBLE: ${{ steps.target.outputs.eligible }}
           FINDINGS_FILE: /tmp/review.md
           REVIEW_METADATA_FILE: /tmp/review-meta.json
+          REVIEW_SCOPE_FILE: /tmp/review-scope.json
           REVIEW_RESULT_FILE: /tmp/review-result.json
           GITHUB_REPO: ${{ steps.target.outputs.repo }}
           PR_NUMBER: ${{ steps.target.outputs.pr }}
@@ -920,17 +922,19 @@ jobs:
           fi
           set -euo pipefail
 
-          finalize_missing_result() {
-            local result_file="${REVIEW_RESULT_FILE:-/tmp/review-result.json}"
-            if [ -s "$result_file" ]; then
-              return
-            fi
+          finalize_missing_surfaces() {
             node <<'NODE'
-          const { appendFileSync, writeFileSync } = require("node:fs");
+          const {
+            appendFileSync,
+            existsSync,
+            readFileSync,
+            writeFileSync,
+          } = require("node:fs");
 
           const baseSha = process.env.BASE_SHA ?? "";
           const headSha = process.env.HEAD_SHA ?? "";
-          const result = {
+          const resultFile = process.env.REVIEW_RESULT_FILE || "/tmp/review-result.json";
+          const conservativeResult = {
             analysis_state: "inconclusive",
             merge_state: "ready",
             sample_state: "unknown",
@@ -948,54 +952,100 @@ jobs:
             remaining_analysis: ["execution_failed"],
             converged: false,
           };
-          writeFileSync(
-            process.env.REVIEW_RESULT_FILE || "/tmp/review-result.json",
-            `${JSON.stringify(result, null, 2)}\n`,
-          );
-          if (process.env.GITHUB_OUTPUT) {
-            appendFileSync(process.env.GITHUB_OUTPUT, [
-              `analysis_state=${result.analysis_state}`,
-              `merge_state=${result.merge_state}`,
-              `sample_state=${result.sample_state}`,
-              `bounded_converged=${result.bounded_converged}`,
-              `base_sha=${result.base_sha}`,
-              `head_sha=${result.head_sha}`,
-              `configuration_fingerprint=${result.configuration_fingerprint}`,
-              `passes_requested=${result.passes_requested}`,
-              `passes_completed=${result.passes_completed}`,
-              `current_counts=${JSON.stringify(result.current_counts)}`,
-              `unresolved_counts=${JSON.stringify(result.unresolved_counts)}`,
-              `reviewed_head=${result.reviewed_head}`,
-              `scope_hash=${result.scope_hash}`,
-              `coverage=${result.coverage}`,
-              `remaining_analysis=${JSON.stringify(result.remaining_analysis)}`,
-              `converged=${result.converged}`,
-              "",
-            ].join("\n"));
+          const requiredFields = Object.keys(conservativeResult);
+          let result = conservativeResult;
+          let preserveResult = false;
+          const existingResult = existsSync(resultFile) ? readFileSync(resultFile, "utf8") : "";
+          if (existingResult.length > 0) {
+            try {
+              const candidate = JSON.parse(existingResult);
+              if (
+                candidate === null
+                || typeof candidate !== "object"
+                || Array.isArray(candidate)
+                || requiredFields.some((field) => !Object.hasOwn(candidate, field))
+                || typeof candidate.current_counts !== "object"
+                || candidate.current_counts === null
+                || typeof candidate.unresolved_counts !== "object"
+                || candidate.unresolved_counts === null
+              ) {
+                throw new TypeError("result is missing required final-result fields");
+              }
+              result = candidate;
+              preserveResult = true;
+            } catch (error) {
+              console.error(`::warning::review poster left an invalid result; replacing it conservatively: ${error.message}`);
+            }
           }
+          if (!preserveResult) {
+            writeFileSync(resultFile, `${JSON.stringify(result, null, 2)}\n`);
+          }
+
+          const outputLines = [
+            `analysis_state=${result.analysis_state}`,
+            `merge_state=${result.merge_state}`,
+            `sample_state=${result.sample_state}`,
+            `bounded_converged=${result.bounded_converged}`,
+            `base_sha=${result.base_sha}`,
+            `head_sha=${result.head_sha}`,
+            `configuration_fingerprint=${result.configuration_fingerprint}`,
+            `passes_requested=${result.passes_requested}`,
+            `passes_completed=${result.passes_completed}`,
+            `current_counts=${JSON.stringify(result.current_counts)}`,
+            `unresolved_counts=${JSON.stringify(result.unresolved_counts)}`,
+            `reviewed_head=${result.reviewed_head}`,
+            `scope_hash=${result.scope_hash}`,
+            `coverage=${result.coverage}`,
+            `remaining_analysis=${JSON.stringify(result.remaining_analysis)}`,
+            `converged=${result.converged}`,
+          ];
+          if (process.env.GITHUB_OUTPUT) {
+            const existingOutput = existsSync(process.env.GITHUB_OUTPUT)
+              ? readFileSync(process.env.GITHUB_OUTPUT, "utf8")
+              : "";
+            const existingOutputLines = new Set(existingOutput.split("\n"));
+            if (!outputLines.every((line) => existingOutputLines.has(line))) {
+              appendFileSync(
+                process.env.GITHUB_OUTPUT,
+                `${existingOutput.length > 0 && !existingOutput.endsWith("\n") ? "\n" : ""}${outputLines.join("\n")}\n`,
+              );
+            }
+          }
+
+          const summaryLines = [
+            "## Agentic review",
+            "| Result | Value |",
+            "| --- | --- |",
+            `| Analysis | \`${result.analysis_state}\` |`,
+            `| Merge gate | \`${result.merge_state}\` |`,
+            `| Sample | \`${result.sample_state}\` |`,
+            `| Bounded convergence | \`${result.bounded_converged ? "yes" : "no"}\` |`,
+            `| Reviewed head | \`${result.reviewed_head}\` |`,
+            `| Scope hash | \`${result.scope_hash}\` |`,
+            `| Coverage | \`${result.coverage}\` |`,
+            `| Remaining analysis | \`${JSON.stringify(result.remaining_analysis)}\` |`,
+            `| Converged | \`${result.converged}\` |`,
+            `| Base SHA | \`${result.base_sha}\` |`,
+            `| Head SHA | \`${result.head_sha}\` |`,
+            `| Configuration fingerprint | \`${result.configuration_fingerprint}\` |`,
+            `| Passes | \`${result.passes_requested} requested / ${result.passes_completed} completed\` |`,
+            `| Current findings | \`Critical: ${result.current_counts.Critical} · High: ${result.current_counts.High} · Medium: ${result.current_counts.Medium}\` |`,
+            `| Held/unresolved findings | \`Critical: ${result.unresolved_counts.Critical} · High: ${result.unresolved_counts.High} · Medium: ${result.unresolved_counts.Medium}\` |`,
+          ];
           if (process.env.GITHUB_STEP_SUMMARY) {
-            appendFileSync(process.env.GITHUB_STEP_SUMMARY, [
-              "## Agentic review",
-              "",
-              "| Result | Value |",
-              "| --- | --- |",
-              `| Analysis | \`${result.analysis_state}\` |`,
-              `| Merge gate | \`${result.merge_state}\` |`,
-              `| Sample | \`${result.sample_state}\` |`,
-              `| Bounded convergence | \`${result.bounded_converged ? "yes" : "no"}\` |`,
-              `| Reviewed head | \`${result.reviewed_head}\` |`,
-              `| Scope hash | \`${result.scope_hash}\` |`,
-              `| Coverage | \`${result.coverage}\` |`,
-              `| Remaining analysis | \`${JSON.stringify(result.remaining_analysis)}\` |`,
-              `| Converged | \`${result.converged}\` |`,
-              `| Base SHA | \`${result.base_sha}\` |`,
-              `| Head SHA | \`${result.head_sha}\` |`,
-              `| Configuration fingerprint | \`${result.configuration_fingerprint}\` |`,
-              `| Passes | \`${result.passes_requested} requested / ${result.passes_completed} completed\` |`,
-              `| Current findings | \`Critical: ${result.current_counts.Critical} · High: ${result.current_counts.High} · Medium: ${result.current_counts.Medium}\` |`,
-              `| Held/unresolved findings | \`Critical: ${result.unresolved_counts.Critical} · High: ${result.unresolved_counts.High} · Medium: ${result.unresolved_counts.Medium}\` |`,
-              "",
-            ].join("\n"));
+            const existingSummary = existsSync(process.env.GITHUB_STEP_SUMMARY)
+              ? readFileSync(process.env.GITHUB_STEP_SUMMARY, "utf8")
+              : "";
+            const existingSummaryLines = new Set(existingSummary.split("\n"));
+            if (!summaryLines.every((line) => existingSummaryLines.has(line))) {
+              const separator = existingSummary.length === 0
+                ? ""
+                : existingSummary.endsWith("\n") ? "\n" : "\n\n";
+              appendFileSync(
+                process.env.GITHUB_STEP_SUMMARY,
+                `${separator}${summaryLines[0]}\n\n${summaryLines.slice(1).join("\n")}\n`,
+              );
+            }
           }
           NODE
           }
@@ -1022,7 +1072,7 @@ jobs:
             echo "::warning::review setup is incomplete; emitting a conservative result"
             # Target resolution and the support checkout are both upstream of
             # this always() step, so the fallback cannot import either one.
-            finalize_missing_result
+            finalize_missing_surfaces
             exit 1
           fi
 
@@ -1039,12 +1089,13 @@ jobs:
             if [ ! -s "${REVIEW_RESULT_FILE:-/tmp/review-result.json}" ]; then
               echo "::warning::review poster failed before emitting a final result; emitting a conservative result"
             fi
-            finalize_missing_result
+            finalize_missing_surfaces
             exit "$poster_status"
           fi
 
-      - uses: actions/upload-artifact@v4
-        if: ${{ !cancelled() && steps.target.outputs.eligible != 'false' }}
+      - name: upload review artifacts
+        if: ${{ !cancelled() && steps.target.outputs.eligible == 'true' }}
+        uses: actions/upload-artifact@v4
         with:
           name: agentic-review
           path: |
@@ -1053,7 +1104,15 @@ jobs:
             /tmp/review-runner.out
             /tmp/review-runner.err
             /tmp/review-result.json
+            /tmp/review-scope.json
           retention-days: 7
-          # Every non-cancelled eligible or unresolved target path must have
-          # produced a final result. Explicit ineligibility skips this step.
+          if-no-files-found: error
+
+      - name: upload target-resolution fallback result
+        if: ${{ !cancelled() && steps.target.outputs.eligible == '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentic-review
+          path: /tmp/review-result.json
+          retention-days: 7
           if-no-files-found: error
