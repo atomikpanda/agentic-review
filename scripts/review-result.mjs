@@ -30,6 +30,7 @@ const SEVERITIES = ["Critical", "High", "Medium"];
 const SEVERITY_SET = new Set(SEVERITIES);
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
 const FINGERPRINT_PATTERN = /^[0-9a-f]{64}$/;
+const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const CREDENTIAL_FIELD_NAMES = new Set([
   "authorization",
   "bearer",
@@ -106,22 +107,27 @@ export function configurationFingerprint(config) {
   return createHash("sha256").update(canonicalize(config)).digest("hex");
 }
 
-export function scopeHash(scope) {
+function inspectCanonicalScope(scope) {
   requirePlainObject(scope, "scope");
-  const expectedKeys = ["base_sha", "configuration_fingerprint", "diff", "head_sha"];
+  const expectedKeys = ["base_sha", "configuration_fingerprint", "diff_base64", "head_sha"];
   if (!arraysEqual(Object.keys(scope).sort(), expectedKeys)) {
     throw new TypeError(`scope must contain exactly ${expectedKeys.join(", ")}`);
   }
   requireSha(scope.base_sha, "scope.base_sha");
   requireFingerprint(scope.configuration_fingerprint, "scope.configuration_fingerprint");
-  requireString(scope.diff, "scope.diff");
+  const diffBytes = decodeCanonicalBase64(scope.diff_base64, "scope.diff_base64");
   requireSha(scope.head_sha, "scope.head_sha");
-  return createHash("sha256").update(canonicalize({
+  const hash = createHash("sha256").update(canonicalize({
     base_sha: scope.base_sha,
     configuration_fingerprint: scope.configuration_fingerprint,
-    diff: scope.diff,
+    diff_base64: scope.diff_base64,
     head_sha: scope.head_sha,
   }, "scope")).digest("hex");
+  return { diffBytes, hash };
+}
+
+export function scopeHash(scope) {
+  return inspectCanonicalScope(scope).hash;
 }
 
 export function deriveTrustedScopeMetadata(trustedScope) {
@@ -130,7 +136,7 @@ export function deriveTrustedScopeMetadata(trustedScope) {
     "base_sha",
     "bytes",
     "configuration_fingerprint",
-    "diff",
+    "diff_base64",
     "head_sha",
     "included_bytes",
   ];
@@ -141,12 +147,15 @@ export function deriveTrustedScopeMetadata(trustedScope) {
   const canonicalScope = {
     base_sha: trustedScope.base_sha,
     configuration_fingerprint: trustedScope.configuration_fingerprint,
-    diff: trustedScope.diff,
+    diff_base64: trustedScope.diff_base64,
     head_sha: trustedScope.head_sha,
   };
-  const computedScopeHash = scopeHash(canonicalScope);
+  const inspectedScope = inspectCanonicalScope(canonicalScope);
   requireInteger(trustedScope.bytes, "trusted scope bytes");
   requireInteger(trustedScope.included_bytes, "trusted scope included_bytes");
+  if (trustedScope.bytes !== inspectedScope.diffBytes.length) {
+    throw new TypeError("trusted scope bytes must match decoded diff_base64 length");
+  }
   if (trustedScope.included_bytes > trustedScope.bytes) {
     throw new TypeError("trusted scope included_bytes must not exceed trusted scope bytes");
   }
@@ -155,7 +164,7 @@ export function deriveTrustedScopeMetadata(trustedScope) {
     base_sha: trustedScope.base_sha,
     configuration_fingerprint: trustedScope.configuration_fingerprint,
     head_sha: trustedScope.head_sha,
-    scope_hash: computedScopeHash,
+    scope_hash: inspectedScope.hash,
     diff: {
       bytes: trustedScope.bytes,
       included_bytes: trustedScope.included_bytes,
@@ -194,6 +203,17 @@ function requireFingerprint(value, path) {
   if (typeof value !== "string" || !FINGERPRINT_PATTERN.test(value)) {
     throw new TypeError(`${path} must be a 64-character lowercase hexadecimal SHA-256`);
   }
+}
+
+function decodeCanonicalBase64(value, path) {
+  if (typeof value !== "string" || !BASE64_PATTERN.test(value)) {
+    throw new TypeError(`${path} must be canonical RFC 4648 base64`);
+  }
+  const decoded = Buffer.from(value, "base64");
+  if (decoded.toString("base64") !== value) {
+    throw new TypeError(`${path} must be canonical RFC 4648 base64`);
+  }
+  return decoded;
 }
 
 function validateStringList(value, path) {

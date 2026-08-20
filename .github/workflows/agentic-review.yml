@@ -934,6 +934,12 @@ jobs:
           const baseSha = process.env.BASE_SHA ?? "";
           const headSha = process.env.HEAD_SHA ?? "";
           const resultFile = process.env.REVIEW_RESULT_FILE || "/tmp/review-result.json";
+          const trustedScopeHash = process.env.TRUSTED_SCOPE_HASH ?? "";
+          const trustedConfigurationFingerprint = (
+            process.env.TRUSTED_CONFIGURATION_FINGERPRINT ?? ""
+          );
+          const trustedPassesRequested = Number(process.env.TRUSTED_PASSES_REQUESTED ?? "0");
+          const trustedPassesCompleted = Number(process.env.TRUSTED_PASSES_COMPLETED ?? "0");
           const conservativeResult = {
             analysis_state: "inconclusive",
             merge_state: "ready",
@@ -974,8 +980,14 @@ jobs:
           const booleanFields = ["bounded_converged", "converged"];
           const integerFields = ["passes_requested", "passes_completed"];
           const severities = ["Critical", "High", "Medium"];
+          const blockingSeverities = new Set(
+            (process.env.BLOCK_SEVERITIES ?? "Critical,High")
+              .split(",")
+              .map((severity) => severity.trim())
+              .filter(Boolean),
+          );
           const fingerprintPattern = /^[0-9a-f]{64}$/;
-          const remainingAnalysisReasons = new Set([
+          const remainingAnalysisReasons = [
             "diff_truncated",
             "finding_cap_reached",
             "pass_failed",
@@ -985,7 +997,8 @@ jobs:
             "merge_failed",
             "reconciliation_unknown",
             "execution_failed",
-          ]);
+          ];
+          const remainingAnalysisReasonSet = new Set(remainingAnalysisReasons);
 
           function validateFinalResult(candidate) {
             if (
@@ -1008,6 +1021,12 @@ jobs:
               if (candidate[field] !== "" && !fingerprintPattern.test(candidate[field])) {
                 throw new TypeError(`${field} must be empty or lowercase 64-hex`);
               }
+            }
+            if (
+              !fingerprintPattern.test(trustedScopeHash)
+              || candidate.scope_hash !== trustedScopeHash
+            ) {
+              throw new TypeError("scope_hash must match the trusted review scope");
             }
             if (
               candidate.base_sha !== baseSha
@@ -1042,7 +1061,9 @@ jobs:
                 "complete analysis requires all passes and nonempty review identity",
               );
             }
-            let findingCount = 0;
+            const aggregateCounts = Object.fromEntries(
+              severities.map((severity) => [severity, 0]),
+            );
             for (const field of ["current_counts", "unresolved_counts"]) {
               const counts = candidate[field];
               if (
@@ -1058,10 +1079,24 @@ jobs:
               ) {
                 throw new TypeError(`${field} must contain non-negative integer severity counts`);
               }
-              findingCount += severities.reduce((total, severity) => total + counts[severity], 0);
+              for (const severity of severities) {
+                aggregateCounts[severity] += counts[severity];
+              }
             }
-            if (findingCount === 0 && candidate.merge_state !== "ready") {
-              throw new TypeError("merge_state must be ready when there are no findings");
+            const findingCount = severities.reduce(
+              (total, severity) => total + aggregateCounts[severity],
+              0,
+            );
+            const expectedMergeState = severities.some(
+              (severity) => (
+                blockingSeverities.has(severity)
+                && aggregateCounts[severity] > 0
+              ),
+            ) ? "blocked" : "ready";
+            if (candidate.merge_state !== expectedMergeState) {
+              throw new TypeError(
+                "merge_state must agree with configured blocking severity counts",
+              );
             }
             const expectedSampleState = findingCount > 0
               ? "findings"
@@ -1076,13 +1111,20 @@ jobs:
               || candidate.remaining_analysis.some(
                 (reason) => (
                   typeof reason !== "string"
-                  || !remainingAnalysisReasons.has(reason)
+                  || !remainingAnalysisReasonSet.has(reason)
                 ),
               )
               || new Set(candidate.remaining_analysis).size !== candidate.remaining_analysis.length
+              || candidate.remaining_analysis.some(
+                (reason, index) => (
+                  index > 0
+                  && remainingAnalysisReasons.indexOf(reason)
+                    < remainingAnalysisReasons.indexOf(candidate.remaining_analysis[index - 1])
+                ),
+              )
             ) {
               throw new TypeError(
-                "remaining_analysis must contain unique canonical reason strings",
+                "remaining_analysis must contain unique canonical ordered reason strings",
               );
             }
             if (
@@ -1127,6 +1169,17 @@ jobs:
               || candidate.converged !== expectedConvergence
             ) {
               throw new TypeError("convergence must agree with analysis_state and sample_state");
+            }
+            if (candidate.configuration_fingerprint !== trustedConfigurationFingerprint) {
+              throw new TypeError(
+                "configuration_fingerprint must match trusted review metadata",
+              );
+            }
+            if (
+              candidate.passes_requested !== trustedPassesRequested
+              || candidate.passes_completed !== trustedPassesCompleted
+            ) {
+              throw new TypeError("pass counts must match trusted review metadata");
             }
           }
 
@@ -1215,6 +1268,10 @@ jobs:
           }
           NODE
           }
+          export TRUSTED_SCOPE_HASH=""
+          export TRUSTED_CONFIGURATION_FINGERPRINT=""
+          export TRUSTED_PASSES_REQUESTED=0
+          export TRUSTED_PASSES_COMPLETED=0
 
           poster_configured=true
           for name in REVIEW_MODE POST_COMMENT SUPPRESS_WRITES RESOLVE_STALE \
@@ -1240,6 +1297,57 @@ jobs:
             # this always() step, so the fallback cannot import either one.
             finalize_missing_surfaces
             exit 1
+          fi
+
+          # Snapshot runner-produced identity and pass evidence before the poster
+          # runs. The trusted runner derived scope_hash from REVIEW_SCOPE_FILE
+          # and validated the two sidecars together. Reusing the metadata avoids
+          # importing the review module or duplicating its canonical contracts.
+          trusted_metadata_snapshot=""
+          if [ -s "${REVIEW_SCOPE_FILE:-}" ] && [ -s "${REVIEW_METADATA_FILE:-}" ]; then
+            if trusted_metadata_snapshot="$(
+              node - "$REVIEW_METADATA_FILE" <<'NODE'
+          const { readFileSync } = require("node:fs");
+          try {
+            const trustedMetadata = JSON.parse(readFileSync(process.argv[2], "utf8"));
+            if (
+              trustedMetadata === null
+              || typeof trustedMetadata !== "object"
+              || Array.isArray(trustedMetadata)
+              || !/^[0-9a-f]{64}$/.test(trustedMetadata.scope_hash)
+              || !/^[0-9a-f]{64}$/.test(trustedMetadata.configuration_fingerprint)
+              || trustedMetadata.passes === null
+              || typeof trustedMetadata.passes !== "object"
+              || Array.isArray(trustedMetadata.passes)
+              || !Array.isArray(trustedMetadata.passes.requested)
+              || !Array.isArray(trustedMetadata.passes.completed)
+            ) {
+              process.exitCode = 1;
+            } else {
+              process.stdout.write([
+                trustedMetadata.scope_hash,
+                trustedMetadata.configuration_fingerprint,
+                trustedMetadata.passes.requested.length,
+                trustedMetadata.passes.completed.length,
+              ].join("\t"));
+            }
+          } catch {
+            process.exitCode = 1;
+          }
+          NODE
+            )"; then
+              IFS=$'\t' read -r \
+                TRUSTED_SCOPE_HASH \
+                TRUSTED_CONFIGURATION_FINGERPRINT \
+                TRUSTED_PASSES_REQUESTED \
+                TRUSTED_PASSES_COMPLETED <<< "$trusted_metadata_snapshot"
+              export TRUSTED_SCOPE_HASH
+              export TRUSTED_CONFIGURATION_FINGERPRINT
+              export TRUSTED_PASSES_REQUESTED
+              export TRUSTED_PASSES_COMPLETED
+            else
+              echo "::warning::trusted review metadata has invalid identity or pass evidence"
+            fi
           fi
 
           poster_status=0

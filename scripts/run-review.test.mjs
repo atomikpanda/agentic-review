@@ -20,6 +20,8 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 
+import { scopeHash } from "./review-result.mjs";
+
 const runner = fileURLToPath(new URL("./run-review.sh", import.meta.url));
 const resultCli = fileURLToPath(new URL("./review-result.mjs", import.meta.url));
 const localState = fileURLToPath(new URL("./local-state.mjs", import.meta.url));
@@ -95,6 +97,39 @@ function expectedExecutionFailureResult(baseSha, headSha) {
   };
 }
 
+function writeTrustedScopeArtifacts({
+  baseSha,
+  configurationFingerprint,
+  completedPasses,
+  headSha,
+  metadataFile,
+  requestedPasses,
+  scopeFile,
+}) {
+  writeFileSync(scopeFile, `${JSON.stringify({
+    base_sha: baseSha,
+    bytes: 0,
+    configuration_fingerprint: configurationFingerprint,
+    diff_base64: "",
+    head_sha: headSha,
+    included_bytes: 0,
+  })}\n`);
+  const scopeHash = execFileSync(
+    process.execPath,
+    [resultCli, "scope", scopeFile],
+    { encoding: "utf8" },
+  ).trim();
+  writeFileSync(metadataFile, `${JSON.stringify({
+    configuration_fingerprint: configurationFingerprint,
+    passes: {
+      requested: requestedPasses,
+      completed: completedPasses,
+    },
+    scope_hash: scopeHash,
+  })}\n`);
+  return scopeHash;
+}
+
 function finding(title, overrides = {}) {
   return {
     title,
@@ -119,7 +154,8 @@ if (process.argv.includes("--version")) {
 const promptArgument = process.argv.slice(2).find((argument) => argument.startsWith("@"));
 if (!promptArgument) process.exit(2);
 const promptPath = promptArgument.slice(1);
-const prompt = readFileSync(promptPath, "utf8");
+const promptBytes = readFileSync(promptPath);
+const prompt = promptBytes.toString("utf8");
 const skillArgument = process.argv.slice(2).find((argument) => argument.startsWith("--append-system-prompt="));
 const skill = skillArgument ? readFileSync(skillArgument.slice("--append-system-prompt=".length), "utf8") : "";
 const instructions = prompt.split("## Changed files", 1)[0];
@@ -157,6 +193,7 @@ appendFileSync(process.env.FAKE_OMP_LOG, JSON.stringify({
   attempt,
   promptPath,
   prompt,
+  prompt_base64: promptBytes.toString("base64"),
   skill,
   cwd: reviewCwd,
   reviewedAlpha,
@@ -761,12 +798,12 @@ test("the default profile runs general, correctness, and boundaries into one val
   const canonicalDiff = execFileSync(
     "git",
     ["diff", "--no-color", run.baseSha, run.headSha],
-    { cwd: run.repository, encoding: "utf8" },
+    { cwd: run.repository },
   );
-  assert.equal(run.scope.diff, canonicalDiff);
-  assert.equal(run.scope.diff.endsWith("\n"), true);
-  assert.equal(run.scope.bytes, Buffer.byteLength(canonicalDiff));
-  assert.equal(run.scope.included_bytes, Buffer.byteLength(canonicalDiff));
+  assert.deepEqual(Buffer.from(run.scope.diff_base64, "base64"), canonicalDiff);
+  assert.equal(canonicalDiff.at(-1), 10);
+  assert.equal(run.scope.bytes, canonicalDiff.length);
+  assert.equal(run.scope.included_bytes, canonicalDiff.length);
   assert.deepEqual(run.metadata.diff, {
     bytes: Buffer.byteLength(canonicalDiff),
     included_bytes: Buffer.byteLength(canonicalDiff),
@@ -942,6 +979,8 @@ test("workflow boundary completes every final surface without replacing trustwor
   const directory = mkdtempSync(join(tmpdir(), "hosted-poster-load-failure-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const trustedPoster = join(directory, "scripts", "post-review.mjs");
+  const scopeFile = join(directory, "review-scope.json");
+  const metadataFile = join(directory, "review-meta.json");
   mkdirSync(dirname(trustedPoster), { recursive: true });
   writeFileSync(trustedPoster, 'import "./missing-trusted-dependency.mjs";\n');
 
@@ -956,6 +995,8 @@ test("workflow boundary completes every final surface without replacing trustwor
     BASE_SHA: baseSha,
     TRUSTED_DATA_ROOT: directory,
     REVIEW_POSTER: trustedPoster,
+    REVIEW_SCOPE_FILE: scopeFile,
+    REVIEW_METADATA_FILE: metadataFile,
     REVIEW_MODE: "summary",
     POST_COMMENT: "false",
     SUPPRESS_WRITES: "true",
@@ -991,17 +1032,27 @@ test("workflow boundary completes every final surface without replacing trustwor
   );
   assertFinalResultSummary(readFileSync(summaryFile, "utf8"), expectedResult);
 
+  const configurationFingerprint = "a".repeat(64);
+  const trustedScopeHash = writeTrustedScopeArtifacts({
+    baseSha,
+    configurationFingerprint,
+    completedPasses: ["general", "correctness", "boundaries"],
+    headSha,
+    metadataFile,
+    requestedPasses: ["general", "correctness", "boundaries"],
+    scopeFile,
+  });
   const emittedResult = {
     ...expectedResult,
     analysis_state: "complete",
-    configuration_fingerprint: "a".repeat(64),
+    configuration_fingerprint: configurationFingerprint,
     passes_requested: 3,
     passes_completed: 3,
     sample_state: "clean",
     bounded_converged: true,
     coverage: "bounded",
     remaining_analysis: [],
-    scope_hash: "b".repeat(64),
+    scope_hash: trustedScopeHash,
     converged: true,
   };
   const emittedResultText = `${JSON.stringify(emittedResult, null, 2)}\n`;
@@ -1076,10 +1127,95 @@ process.exit(29);
   assertFinalResultSummary(readFileSync(repairedSummary, "utf8"), emittedResult);
 });
 
+test("workflow boundary rejects a valid poster result for another trusted scope", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hosted-result-scope-mismatch-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const trustedPoster = join(directory, "scripts", "post-review.mjs");
+  const scopeFile = join(directory, "review-scope.json");
+  const metadataFile = join(directory, "review-meta.json");
+  mkdirSync(dirname(trustedPoster), { recursive: true });
+  writeFileSync(trustedPoster, `
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.REVIEW_RESULT_FILE, process.env.EMITTED_RESULT);
+process.exit(37);
+`);
+
+  const baseSha = "1111111111111111111111111111111111111111";
+  const headSha = "2222222222222222222222222222222222222222";
+  const configurationFingerprint = "a".repeat(64);
+  const trustedScopeHash = writeTrustedScopeArtifacts({
+    baseSha,
+    configurationFingerprint,
+    completedPasses: ["general", "correctness", "boundaries"],
+    headSha,
+    metadataFile,
+    requestedPasses: ["general", "correctness", "boundaries"],
+    scopeFile,
+  });
+  const validResultForAnotherScope = {
+    ...expectedExecutionFailureResult(baseSha, headSha),
+    analysis_state: "complete",
+    configuration_fingerprint: configurationFingerprint,
+    passes_requested: 3,
+    passes_completed: 3,
+    sample_state: "clean",
+    bounded_converged: true,
+    coverage: "bounded",
+    remaining_analysis: [],
+    scope_hash: "c".repeat(64),
+    converged: true,
+  };
+  const resultFile = join(directory, "review-result.json");
+  const outputFile = join(directory, "github-output");
+  const summaryFile = join(directory, "step-summary");
+  const finalized = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      TARGET_ELIGIBLE: "true",
+      PR_NUMBER: "7",
+      GITHUB_REPO: "example/repository",
+      HEAD_SHA: headSha,
+      BASE_SHA: baseSha,
+      TRUSTED_DATA_ROOT: directory,
+      REVIEW_POSTER: trustedPoster,
+      REVIEW_SCOPE_FILE: scopeFile,
+      REVIEW_METADATA_FILE: metadataFile,
+      REVIEW_RESULT_FILE: resultFile,
+      GITHUB_OUTPUT: outputFile,
+      GITHUB_STEP_SUMMARY: summaryFile,
+      REVIEW_MODE: "summary",
+      POST_COMMENT: "false",
+      SUPPRESS_WRITES: "true",
+      RESOLVE_STALE: "false",
+      MAX_FINDINGS: "20",
+      FAIL_ON_FINDINGS: "false",
+      BLOCK_SEVERITIES: "Critical,High",
+      EMITTED_RESULT: `${JSON.stringify(validResultForAnotherScope, null, 2)}\n`,
+    },
+  });
+
+  const expectedResult = expectedExecutionFailureResult(baseSha, headSha);
+  assert.equal(finalized.status, 37, finalized.stderr);
+  assert.match(finalized.stderr, /scope_hash must match the trusted review scope/);
+  assert.deepEqual(JSON.parse(readFileSync(resultFile, "utf8")), expectedResult);
+  assert.deepEqual(
+    envFileValues(outputFile),
+    Object.fromEntries(Object.entries(expectedResult).map(([name, value]) => [
+      name,
+      typeof value === "object" ? JSON.stringify(value) : String(value),
+    ])),
+  );
+  assertFinalResultSummary(readFileSync(summaryFile, "utf8"), expectedResult);
+});
+
 test("workflow boundary replaces key-complete semantically invalid poster results", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "hosted-invalid-result-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const trustedPoster = join(directory, "scripts", "post-review.mjs");
+  const scopeFile = join(directory, "review-scope.json");
+  const metadataFile = join(directory, "review-meta.json");
   mkdirSync(dirname(trustedPoster), { recursive: true });
   writeFileSync(trustedPoster, `
 import { writeFileSync } from "node:fs";
@@ -1089,7 +1225,24 @@ process.exit(31);
 
   const baseSha = "1111111111111111111111111111111111111111";
   const headSha = "2222222222222222222222222222222222222222";
-  const validResult = expectedExecutionFailureResult(baseSha, headSha);
+  const configurationFingerprint = "a".repeat(64);
+  const trustedScopeHash = writeTrustedScopeArtifacts({
+    baseSha,
+    configurationFingerprint,
+    completedPasses: ["general"],
+    headSha,
+    metadataFile,
+    requestedPasses: ["general"],
+    scopeFile,
+  });
+  const expectedResult = expectedExecutionFailureResult(baseSha, headSha);
+  const validResult = {
+    ...expectedResult,
+    configuration_fingerprint: configurationFingerprint,
+    passes_requested: 1,
+    passes_completed: 1,
+    scope_hash: trustedScopeHash,
+  };
   const invalidResults = [
     ["string boolean", { ...validResult, bounded_converged: "false" }],
     ["string pass count", { ...validResult, passes_requested: "0" }],
@@ -1101,11 +1254,29 @@ process.exit(31);
       "invalid configuration fingerprint",
       { ...validResult, configuration_fingerprint: "A".repeat(64) },
     ],
+    [
+      "different valid configuration fingerprint",
+      { ...validResult, configuration_fingerprint: "b".repeat(64) },
+      /configuration_fingerprint must match trusted review metadata/,
+    ],
+    [
+      "different requested pass count",
+      { ...validResult, passes_requested: 2 },
+      /pass counts must match trusted review metadata/,
+    ],
+    [
+      "different completed pass count",
+      { ...validResult, passes_completed: 0 },
+      /pass counts must match trusted review metadata/,
+    ],
     ["invalid scope hash", { ...validResult, scope_hash: "f".repeat(63) }],
     [
       "complete result with zero passes and empty identity",
       {
         ...validResult,
+        configuration_fingerprint: "",
+        passes_requested: 0,
+        passes_completed: 0,
         analysis_state: "complete",
         sample_state: "clean",
         bounded_converged: true,
@@ -1124,7 +1295,7 @@ process.exit(31);
         configuration_fingerprint: "a".repeat(64),
         current_counts: { Critical: 0, High: 0, Medium: 1 },
         sample_state: "findings",
-        scope_hash: "b".repeat(64),
+        scope_hash: trustedScopeHash,
         remaining_analysis: ["diff_truncated"],
       },
     ],
@@ -1136,7 +1307,7 @@ process.exit(31);
         passes_requested: 1,
         passes_completed: 1,
         configuration_fingerprint: "a".repeat(64),
-        scope_hash: "b".repeat(64),
+        scope_hash: trustedScopeHash,
       },
     ],
     ["array count map", { ...validResult, current_counts: [] }],
@@ -1162,16 +1333,40 @@ process.exit(31);
       {
         ...validResult,
         sample_state: "clean",
-        current_counts: { Critical: 0, High: 1, Medium: 0 },
+        current_counts: { Critical: 0, High: 0, Medium: 1 },
       },
     ],
     ["findings result without counts", { ...validResult, sample_state: "findings" }],
     ["clean execution failure without counts", { ...validResult, sample_state: "clean" }],
     ["blocked result without findings", { ...validResult, merge_state: "blocked" }],
+    [
+      "ready result with configured blocking findings",
+      {
+        ...validResult,
+        unresolved_counts: { Critical: 0, High: 1, Medium: 0 },
+        sample_state: "findings",
+      },
+      /merge_state must agree with configured blocking severity counts/,
+    ],
+    [
+      "blocked result without configured blockers",
+      {
+        ...validResult,
+        merge_state: "blocked",
+        current_counts: { Critical: 0, High: 0, Medium: 1 },
+        sample_state: "findings",
+      },
+      /merge_state must agree with configured blocking severity counts/,
+    ],
     ["unsupported remaining reason", { ...validResult, remaining_analysis: ["unsupported"] }],
     [
       "duplicate remaining reasons",
       { ...validResult, remaining_analysis: ["execution_failed", "execution_failed"] },
+    ],
+    [
+      "remaining reasons outside canonical order",
+      { ...validResult, remaining_analysis: ["execution_failed", "diff_truncated"] },
+      /remaining_analysis must contain unique canonical ordered reason strings/,
     ],
     [
       "inconclusive result with reconciliation only",
@@ -1199,7 +1394,7 @@ process.exit(31);
     ],
   ];
 
-  for (const [name, invalidResult] of invalidResults) {
+  for (const [name, invalidResult, expectedDiagnostic] of invalidResults) {
     const suffix = name.replaceAll(" ", "-");
     const outputFile = join(directory, `${suffix}-output`);
     const resultFile = join(directory, `${suffix}-result.json`);
@@ -1216,6 +1411,8 @@ process.exit(31);
         BASE_SHA: baseSha,
         TRUSTED_DATA_ROOT: directory,
         REVIEW_POSTER: trustedPoster,
+        REVIEW_SCOPE_FILE: scopeFile,
+        REVIEW_METADATA_FILE: metadataFile,
         REVIEW_MODE: "summary",
         POST_COMMENT: "false",
         SUPPRESS_WRITES: "true",
@@ -1236,17 +1433,18 @@ process.exit(31);
       /review poster left an invalid result; replacing it conservatively/,
       name,
     );
-    assert.deepEqual(JSON.parse(readFileSync(resultFile, "utf8")), validResult, name);
+    if (expectedDiagnostic) assert.match(finalized.stderr, expectedDiagnostic, name);
+    assert.deepEqual(JSON.parse(readFileSync(resultFile, "utf8")), expectedResult, name);
     assert.deepEqual(
       envFileValues(outputFile),
-      Object.fromEntries(Object.entries(validResult).map(([field, value]) => [
+      Object.fromEntries(Object.entries(expectedResult).map(([field, value]) => [
         field,
         typeof value === "object" ? JSON.stringify(value) : String(value),
       ])),
       name,
     );
     const summary = readFileSync(summaryFile, "utf8");
-    assertFinalResultSummary(summary, validResult);
+    assertFinalResultSummary(summary, expectedResult);
     assert.doesNotMatch(summary, /undefined|Bounded convergence \| `yes`/, name);
   }
 });
@@ -2001,6 +2199,11 @@ test("diff truncation is recorded and makes an otherwise valid run inconclusive"
   assert.equal(run.metadata.diff.included_bytes, 80);
   const trustedDiffBytes = run.scope.bytes;
   assert.equal(run.scope.included_bytes, 80);
+  const expectedFullDiff = execFileSync("git", ["diff", "--no-color", "main", "HEAD"], {
+    cwd: run.repository,
+  });
+  assert.deepEqual(Buffer.from(run.scope.diff_base64, "base64"), expectedFullDiff);
+  assert.equal(run.scope.bytes, expectedFullDiff.length);
   assert.deepEqual(run.metadata.diff, {
     bytes: trustedDiffBytes,
     included_bytes: run.scope.included_bytes,
@@ -2024,14 +2227,14 @@ test("diff metadata and canonical scope preserve the exact UTF-8 git diff bytes"
     cwd: run.repository,
   });
   assert.equal(expectedDiff.at(-1), 10);
-  assert.equal(run.scope.diff, expectedDiff.toString("utf8"));
+  assert.deepEqual(Buffer.from(run.scope.diff_base64, "base64"), expectedDiff);
   assert.equal(run.scope.bytes, expectedDiff.length);
   assert.equal(run.metadata.diff.bytes, expectedDiff.length);
   assert.equal(run.metadata.diff.included_bytes, expectedDiff.length);
   assert.equal(validateMetadata(run.metadataFile).status, 0);
 });
 
-test("trusted raw byte counts keep non-UTF-8 full diffs complete", (t) => {
+test("scope hashes distinguish invalid UTF-8 diff bytes while the raw review run validates", (t) => {
   const run = runReview(t, {
     general: [{ findings: [] }],
     correctness: [{ findings: [] }],
@@ -2046,8 +2249,12 @@ test("trusted raw byte counts keep non-UTF-8 full diffs complete", (t) => {
   const expectedDiff = execFileSync("git", ["diff", "--no-color", "main", "HEAD"], {
     cwd: run.repository,
   });
+  const collidingUnderUtf8Decode = Buffer.from(
+    expectedDiff.map((byte) => byte === 0x80 ? 0x81 : byte),
+  );
   assert.equal(expectedDiff.includes(0x80), true);
-  assert.notEqual(Buffer.byteLength(run.scope.diff), expectedDiff.length);
+  assert.equal(expectedDiff.toString("utf8"), collidingUnderUtf8Decode.toString("utf8"));
+  assert.deepEqual(Buffer.from(run.scope.diff_base64, "base64"), expectedDiff);
   assert.equal(run.scope.bytes, expectedDiff.length);
   assert.equal(run.scope.included_bytes, expectedDiff.length);
   assert.deepEqual(run.metadata.diff, {
@@ -2055,6 +2262,17 @@ test("trusted raw byte counts keep non-UTF-8 full diffs complete", (t) => {
     included_bytes: expectedDiff.length,
     truncated: false,
   });
+  const alternateScopeHash = scopeHash({
+    base_sha: run.scope.base_sha,
+    configuration_fingerprint: run.scope.configuration_fingerprint,
+    diff_base64: collidingUnderUtf8Decode.toString("base64"),
+    head_sha: run.scope.head_sha,
+  });
+  assert.notEqual(run.metadata.scope_hash, alternateScopeHash);
+  assert.equal(Buffer.from(run.logs[0].prompt_base64, "base64").includes(expectedDiff), true);
+  for (const log of run.logs) {
+    assert.equal(Buffer.from(log.prompt_base64, "base64").includes(0x80), true);
+  }
   assert.equal(run.metadata.analysis_state, "complete");
   assert.equal(run.metadata.coverage, "bounded");
   assert.equal(validateMetadata(run.metadataFile).status, 0);

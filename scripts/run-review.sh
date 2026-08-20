@@ -776,11 +776,12 @@ SCOPE_FILE="$RUN_TMP/scope.json"
 BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" \
 CONFIGURATION_FINGERPRINT="$CONFIGURATION_FINGERPRINT" node -e '
   const fs = require("node:fs");
+  const fullDiff = fs.readFileSync(process.argv[1]);
   fs.writeFileSync(process.argv[3], JSON.stringify({
     base_sha: process.env.BASE_SHA,
-    bytes: fs.statSync(process.argv[1]).size,
+    bytes: fullDiff.length,
     configuration_fingerprint: process.env.CONFIGURATION_FINGERPRINT,
-    diff: fs.readFileSync(process.argv[1], "utf8"),
+    diff_base64: fullDiff.toString("base64"),
     head_sha: process.env.HEAD_SHA,
     included_bytes: fs.statSync(process.argv[2]).size,
   }));

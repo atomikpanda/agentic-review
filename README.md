@@ -174,7 +174,8 @@ The additive final-result contract also exposes:
 
 - `reviewed_head`, which is exactly `head_sha`;
 - `scope_hash`, the SHA-256 of canonical JSON
-  `{base_sha, configuration_fingerprint, diff, head_sha}`;
+  `{base_sha, configuration_fingerprint, diff_base64, head_sha}`, where
+  `diff_base64` is strict canonical base64 of the exact raw full-diff bytes;
 - `coverage`, which is `bounded` only when the configured execution completed
   against its immutable snapshot, and otherwise `unknown`;
 - `remaining_analysis`, a JSON reason-code array; and

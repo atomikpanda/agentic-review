@@ -49,7 +49,7 @@ function reviewScope(run = {}) {
   return {
     base_sha: run.base_sha ?? BASE_SHA,
     configuration_fingerprint: run.configuration_fingerprint ?? FINGERPRINT,
-    diff: REVIEW_DIFF,
+    diff_base64: Buffer.from(REVIEW_DIFF).toString("base64"),
     head_sha: run.head_sha ?? HEAD_SHA,
   };
 }

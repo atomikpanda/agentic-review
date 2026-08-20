@@ -29,11 +29,12 @@ const DIFF = [
   "",
 ].join("\n");
 const DIFF_BYTES = Buffer.byteLength(DIFF);
-const SCOPE_HASH = "0012d7453c71630d2e70e36517ba3482fb1e190611543c94b1955dd9a8083ebb";
+const DIFF_BASE64 = Buffer.from(DIFF).toString("base64");
+const SCOPE_HASH = "6ae596c97b1dc77c831b48e19d40ee817d7ebab483d036d30d4ebdea7986d581";
 const CANONICAL_SCOPE = {
   base_sha: BASE_SHA,
   configuration_fingerprint: FINGERPRINT,
-  diff: DIFF,
+  diff_base64: DIFF_BASE64,
   head_sha: HEAD_SHA,
 };
 const TRUSTED_SCOPE = {
@@ -417,6 +418,14 @@ test("run metadata validation fails closed without trusted reviewed-byte coverag
     }),
     /included_bytes must not exceed/i,
   );
+  assert.throws(
+    () => validateRunMetadata(metadata, {
+      ...CANONICAL_SCOPE,
+      bytes: DIFF_BYTES + 1,
+      included_bytes: DIFF_BYTES,
+    }),
+    /bytes must match decoded diff_base64/i,
+  );
 });
 
 test("run metadata validation rejects target, fingerprint, pass, and derived-state inconsistencies", () => {
@@ -511,12 +520,12 @@ test("run metadata validation rejects malformed values instead of coercing them"
   }
 });
 
-test("scope hashes are exact, canonical, and sensitive to the full diff and configuration", () => {
+test("scope hashes bind canonical base64 for the exact full diff bytes", () => {
   const script = new URL("./review-result.mjs", import.meta.url);
   const scope = {
     base_sha: BASE_SHA,
     head_sha: HEAD_SHA,
-    diff: DIFF,
+    diff_base64: DIFF_BASE64,
     configuration_fingerprint: FINGERPRINT,
   };
   const hash = (value) => {
@@ -527,11 +536,13 @@ test("scope hashes are exact, canonical, and sensitive to the full diff and conf
     assert.equal(result.status, 0, result.stderr);
     return result.stdout.trim();
   };
+  const invalidUtf8A = Buffer.from([0x61, 0x80, 0x0a]);
+  const invalidUtf8B = Buffer.from([0x61, 0x81, 0x0a]);
 
   assert.equal(hash(scope), SCOPE_HASH);
   assert.equal(hash({
     configuration_fingerprint: FINGERPRINT,
-    diff: DIFF,
+    diff_base64: DIFF_BASE64,
     head_sha: HEAD_SHA,
     base_sha: BASE_SHA,
   }), SCOPE_HASH);
@@ -540,8 +551,37 @@ test("scope hashes are exact, canonical, and sensitive to the full diff and conf
     ...scope,
     included_bytes: DIFF_BYTES,
   }), SCOPE_HASH);
-  assert.notEqual(hash({ ...scope, diff: `${DIFF}+another line\n` }), SCOPE_HASH);
+  assert.equal(invalidUtf8A.toString("utf8"), invalidUtf8B.toString("utf8"));
+  assert.notEqual(
+    hash({ ...scope, diff_base64: invalidUtf8A.toString("base64") }),
+    hash({ ...scope, diff_base64: invalidUtf8B.toString("base64") }),
+  );
+  assert.notEqual(
+    hash({ ...scope, diff_base64: Buffer.from(`${DIFF}+another line\n`).toString("base64") }),
+    SCOPE_HASH,
+  );
   assert.notEqual(hash({ ...scope, configuration_fingerprint: "4".repeat(64) }), SCOPE_HASH);
+});
+
+test("scope validation rejects lossy and noncanonical diff encodings", () => {
+  const script = new URL("./review-result.mjs", import.meta.url);
+  for (const invalid of [
+    {
+      base_sha: BASE_SHA,
+      configuration_fingerprint: FINGERPRINT,
+      diff: DIFF,
+      head_sha: HEAD_SHA,
+    },
+    { ...CANONICAL_SCOPE, diff_base64: "YQ" },
+    { ...CANONICAL_SCOPE, diff_base64: "YR==" },
+    { ...CANONICAL_SCOPE, diff_base64: "YQ==\n" },
+  ]) {
+    const result = spawnSync(process.execPath, [script.pathname, "scope", "-"], {
+      input: JSON.stringify(invalid),
+      encoding: "utf8",
+    });
+    assert.notEqual(result.status, 0);
+  }
 });
 
 test("the guarded CLI uses the importable fingerprint, analysis, and validation implementations", () => {
