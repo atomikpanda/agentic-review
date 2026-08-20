@@ -1146,6 +1146,10 @@ function deriveState(metadata, current, unresolved, reconciliationKnown, evidenc
 }
 
 function emitState(metadata, state, { reconciliationKnown = true, executionFailed = false } = {}) {
+  if (!executionFailed) {
+    lastTrustworthyState = state;
+    lastReconciliationKnown = reconciliationKnown;
+  }
   emitWorkflowResult({
     metadata,
     state,
@@ -1507,6 +1511,8 @@ async function runInlineMode({ metadata, findings, repo, pr, token, botLogin, id
 }
 
 let activeMetadata = null;
+let lastTrustworthyState = null;
+let lastReconciliationKnown = true;
 
 function emitHardFailureResult() {
   const metadata = activeMetadata ?? {
@@ -1515,14 +1521,25 @@ function emitHardFailureResult() {
     configuration_fingerprint: "",
     passes: { requested: [], completed: [] },
   };
-  const state = {
-    analysis_state: "inconclusive",
-    merge_state: "ready",
-    sample_state: "unknown",
-    bounded_converged: false,
-    current_counts: { Critical: 0, High: 0, Medium: 0 },
-    unresolved_counts: { Critical: 0, High: 0, Medium: 0 },
-  };
+  const state = lastTrustworthyState
+    ? {
+      ...lastTrustworthyState,
+      analysis_state: "inconclusive",
+      sample_state: SUMMARY_SEVERITIES.some(
+        (severity) => lastTrustworthyState.current_counts[severity]
+          + lastTrustworthyState.unresolved_counts[severity] > 0,
+      ) ? "findings" : "unknown",
+      bounded_converged: false,
+      converged: false,
+    }
+    : {
+      analysis_state: "inconclusive",
+      merge_state: "ready",
+      sample_state: "unknown",
+      bounded_converged: false,
+      current_counts: { Critical: 0, High: 0, Medium: 0 },
+      unresolved_counts: { Critical: 0, High: 0, Medium: 0 },
+    };
   const resultMetadata = activeMetadata ? undefined : {
     reviewed_head: env("HEAD_SHA", metadata.head_sha ?? ""),
     scope_hash: "",
@@ -1535,6 +1552,7 @@ function emitHardFailureResult() {
     outputFile: env("GITHUB_OUTPUT", ""),
     summaryFile: env("GITHUB_STEP_SUMMARY", ""),
     resultFile: env("REVIEW_RESULT_FILE", ""),
+    reconciliationKnown: lastTrustworthyState ? lastReconciliationKnown : true,
     executionFailed: true,
     resultMetadata,
   });

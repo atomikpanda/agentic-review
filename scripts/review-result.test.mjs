@@ -57,6 +57,7 @@ function completeRun(overrides = {}) {
     remaining_analysis: [],
     diff: { bytes: 100, included_bytes: 100, truncated: false },
     finding_cap: 20,
+    min_votes: 1,
     merge_succeeded: true,
     passes: {
       requested: [...PASS_IDS],
@@ -216,6 +217,26 @@ test("analysis is complete only for successful uncapped passes on one target and
   assert.equal(deriveAnalysisState(wrongTarget), "inconclusive");
 
   assert.equal(deriveAnalysisState(completeRun({ merge_succeeded: false })), "inconclusive");
+});
+
+test("vote thresholds stay inconclusive without classifying a successful merge as failed", () => {
+  const successful = {
+    schema_version: REVIEW_RESULT_SCHEMA_VERSION,
+    ...completeRun({
+      min_votes: 2,
+      coverage: "unknown",
+      remaining_analysis: ["vote_threshold_applied"],
+    }),
+    analysis_state: "inconclusive",
+  };
+  assert.equal(validateRunMetadata(successful), successful);
+
+  const failed = {
+    ...structuredClone(successful),
+    merge_succeeded: false,
+    remaining_analysis: ["vote_threshold_applied", "merge_failed"],
+  };
+  assert.equal(validateRunMetadata(failed), failed);
 });
 
 test("configuration fingerprints are canonical and content-sensitive", () => {
@@ -387,6 +408,7 @@ test("run metadata validation rejects malformed values instead of coercing them"
     [(value) => { value.diff.truncated = "false"; }, /diff\.truncated/],
     [(value) => { value.snapshot_immutable = "true"; }, /snapshot_immutable/],
     [(value) => { value.finding_cap = -1; }, /finding_cap/],
+    [(value) => { value.min_votes = 0; }, /min_votes/],
     [(value) => { value.passes.results[0].attempts = "1"; }, /attempts.*general/i],
     [(value) => { value.passes.results[0].attempts = 3; }, /attempts.*general/i],
     [(value) => { value.passes.results[0].finding_count = 20; }, /capped.*general/i],

@@ -82,8 +82,9 @@ Normally it is the union of every valid pass. If union fails, the runner
 preserves the first valid structured pass and marks the separate schema-v1
 metadata inconclusive rather than presenting the fallback as merged.
 `--metadata-out FILE` writes that bounded-run metadata: immutable base and head
-SHAs, the configuration fingerprint, diff and cap status, requested/completed
-pass identifiers, per-pass status, and `analysis_state`. Both outputs reject a
+SHAs, the configuration fingerprint and configured vote threshold, diff and cap
+status, requested/completed pass identifiers, per-pass status, merge success,
+and `analysis_state`. Both outputs reject a
 symlink destination before model work, and the paths must resolve to different
 destinations. `--no-state` still reads existing history for the
 rendered state and exit status but never mutates it. Advanced local experiments
@@ -179,8 +180,9 @@ The additive final-result contract also exposes:
 - `remaining_analysis`, a JSON reason-code array; and
 - `converged`, an exact alias of `bounded_converged`.
 
-A successful configured execution has `remaining_analysis=[]`. Otherwise reason
-codes appear once in this deterministic order:
+A successful configured execution using the default union policy has
+`remaining_analysis=[]`. Otherwise reason codes appear once in this
+deterministic order:
 
 | Reason code | Meaning |
 |---|---|
@@ -189,6 +191,7 @@ codes appear once in this deterministic order:
 | `pass_failed` | A configured pass did not return valid structured output |
 | `snapshot_mutable` | The reviewed snapshot was not immutable |
 | `pass_scope_mismatch` | Passes did not share the same base, head, or configuration |
+| `vote_threshold_applied` | A configured vote threshold above one deliberately keeps analysis inconclusive |
 | `merge_failed` | Valid pass results could not be merged |
 | `reconciliation_unknown` | Prior finding state could not be reconciled safely |
 | `execution_failed` | Hosted execution or final-result construction failed |
@@ -205,10 +208,10 @@ reconciled evidence contain no actionable finding; it does not claim exhaustive
 repository coverage.
 
 A mutable snapshot, failed pass after its retry, base/head/configuration
-mismatch, truncated diff, findings cap, or failed union makes analysis
-`inconclusive`. Known findings still produce `sample_state=findings`; no known
-finding produces `sample_state=unknown`, never `clean`. None of those runs can
-set `bounded_converged=true`.
+mismatch, truncated diff, findings cap, vote threshold above one, or failed
+merge makes analysis `inconclusive`. Known findings still produce
+`sample_state=findings`; no known finding produces `sample_state=unknown`, never
+`clean`. None of those runs can set `bounded_converged=true`.
 
 `fail_on_findings: true` fails the hosted job only when
 `merge_state=blocked`. Without it, job success means execution succeeded, not

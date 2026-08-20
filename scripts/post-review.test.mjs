@@ -1743,12 +1743,26 @@ test("runner and poster hard failures still write conservative outputs and a fin
   }
 });
 
-test("poster failure appends a conservative final result after an optimistic job summary", () => {
+test("poster failure preserves reconciled blockers in the conservative final result", () => {
+  const current = finding({
+    severity: "Critical",
+    title: "Current critical blocker",
+  });
+  const unresolved = finding({
+    file: "src/auth.mjs",
+    start_line: 8,
+    end_line: 9,
+    severity: "High",
+    title: "Held high blocker",
+    body: "The prior authorization defect remains unresolved.",
+    suggestion: null,
+  });
   const result = runPosterWithHistory({
     mode: "summary",
+    currentFindings: [current],
     summaryComments: [botComment(
       41,
-      encodeSummaryMarker({ headSha: PRIOR_HEAD_SHA, findings: [] }),
+      encodeSummaryMarker({ headSha: HEAD_SHA, findings: [unresolved] }),
     )],
     failSummaryPost: true,
   });
@@ -1759,31 +1773,63 @@ test("poster failure appends a conservative final result after an optimistic job
     return [line.slice(0, separator), line.slice(separator + 1)];
   }));
   assert.equal(outputs.analysis_state, "inconclusive");
-  assert.equal(outputs.sample_state, "unknown");
+  assert.equal(outputs.merge_state, "blocked");
+  assert.equal(outputs.sample_state, "findings");
   assert.equal(outputs.bounded_converged, "false");
+  assert.deepEqual(JSON.parse(outputs.current_counts), { Critical: 1, High: 0, Medium: 0 });
+  assert.deepEqual(JSON.parse(outputs.unresolved_counts), { Critical: 0, High: 1, Medium: 0 });
   assert.equal(outputs.coverage, "unknown");
   assert.deepEqual(JSON.parse(outputs.remaining_analysis), ["execution_failed"]);
   assert.equal(outputs.converged, "false");
-  assert.deepEqual(result.finalResult, {
-    ...result.finalResult,
-    analysis_state: outputs.analysis_state,
-    sample_state: outputs.sample_state,
-    bounded_converged: false,
-    coverage: outputs.coverage,
-    remaining_analysis: JSON.parse(outputs.remaining_analysis),
-    converged: false,
-  });
 
-  const optimistic = result.jobSummary.indexOf("| Sample | `clean` |");
-  assert.notEqual(optimistic, -1);
+  assert.equal(result.finalResult.analysis_state, outputs.analysis_state);
+  assert.equal(result.finalResult.merge_state, outputs.merge_state);
+  assert.equal(result.finalResult.sample_state, outputs.sample_state);
+  assert.equal(result.finalResult.bounded_converged, false);
+  assert.deepEqual(result.finalResult.current_counts, JSON.parse(outputs.current_counts));
+  assert.deepEqual(result.finalResult.unresolved_counts, JSON.parse(outputs.unresolved_counts));
+  assert.equal(result.finalResult.coverage, outputs.coverage);
+  assert.deepEqual(result.finalResult.remaining_analysis, JSON.parse(outputs.remaining_analysis));
+  assert.equal(result.finalResult.converged, false);
+
+  const reconciledSummary = result.jobSummary.indexOf("| Analysis | `complete` |");
+  const finalSummary = result.jobSummary.slice(result.jobSummary.lastIndexOf("## Agentic review"));
+  assert.notEqual(reconciledSummary, -1);
   for (const row of [
     "| Analysis | `inconclusive` |",
-    "| Sample | `unknown` |",
+    "| Merge gate | `blocked` |",
+    "| Sample | `findings` |",
     "| Bounded convergence | `no` |",
     "| Coverage | `unknown` |",
     '| Remaining analysis | `["execution_failed"]` |',
     "| Converged | `false` |",
+    "| Current findings | `Critical: 1 · High: 0 · Medium: 0` |",
+    "| Held/unresolved findings | `Critical: 0 · High: 1 · Medium: 0` |",
   ]) {
-    assert.ok(result.jobSummary.lastIndexOf(row) > optimistic, row);
+    assert.ok(finalSummary.includes(row), row);
   }
+});
+
+test("poster failure downgrades a reconciled clean sample to unknown", () => {
+  const result = runPosterWithHistory({
+    mode: "summary",
+    summaryComments: [botComment(
+      42,
+      encodeSummaryMarker({ headSha: HEAD_SHA, findings: [] }),
+    )],
+    failSummaryPost: true,
+  });
+
+  assert.notEqual(result.status, 0, result.stderr);
+  const outputs = Object.fromEntries(result.workflowOutput.trim().split("\n").map((line) => {
+    const separator = line.indexOf("=");
+    return [line.slice(0, separator), line.slice(separator + 1)];
+  }));
+  assert.equal(outputs.analysis_state, "inconclusive");
+  assert.equal(outputs.merge_state, "ready");
+  assert.equal(outputs.sample_state, "unknown");
+  assert.equal(outputs.bounded_converged, "false");
+  assert.deepEqual(JSON.parse(outputs.current_counts), { Critical: 0, High: 0, Medium: 0 });
+  assert.deepEqual(JSON.parse(outputs.unresolved_counts), { Critical: 0, High: 0, Medium: 0 });
+  assert.equal(result.finalResult.sample_state, "unknown");
 });

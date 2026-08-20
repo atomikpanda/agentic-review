@@ -20,6 +20,7 @@ export const REMAINING_ANALYSIS_REASONS = [
   "pass_failed",
   "snapshot_mutable",
   "pass_scope_mismatch",
+  "vote_threshold_applied",
   "merge_failed",
   "reconciliation_unknown",
   "execution_failed",
@@ -204,6 +205,7 @@ function inspectRun(run) {
   requireBoolean(run.snapshot_immutable, "snapshot_immutable");
   validateDiff(run.diff);
   requireInteger(run.finding_cap, "finding_cap");
+  if (run.min_votes !== undefined) requireInteger(run.min_votes, "min_votes", 1);
   if (run.merge_succeeded !== undefined) requireBoolean(run.merge_succeeded, "merge_succeeded");
   if (run.reconciliation_known !== undefined) {
     requireBoolean(run.reconciliation_known, "reconciliation_known");
@@ -267,6 +269,7 @@ export function deriveRemainingAnalysis(run, {
   if (passFailed) facts.add("pass_failed");
   if (!run.snapshot_immutable) facts.add("snapshot_mutable");
   if (passScopeMismatch) facts.add("pass_scope_mismatch");
+  if (run.min_votes > 1) facts.add("vote_threshold_applied");
   if (run.merge_succeeded === false) facts.add("merge_failed");
   if (reconciliationKnown === false) facts.add("reconciliation_unknown");
   if (executionFailed === true || noSuccessfulPass) facts.add("execution_failed");
@@ -292,6 +295,7 @@ export function deriveAnalysisState(run) {
 
   const complete = requested.length > 0
     && run.snapshot_immutable === true
+    && (run.min_votes === undefined || run.min_votes === 1)
     && run.merge_succeeded !== false
     && run.execution_failed !== true
     && run.diff.truncated === false

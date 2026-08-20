@@ -40,7 +40,7 @@ const STORED_SEVERITIES = new Set(["Critical", "High", "Medium"]);
 const NON_LOWERCASE_HEX = /[^0-9a-f]/;
 const STAGED_TARGET_REF_PREFIX = "refs/agentic-review/staged-targets/";
 
-const findingOwnsStagedTarget = (finding) => finding.status !== "gone";
+const findingOwnsStagedTarget = (finding) => finding.stagedTarget === true && finding.status !== "gone";
 
 function retainStagedTarget(state, target) {
   if (!target) return;
@@ -100,6 +100,9 @@ function migrateAndValidateStoredFinding(finding, index) {
     }
   } else if (Object.hasOwn(finding, "goneAt")) {
     throw new TypeError(`${label}.goneAt is only valid for gone findings`);
+  }
+  if (Object.hasOwn(finding, "stagedTarget") && typeof finding.stagedTarget !== "boolean") {
+    throw new TypeError(`${label}.stagedTarget must be a boolean`);
   }
   if (
     !Number.isInteger(finding.line)
@@ -232,6 +235,7 @@ if (cmd === "record") {
       known.line = f.start_line ?? known.line;
       known.endLine = f.end_line ?? f.start_line ?? known.endLine;
       known.lastCommit = head;
+      known.stagedTarget = Boolean(stagedTarget);
       if (known.status === "dismissed") { muted++; continue; }
       // Reported again after being marked gone: the defect returned, so the
       // record has to return with it rather than staying closed forever.
@@ -244,7 +248,7 @@ if (cmd === "record") {
         id, file: f.file, title: f.title, body: f.body, severity: f.severity,
         line: f.start_line, endLine: f.end_line ?? f.start_line, status: "open",
         firstSeen: now, lastSeen: now, firstCommit: head, lastCommit: head,
-        count: 1,
+        stagedTarget: Boolean(stagedTarget), count: 1,
       });
       fresh++;
     }
@@ -318,7 +322,9 @@ if (cmd === "dismiss" || cmd === "reopen") {
   let n = 0;
   for (const f of state.findings) {
     if (!ids.includes(f.id)) continue;
-    const restoringStagedOwnership = f.status === "gone";
+    const restoringStagedOwnership = cmd === "reopen"
+      && f.status !== "open"
+      && f.stagedTarget === true;
     f.status = cmd === "dismiss" ? "dismissed" : "open";
     delete f.goneAt;
     if (restoringStagedOwnership) retainStagedTarget(state, f.lastCommit);

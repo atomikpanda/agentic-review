@@ -761,6 +761,21 @@ test("workflow skips the write-capable poster after cancellation but not ordinar
   assert.match(posterStep, /^\s+if: \$\{\{ !cancelled\(\) \}\}$/m);
 });
 
+test("workflow uploads target-resolution fallback artifacts without publishing cancelled or ineligible runs", () => {
+  const source = readFileSync(workflow, "utf8");
+  const artifactStep = source.match(
+    /^      - uses: actions\/upload-artifact@v4\n[\s\S]*$/m,
+  )?.[0];
+
+  assert.ok(artifactStep);
+  assert.match(
+    artifactStep,
+    /^\s+if: \$\{\{ !cancelled\(\) && steps\.target\.outputs\.eligible != 'false' \}\}$/m,
+  );
+  assert.match(artifactStep, /^\s+\/tmp\/review-result\.json$/m);
+  assert.match(artifactStep, /^\s+if-no-files-found: error$/m);
+});
+
 test("early hosted setup failure emits the same conservative result everywhere", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "hosted-finalizer-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -1762,6 +1777,7 @@ test("staged review state keeps its synthetic target reachable for later reconci
   const statePath = join(first.repository, ".git", "agentic-review", "state.json");
   const [stored] = JSON.parse(readFileSync(statePath, "utf8")).findings;
   assert.equal(stored.lastCommit, first.metadata.head_sha);
+  assert.equal(stored.stagedTarget, true);
   assert.notEqual(stored.lastCommit, git(first.repository, "rev-parse", "HEAD"));
   const retainingRefs = git(
     first.repository,
@@ -1798,6 +1814,69 @@ test("staged review state keeps its synthetic target reachable for later reconci
   assert.match(fixed.result.stdout, /\| Sample \| `clean` \|/);
   const [retired] = JSON.parse(readFileSync(statePath, "utf8")).findings;
   assert.equal(retired.status, "gone");
+  assert.equal(retired.stagedTarget, true);
+});
+
+test("ordinary gone findings can reopen after their historical commit is pruned", (t) => {
+  const reported = finding("Reopened branch defect", {
+    file: "alpha.txt",
+    start_line: 1,
+    end_line: 1,
+  });
+  const first = runReview(t, {
+    general: [{ findings: [reported] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    noState: false,
+  });
+  assert.equal(first.result.status, 0, first.result.stderr);
+
+  const statePath = join(first.repository, ".git", "agentic-review", "state.json");
+  const [stored] = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  assert.equal(stored.stagedTarget, false);
+
+  writeFileSync(join(first.repository, "alpha.txt"), "alpha fixed\n");
+  git(first.repository, "add", "alpha.txt");
+  git(first.repository, "commit", "-m", "fix ordinary finding");
+  const fixed = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: [],
+    existingFixture: first,
+    noState: false,
+  });
+  assert.equal(fixed.result.status, 0, fixed.result.stderr);
+  assert.equal(JSON.parse(readFileSync(statePath, "utf8")).findings[0].status, "gone");
+
+  git(first.repository, "reset", "--hard", first.baseSha);
+  writeFileSync(join(first.repository, "alpha.txt"), "replacement history\n");
+  git(first.repository, "add", "alpha.txt");
+  git(first.repository, "commit", "-m", "replace ordinary history");
+  git(first.repository, "reflog", "expire", "--expire=now", "--all");
+  git(first.repository, "prune", "--expire=now");
+  const unavailableHistory = spawnSync(
+    "git",
+    ["cat-file", "-e", `${stored.lastCommit}^{commit}`],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.notEqual(unavailableHistory.status, 0, "ordinary historical commit must be pruned");
+
+  const reopened = spawnSync(process.execPath, [localState, "reopen", stored.id], {
+    cwd: first.repository,
+    encoding: "utf8",
+  });
+  assert.equal(reopened.status, 0, reopened.stderr);
+  assert.equal(JSON.parse(readFileSync(statePath, "utf8")).findings[0].status, "open");
+  const stagedTarget = spawnSync(
+    "git",
+    ["show-ref", "--verify", "--quiet", `${stagedTargetRefPrefix}${stored.lastCommit}`],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.notEqual(stagedTarget.status, 0, "ordinary history must not gain a staged-target ref");
 });
 
 test("reopening a gone staged finding restores ownership before later pruning", (t) => {
@@ -1819,6 +1898,7 @@ test("reopening a gone staged finding restores ownership before later pruning", 
 
   const statePath = join(first.repository, ".git", "agentic-review", "state.json");
   const [stored] = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  assert.equal(stored.stagedTarget, true);
   const stagedTargetRef = `${stagedTargetRefPrefix}${stored.lastCommit}`;
   const temporaryRef = "refs/agentic-review/test-reopen-target";
   git(first.repository, "update-ref", temporaryRef, stored.lastCommit);
@@ -1839,6 +1919,7 @@ test("reopening a gone staged finding restores ownership before later pruning", 
 
   const [gone] = JSON.parse(readFileSync(statePath, "utf8")).findings;
   assert.equal(gone.status, "gone");
+  assert.equal(gone.stagedTarget, true);
   assert.equal(git(first.repository, "rev-parse", temporaryRef), stored.lastCommit);
   const released = spawnSync(
     "git",
@@ -1866,7 +1947,7 @@ test("reopening a gone staged finding restores ownership before later pruning", 
   assert.equal(retainedTarget.status, 0, "reopened staged target must survive Git pruning");
 });
 
-test("reopening fails without changing gone state when its staged target is unavailable", (t) => {
+test("unavailable staged targets block reopen atomically but not dismissal", (t) => {
   const reported = finding("Unavailable staged defect", {
     file: "alpha.txt",
     start_line: 1,
@@ -1885,6 +1966,7 @@ test("reopening fails without changing gone state when its staged target is unav
 
   const statePath = join(first.repository, ".git", "agentic-review", "state.json");
   const [stored] = JSON.parse(readFileSync(statePath, "utf8")).findings;
+  assert.equal(stored.stagedTarget, true);
   const stagedTargetRef = `${stagedTargetRefPrefix}${stored.lastCommit}`;
 
   writeFileSync(join(first.repository, "alpha.txt"), "alpha fixed\n");
@@ -1901,6 +1983,7 @@ test("reopening fails without changing gone state when its staged target is unav
   });
   assert.equal(fixed.result.status, 0, fixed.result.stderr);
   assert.equal(JSON.parse(readFileSync(statePath, "utf8")).findings[0].status, "gone");
+  assert.equal(JSON.parse(readFileSync(statePath, "utf8")).findings[0].stagedTarget, true);
   const released = spawnSync(
     "git",
     ["show-ref", "--verify", "--quiet", stagedTargetRef],
@@ -1924,6 +2007,19 @@ test("reopening fails without changing gone state when its staged target is unav
   });
   assert.notEqual(reopened.status, 0, "reopen must fail when its target cannot be retained");
   assert.equal(readFileSync(statePath, "utf8"), goneState);
+
+  const dismissed = spawnSync(process.execPath, [localState, "dismiss", stored.id], {
+    cwd: first.repository,
+    encoding: "utf8",
+  });
+  assert.equal(dismissed.status, 0, dismissed.stderr);
+  assert.equal(JSON.parse(readFileSync(statePath, "utf8")).findings[0].status, "dismissed");
+  const retained = spawnSync(
+    "git",
+    ["show-ref", "--verify", "--quiet", stagedTargetRef],
+    { cwd: first.repository, encoding: "utf8" },
+  );
+  assert.notEqual(retained.status, 0, "dismissing a gone finding must not retain its target");
 });
 
 test("legacy live-checkout fallback is explicitly mutable and inconclusive", (t) => {
@@ -2279,6 +2375,10 @@ test("min-votes filtering cannot hide one-pass blocking evidence or report conve
   assert.equal(run.result.status, 0, run.result.stderr);
   assert.deepEqual(run.findings.findings.map(({ title }) => title), [blocker.title]);
   assert.equal(run.metadata.analysis_state, "inconclusive");
+  assert.equal(run.metadata.min_votes, 2);
+  assert.equal(run.metadata.merge_succeeded, true);
+  assert.deepEqual(run.metadata.remaining_analysis, ["vote_threshold_applied"]);
+  assert.equal(validateMetadata(run.metadataFile).status, 0);
   const rendered = spawnSync(process.execPath, [poster], {
     encoding: "utf8",
     env: {
@@ -2294,6 +2394,9 @@ test("min-votes filtering cannot hide one-pass blocking evidence or report conve
   assert.match(rendered.stdout, /\| Analysis \| `inconclusive` \|/);
   assert.match(rendered.stdout, /\| Merge gate \| `blocked` \|/);
   assert.match(rendered.stdout, /\| Bounded convergence \| `no` \|/);
+  assert.match(rendered.stdout, /\| Coverage \| `unknown` \|/);
+  assert.match(rendered.stdout, /\| Remaining analysis \| `\["vote_threshold_applied"\]` \|/);
+  assert.match(rendered.stdout, /\| Converged \| `false` \|/);
   assert.match(rendered.stdout, /Single-pass blocker/);
 });
 

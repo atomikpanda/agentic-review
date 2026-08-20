@@ -1028,7 +1028,7 @@ jobs:
             node "$REVIEW_POSTER"
 
       - uses: actions/upload-artifact@v4
-        if: always() && steps.target.outputs.eligible == 'true'
+        if: ${{ !cancelled() && steps.target.outputs.eligible != 'false' }}
         with:
           name: agentic-review
           path: |
@@ -1038,7 +1038,6 @@ jobs:
             /tmp/review-runner.err
             /tmp/review-result.json
           retention-days: 7
-          # This step is `always()`, so it also runs when the review failed
-          # before either file existed. Without this the real error is followed
-          # by a "No files were found" warning that reads like a second fault.
-          if-no-files-found: ignore
+          # Every non-cancelled eligible or unresolved target path must have
+          # produced a final result. Explicit ineligibility skips this step.
+          if-no-files-found: error

@@ -839,7 +839,7 @@ write_metadata() {
   BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" CONFIGURATION_FINGERPRINT="$CONFIGURATION_FINGERPRINT" \
   SCOPE_HASH="$SCOPE_HASH" SNAPSHOT_IMMUTABLE="$SNAPSHOT_IMMUTABLE" \
   DIFF_BYTES="$DIFF_BYTES" INCLUDED_DIFF_BYTES="$INCLUDED_DIFF_BYTES" \
-  TRUNCATED="$TRUNCATED" MAX_FINDINGS="$MAX_FINDINGS" \
+  TRUNCATED="$TRUNCATED" MAX_FINDINGS="$MAX_FINDINGS" MIN_VOTES="$MIN_VOTES" \
   MERGE_SUCCEEDED="$merge_succeeded" EXECUTION_FAILED="$execution_failed" \
   node --input-type=module -e '
     import fs from "node:fs";
@@ -872,12 +872,14 @@ write_metadata() {
         truncated: process.env.TRUNCATED === "1",
       },
       finding_cap: Number(process.env.MAX_FINDINGS),
+      min_votes: Number(process.env.MIN_VOTES),
       passes: {
         requested: results.map(({ id }) => id),
         completed: results.filter(({ status }) => status === "valid").map(({ id }) => id),
         results,
       },
     };
+    if (process.env.MERGE_SUCCEEDED === "true") run.merge_succeeded = true;
     if (process.env.MERGE_SUCCEEDED === "false") run.merge_succeeded = false;
     const metadata = enrichRunMetadata(run, {
       scopeHash: process.env.SCOPE_HASH,
@@ -916,7 +918,6 @@ if ! node "$MERGE" --min-votes 1 "${VALID_OUTS[@]}" > "$UNION_OUT" \
 elif [ "$MIN_VOTES" = 1 ]; then
   mv "$UNION_OUT" "$TMP_OUT"
 else
-  MERGE_SUCCEEDED=false
   if node "$MERGE" --min-votes "$MIN_VOTES" "${VALID_OUTS[@]}" > "$TMP_OUT" \
      && node "$MERGE" --check "$TMP_OUT" 2>/dev/null; then
     if ! cmp -s "$UNION_OUT" "$TMP_OUT"; then
@@ -924,6 +925,7 @@ else
       mv -f "$UNION_OUT" "$TMP_OUT"
     fi
   else
+    MERGE_SUCCEEDED=false
     say "min-votes $MIN_VOTES merge failed — preserving the union"
     mv -f "$UNION_OUT" "$TMP_OUT"
   fi
