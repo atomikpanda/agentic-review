@@ -1866,6 +1866,7 @@ async function runCyclePlanMode() {
   writeFileSync(planFile, `${JSON.stringify(plan, null, 2)}\n`);
   const verificationFindings = plan.known_findings.map((finding, index) => ({
     ...finding,
+    suggestion: finding.suggestion ?? null,
     verification_id: `K${index + 1}`,
   }));
   writeFileSync(knownFindingsFile, `${JSON.stringify({ findings: verificationFindings }, null, 2)}\n`);

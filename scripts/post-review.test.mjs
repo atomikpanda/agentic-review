@@ -567,6 +567,7 @@ test("terminal cycle planning emits conservative evidence without another review
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.cyclePlan.should_run, false);
   assert.equal(result.knownFindings[0].title, priorFinding.title);
+  assert.equal(result.knownFindings[0].suggestion, null);
   assert.equal(result.finalResult.analysis_state, "inconclusive");
   assert.equal(result.finalResult.merge_state, "blocked");
   assert.equal(result.finalResult.sample_state, "findings");
