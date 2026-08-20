@@ -389,6 +389,30 @@ test("an aged empty legacy reaper marker does not permanently block mutations", 
   assert.equal(existsSync(lockDirectory), false);
 });
 
+test("an aged malformed JSON reaper marker does not permanently block mutations", (t) => {
+  const repository = createRepository(t, "local-state-malformed-json-reaper-");
+  const stateDirectory = join(repository, ".git", "agentic-review");
+  const lockDirectory = join(stateDirectory, "state.lock");
+  mkdirSync(lockDirectory, { recursive: true });
+  writeFileSync(join(stateDirectory, "state.json"), JSON.stringify({ findings: [] }));
+  writeFileSync(join(lockDirectory, "owner.json"), JSON.stringify({
+    pid: 2_147_483_647,
+    token: "abandoned-lock",
+    processIdentity: "linux:abandoned-lock",
+  }));
+  const malformedReaper = join(lockDirectory, "reaper");
+  writeFileSync(malformedReaper, "{}");
+  utimesSync(malformedReaper, new Date(0), new Date(0));
+
+  const mutation = spawnSync(process.execPath, [localState, "dismiss", "missing"], {
+    cwd: repository,
+    encoding: "utf8",
+    timeout: 1_000,
+  });
+  assert.equal(mutation.status, 0, mutation.error?.message ?? mutation.stderr);
+  assert.equal(existsSync(lockDirectory), false);
+});
+
 test("a live stale-lock reaper is not displaced by another mutation", (t) => {
   const repository = createRepository(t, "local-state-live-reaper-");
   const stateDirectory = join(repository, ".git", "agentic-review");
@@ -435,6 +459,31 @@ test("a young empty legacy reaper marker is not displaced", (t) => {
   assert.equal(mutation.status, null);
   assert.equal(mutation.error?.code, "ETIMEDOUT");
   assert.equal(readFileSync(emptyReaper, "utf8"), "");
+});
+
+test("a young malformed JSON reaper marker is not displaced", (t) => {
+  const repository = createRepository(t, "local-state-young-malformed-json-reaper-");
+  const stateDirectory = join(repository, ".git", "agentic-review");
+  const lockDirectory = join(stateDirectory, "state.lock");
+  mkdirSync(lockDirectory, { recursive: true });
+  writeFileSync(join(stateDirectory, "state.json"), JSON.stringify({ findings: [] }));
+  writeFileSync(join(lockDirectory, "owner.json"), JSON.stringify({
+    pid: 2_147_483_647,
+    token: "abandoned-lock",
+    processIdentity: "linux:abandoned-lock",
+  }));
+  const malformedReaper = join(lockDirectory, "reaper");
+  const marker = "{\n  \"token\": \"missing-pid\"\n}\n";
+  writeFileSync(malformedReaper, marker);
+
+  const mutation = spawnSync(process.execPath, [localState, "dismiss", "missing"], {
+    cwd: repository,
+    encoding: "utf8",
+    timeout: 500,
+  });
+  assert.equal(mutation.status, null);
+  assert.equal(mutation.error?.code, "ETIMEDOUT");
+  assert.equal(readFileSync(malformedReaper, "utf8"), marker);
 });
 
 test("runs with equal timestamps retain immutable history and list newest first", (t) => {

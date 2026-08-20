@@ -76,7 +76,8 @@ function assertFinalResultSummary(summary, result) {
   }
 }
 
-function expectedExecutionFailureResult(baseSha, headSha) {
+function expectedExecutionFailureResult(baseSha, headSha, evidence = {}) {
+  const remainingAnalysis = evidence.remainingAnalysis ?? [];
   return {
     analysis_state: "inconclusive",
     merge_state: "ready",
@@ -84,15 +85,15 @@ function expectedExecutionFailureResult(baseSha, headSha) {
     bounded_converged: false,
     base_sha: baseSha,
     head_sha: headSha,
-    configuration_fingerprint: "",
-    passes_requested: 0,
-    passes_completed: 0,
+    configuration_fingerprint: evidence.configurationFingerprint ?? "",
+    passes_requested: evidence.passesRequested ?? 0,
+    passes_completed: evidence.passesCompleted ?? 0,
     current_counts: { Critical: 0, High: 0, Medium: 0 },
     unresolved_counts: { Critical: 0, High: 0, Medium: 0 },
     reviewed_head: headSha,
-    scope_hash: "",
+    scope_hash: evidence.scopeHash ?? "",
     coverage: "unknown",
-    remaining_analysis: ["execution_failed"],
+    remaining_analysis: [...remainingAnalysis, "execution_failed"],
     converged: false,
   };
 }
@@ -919,7 +920,7 @@ test("workflow retains normal artifacts and uploads result-only target-resolutio
   assert.match(fallbackArtifactStep, /^\s+if-no-files-found: error$/m);
 });
 
-test("early hosted setup failure emits the same conservative result everywhere", (t) => {
+test("early hosted setup failure without a publication uses target fallback defaults", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "hosted-finalizer-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const outputFile = join(directory, "github-output");
@@ -992,7 +993,7 @@ writeFileSync(process.env.UNTRUSTED_POSTER_MARKER, "executed");
   }
 });
 
-test("workflow boundary preserves behind-base results only for the trusted merge-base", (t) => {
+test("behind-base poster no-result fallback pairs with the trusted merge-base publication", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "hosted-poster-load-failure-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const trustedPoster = join(directory, "scripts", "post-review.mjs");
@@ -1059,6 +1060,41 @@ test("workflow boundary preserves behind-base results only for the trusted merge
     requestedPasses: ["general", "correctness", "boundaries"],
     scopeFile,
   });
+  writeFileSync(trustedPoster, "process.exit(47);\n");
+  const killedOutput = join(directory, "killed-output");
+  const killedResultFile = join(directory, "killed-result.json");
+  const killedSummary = join(directory, "killed-summary");
+  const killedBeforeResult = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...env,
+      GITHUB_OUTPUT: killedOutput,
+      REVIEW_RESULT_FILE: killedResultFile,
+      GITHUB_STEP_SUMMARY: killedSummary,
+    },
+  });
+  const expectedKilledResult = expectedExecutionFailureResult(baseSha, headSha, {
+    configurationFingerprint,
+    passesRequested: 3,
+    passesCompleted: 3,
+    scopeHash: trustedScopeHash,
+  });
+
+  assert.equal(killedBeforeResult.status, 47, killedBeforeResult.stderr);
+  assert.deepEqual(
+    JSON.parse(readFileSync(killedResultFile, "utf8")),
+    expectedKilledResult,
+  );
+  assert.deepEqual(
+    envFileValues(killedOutput),
+    Object.fromEntries(Object.entries(expectedKilledResult).map(([name, value]) => [
+      name,
+      typeof value === "object" ? JSON.stringify(value) : String(value),
+    ])),
+  );
+  assertFinalResultSummary(readFileSync(killedSummary, "utf8"), expectedKilledResult);
+
   const emittedResult = {
     ...expectedExecutionFailureResult(baseSha, headSha),
     analysis_state: "complete",
@@ -1170,7 +1206,7 @@ process.exit(29);
   assert.match(failedWithMismatchedBase.stderr, /result target must match the trusted review scope/);
   assert.deepEqual(
     JSON.parse(readFileSync(mismatchedResultFile, "utf8")),
-    expectedResult,
+    expectedKilledResult,
   );
 });
 
@@ -1191,7 +1227,6 @@ process.exit(41);
   const headSha = "2222222222222222222222222222222222222222";
   const configurationFingerprint = "a".repeat(64);
   const requestedPasses = ["general", "correctness", "boundaries"];
-  const expectedResult = expectedExecutionFailureResult(baseSha, headSha);
   const env = {
     ...process.env,
     TARGET_ELIGIBLE: "true",
@@ -1230,6 +1265,13 @@ process.exit(41);
       remainingAnalysis,
       requestedPasses,
       scopeFile,
+    });
+    const expectedResult = expectedExecutionFailureResult(baseSha, headSha, {
+      configurationFingerprint,
+      passesRequested: requestedPasses.length,
+      passesCompleted: requestedPasses.length,
+      scopeHash: trustedScopeHash,
+      remainingAnalysis,
     });
     const strongerResult = {
       ...expectedResult,
@@ -1276,7 +1318,12 @@ process.exit(41);
     scopeFile,
   });
   const reconciledResult = {
-    ...expectedResult,
+    ...expectedExecutionFailureResult(baseSha, headSha, {
+      configurationFingerprint,
+      passesRequested: requestedPasses.length,
+      passesCompleted: requestedPasses.length,
+      scopeHash: trustedScopeHash,
+    }),
     analysis_state: "complete",
     merge_state: "blocked",
     sample_state: "findings",
@@ -1383,7 +1430,12 @@ process.exit(37);
     },
   });
 
-  const expectedResult = expectedExecutionFailureResult(baseSha, headSha);
+  const expectedResult = expectedExecutionFailureResult(baseSha, headSha, {
+    configurationFingerprint,
+    passesRequested: 3,
+    passesCompleted: 3,
+    scopeHash: trustedScopeHash,
+  });
   assert.equal(finalized.status, 37, finalized.stderr);
   assert.match(finalized.stderr, /scope_hash must match the trusted review scope/);
   assert.deepEqual(JSON.parse(readFileSync(resultFile, "utf8")), expectedResult);
@@ -1422,7 +1474,12 @@ process.exit(31);
     requestedPasses: ["general"],
     scopeFile,
   });
-  const expectedResult = expectedExecutionFailureResult(baseSha, headSha);
+  const expectedResult = expectedExecutionFailureResult(baseSha, headSha, {
+    configurationFingerprint,
+    passesRequested: 1,
+    passesCompleted: 1,
+    scopeHash: trustedScopeHash,
+  });
   const validResult = {
     ...expectedResult,
     configuration_fingerprint: configurationFingerprint,

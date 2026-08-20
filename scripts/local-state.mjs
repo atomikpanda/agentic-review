@@ -87,7 +87,7 @@ function readStateLockReaper() {
   try {
     const marker = readFileSync(STATE_LOCK_REAPER, "utf8");
     try {
-      return parseProcessOwner(marker);
+      return parseProcessOwner(marker) ?? { token: marker };
     } catch (error) {
       if (error instanceof SyntaxError) return { token: marker };
       throw error;

@@ -934,6 +934,7 @@ jobs:
           const headSha = process.env.HEAD_SHA ?? "";
           const resultFile = process.env.REVIEW_RESULT_FILE || "/tmp/review-result.json";
           const trustedBaseSha = process.env.TRUSTED_BASE_SHA ?? "";
+          const trustedHeadSha = process.env.TRUSTED_HEAD_SHA ?? "";
           const trustedScopeHash = process.env.TRUSTED_SCOPE_HASH ?? "";
           const trustedConfigurationFingerprint = (
             process.env.TRUSTED_CONFIGURATION_FINGERPRINT ?? ""
@@ -1019,6 +1020,38 @@ jobs:
             "reconciliation_unknown",
             "execution_failed",
           ]);
+          // A poster crash invalidates presentation and reconciliation, not the
+          // immutable runner identity. Retain that evidence without promoting
+          // its sample, coverage, or convergence into the final result.
+          const trustedPublicationAvailable = (
+            /^[0-9a-f]{40}$/.test(trustedBaseSha)
+            && trustedHeadSha === headSha
+            && fingerprintPattern.test(trustedScopeHash)
+            && fingerprintPattern.test(trustedConfigurationFingerprint)
+            && Number.isSafeInteger(trustedPassesRequested)
+            && trustedPassesRequested >= 0
+            && Number.isSafeInteger(trustedPassesCompleted)
+            && trustedPassesCompleted >= 0
+            && trustedPassesCompleted <= trustedPassesRequested
+            && stateValues.analysis_state.has(trustedAnalysisState)
+            && stateValues.coverage.has(trustedCoverage)
+            && trustedRemainingAnalysis !== null
+          );
+          if (trustedPublicationAvailable) {
+            Object.assign(conservativeResult, {
+              base_sha: trustedBaseSha,
+              head_sha: trustedHeadSha,
+              configuration_fingerprint: trustedConfigurationFingerprint,
+              passes_requested: trustedPassesRequested,
+              passes_completed: trustedPassesCompleted,
+              reviewed_head: trustedHeadSha,
+              scope_hash: trustedScopeHash,
+              remaining_analysis: remainingAnalysisReasons.filter(
+                (reason) => reason === "execution_failed"
+                  || trustedRemainingAnalysis.includes(reason),
+              ),
+            });
+          }
 
           function validateFinalResult(candidate) {
             if (
@@ -1312,6 +1345,7 @@ jobs:
           }
           export TRUSTED_SCOPE_HASH=""
           export TRUSTED_BASE_SHA=""
+          export TRUSTED_HEAD_SHA=""
           export TRUSTED_CONFIGURATION_FINGERPRINT=""
           export TRUSTED_PASSES_REQUESTED=0
           export TRUSTED_PASSES_COMPLETED=0
@@ -1366,6 +1400,8 @@ jobs:
               || Array.isArray(publication)
               || publication.schema_version !== 1
               || !/^[0-9a-f]{40}$/.test(trustedMetadata.base_sha)
+              || !/^[0-9a-f]{40}$/.test(trustedMetadata.head_sha)
+              || trustedMetadata.head_sha !== process.env.HEAD_SHA
               || !/^[0-9a-f]{64}$/.test(trustedMetadata.scope_hash)
               || !/^[0-9a-f]{64}$/.test(trustedMetadata.configuration_fingerprint)
               || trustedMetadata.passes === null
@@ -1384,6 +1420,7 @@ jobs:
             } else {
               process.stdout.write([
                 trustedMetadata.base_sha,
+                trustedMetadata.head_sha,
                 trustedMetadata.scope_hash,
                 trustedMetadata.configuration_fingerprint,
                 trustedMetadata.passes.requested.length,
@@ -1400,6 +1437,7 @@ jobs:
             )"; then
               IFS=$'\t' read -r \
                 TRUSTED_BASE_SHA \
+                TRUSTED_HEAD_SHA \
                 TRUSTED_SCOPE_HASH \
                 TRUSTED_CONFIGURATION_FINGERPRINT \
                 TRUSTED_PASSES_REQUESTED \
@@ -1409,6 +1447,7 @@ jobs:
                 TRUSTED_REMAINING_ANALYSIS <<< "$trusted_metadata_snapshot"
               export TRUSTED_SCOPE_HASH
               export TRUSTED_BASE_SHA
+              export TRUSTED_HEAD_SHA
               export TRUSTED_CONFIGURATION_FINGERPRINT
               export TRUSTED_PASSES_REQUESTED
               export TRUSTED_PASSES_COMPLETED
