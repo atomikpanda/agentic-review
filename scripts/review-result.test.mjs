@@ -9,8 +9,10 @@ import {
   DEFAULT_PASS_DESCRIPTORS,
   REVIEW_RESULT_SCHEMA_VERSION,
   configurationFingerprint,
+  createReviewPublication,
   deriveAnalysisState,
   deriveReviewState,
+  validateReviewPublication,
   validateRunMetadata,
 } from "./review-result.mjs";
 
@@ -339,6 +341,36 @@ test("run metadata validation accepts an internally consistent exact result", ()
   assert.equal(validateRunMetadata(metadata, TRUSTED_SCOPE), metadata);
 });
 
+test("review publications atomically bind metadata to its exact raw scope", () => {
+  const metadata = {
+    schema_version: REVIEW_RESULT_SCHEMA_VERSION,
+    ...completeRun(),
+    analysis_state: "complete",
+  };
+  const publication = createReviewPublication(metadata, TRUSTED_SCOPE);
+
+  assert.deepEqual(Object.keys(publication).sort(), ["metadata", "schema_version", "scope"]);
+  assert.equal(validateReviewPublication(publication), publication);
+  assert.equal(publication.metadata.base_sha, BASE_SHA);
+  assert.equal(
+    Buffer.from(publication.scope.diff_base64, "base64").toString("utf8"),
+    DIFF,
+  );
+
+  const otherScope = {
+    ...TRUSTED_SCOPE,
+    configuration_fingerprint: "4".repeat(64),
+  };
+  assert.throws(
+    () => validateReviewPublication({ ...publication, scope: otherScope }),
+    /trusted scope configuration_fingerprint must match metadata/i,
+  );
+  assert.throws(
+    () => validateReviewPublication({ ...publication, compatibility_scope_path: "scope.json" }),
+    /publication must contain exactly/i,
+  );
+});
+
 test("run metadata validation rejects a valid-looking noncanonical scope hash", () => {
   const metadata = {
     schema_version: REVIEW_RESULT_SCHEMA_VERSION,
@@ -596,11 +628,10 @@ test("the guarded CLI uses the importable fingerprint, analysis, and validation 
 
   try {
     const runFile = join(directory, "run.json");
-    const metadataFile = join(directory, "metadata.json");
-    const scopeFile = join(directory, "scope.json");
+    const publicationFile = join(directory, "publication.json");
+    const publication = createReviewPublication(metadata, TRUSTED_SCOPE);
     writeFileSync(runFile, JSON.stringify(completeRun()));
-    writeFileSync(metadataFile, JSON.stringify(metadata));
-    writeFileSync(scopeFile, JSON.stringify(TRUSTED_SCOPE));
+    writeFileSync(publicationFile, JSON.stringify(publication));
 
     const fingerprint = spawnSync(process.execPath, [script.pathname, "fingerprint", "-"], {
       input: JSON.stringify(config),
@@ -616,13 +647,13 @@ test("the guarded CLI uses the importable fingerprint, analysis, and validation 
     assert.deepEqual(
       JSON.parse(execFileSync(
         process.execPath,
-        [script.pathname, "validate", metadataFile, scopeFile],
+        [script.pathname, "validate", publicationFile],
         { encoding: "utf8" },
       )),
       validateRunMetadata(metadata, TRUSTED_SCOPE),
     );
 
-    const malformed = spawnSync(process.execPath, [script.pathname, "validate", "-", scopeFile], {
+    const malformed = spawnSync(process.execPath, [script.pathname, "validate", "-"], {
       input: "{}",
       encoding: "utf8",
     });

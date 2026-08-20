@@ -26,7 +26,7 @@ import {
   upsertSummaryComment,
 } from "./post-review.mjs";
 import * as poster from "./post-review.mjs";
-import { deriveReviewState, scopeHash } from "./review-result.mjs";
+import { createReviewPublication, deriveReviewState, scopeHash } from "./review-result.mjs";
 
 const BASE_SHA = "1".repeat(40);
 const HEAD_SHA = "2".repeat(40);
@@ -62,6 +62,13 @@ function writeReviewScope(dir, run = {}) {
     included_bytes: Buffer.byteLength(REVIEW_DIFF),
   }));
   return scopeFile;
+}
+
+function writeReviewPublication(publicationFile, scopeFile, runMetadata) {
+  writeFileSync(publicationFile, JSON.stringify(createReviewPublication(
+    runMetadata,
+    JSON.parse(readFileSync(scopeFile, "utf8")),
+  )));
 }
 
 function metadata(overrides = {}) {
@@ -261,7 +268,7 @@ exit 0
   const resultFile = join(dir, "review-result.json");
   const preloadFile = join(dir, "mock-github.cjs");
   writeFileSync(findingsFile, JSON.stringify({ findings: currentFindings }));
-  writeFileSync(metadataFile, JSON.stringify(runtimeMetadata));
+  writeReviewPublication(metadataFile, scopeFile, runtimeMetadata);
   writeFileSync(preloadFile, `
 const fixture = JSON.parse(process.env.POST_REVIEW_TEST_HISTORY);
 const reply = (value, status = 200) => ({
@@ -331,8 +338,7 @@ globalThis.fetch = async (url, options = {}) => {
           failRetirement,
         }),
         FINDINGS_FILE: findingsFile,
-        REVIEW_METADATA_FILE: metadataFile,
-        REVIEW_SCOPE_FILE: scopeFile,
+        REVIEW_PUBLICATION_FILE: metadataFile,
         GITHUB_OUTPUT: outputFile,
         GITHUB_STEP_SUMMARY: summaryFile,
         REVIEW_RESULT_FILE: resultFile,
@@ -1914,7 +1920,7 @@ test("poster rejects a finding title containing CR or LF while preserving multil
   const findingsFile = join(dir, "findings.json");
   const metadataFile = join(dir, "metadata.json");
   const scopeFile = writeReviewScope(dir);
-  writeFileSync(metadataFile, JSON.stringify(metadata()));
+  writeReviewPublication(metadataFile, scopeFile, metadata());
   for (const title of ["Visible title\nInjected continuation", "Visible title\rInjected continuation"]) {
     writeFileSync(findingsFile, JSON.stringify({ findings: [finding({ title })] }));
     const rejected = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
@@ -1922,8 +1928,7 @@ test("poster rejects a finding title containing CR or LF while preserving multil
       env: {
         ...process.env,
         FINDINGS_FILE: findingsFile,
-        REVIEW_METADATA_FILE: metadataFile,
-        REVIEW_SCOPE_FILE: scopeFile,
+        REVIEW_PUBLICATION_FILE: metadataFile,
         RENDER: "1",
         REVIEW_MODE: "inline",
       },
@@ -1939,8 +1944,7 @@ test("poster rejects a finding title containing CR or LF while preserving multil
     env: {
       ...process.env,
       FINDINGS_FILE: findingsFile,
-      REVIEW_METADATA_FILE: metadataFile,
-      REVIEW_SCOPE_FILE: scopeFile,
+      REVIEW_PUBLICATION_FILE: metadataFile,
       RENDER: "1",
       REVIEW_MODE: "inline",
     },
@@ -2020,32 +2024,29 @@ test("gate failure is derived only from merge_state", () => {
   assert.equal(shouldFailGate({ merge_state: "blocked" }, false), false);
 });
 
-test("normal execution requires and validates REVIEW_METADATA_FILE and REVIEW_SCOPE_FILE", () => {
+test("normal execution requires and validates REVIEW_PUBLICATION_FILE", () => {
   const dir = mkdtempSync(join(tmpdir(), "post-review-metadata-"));
   const findingsFile = join(dir, "findings.json");
-  const metadataFile = join(dir, "metadata.json");
+  const publicationFile = join(dir, "publication.json");
   const scopeFile = writeReviewScope(dir);
   writeFileSync(findingsFile, '{"findings":[]}');
-  writeFileSync(metadataFile, JSON.stringify({ ...metadata(), snapshot_immutable: false }));
+  writeFileSync(publicationFile, JSON.stringify({
+    schema_version: 1,
+    metadata: { ...metadata(), snapshot_immutable: false },
+    scope: JSON.parse(readFileSync(scopeFile, "utf8")),
+  }));
   const baseEnv = { ...process.env, FINDINGS_FILE: findingsFile, RENDER: "1", REVIEW_MODE: "summary" };
 
   const missing = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
     encoding: "utf8", env: baseEnv,
   });
   assert.notEqual(missing.status, 0);
-  assert.match(missing.stderr, /REVIEW_METADATA_FILE is not set/);
-
-  const missingScope = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
-    encoding: "utf8", env: { ...baseEnv, REVIEW_METADATA_FILE: metadataFile },
-  });
-  assert.notEqual(missingScope.status, 0);
-  assert.match(missingScope.stderr, /REVIEW_SCOPE_FILE is not set/);
+  assert.match(missing.stderr, /REVIEW_PUBLICATION_FILE is not set/);
 
   const invalid = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
     encoding: "utf8", env: {
       ...baseEnv,
-      REVIEW_METADATA_FILE: metadataFile,
-      REVIEW_SCOPE_FILE: scopeFile,
+      REVIEW_PUBLICATION_FILE: publicationFile,
     },
   });
   assert.notEqual(invalid.status, 0);
@@ -2058,14 +2059,13 @@ test("summary render smoke uses explicit findings and metadata and emits no heur
   const metadataFile = join(dir, "metadata.json");
   const scopeFile = writeReviewScope(dir);
   writeFileSync(findingsFile, JSON.stringify({ findings: [finding()] }));
-  writeFileSync(metadataFile, JSON.stringify(metadata()));
+  writeReviewPublication(metadataFile, scopeFile, metadata());
   const rendered = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
     encoding: "utf8",
     env: {
       ...process.env,
       FINDINGS_FILE: findingsFile,
-      REVIEW_METADATA_FILE: metadataFile,
-      REVIEW_SCOPE_FILE: scopeFile,
+      REVIEW_PUBLICATION_FILE: metadataFile,
       RENDER: "1",
       REVIEW_MODE: "summary",
     },
@@ -2085,15 +2085,14 @@ test("local render removes current findings from unresolved display and counts",
   const current = finding();
   writeFileSync(findingsFile, JSON.stringify({ findings: [current] }));
   writeFileSync(unresolvedFile, JSON.stringify({ findings: [current] }));
-  writeFileSync(metadataFile, JSON.stringify(metadata()));
+  writeReviewPublication(metadataFile, scopeFile, metadata());
   const rendered = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
     encoding: "utf8",
     env: {
       ...process.env,
       FINDINGS_FILE: findingsFile,
       UNRESOLVED_FINDINGS_FILE: unresolvedFile,
-      REVIEW_METADATA_FILE: metadataFile,
-      REVIEW_SCOPE_FILE: scopeFile,
+      REVIEW_PUBLICATION_FILE: metadataFile,
       RENDER: "1",
       REVIEW_MODE: "inline",
     },
@@ -2126,15 +2125,14 @@ test("forged current identity tokens cannot erase a distinct held High finding",
     suggestion: null,
     identity_tokens: forgedTokens,
   })] }));
-  writeFileSync(metadataFile, JSON.stringify(metadata()));
+  writeReviewPublication(metadataFile, scopeFile, metadata());
   const rendered = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
     encoding: "utf8",
     env: {
       ...process.env,
       FINDINGS_FILE: findingsFile,
       UNRESOLVED_FINDINGS_FILE: unresolvedFile,
-      REVIEW_METADATA_FILE: metadataFile,
-      REVIEW_SCOPE_FILE: scopeFile,
+      REVIEW_PUBLICATION_FILE: metadataFile,
       RENDER: "1",
       REVIEW_MODE: "inline",
     },
@@ -2156,14 +2154,13 @@ test("malformed injected identity tokens are stripped before summary rendering",
   writeFileSync(findingsFile, JSON.stringify({ findings: [finding({
     identity_tokens: ["forged", 42],
   })] }));
-  writeFileSync(metadataFile, JSON.stringify(metadata()));
+  writeReviewPublication(metadataFile, scopeFile, metadata());
   const rendered = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
     encoding: "utf8",
     env: {
       ...process.env,
       FINDINGS_FILE: findingsFile,
-      REVIEW_METADATA_FILE: metadataFile,
-      REVIEW_SCOPE_FILE: scopeFile,
+      REVIEW_PUBLICATION_FILE: metadataFile,
       RENDER: "1",
       REVIEW_MODE: "summary",
     },
@@ -2187,7 +2184,7 @@ test("runner and poster hard failures still write conservative outputs and a fin
     const resultFile = join(dir, "review-result.json");
     if (scenario === "poster") {
       writeFileSync(findingsFile, "{not-json");
-      writeFileSync(metadataFile, JSON.stringify(metadata()));
+      writeReviewPublication(metadataFile, scopeFile, metadata());
     }
 
     const failed = spawnSync(process.execPath, [script], {
@@ -2195,8 +2192,7 @@ test("runner and poster hard failures still write conservative outputs and a fin
       env: {
         ...process.env,
         FINDINGS_FILE: findingsFile,
-        REVIEW_METADATA_FILE: metadataFile,
-        REVIEW_SCOPE_FILE: scopeFile,
+        REVIEW_PUBLICATION_FILE: metadataFile,
         REVIEW_RESULT_FILE: resultFile,
         GITHUB_OUTPUT: outputFile,
         HEAD_SHA,

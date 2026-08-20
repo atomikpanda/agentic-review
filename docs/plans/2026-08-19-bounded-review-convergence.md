@@ -301,7 +301,7 @@ Expected: fail because summary state and new labels do not exist.
 
 ### Step 2: Replace heuristic confidence with explicit state
 
-Require `REVIEW_METADATA_FILE` for normal execution and validate it with `validateRunMetadata`. `RENDER=1` tests may pass an explicit fixture metadata file; remove implicit `PASSES_TRIED/PASSES_OK/DIFF_TRUNCATED` defaults after every caller/test is migrated.
+Require `REVIEW_PUBLICATION_FILE` for normal execution and validate its atomically bound metadata and raw reviewed scope. `RENDER=1` tests may pass an explicit publication fixture; remove implicit `PASSES_TRIED/PASSES_OK/DIFF_TRUNCATED` defaults after every caller/test is migrated.
 
 After querying prior bot threads/comments:
 
@@ -352,7 +352,7 @@ Run:
 ```bash
 node --test scripts/post-review.test.mjs scripts/review-result.test.mjs scripts/thread-change.test.mjs
 node --check scripts/post-review.mjs scripts/review-result.mjs
-FINDINGS_FILE=<fixture-findings> REVIEW_METADATA_FILE=<fixture-metadata> REVIEW_SCOPE_FILE=<fixture-scope> RENDER=1 REVIEW_MODE=summary node scripts/post-review.mjs
+FINDINGS_FILE=<fixture-findings> REVIEW_PUBLICATION_FILE=<fixture-publication> RENDER=1 REVIEW_MODE=summary node scripts/post-review.mjs
 ```
 
 Expected: suites pass; the smoke output contains one summary with explicit states and no exhaustive claim.
@@ -421,7 +421,7 @@ fall back to an unrelated reviewed repository.
 
 ### Step 4: Route every mode through the poster
 
-Delete the workflow's separate summary `gh pr comment` branch. Call `post-review.mjs` once for `summary`, `inline`, and `suggest`, always passing `FINDINGS_FILE` and `REVIEW_METADATA_FILE`. Give the step a stable `id` for outputs.
+Delete the workflow's separate summary `gh pr comment` branch. Call `post-review.mjs` once for `summary`, `inline`, and `suggest`, always passing `FINDINGS_FILE` and `REVIEW_PUBLICATION_FILE`. Give the step a stable `id` for outputs.
 
 The poster, not shell branches, owns:
 

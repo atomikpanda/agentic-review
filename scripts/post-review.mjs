@@ -19,8 +19,7 @@
 //
 // Env:
 //   FINDINGS_FILE         merged structured findings          (required)
-//   REVIEW_METADATA_FILE validated schema-v1 run metadata     (required)
-//   REVIEW_SCOPE_FILE    canonical trusted review scope       (required)
+//   REVIEW_PUBLICATION_FILE atomically bound run metadata and reviewed scope (required)
 //   GITHUB_REPO           owner/name                           (required except RENDER)
 //   PR_NUMBER             pull request number                  (required except RENDER)
 //   GH_TOKEN              token with pull-requests: write      (required except RENDER)
@@ -46,7 +45,7 @@ import {
   SIMILARITY_DEFAULT,
   tokenSet,
 } from "./lib-findings.mjs";
-import { deriveReviewState, enrichRunMetadata, validateRunMetadata } from "./review-result.mjs";
+import { deriveReviewState, enrichRunMetadata, validateReviewPublication } from "./review-result.mjs";
 import {
   GIT_DIFF_MAX_BUFFER_BYTES,
   changeIsConfirmed,
@@ -1643,11 +1642,9 @@ function emitHardFailureResult() {
 
 async function main() {
   const findingsPath = required("FINDINGS_FILE");
-  const metadataPath = required("REVIEW_METADATA_FILE");
-  const scopePath = required("REVIEW_SCOPE_FILE");
-  const metadata = validateRunMetadata(
-    JSON.parse(readFileSync(metadataPath, "utf8")),
-    JSON.parse(readFileSync(scopePath, "utf8")),
+  const publicationPath = required("REVIEW_PUBLICATION_FILE");
+  const { metadata } = validateReviewPublication(
+    JSON.parse(readFileSync(publicationPath, "utf8")),
   );
   activeMetadata = metadata;
   const parsed = extractJson(readFileSync(findingsPath, "utf8"));

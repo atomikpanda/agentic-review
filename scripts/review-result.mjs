@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { sameFinding } from "./lib-findings.mjs";
 
 export const REVIEW_RESULT_SCHEMA_VERSION = 1;
+export const REVIEW_PUBLICATION_SCHEMA_VERSION = 1;
 export const DEFAULT_PASS_DESCRIPTORS = [
   { id: "general", lens: null },
   { id: "correctness", lens: "review/lenses/correctness.md" },
@@ -585,6 +586,29 @@ export function validateRunMetadata(value, trustedScope) {
   return value;
 }
 
+export function validateReviewPublication(value) {
+  canonicalize(value, "publication");
+  requirePlainObject(value, "publication");
+  const expectedKeys = ["metadata", "schema_version", "scope"];
+  if (!arraysEqual(Object.keys(value).sort(), expectedKeys)) {
+    throw new TypeError(`publication must contain exactly ${expectedKeys.join(", ")}`);
+  }
+  if (value.schema_version !== REVIEW_PUBLICATION_SCHEMA_VERSION) {
+    throw new TypeError(`publication schema_version must be ${REVIEW_PUBLICATION_SCHEMA_VERSION}`);
+  }
+  validateRunMetadata(value.metadata, value.scope);
+  return value;
+}
+
+export function createReviewPublication(metadata, scope) {
+  const publication = {
+    schema_version: REVIEW_PUBLICATION_SCHEMA_VERSION,
+    metadata,
+    scope,
+  };
+  return validateReviewPublication(publication);
+}
+
 function readJson(source) {
   const text = source === undefined || source === "-"
     ? readFileSync(0, "utf8")
@@ -593,15 +617,11 @@ function readJson(source) {
 }
 
 function runCli(argv) {
-  const [command, source, scopeSource, ...extra] = argv;
+  const [command, source, ...extra] = argv;
   const commands = ["fingerprint", "scope", "analysis", "validate"];
-  const invalidSources = command === "validate"
-    ? source === undefined || scopeSource === undefined || scopeSource === "-"
-    : scopeSource !== undefined;
-  if (extra.length > 0 || !commands.includes(command) || invalidSources) {
+  if (extra.length > 0 || !commands.includes(command)) {
     throw new TypeError(
-      `usage: review-result.mjs <fingerprint|scope|analysis> [JSON_FILE|-]`
-      + " | review-result.mjs validate <METADATA_JSON_FILE|-> <SCOPE_JSON_FILE>",
+      "usage: review-result.mjs <fingerprint|scope|analysis|validate> [JSON_FILE|-]",
     );
   }
   const value = readJson(source);
@@ -612,7 +632,7 @@ function runCli(argv) {
       : scopeHash(value);
   }
   if (command === "analysis") return deriveAnalysisState(value);
-  return JSON.stringify(validateRunMetadata(value, readJson(scopeSource)));
+  return JSON.stringify(validateReviewPublication(value).metadata);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

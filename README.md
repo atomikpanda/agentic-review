@@ -81,12 +81,15 @@ export OPENROUTER_API_KEY=sk-or-v1-yourkeyhere   # or see OPENROUTER_API_KEY_FIL
 Normally it is the union of every valid pass. If union fails, the runner
 preserves the first valid structured pass and marks the separate schema-v1
 metadata inconclusive rather than presenting the fallback as merged.
-`--metadata-out FILE` writes that bounded-run metadata: immutable base and head
-SHAs, the configuration fingerprint and configured vote threshold, diff and cap
-status, requested/completed pass identifiers, per-pass status, merge success,
-and `analysis_state`. Both outputs reject a
-symlink destination before model work, and the paths must resolve to different
-destinations. `--no-state` still reads existing history for the
+`--metadata-out FILE` atomically writes a publication containing that bounded-run
+metadata and the exact raw-byte review scope it describes. Readers validate the
+pair from this one publication, so concurrent runners sharing an output path
+cannot expose metadata from one run with scope evidence from another. The
+metadata includes immutable base and head SHAs, the configuration fingerprint
+and configured vote threshold, diff and cap status, requested/completed pass
+identifiers, per-pass status, merge success, and `analysis_state`. Both outputs
+reject a symlink destination before model work, and the paths must resolve to
+different destinations. `--no-state` still reads existing history for the
 rendered state and exit status but never mutates it. Advanced local experiments
 can change the ensemble with `--passes N`, `--lenses a,b,c`, and
 `--min-votes N`; pass/lens changes appear in the metadata identifiers, and all
@@ -237,10 +240,11 @@ The reusable workflow exposes these exact outputs:
 
 The same values appear in the review body and GitHub job summary. The hosted
 `agentic-review` artifact retains the final result (`review-result.json`),
-structured findings (`review.md`), bounded-run metadata (`review-meta.json`),
-and runner stdout and stderr for seven days. The poster writes the final result
-at `/tmp/review-result.json` before artifact upload. Locally, `--out` and
-`--metadata-out` write the findings and metadata artifacts directly.
+structured findings (`review.md`), the atomic metadata-and-scope publication
+(`review-meta.json`), the standalone raw scope (`review-scope.json`), and runner
+stdout and stderr for seven days. The poster writes the final result at
+`/tmp/review-result.json` before artifact upload. Locally, `--out` and
+`--metadata-out` write the findings and publication artifacts directly.
 
 ### Standing summaries and finding history
 

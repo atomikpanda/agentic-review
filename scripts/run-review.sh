@@ -31,7 +31,7 @@
 #                       suggest prints the fixes it would offer on a PR
 #   --omp-version V     npm version or dist-tag       $AGENTIC_REVIEW_OMP_VERSION
 #   --out FILE          write the review here
-#   --metadata-out FILE write bounded-run metadata here $AGENTIC_REVIEW_METADATA_OUT
+#   --metadata-out FILE atomically write metadata with its reviewed scope here $AGENTIC_REVIEW_METADATA_OUT
 #   --no-state          do not update local review history
 #   --open              list findings still open from previous runs
 #   --all               list every tracked finding, including dismissed
@@ -868,10 +868,13 @@ write_metadata() {
     import fs from "node:fs";
     import { pathToFileURL } from "node:url";
 
-    const { deriveTrustedScopeMetadata, enrichRunMetadata } = await import(pathToFileURL(process.argv[3]).href);
-    const trustedMetadata = deriveTrustedScopeMetadata(
-      JSON.parse(fs.readFileSync(process.argv[4], "utf8")),
-    );
+    const {
+      createReviewPublication,
+      deriveTrustedScopeMetadata,
+      enrichRunMetadata,
+    } = await import(pathToFileURL(process.argv[3]).href);
+    const trustedScope = JSON.parse(fs.readFileSync(process.argv[4], "utf8"));
+    const trustedMetadata = deriveTrustedScopeMetadata(trustedScope);
     const results = fs.readFileSync(process.argv[1], "utf8").trimEnd().split("\n").filter(Boolean)
       .map((line) => {
         const [id, status, attempts, finding_count, capped] = line.split("\t");
@@ -907,11 +910,13 @@ write_metadata() {
       scopeHash: trustedMetadata.scope_hash,
       executionFailed: process.env.EXECUTION_FAILED === "1" ? true : undefined,
     });
+    const publication = createReviewPublication(metadata, trustedScope);
     fs.writeFileSync(process.argv[2], JSON.stringify(metadata, null, 2));
-  ' "$records" "$RUN_TMP/metadata.json" "$RESULT_HELPER" "$SCOPE_FILE" \
-    || die "could not derive review metadata"
-  node "$RESULT_HELPER" validate "$RUN_TMP/metadata.json" "$SCOPE_FILE" >/dev/null \
-    || die "generated review metadata failed validation"
+    fs.writeFileSync(process.argv[5], JSON.stringify(publication, null, 2));
+  ' "$records" "$RUN_TMP/metadata.json" "$RESULT_HELPER" "$SCOPE_FILE" "$RUN_TMP/publication.json" \
+    || die "could not derive review publication"
+  node "$RESULT_HELPER" validate "$RUN_TMP/publication.json" >/dev/null \
+    || die "generated review publication failed validation"
   if [ -n "$SCOPE_OUT" ]; then
     scope_tmp="${SCOPE_OUT}.tmp.$$"
     if ! cp "$SCOPE_FILE" "$scope_tmp"; then
@@ -925,12 +930,18 @@ write_metadata() {
   fi
   if [ -n "$METADATA_OUT" ]; then
     metadata_tmp="${METADATA_OUT}.tmp.$$"
-    cp "$RUN_TMP/metadata.json" "$metadata_tmp" || die "could not write metadata beside $METADATA_OUT"
-    if ! node "$RESULT_HELPER" validate "$metadata_tmp" "$SCOPE_FILE" >/dev/null; then
+    if ! cp "$RUN_TMP/publication.json" "$metadata_tmp"; then
       rm -f "$metadata_tmp"
-      die "metadata at $metadata_tmp failed validation"
+      die "could not write review publication beside $METADATA_OUT"
     fi
-    mv -f "$metadata_tmp" "$METADATA_OUT"
+    if ! node "$RESULT_HELPER" validate "$metadata_tmp" >/dev/null; then
+      rm -f "$metadata_tmp"
+      die "review publication at $metadata_tmp failed validation"
+    fi
+    mv -f "$metadata_tmp" "$METADATA_OUT" || {
+      rm -f "$metadata_tmp"
+      die "could not publish review metadata at $METADATA_OUT"
+    }
     ok "metadata written to $METADATA_OUT"
   fi
 }
@@ -1019,8 +1030,7 @@ fi
 if [ "$AS_JSON" = 1 ]; then
   cat "$TMP_OUT"
 elif RENDERER="$(support_exec scripts/post-review.mjs)"; then
-  FINDINGS_FILE="$TMP_OUT" REVIEW_METADATA_FILE="$RUN_TMP/metadata.json" \
-    REVIEW_SCOPE_FILE="$SCOPE_FILE" \
+  FINDINGS_FILE="$TMP_OUT" REVIEW_PUBLICATION_FILE="$RUN_TMP/publication.json" \
     UNRESOLVED_FINDINGS_FILE="$LOCAL_UNRESOLVED_FILE" \
     RECONCILIATION_KNOWN="$LOCAL_RECONCILIATION_KNOWN" \
     REVIEW_MODE="$REVIEW_MODE" RENDER=1 node "$RENDERER" || cat "$TMP_OUT"

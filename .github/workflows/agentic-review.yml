@@ -897,7 +897,7 @@ jobs:
           fi
           cat /tmp/review-runner.err >&2
           echo "  review result: $(wc -c < /tmp/review.md) bytes"
-          echo "  metadata: $(wc -c < /tmp/review-meta.json) bytes"
+          echo "  publication: $(wc -c < /tmp/review-meta.json) bytes"
 
       - name: post review
         id: poster
@@ -909,8 +909,7 @@ jobs:
           GH_TOKEN: ${{ steps.target.outputs.eligible == 'true' && (steps.target.outputs.token || github.token) || '' }}
           TARGET_ELIGIBLE: ${{ steps.target.outputs.eligible }}
           FINDINGS_FILE: /tmp/review.md
-          REVIEW_METADATA_FILE: /tmp/review-meta.json
-          REVIEW_SCOPE_FILE: /tmp/review-scope.json
+          REVIEW_PUBLICATION_FILE: /tmp/review-meta.json
           REVIEW_RESULT_FILE: /tmp/review-result.json
           GITHUB_REPO: ${{ steps.target.outputs.repo }}
           PR_NUMBER: ${{ steps.target.outputs.pr }}
@@ -934,6 +933,7 @@ jobs:
           const baseSha = process.env.BASE_SHA ?? "";
           const headSha = process.env.HEAD_SHA ?? "";
           const resultFile = process.env.REVIEW_RESULT_FILE || "/tmp/review-result.json";
+          const trustedBaseSha = process.env.TRUSTED_BASE_SHA ?? "";
           const trustedScopeHash = process.env.TRUSTED_SCOPE_HASH ?? "";
           const trustedConfigurationFingerprint = (
             process.env.TRUSTED_CONFIGURATION_FINGERPRINT ?? ""
@@ -1049,11 +1049,11 @@ jobs:
               throw new TypeError("scope_hash must match the trusted review scope");
             }
             if (
-              candidate.base_sha !== baseSha
+              candidate.base_sha !== (trustedBaseSha || baseSha)
               || candidate.head_sha !== headSha
               || candidate.reviewed_head !== candidate.head_sha
             ) {
-              throw new TypeError("result target must match the resolved review target");
+              throw new TypeError("result target must match the trusted review scope");
             }
             for (const field of booleanFields) {
               if (typeof candidate[field] !== "boolean") {
@@ -1311,6 +1311,7 @@ jobs:
           NODE
           }
           export TRUSTED_SCOPE_HASH=""
+          export TRUSTED_BASE_SHA=""
           export TRUSTED_CONFIGURATION_FINGERPRINT=""
           export TRUSTED_PASSES_REQUESTED=0
           export TRUSTED_PASSES_COMPLETED=0
@@ -1345,21 +1346,26 @@ jobs:
           fi
 
           # Snapshot runner-produced identity, pass, and bounded-analysis
-          # evidence before the poster runs. The trusted runner derived these
-          # fields from REVIEW_SCOPE_FILE and validated the two sidecars
-          # together. Reusing the metadata avoids importing the review module
-          # or duplicating its canonical contracts.
+          # evidence from the validated atomic publication before the poster
+          # runs. Reusing the metadata avoids importing the review module or
+          # duplicating its canonical contracts.
           trusted_metadata_snapshot=""
-          if [ -s "${REVIEW_SCOPE_FILE:-}" ] && [ -s "${REVIEW_METADATA_FILE:-}" ]; then
+          if [ -s "${REVIEW_PUBLICATION_FILE:-}" ]; then
             if trusted_metadata_snapshot="$(
-              node - "$REVIEW_METADATA_FILE" <<'NODE'
+              node - "$REVIEW_PUBLICATION_FILE" <<'NODE'
           const { readFileSync } = require("node:fs");
           try {
-            const trustedMetadata = JSON.parse(readFileSync(process.argv[2], "utf8"));
+            const publication = JSON.parse(readFileSync(process.argv[2], "utf8"));
+            const trustedMetadata = publication?.metadata;
             if (
               trustedMetadata === null
               || typeof trustedMetadata !== "object"
               || Array.isArray(trustedMetadata)
+              || publication === null
+              || typeof publication !== "object"
+              || Array.isArray(publication)
+              || publication.schema_version !== 1
+              || !/^[0-9a-f]{40}$/.test(trustedMetadata.base_sha)
               || !/^[0-9a-f]{64}$/.test(trustedMetadata.scope_hash)
               || !/^[0-9a-f]{64}$/.test(trustedMetadata.configuration_fingerprint)
               || trustedMetadata.passes === null
@@ -1377,6 +1383,7 @@ jobs:
               process.exitCode = 1;
             } else {
               process.stdout.write([
+                trustedMetadata.base_sha,
                 trustedMetadata.scope_hash,
                 trustedMetadata.configuration_fingerprint,
                 trustedMetadata.passes.requested.length,
@@ -1392,6 +1399,7 @@ jobs:
           NODE
             )"; then
               IFS=$'\t' read -r \
+                TRUSTED_BASE_SHA \
                 TRUSTED_SCOPE_HASH \
                 TRUSTED_CONFIGURATION_FINGERPRINT \
                 TRUSTED_PASSES_REQUESTED \
@@ -1400,6 +1408,7 @@ jobs:
                 TRUSTED_COVERAGE \
                 TRUSTED_REMAINING_ANALYSIS <<< "$trusted_metadata_snapshot"
               export TRUSTED_SCOPE_HASH
+              export TRUSTED_BASE_SHA
               export TRUSTED_CONFIGURATION_FINGERPRINT
               export TRUSTED_PASSES_REQUESTED
               export TRUSTED_PASSES_COMPLETED
