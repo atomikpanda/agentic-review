@@ -189,7 +189,7 @@ First failing scenario:
 - general returns finding A;
 - correctness returns A + B;
 - boundaries returns C;
-- invoke the runner with default profile, `--json`, `--out <findings>`, `--metadata-out <metadata>`, and `--no-state`;
+- invoke the runner with default profile, `--json`, `--out <findings>`, `--publication-out <publication>`, and `--no-state`;
 - assert exactly three invocations and pass ids;
 - assert A/B/C survive, A has two votes, and only one merged findings document is produced;
 - assert metadata has all requested/completed ids, identical base/head/fingerprint, `analysis_state=complete`, and `capped=false`.
@@ -239,7 +239,7 @@ Required changes:
 - never fall back to the first successful pass while claiming complete analysis;
 - fail if all configured passes fail;
 - compute one configuration fingerprint before invoking any pass;
-- emit metadata atomically via new `--metadata-out PATH` / `AGENTIC_REVIEW_METADATA_OUT`;
+- emit findings, metadata, and reviewed scope atomically via new `--publication-out PATH` / `AGENTIC_REVIEW_PUBLICATION_OUT`;
 - add `--no-state` for hosted/ephemeral execution while preserving local state by default;
 - add `AGENTIC_REVIEW_TRUSTED_DATA_ROOT`: when set, relative prompt/format/skill/lens data resolve only below that root; explicitly supplied absolute files remain allowed; executable helpers continue to resolve only below `SELF_ROOT`;
 - keep `--passes` and `--lenses` as advanced overrides, but derive requested ids and completeness from the actual bounded profile;
@@ -301,7 +301,7 @@ Expected: fail because summary state and new labels do not exist.
 
 ### Step 2: Replace heuristic confidence with explicit state
 
-Require `REVIEW_PUBLICATION_FILE` for normal execution and validate its atomically bound metadata and raw reviewed scope. `RENDER=1` tests may pass an explicit publication fixture; remove implicit `PASSES_TRIED/PASSES_OK/DIFF_TRUNCATED` defaults after every caller/test is migrated.
+Require `REVIEW_PUBLICATION_FILE` for normal execution and validate its atomically bound findings, metadata, and raw reviewed scope. `RENDER=1` tests may pass an explicit publication fixture; remove implicit `PASSES_TRIED/PASSES_OK/DIFF_TRUNCATED` defaults after every caller/test is migrated.
 
 After querying prior bot threads/comments:
 
@@ -352,7 +352,7 @@ Run:
 ```bash
 node --test scripts/post-review.test.mjs scripts/review-result.test.mjs scripts/thread-change.test.mjs
 node --check scripts/post-review.mjs scripts/review-result.mjs
-FINDINGS_FILE=<fixture-findings> REVIEW_PUBLICATION_FILE=<fixture-publication> RENDER=1 REVIEW_MODE=summary node scripts/post-review.mjs
+REVIEW_PUBLICATION_FILE=<fixture-publication> RENDER=1 REVIEW_MODE=summary node scripts/post-review.mjs
 ```
 
 Expected: suites pass; the smoke output contains one summary with explicit states and no exhaustive claim.
@@ -406,8 +406,8 @@ Invoke only the central `scripts/run-review.sh` for enrolled repositories. Pass:
 - resolved base/head and validated model/reasoning/tools/time/cap configuration;
 - resolved absolute prompt and skill files;
 - `AGENTIC_REVIEW_TRUSTED_DATA_ROOT=.central-skills` so format and lens data cannot come from the reviewed head;
-- structured findings output `/tmp/review.md`;
-- metadata output `/tmp/review-meta.json`;
+- human-readable structured findings output `/tmp/review.md`;
+- authoritative publication output `/tmp/review-publication.json`;
 - `--no-state --no-fail`;
 - validated extra OMP arguments after `--`.
 
@@ -421,7 +421,7 @@ fall back to an unrelated reviewed repository.
 
 ### Step 4: Route every mode through the poster
 
-Delete the workflow's separate summary `gh pr comment` branch. Call `post-review.mjs` once for `summary`, `inline`, and `suggest`, always passing `FINDINGS_FILE` and `REVIEW_PUBLICATION_FILE`. Give the step a stable `id` for outputs.
+Delete the workflow's separate summary `gh pr comment` branch. Call `post-review.mjs` once for `summary`, `inline`, and `suggest`, always passing only `REVIEW_PUBLICATION_FILE` as trusted run evidence. Give the step a stable `id` for outputs.
 
 The poster, not shell branches, owns:
 
@@ -431,7 +431,7 @@ The poster, not shell branches, owns:
 - job summary;
 - merge gate and `fail_on_findings`.
 
-Keep the write token scoped to this step. Upload `/tmp/review-meta.json` and any retained per-pass diagnostics with the review artifact.
+Keep the write token scoped to this step. Upload `/tmp/review-publication.json` and any retained per-pass diagnostics with the review artifact.
 
 ### Step 5: Verify workflow and shared smoke behavior
 
@@ -482,7 +482,7 @@ Document:
 - `analysis_state`, `merge_state`, `sample_state`, and derived `bounded_converged` outputs;
 - why ready is not the same as clean or converged;
 - summary as a renderer over structured findings and its standing-comment behavior;
-- local `--metadata-out`, `--no-state`, advanced pass/lens overrides, and structured `--out` artifact;
+- local `--publication-out`, `--no-state`, advanced pass/lens overrides, and structured `--out` artifact;
 - incomplete/truncated/capped runs never report clean convergence;
 - bounded sampling is not exhaustive repository coverage.
 

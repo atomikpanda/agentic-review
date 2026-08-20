@@ -18,8 +18,7 @@
 // step, and does not depend on bun being present.
 //
 // Env:
-//   FINDINGS_FILE         merged structured findings          (required)
-//   REVIEW_PUBLICATION_FILE atomically bound run metadata and reviewed scope (required)
+//   REVIEW_PUBLICATION_FILE atomic findings, run metadata, and reviewed scope (required)
 //   GITHUB_REPO           owner/name                           (required except RENDER)
 //   PR_NUMBER             pull request number                  (required except RENDER)
 //   GH_TOKEN              token with pull-requests: write      (required except RENDER)
@@ -406,7 +405,7 @@ function extractJson(text) {
 function commentableRanges(baseSha, headSha) {
   const diff = execFileSync(
     "git",
-    ["diff", "--no-ext-diff", "--unified=3", "--no-color", `${baseSha}`, `${headSha}`],
+    ["diff", "--no-ext-diff", "--no-textconv", "--unified=3", "--no-color", `${baseSha}`, `${headSha}`],
     { encoding: "utf8", maxBuffer: GIT_DIFF_MAX_BUFFER_BYTES },
   );
 
@@ -997,7 +996,7 @@ function fileChangedSince(t, head) {
           key,
           execFileSync(
             "git",
-            ["diff", "--unified=0", "--no-ext-diff", t.origOid, head, "--", literalPathspec(t.path)],
+            ["diff", "--unified=0", "--no-ext-diff", "--no-textconv", t.origOid, head, "--", literalPathspec(t.path)],
             {
               encoding: "utf8",
               maxBuffer: GIT_DIFF_MAX_BUFFER_BYTES,
@@ -1013,7 +1012,7 @@ function fileChangedSince(t, head) {
   }
 
   try {
-    execFileSync("git", ["diff", "--no-ext-diff", "--quiet", t.origOid, head, "--", literalPathspec(t.path)], { stdio: "ignore" });
+    execFileSync("git", ["diff", "--no-ext-diff", "--no-textconv", "--quiet", t.origOid, head, "--", literalPathspec(t.path)], { stdio: "ignore" });
     return false;
   } catch (e) {
     return e.status === 1 ? true : null;
@@ -1641,15 +1640,16 @@ function emitHardFailureResult() {
 }
 
 async function main() {
-  const findingsPath = required("FINDINGS_FILE");
   const publicationPath = required("REVIEW_PUBLICATION_FILE");
-  const { metadata } = validateReviewPublication(
+  const { findings: publishedFindings, metadata } = validateReviewPublication(
     JSON.parse(readFileSync(publicationPath, "utf8")),
   );
+  const expectedHeadSha = env("HEAD_SHA", "");
+  if (expectedHeadSha && metadata.head_sha !== expectedHeadSha) {
+    throw new TypeError("publication head_sha must match HEAD_SHA");
+  }
   activeMetadata = metadata;
-  const parsed = extractJson(readFileSync(findingsPath, "utf8"));
-  if (!parsed) throw new TypeError("findings artifact is not the requested structured JSON");
-  const findings = parsed.findings;
+  const findings = publishedFindings.map(projectPublicFinding);
   const mode = env("REVIEW_MODE", "suggest");
   if (!["summary", "inline", "suggest"].includes(mode)) {
     throw new TypeError("REVIEW_MODE must be summary, inline, or suggest");

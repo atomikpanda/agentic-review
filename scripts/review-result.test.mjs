@@ -341,16 +341,21 @@ test("run metadata validation accepts an internally consistent exact result", ()
   assert.equal(validateRunMetadata(metadata, TRUSTED_SCOPE), metadata);
 });
 
-test("review publications atomically bind metadata to its exact raw scope", () => {
+test("review publications atomically bind findings, metadata, and exact raw scope", () => {
   const metadata = {
     schema_version: REVIEW_RESULT_SCHEMA_VERSION,
     ...completeRun(),
     analysis_state: "complete",
   };
-  const publication = createReviewPublication(metadata, TRUSTED_SCOPE);
+  const findings = [finding("High")];
+  const publication = createReviewPublication(metadata, TRUSTED_SCOPE, findings);
 
-  assert.deepEqual(Object.keys(publication).sort(), ["metadata", "schema_version", "scope"]);
+  assert.deepEqual(
+    Object.keys(publication).sort(),
+    ["findings", "metadata", "schema_version", "scope"],
+  );
   assert.equal(validateReviewPublication(publication), publication);
+  assert.deepEqual(publication.findings, findings);
   assert.equal(publication.metadata.base_sha, BASE_SHA);
   assert.equal(
     Buffer.from(publication.scope.diff_base64, "base64").toString("utf8"),
@@ -364,6 +369,10 @@ test("review publications atomically bind metadata to its exact raw scope", () =
   assert.throws(
     () => validateReviewPublication({ ...publication, scope: otherScope }),
     /trusted scope configuration_fingerprint must match metadata/i,
+  );
+  assert.throws(
+    () => validateReviewPublication({ ...publication, findings: [{}] }),
+    /publication findings/i,
   );
   assert.throws(
     () => validateReviewPublication({ ...publication, compatibility_scope_path: "scope.json" }),
@@ -629,7 +638,7 @@ test("the guarded CLI uses the importable fingerprint, analysis, and validation 
   try {
     const runFile = join(directory, "run.json");
     const publicationFile = join(directory, "publication.json");
-    const publication = createReviewPublication(metadata, TRUSTED_SCOPE);
+    const publication = createReviewPublication(metadata, TRUSTED_SCOPE, []);
     writeFileSync(runFile, JSON.stringify(completeRun()));
     writeFileSync(publicationFile, JSON.stringify(publication));
 

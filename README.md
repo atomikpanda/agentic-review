@@ -73,23 +73,25 @@ export OPENROUTER_API_KEY=sk-or-v1-yourkeyhere   # or see OPENROUTER_API_KEY_FIL
 ./scripts/run-review.sh --staged                 # only what's staged
 ./scripts/run-review.sh --review-mode suggest    # with the fixes it would offer
 ./scripts/run-review.sh --json | jq '.findings[].file'
-./scripts/run-review.sh --out review.json --metadata-out review-meta.json
+./scripts/run-review.sh --out review.json --publication-out review-publication.json
 ./scripts/run-review.sh --no-state               # leave local history unchanged
 ```
 
-`--out FILE` atomically writes the validated structured findings result.
+`--out FILE` atomically writes a validated structured findings document for
+people and local tooling. It is not an authoritative input to the poster.
 Normally it is the union of every valid pass. If union fails, the runner
-preserves the first valid structured pass and marks the separate schema-v1
-metadata inconclusive rather than presenting the fallback as merged.
-`--metadata-out FILE` atomically writes a publication containing that bounded-run
-metadata and the exact raw-byte review scope it describes. Readers validate the
-pair from this one publication, so concurrent runners sharing an output path
-cannot expose metadata from one run with scope evidence from another. The
-metadata includes immutable base and head SHAs, the configuration fingerprint
-and configured vote threshold, diff and cap status, requested/completed pass
-identifiers, per-pass status, merge success, and `analysis_state`. Both outputs
-reject a symlink destination before model work, and the paths must resolve to
-different destinations. `--no-state` still reads existing history for the
+preserves the first valid structured pass and marks the publication metadata
+inconclusive rather than presenting the fallback as merged.
+`--publication-out FILE` atomically writes the authoritative schema-v2
+publication: the merged findings, bounded-run metadata, and exact raw-byte
+review scope in one object. The poster reads findings and run evidence only
+from this publication, so concurrent runners sharing fixed output paths cannot
+pair findings, metadata, or scope from different runs. The metadata includes
+immutable base and head SHAs, the configuration fingerprint and configured vote
+threshold, diff and cap status, requested/completed pass identifiers, per-pass
+status, merge success, and `analysis_state`. Both outputs reject a symlink
+destination before model work, and the paths must resolve to different
+destinations. `--no-state` still reads existing history for the
 rendered state and exit status but never mutates it. Advanced local experiments
 can change the ensemble with `--passes N`, `--lenses a,b,c`, and
 `--min-votes N`; pass/lens changes appear in the metadata identifiers, and all
@@ -239,12 +241,13 @@ The reusable workflow exposes these exact outputs:
 | `current_counts`, `unresolved_counts` | JSON severity maps for current and held findings |
 
 The same values appear in the review body and GitHub job summary. The hosted
-`agentic-review` artifact retains the final result (`review-result.json`),
-structured findings (`review.md`), the atomic metadata-and-scope publication
-(`review-meta.json`), the standalone raw scope (`review-scope.json`), and runner
-stdout and stderr for seven days. The poster writes the final result at
+`agentic-review` artifact retains the final result (`review-result.json`), a
+human-readable structured findings document (`review.md`), the authoritative
+atomic findings-metadata-scope publication (`review-publication.json`), and
+runner stdout and stderr for seven days. The poster writes the final result at
 `/tmp/review-result.json` before artifact upload. Locally, `--out` and
-`--metadata-out` write the findings and publication artifacts directly.
+`--publication-out` write the human-readable findings and authoritative
+publication artifacts directly.
 
 ### Standing summaries and finding history
 

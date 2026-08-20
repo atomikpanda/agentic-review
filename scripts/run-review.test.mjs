@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 
-import { scopeHash } from "./review-result.mjs";
+import { deriveTrustedScopeMetadata, scopeHash } from "./review-result.mjs";
 
 const runner = fileURLToPath(new URL("./run-review.sh", import.meta.url));
 const resultCli = fileURLToPath(new URL("./review-result.mjs", import.meta.url));
@@ -104,10 +104,10 @@ function writeTrustedPublication({
   configurationFingerprint,
   completedPasses,
   coverage = "bounded",
+  findings = [],
   headSha,
   publicationFile,
   requestedPasses,
-  scopeFile,
   remainingAnalysis = [],
 }) {
   const scope = {
@@ -118,14 +118,10 @@ function writeTrustedPublication({
     head_sha: headSha,
     included_bytes: 0,
   };
-  writeFileSync(scopeFile, `${JSON.stringify(scope)}\n`);
-  const scopeHash = execFileSync(
-    process.execPath,
-    [resultCli, "scope", scopeFile],
-    { encoding: "utf8" },
-  ).trim();
+  const trustedScopeHash = deriveTrustedScopeMetadata(scope).scope_hash;
   writeFileSync(publicationFile, `${JSON.stringify({
-    schema_version: 1,
+    schema_version: 2,
+    findings,
     metadata: {
       analysis_state: analysisState,
       base_sha: baseSha,
@@ -137,11 +133,11 @@ function writeTrustedPublication({
         completed: completedPasses,
       },
       remaining_analysis: remainingAnalysis,
-      scope_hash: scopeHash,
+      scope_hash: trustedScopeHash,
     },
     scope,
   })}\n`);
-  return scopeHash;
+  return trustedScopeHash;
 }
 
 function finding(title, overrides = {}) {
@@ -342,7 +338,7 @@ function runReview(t, plan, {
   targetSymlinks = {},
   staged = false,
   includeOutputs = true,
-  metadataViaEnv = false,
+  publicationViaEnv = false,
   noState = true,
   noFail = true,
   failMerge = false,
@@ -370,18 +366,15 @@ function runReview(t, plan, {
   const codegraphLogFile = join(fixture.directory, "codegraph.log");
   const bunxLogFile = join(fixture.directory, "bunx.log");
   let findingsFile = join(fixture.directory, "findings.json");
-  let metadataFile = join(fixture.directory, "metadata.json");
-  let scopeFile = `${metadataFile}.scope`;
+  let publicationFile = join(fixture.directory, "publication.json");
   if (outputPaths) {
     const outputFiles = outputPaths({
       ...fixture,
       findingsFile,
-      metadataFile,
-      scopeFile,
+      publicationFile,
     });
     findingsFile = outputFiles.findingsFile;
-    metadataFile = outputFiles.metadataFile;
-    scopeFile = outputFiles.scopeFile ?? `${metadataFile}.scope`;
+    publicationFile = outputFiles.publicationFile;
   }
   writeFileSync(planFile, JSON.stringify(plan));
   const runnerArgs = [
@@ -393,7 +386,7 @@ function runReview(t, plan, {
     ...(includeOutputs
       ? [
           "--out", findingsFile,
-          ...(metadataViaEnv ? [] : ["--metadata-out", metadataFile]),
+          ...(publicationViaEnv ? [] : ["--publication-out", publicationFile]),
         ]
       : []),
     ...args,
@@ -467,8 +460,7 @@ printf '%s\\n' '1.3.14'
       AGENTIC_REVIEW_LENSES: "",
       AGENTIC_REVIEW_MAX_DIFF_BYTES: "",
       AGENTIC_REVIEW_MAX_FINDINGS: "",
-      AGENTIC_REVIEW_METADATA_OUT: "",
-      AGENTIC_REVIEW_SCOPE_OUT: scopeFile,
+      AGENTIC_REVIEW_PUBLICATION_OUT: "",
       AGENTIC_REVIEW_PASSES: "",
       AGENTIC_REVIEW_PROMPT: "",
       AGENTIC_REVIEW_SKILL: "",
@@ -481,7 +473,7 @@ printf '%s\\n' '1.3.14'
       FAKE_CODEGRAPH_LOG: codegraphLogFile,
       FAKE_BUNX_LOG: bunxLogFile,
       REAL_NODE: process.execPath,
-      ...(metadataViaEnv ? { AGENTIC_REVIEW_METADATA_OUT: metadataFile } : {}),
+      ...(publicationViaEnv ? { AGENTIC_REVIEW_PUBLICATION_OUT: publicationFile } : {}),
       ...env,
     },
   });
@@ -491,8 +483,8 @@ printf '%s\\n' '1.3.14'
   const codegraphLogs = existsSync(codegraphLogFile)
     ? readFileSync(codegraphLogFile, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse)
     : [];
-  const publication = existsSync(metadataFile)
-    ? JSON.parse(readFileSync(metadataFile, "utf8"))
+  const publication = existsSync(publicationFile)
+    ? JSON.parse(readFileSync(publicationFile, "utf8"))
     : null;
   return {
     ...fixture,
@@ -500,20 +492,19 @@ printf '%s\\n' '1.3.14'
     logs,
     codegraphLogs,
     findingsFile,
-    metadataFile,
-    scopeFile,
+    publicationFile,
     bunxLogFile,
     findings: existsSync(findingsFile) ? JSON.parse(readFileSync(findingsFile, "utf8")) : null,
     publication,
     metadata: publication?.metadata ?? null,
-    scope: existsSync(scopeFile) ? JSON.parse(readFileSync(scopeFile, "utf8")) : null,
+    scope: publication?.scope ?? null,
   };
 }
 
-function validateMetadata(metadataFile) {
+function validatePublication(publicationFile) {
   return spawnSync(
     process.execPath,
-    [resultCli, "validate", metadataFile],
+    [resultCli, "validate", publicationFile],
     { encoding: "utf8" },
   );
 }
@@ -800,6 +791,7 @@ test("the default profile runs general, correctness, and boundaries into one val
   );
   assert.equal(run.findings.findings.find(({ title }) => title === repeated.title).votes, 2);
   assert.deepEqual(JSON.parse(run.result.stdout), run.findings);
+  assert.deepEqual(run.publication.findings, run.findings.findings);
   assert.equal(existsSync(join(run.repository, ".git", "agentic-review")), false);
 
   assert.deepEqual(run.metadata.passes.requested, ["general", "correctness", "boundaries"]);
@@ -839,10 +831,7 @@ test("the default profile runs general, correctness, and boundaries into one val
       head_sha: run.metadata.head_sha,
     },
   );
-  assert.equal(
-    execFileSync(process.execPath, [resultCli, "scope", run.scopeFile], { encoding: "utf8" }).trim(),
-    run.metadata.scope_hash,
-  );
+  assert.equal(deriveTrustedScopeMetadata(run.scope).scope_hash, run.metadata.scope_hash);
   for (const pass of run.metadata.passes.results) {
     assert.equal(pass.base_sha, run.baseSha);
     assert.equal(pass.head_sha, run.headSha);
@@ -851,7 +840,7 @@ test("the default profile runs general, correctness, and boundaries into one val
     assert.equal(pass.attempts, 1);
     assert.equal(pass.capped, false);
   }
-  const validation = validateMetadata(run.metadataFile);
+  const validation = validatePublication(run.publicationFile);
   assert.equal(validation.status, 0, validation.stderr);
   assert.deepEqual(JSON.parse(validation.stdout), run.metadata);
 });
@@ -882,7 +871,7 @@ test("workflow skips the write-capable poster after cancellation but not ordinar
   assert.match(posterStep, /^\s+if: \$\{\{ !cancelled\(\) \}\}$/m);
 });
 
-test("workflow retains normal artifacts and uploads result-only target-resolution fallbacks", () => {
+test("workflow retains one authoritative publication and result-only target fallbacks", () => {
   const source = readFileSync(workflow, "utf8");
   const artifactStep = source.match(
     /^      - name: upload review artifacts\n[\s\S]*?(?=^      - name:)/m,
@@ -891,8 +880,8 @@ test("workflow retains normal artifacts and uploads result-only target-resolutio
     /^      - name: upload target-resolution fallback result\n[\s\S]*$/m,
   )?.[0];
 
-  assert.match(source, /^\s+AGENTIC_REVIEW_SCOPE_OUT: \/tmp\/review-scope\.json$/m);
-  assert.match(source, /^\s+REVIEW_PUBLICATION_FILE: \/tmp\/review-meta\.json$/m);
+  assert.match(source, /^\s+REVIEW_PUBLICATION_FILE: \/tmp\/review-publication\.json$/m);
+  assert.doesNotMatch(source, /AGENTIC_REVIEW_SCOPE_OUT|review-scope\.json/);
   assert.ok(artifactStep);
   assert.match(
     artifactStep,
@@ -900,11 +889,10 @@ test("workflow retains normal artifacts and uploads result-only target-resolutio
   );
   for (const path of [
     "/tmp/review.md",
-    "/tmp/review-meta.json",
+    "/tmp/review-publication.json",
     "/tmp/review-runner.out",
     "/tmp/review-runner.err",
     "/tmp/review-result.json",
-    "/tmp/review-scope.json",
   ]) {
     assert.match(artifactStep, new RegExp(`^\\s+${path.replaceAll(".", "\\.")}$`, "m"));
   }
@@ -916,7 +904,10 @@ test("workflow retains normal artifacts and uploads result-only target-resolutio
     /^\s+if: \$\{\{ !cancelled\(\) && steps\.target\.outputs\.eligible == '' \}\}$/m,
   );
   assert.match(fallbackArtifactStep, /^\s+path: \/tmp\/review-result\.json$/m);
-  assert.doesNotMatch(fallbackArtifactStep, /\/tmp\/review(?:\.md|-meta\.json|-runner\.(?:out|err)|-scope\.json)/);
+  assert.doesNotMatch(
+    fallbackArtifactStep,
+    /\/tmp\/review(?:\.md|-publication\.json|-runner\.(?:out|err))/,
+  );
   assert.match(fallbackArtifactStep, /^\s+if-no-files-found: error$/m);
 });
 
@@ -997,8 +988,7 @@ test("behind-base poster no-result fallback pairs with the trusted merge-base pu
   const directory = mkdtempSync(join(tmpdir(), "hosted-poster-load-failure-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const trustedPoster = join(directory, "scripts", "post-review.mjs");
-  const scopeFile = join(directory, "review-scope.json");
-  const metadataFile = join(directory, "review-meta.json");
+  const publicationFile = join(directory, "review-publication.json");
   mkdirSync(dirname(trustedPoster), { recursive: true });
   writeFileSync(trustedPoster, 'import "./missing-trusted-dependency.mjs";\n');
 
@@ -1014,7 +1004,7 @@ test("behind-base poster no-result fallback pairs with the trusted merge-base pu
     BASE_SHA: targetBaseSha,
     TRUSTED_DATA_ROOT: directory,
     REVIEW_POSTER: trustedPoster,
-    REVIEW_PUBLICATION_FILE: metadataFile,
+    REVIEW_PUBLICATION_FILE: publicationFile,
     REVIEW_MODE: "summary",
     POST_COMMENT: "false",
     SUPPRESS_WRITES: "true",
@@ -1056,9 +1046,8 @@ test("behind-base poster no-result fallback pairs with the trusted merge-base pu
     configurationFingerprint,
     completedPasses: ["general", "correctness", "boundaries"],
     headSha,
-    publicationFile: metadataFile,
+    publicationFile: publicationFile,
     requestedPasses: ["general", "correctness", "boundaries"],
-    scopeFile,
   });
   writeFileSync(trustedPoster, "process.exit(47);\n");
   const killedOutput = join(directory, "killed-output");
@@ -1214,8 +1203,7 @@ test("workflow failure fallback is bounded by trusted runner analysis", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "hosted-result-analysis-boundary-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const trustedPoster = join(directory, "scripts", "post-review.mjs");
-  const scopeFile = join(directory, "review-scope.json");
-  const metadataFile = join(directory, "review-meta.json");
+  const publicationFile = join(directory, "review-publication.json");
   mkdirSync(dirname(trustedPoster), { recursive: true });
   writeFileSync(trustedPoster, `
 import { writeFileSync } from "node:fs";
@@ -1236,7 +1224,7 @@ process.exit(41);
     BASE_SHA: baseSha,
     TRUSTED_DATA_ROOT: directory,
     REVIEW_POSTER: trustedPoster,
-    REVIEW_PUBLICATION_FILE: metadataFile,
+    REVIEW_PUBLICATION_FILE: publicationFile,
     REVIEW_MODE: "summary",
     POST_COMMENT: "false",
     SUPPRESS_WRITES: "true",
@@ -1261,10 +1249,9 @@ process.exit(41);
       completedPasses: requestedPasses,
       coverage: "unknown",
       headSha,
-      publicationFile: metadataFile,
+      publicationFile: publicationFile,
       remainingAnalysis,
       requestedPasses,
-      scopeFile,
     });
     const expectedResult = expectedExecutionFailureResult(baseSha, headSha, {
       configurationFingerprint,
@@ -1313,9 +1300,8 @@ process.exit(41);
     configurationFingerprint,
     completedPasses: requestedPasses,
     headSha,
-    publicationFile: metadataFile,
+    publicationFile: publicationFile,
     requestedPasses,
-    scopeFile,
   });
   const reconciledResult = {
     ...expectedExecutionFailureResult(baseSha, headSha, {
@@ -1366,8 +1352,7 @@ test("workflow boundary rejects a valid poster result for another trusted scope"
   const directory = mkdtempSync(join(tmpdir(), "hosted-result-scope-mismatch-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const trustedPoster = join(directory, "scripts", "post-review.mjs");
-  const scopeFile = join(directory, "review-scope.json");
-  const metadataFile = join(directory, "review-meta.json");
+  const publicationFile = join(directory, "review-publication.json");
   mkdirSync(dirname(trustedPoster), { recursive: true });
   writeFileSync(trustedPoster, `
 import { writeFileSync } from "node:fs";
@@ -1383,9 +1368,8 @@ process.exit(37);
     configurationFingerprint,
     completedPasses: ["general", "correctness", "boundaries"],
     headSha,
-    publicationFile: metadataFile,
+    publicationFile: publicationFile,
     requestedPasses: ["general", "correctness", "boundaries"],
-    scopeFile,
   });
   const validResultForAnotherScope = {
     ...expectedExecutionFailureResult(baseSha, headSha),
@@ -1415,7 +1399,7 @@ process.exit(37);
       BASE_SHA: baseSha,
       TRUSTED_DATA_ROOT: directory,
       REVIEW_POSTER: trustedPoster,
-      REVIEW_PUBLICATION_FILE: metadataFile,
+      REVIEW_PUBLICATION_FILE: publicationFile,
       REVIEW_RESULT_FILE: resultFile,
       GITHUB_OUTPUT: outputFile,
       GITHUB_STEP_SUMMARY: summaryFile,
@@ -1453,8 +1437,7 @@ test("workflow boundary replaces key-complete semantically invalid poster result
   const directory = mkdtempSync(join(tmpdir(), "hosted-invalid-result-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const trustedPoster = join(directory, "scripts", "post-review.mjs");
-  const scopeFile = join(directory, "review-scope.json");
-  const metadataFile = join(directory, "review-meta.json");
+  const publicationFile = join(directory, "review-publication.json");
   mkdirSync(dirname(trustedPoster), { recursive: true });
   writeFileSync(trustedPoster, `
 import { writeFileSync } from "node:fs";
@@ -1470,9 +1453,8 @@ process.exit(31);
     configurationFingerprint,
     completedPasses: ["general"],
     headSha,
-    publicationFile: metadataFile,
+    publicationFile: publicationFile,
     requestedPasses: ["general"],
-    scopeFile,
   });
   const expectedResult = expectedExecutionFailureResult(baseSha, headSha, {
     configurationFingerprint,
@@ -1655,7 +1637,7 @@ process.exit(31);
         BASE_SHA: baseSha,
         TRUSTED_DATA_ROOT: directory,
         REVIEW_POSTER: trustedPoster,
-        REVIEW_PUBLICATION_FILE: metadataFile,
+        REVIEW_PUBLICATION_FILE: publicationFile,
         REVIEW_MODE: "summary",
         POST_COMMENT: "false",
         SUPPRESS_WRITES: "true",
@@ -1903,11 +1885,10 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
   assert.equal(readFileSync(promptSupport.SKILL_FILE, "utf8").includes(targetDataMarker), false);
 
   const findingsFile = "/tmp/review.md";
-  const metadataFile = "/tmp/review-meta.json";
-  const scopeFile = "/tmp/review-scope.json";
+  const publicationFile = "/tmp/review-publication.json";
   const runnerOutFile = "/tmp/review-runner.out";
   const runnerErrFile = "/tmp/review-runner.err";
-  for (const path of [findingsFile, metadataFile, scopeFile, runnerOutFile, runnerErrFile]) {
+  for (const path of [findingsFile, publicationFile, runnerOutFile, runnerErrFile]) {
     rmSync(path, { force: true });
     t.after(() => rmSync(path, { force: true }));
   }
@@ -1935,15 +1916,14 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
       REVIEW_MODE: "summary",
       OMP_VERSION: "latest",
       EXTRA_ARGS: "--print-thoughts",
-      AGENTIC_REVIEW_SCOPE_OUT: scopeFile,
       CODEGRAPH: "false",
     },
   });
   assert.equal(reviewResult.status, 0, reviewResult.stderr);
 
   const logs = readFileSync(logFile, "utf8").trim().split("\n").map(JSON.parse);
-  const findings = JSON.parse(readFileSync(findingsFile, "utf8"));
-  const { metadata } = JSON.parse(readFileSync(metadataFile, "utf8"));
+  const findingsDocument = JSON.parse(readFileSync(findingsFile, "utf8"));
+  const { findings, metadata } = JSON.parse(readFileSync(publicationFile, "utf8"));
   assert.equal(logs.length, 3);
   assert.deepEqual(logs.map(({ id }) => id), ["general", "correctness", "boundaries"]);
   assert.ok(logs.every(({ attempt }) => attempt === 1));
@@ -1953,8 +1933,7 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
   assert.ok(logs.every(({ skill }) => !skill.includes(targetDataMarker)));
   assert.equal(existsSync(maliciousExecutableMarker), false);
   assert.equal(existsSync(findingsFile), true);
-  assert.equal(existsSync(metadataFile), true);
-  assert.equal(existsSync(scopeFile), true);
+  assert.equal(existsSync(publicationFile), true);
   assert.deepEqual(metadata.passes.requested, ["general", "correctness", "boundaries"]);
   assert.deepEqual(metadata.passes.completed, ["general", "correctness", "boundaries"]);
   assert.equal(metadata.analysis_state, "complete");
@@ -1963,10 +1942,11 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
   assert.equal(metadata.coverage, "bounded");
   assert.deepEqual(metadata.remaining_analysis, []);
   assert.deepEqual(
-    findings.findings.map(({ title }) => title).sort(),
+    findings.map(({ title }) => title).sort(),
     ["Correctness hosted defect", "Shared hosted defect"],
   );
-  assert.equal(findings.findings.find(({ title }) => title === shared.title).votes, 2);
+  assert.equal(findings.find(({ title }) => title === shared.title).votes, 2);
+  assert.deepEqual(findings, findingsDocument.findings);
 
   const githubLogFile = join(fixture.directory, "github.log");
   const posterCallsFile = join(fixture.directory, "poster-calls.log");
@@ -2007,8 +1987,7 @@ globalThis.fetch = async (url, options = {}) => {
       FAKE_GITHUB_LOG: githubLogFile,
       FAKE_POSTER_CALLS: posterCallsFile,
       GH_TOKEN: "installation-token",
-      FINDINGS_FILE: findingsFile,
-      REVIEW_PUBLICATION_FILE: metadataFile,
+      REVIEW_PUBLICATION_FILE: publicationFile,
       GITHUB_REPO: "outside/target",
       PR_NUMBER: "17",
       HEAD_SHA: fixture.headSha,
@@ -2370,10 +2349,10 @@ test("a permanently malformed pass is failed while valid pass findings survive t
     run.findings.findings.map(({ title }) => title).sort(),
     [boundaries.title, general.title],
   );
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
 });
 
-test("all-pass failure writes valid diagnostic metadata before exiting nonzero", (t) => {
+test("all-pass failure writes a valid diagnostic publication before exiting nonzero", (t) => {
   const run = runReview(t, {
     general: ["bad", "bad again"],
     correctness: ["bad", "bad again"],
@@ -2382,6 +2361,7 @@ test("all-pass failure writes valid diagnostic metadata before exiting nonzero",
 
   assert.notEqual(run.result.status, 0);
   assert.equal(run.findings, null);
+  assert.deepEqual(run.publication.findings, []);
   assert.equal(run.metadata.analysis_state, "inconclusive");
   assert.equal(run.metadata.coverage, "unknown");
   assert.deepEqual(run.metadata.remaining_analysis, ["pass_failed", "execution_failed"]);
@@ -2394,7 +2374,7 @@ test("all-pass failure writes valid diagnostic metadata before exiting nonzero",
       status: "failed", attempts: 2, finding_count: 0, capped: false,
     })),
   );
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
   assert.doesNotMatch(run.result.stdout, /No findings/);
 });
 
@@ -2420,7 +2400,7 @@ test("a raw finding count equal to the nonzero cap is capped and inconclusive", 
       { finding_count: 0, capped: false },
     ],
   );
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
 });
 
 test("diff truncation is recorded and makes an otherwise valid run inconclusive", (t) => {
@@ -2451,7 +2431,7 @@ test("diff truncation is recorded and makes an otherwise valid run inconclusive"
     included_bytes: run.scope.included_bytes,
     truncated: true,
   });
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
 });
 
 test("diff metadata and canonical scope preserve the exact UTF-8 git diff bytes", (t) => {
@@ -2473,7 +2453,7 @@ test("diff metadata and canonical scope preserve the exact UTF-8 git diff bytes"
   assert.equal(run.scope.bytes, expectedDiff.length);
   assert.equal(run.metadata.diff.bytes, expectedDiff.length);
   assert.equal(run.metadata.diff.included_bytes, expectedDiff.length);
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
 });
 
 test("scope hashes distinguish invalid UTF-8 diff bytes while the raw review run validates", (t) => {
@@ -2517,12 +2497,14 @@ test("scope hashes distinguish invalid UTF-8 diff bytes while the raw review run
   }
   assert.equal(run.metadata.analysis_state, "complete");
   assert.equal(run.metadata.coverage, "bounded");
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
 });
 
 
-test("external diff helpers cannot replace the trusted diff or skip model review", (t) => {
-  const fixture = createFixture(t);
+test("external diff and textconv helpers cannot replace trusted diff evidence", (t) => {
+  const fixture = createFixture(t, {
+    baseFiles: { ".gitattributes": "*.txt diff=empty\n" },
+  });
   const externalDiff = join(fixture.directory, "empty-diff");
   const externalDiffLog = join(fixture.directory, "empty-diff.log");
   writeFileSync(externalDiff, `#!/usr/bin/env bash
@@ -2531,6 +2513,14 @@ exit 0
 `);
   chmodSync(externalDiff, 0o755);
   git(fixture.repository, "config", "diff.external", externalDiff);
+  const textconv = join(fixture.directory, "empty-textconv");
+  const textconvLog = join(fixture.directory, "empty-textconv.log");
+  writeFileSync(textconv, `#!/usr/bin/env bash
+touch "\${TEXTCONV_LOG}"
+exit 0
+`);
+  chmodSync(textconv, 0o755);
+  git(fixture.repository, "config", "diff.empty.textconv", textconv);
 
   const run = runReview(t, {
     general: [{ findings: [] }],
@@ -2540,18 +2530,22 @@ exit 0
     env: {
       EXTERNAL_DIFF_LOG: externalDiffLog,
       GIT_EXTERNAL_DIFF: externalDiff,
+      TEXTCONV_LOG: textconvLog,
     },
     existingFixture: fixture,
+    fakeCodegraph: true,
+    untrackedCodegraph: true,
   });
   const expectedDiff = execFileSync(
     "git",
-    ["diff", "--no-ext-diff", "--no-color", "main", "HEAD"],
+    ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "main", "HEAD"],
     { cwd: fixture.repository },
   );
 
   assert.ok(expectedDiff.length > 0);
   assert.equal(run.result.status, 0, run.result.stderr);
   assert.equal(existsSync(externalDiffLog), false);
+  assert.equal(existsSync(textconvLog), false);
   assert.deepEqual(Buffer.from(run.scope.diff_base64, "base64"), expectedDiff);
   assert.equal(run.metadata.scope_hash, scopeHash({
     base_sha: run.scope.base_sha,
@@ -2562,8 +2556,11 @@ exit 0
   assert.equal(run.logs.length, 3);
   for (const log of run.logs) {
     assert.match(log.prompt, /\+alpha head/);
+    assert.match(log.prompt, /\+beta head/);
+    assert.match(log.prompt, /\+gamma head/);
   }
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  assert.ok(run.codegraphLogs.some(({ operation }) => operation === "query"));
+  assert.equal(validatePublication(run.publicationFile).status, 0);
 });
 
 test("canonical diff rendering failures stop before model work", (t) => {
@@ -2627,20 +2624,13 @@ test("every rotated pass includes deletions and unusual filenames", (t) => {
   }
 });
 
-test("concurrent runners publish only internally consistent scope and metadata evidence", async (t) => {
+test("concurrent runners atomically publish findings, metadata, and scope for one run", async (t) => {
   const fixture = createFixture(t);
+  const findingsFile = join(fixture.directory, "shared-findings.json");
   const publicationFile = join(fixture.directory, "shared-publication.json");
-  const scopeFile = join(fixture.directory, "shared-scope.json");
-  const planFile = join(fixture.directory, "shared-plan.json");
   const gateFile = join(fixture.directory, "publication-a-ready");
   const releaseFile = join(fixture.directory, "release-publication-a");
   const mv = join(fixture.bin, "mv");
-  const plan = {
-    general: [{ findings: [] }],
-    correctness: [{ findings: [] }],
-    boundaries: [{ findings: [] }],
-  };
-  writeFileSync(planFile, JSON.stringify(plan));
   writeFileSync(mv, `#!/usr/bin/env bash
 destination="\${@: -1}"
 if [ "\${PUBLICATION_RUN:-}" = "a" ] && [ "$destination" = "\${PUBLICATION_OUT}" ]; then
@@ -2654,6 +2644,12 @@ PATH="\${PATH#*:}" exec mv "$@"
   const start = (name) => {
     const state = join(fixture.directory, `state-${name}`);
     const log = join(fixture.directory, `omp-${name}.log`);
+    const planFile = join(fixture.directory, `plan-${name}.json`);
+    writeFileSync(planFile, JSON.stringify({
+      general: [{ findings: [finding(`Publication ${name.toUpperCase()} finding`)] }],
+      correctness: [{ findings: [] }],
+      boundaries: [{ findings: [] }],
+    }));
     mkdirSync(state);
     const child = spawn("bash", [
       runner,
@@ -2662,13 +2658,13 @@ PATH="\${PATH#*:}" exec mv "$@"
       "--no-codegraph",
       "--no-state",
       "--no-fail",
-      "--metadata-out", publicationFile,
+      "--out", findingsFile,
+      "--publication-out", publicationFile,
       "--json",
     ], {
       cwd: fixture.repository,
       env: {
         ...process.env,
-        AGENTIC_REVIEW_SCOPE_OUT: scopeFile,
         OPENROUTER_API_KEY: "sk-or-runner-test",
         PATH: `${fixture.bin}:${process.env.PATH}`,
         FAKE_OMP_PLAN: planFile,
@@ -2689,6 +2685,21 @@ PATH="\${PATH#*:}" exec mv "$@"
     };
   };
 
+  const render = (name, publication) => {
+    const snapshot = join(fixture.directory, `publication-${name}.json`);
+    writeFileSync(snapshot, JSON.stringify(publication));
+    return spawnSync(process.execPath, [poster], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HEAD_SHA: publication.metadata.head_sha,
+        REVIEW_PUBLICATION_FILE: snapshot,
+        RENDER: "1",
+        REVIEW_MODE: "summary",
+      },
+    });
+  };
+
   const first = start("a");
   for (let attempt = 0; attempt < 1000 && !existsSync(gateFile); attempt += 1) {
     await delay(10);
@@ -2700,7 +2711,7 @@ PATH="\${PATH#*:}" exec mv "$@"
   const secondBytes = existsSync(publicationFile)
     ? readFileSync(publicationFile, "utf8")
     : null;
-  const secondValidation = secondBytes === null ? null : validateMetadata(publicationFile);
+  const secondValidation = secondBytes === null ? null : validatePublication(publicationFile);
 
   writeFileSync(releaseFile, "");
   const firstResult = await first.done;
@@ -2710,38 +2721,43 @@ PATH="\${PATH#*:}" exec mv "$@"
   const secondPublication = JSON.parse(secondBytes);
   assert.equal(firstResult.status, 0, firstResult.stderr);
   const firstPublication = JSON.parse(readFileSync(publicationFile, "utf8"));
-  const standaloneScope = JSON.parse(readFileSync(scopeFile, "utf8"));
+  const standaloneFindings = JSON.parse(readFileSync(findingsFile, "utf8")).findings;
 
-  const firstValidation = validateMetadata(publicationFile);
+  const firstValidation = validatePublication(publicationFile);
   assert.equal(firstValidation.status, 0, firstValidation.stderr);
   assert.notEqual(
     firstPublication.metadata.configuration_fingerprint,
     secondPublication.metadata.configuration_fingerprint,
   );
+  assert.equal(firstPublication.findings[0].title, "Publication A finding");
+  assert.equal(secondPublication.findings[0].title, "Publication B finding");
   assert.equal(
-    secondPublication.scope.configuration_fingerprint,
-    standaloneScope.configuration_fingerprint,
-  );
-  assert.notEqual(
-    firstPublication.metadata.configuration_fingerprint,
-    standaloneScope.configuration_fingerprint,
-    "the schedule must expose why consumers cannot pair independent output files",
+    standaloneFindings[0].title,
+    "Publication B finding",
+    "the schedule must leave the human-readable output from a different run",
   );
   for (const publication of [secondPublication, firstPublication]) {
     assert.equal(
       publication.metadata.configuration_fingerprint,
       publication.scope.configuration_fingerprint,
     );
-    assert.equal(publication.metadata.scope_hash, scopeHash({
-      base_sha: publication.scope.base_sha,
-      configuration_fingerprint: publication.scope.configuration_fingerprint,
-      diff_base64: publication.scope.diff_base64,
-      head_sha: publication.scope.head_sha,
-    }));
+    assert.equal(
+      publication.metadata.scope_hash,
+      deriveTrustedScopeMetadata(publication.scope).scope_hash,
+    );
   }
+
+  const renderedSecond = render("b", secondPublication);
+  assert.equal(renderedSecond.status, 0, renderedSecond.stderr);
+  assert.match(renderedSecond.stdout, /Publication B finding/);
+  assert.doesNotMatch(renderedSecond.stdout, /Publication A finding/);
+  const renderedFirst = render("a", firstPublication);
+  assert.equal(renderedFirst.status, 0, renderedFirst.stderr);
+  assert.match(renderedFirst.stdout, /Publication A finding/);
+  assert.doesNotMatch(renderedFirst.stdout, /Publication B finding/);
 });
 
-test("findings and metadata destinations cannot resolve to the same file", (t) => {
+test("findings and publication destinations cannot resolve to the same file", (t) => {
   const plan = {
     general: [{ findings: [] }],
     correctness: [{ findings: [] }],
@@ -2750,12 +2766,12 @@ test("findings and metadata destinations cannot resolve to the same file", (t) =
   const dotAlias = runReview(t, plan, {
     outputPaths: ({ directory }) => ({
       findingsFile: join(directory, "same.json"),
-      metadataFile: `${directory}/./same.json`,
+      publicationFile: `${directory}/./same.json`,
     }),
   });
   assert.notEqual(dotAlias.result.status, 0);
   assert.equal(dotAlias.logs.length, 0);
-  assert.match(dotAlias.result.stderr, /--out.*--metadata-out|same destination/);
+  assert.match(dotAlias.result.stderr, /--out.*--publication-out|same destination/);
 
   const symlinkAlias = runReview(t, plan, {
     outputPaths: ({ directory }) => {
@@ -2765,77 +2781,13 @@ test("findings and metadata destinations cannot resolve to the same file", (t) =
       symlinkSync(realDirectory, aliasDirectory, "dir");
       return {
         findingsFile: join(realDirectory, "result.json"),
-        metadataFile: join(aliasDirectory, "result.json"),
+        publicationFile: join(aliasDirectory, "result.json"),
       };
     },
   });
   assert.notEqual(symlinkAlias.result.status, 0);
   assert.equal(symlinkAlias.logs.length, 0);
-  assert.match(symlinkAlias.result.stderr, /--out.*--metadata-out|same destination/);
-});
-
-test("scope and findings destinations cannot resolve to the same file without replacing artifacts", (t) => {
-  const staleShared = '{"sentinel":"shared"}\n';
-  const staleMetadata = '{"sentinel":"metadata"}\n';
-  let sharedFile;
-  let metadataFile;
-  const run = runReview(t, {
-    general: [{ findings: [] }],
-    correctness: [{ findings: [] }],
-    boundaries: [{ findings: [] }],
-  }, {
-    outputPaths: ({ directory, metadataFile: defaultMetadata }) => {
-      sharedFile = join(directory, "scope-findings.json");
-      metadataFile = defaultMetadata;
-      writeFileSync(sharedFile, staleShared);
-      writeFileSync(metadataFile, staleMetadata);
-      return {
-        findingsFile: sharedFile,
-        metadataFile,
-        scopeFile: `${directory}/./scope-findings.json`,
-      };
-    },
-  });
-
-  assert.notEqual(run.result.status, 0);
-  assert.equal(run.logs.length, 0);
-  assert.equal(readFileSync(sharedFile, "utf8"), staleShared);
-  assert.equal(readFileSync(metadataFile, "utf8"), staleMetadata);
-  assert.match(run.result.stderr, /--out.*AGENTIC_REVIEW_SCOPE_OUT|AGENTIC_REVIEW_SCOPE_OUT.*--out|same destination/);
-});
-
-test("scope and metadata destinations cannot resolve through symlinked directories without replacing artifacts", (t) => {
-  const staleFindings = '{"sentinel":"findings"}\n';
-  const staleShared = '{"sentinel":"shared"}\n';
-  let findingsFile;
-  let sharedFile;
-  const run = runReview(t, {
-    general: [{ findings: [] }],
-    correctness: [{ findings: [] }],
-    boundaries: [{ findings: [] }],
-  }, {
-    outputPaths: ({ directory, findingsFile: defaultFindings }) => {
-      const realDirectory = join(directory, "real-scope-output");
-      const aliasDirectory = join(directory, "alias-scope-output");
-      mkdirSync(realDirectory);
-      symlinkSync(realDirectory, aliasDirectory, "dir");
-      findingsFile = defaultFindings;
-      sharedFile = join(realDirectory, "scope-metadata.json");
-      writeFileSync(findingsFile, staleFindings);
-      writeFileSync(sharedFile, staleShared);
-      return {
-        findingsFile,
-        metadataFile: sharedFile,
-        scopeFile: join(aliasDirectory, "scope-metadata.json"),
-      };
-    },
-  });
-
-  assert.notEqual(run.result.status, 0);
-  assert.equal(run.logs.length, 0);
-  assert.equal(readFileSync(findingsFile, "utf8"), staleFindings);
-  assert.equal(readFileSync(sharedFile, "utf8"), staleShared);
-  assert.match(run.result.stderr, /--metadata-out.*AGENTIC_REVIEW_SCOPE_OUT|AGENTIC_REVIEW_SCOPE_OUT.*--metadata-out|same destination/);
+  assert.match(symlinkAlias.result.stderr, /--out.*--publication-out|same destination/);
 });
 
 test("symlink artifact destinations are rejected before model work without replacing outputs", (t) => {
@@ -2844,24 +2796,22 @@ test("symlink artifact destinations are rejected before model work without repla
     correctness: [{ findings: [] }],
     boundaries: [{ findings: [] }],
   };
-  for (const selected of ["findings", "metadata", "scope"]) {
+  for (const selected of ["findings", "publication"]) {
     let staleTarget;
     let otherOutput;
     const stale = selected === "findings"
       ? '{"findings":[{"title":"stale"}]}\n'
-      : selected === "metadata"
-        ? '{"analysis_state":"stale"}\n'
-        : '{"base_sha":"stale"}\n';
+      : '{"analysis_state":"stale"}\n';
     const run = runReview(t, plan, {
-      outputPaths: ({ directory, findingsFile, metadataFile }) => {
+      outputPaths: ({ directory, findingsFile, publicationFile }) => {
         staleTarget = join(directory, `${selected}-stale-target.json`);
         writeFileSync(staleTarget, stale);
         const symlink = join(directory, `${selected}-artifact.json`);
         symlinkSync(staleTarget, symlink);
-        otherOutput = selected === "findings" ? metadataFile : findingsFile;
-        if (selected === "findings") return { findingsFile: symlink, metadataFile };
-        if (selected === "metadata") return { findingsFile, metadataFile: symlink };
-        return { findingsFile, metadataFile, scopeFile: symlink };
+        otherOutput = selected === "findings" ? publicationFile : findingsFile;
+        return selected === "findings"
+          ? { findingsFile: symlink, publicationFile }
+          : { findingsFile, publicationFile: symlink };
       },
     });
 
@@ -2869,15 +2819,13 @@ test("symlink artifact destinations are rejected before model work without repla
     assert.equal(run.logs.length, 0, selected);
     const selectedOutput = selected === "findings"
       ? run.findingsFile
-      : selected === "metadata"
-        ? run.metadataFile
-        : run.scopeFile;
+      : run.publicationFile;
     assert.equal(lstatSync(selectedOutput).isSymbolicLink(), true);
     assert.equal(readFileSync(staleTarget, "utf8"), stale);
     assert.equal(existsSync(otherOutput), false, `${selected}: other artifact was partially written`);
     assert.match(
       run.result.stderr,
-      /symlink.*(?:--out|--metadata-out|AGENTIC_REVIEW_SCOPE_OUT)|(?:--out|--metadata-out|AGENTIC_REVIEW_SCOPE_OUT).*symlink/i,
+      /symlink.*(?:--out|--publication-out)|(?:--out|--publication-out).*symlink/i,
     );
   }
 });
@@ -3871,7 +3819,7 @@ test("legacy live-checkout fallback is explicitly mutable and inconclusive", (t)
   assert.equal(run.metadata.analysis_state, "inconclusive");
   assert.equal(run.metadata.coverage, "unknown");
   assert.deepEqual(run.metadata.remaining_analysis, ["snapshot_mutable"]);
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
 });
 
 test("codegraph context comes only from the pinned review snapshot", (t) => {
@@ -4131,13 +4079,13 @@ test("legacy relative project data and local state remain available unless expli
     args: ["--prompt", "project-prompt.md", "--json"],
     targetFiles: { "project-prompt.md": "PROJECT_PROMPT_MARKER\\n" },
     noState: false,
-    metadataViaEnv: true,
+    publicationViaEnv: true,
   });
 
   assert.equal(run.result.status, 0, run.result.stderr);
   assert.ok(run.logs.every(({ prompt }) => prompt.includes("PROJECT_PROMPT_MARKER")));
   assert.ok(existsSync(join(run.repository, ".git", "agentic-review", "state.json")));
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
 });
 
 test("configuration fingerprint is shared before passes and excludes credentials", (t) => {
@@ -4212,13 +4160,13 @@ test("min-votes filtering cannot hide one-pass blocking evidence or report conve
   assert.equal(run.metadata.min_votes, 2);
   assert.equal(run.metadata.merge_succeeded, true);
   assert.deepEqual(run.metadata.remaining_analysis, ["vote_threshold_applied"]);
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
   const rendered = spawnSync(process.execPath, [poster], {
     encoding: "utf8",
     env: {
       ...process.env,
-      FINDINGS_FILE: run.findingsFile,
-      REVIEW_PUBLICATION_FILE: run.metadataFile,
+      HEAD_SHA: run.headSha,
+      REVIEW_PUBLICATION_FILE: run.publicationFile,
       RENDER: "1",
       REVIEW_MODE: "inline",
       FAIL_ON_FINDINGS: "true",
@@ -4250,5 +4198,5 @@ test("merge failure preserves a structured valid-pass artifact but is never comp
   assert.equal(run.metadata.merge_succeeded, false);
   assert.equal(run.metadata.coverage, "unknown");
   assert.deepEqual(run.metadata.remaining_analysis, ["merge_failed"]);
-  assert.equal(validateMetadata(run.metadataFile).status, 0);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
 });

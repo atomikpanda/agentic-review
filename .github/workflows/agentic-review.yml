@@ -850,7 +850,6 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           BASE: ${{ steps.target.outputs.base }}
           HEAD: ${{ steps.target.outputs.head }}
-          AGENTIC_REVIEW_SCOPE_OUT: /tmp/review-scope.json
         run: |
           set -euo pipefail
           actual_head="$(git rev-parse --verify 'HEAD^{commit}')"
@@ -870,7 +869,7 @@ jobs:
             --review-mode "$REVIEW_MODE"
             --omp-version "$OMP_VERSION"
             --out /tmp/review.md
-            --metadata-out /tmp/review-meta.json
+            --publication-out /tmp/review-publication.json
             --no-state
             --no-fail
             --json
@@ -897,7 +896,7 @@ jobs:
           fi
           cat /tmp/review-runner.err >&2
           echo "  review result: $(wc -c < /tmp/review.md) bytes"
-          echo "  publication: $(wc -c < /tmp/review-meta.json) bytes"
+          echo "  publication: $(wc -c < /tmp/review-publication.json) bytes"
 
       - name: post review
         id: poster
@@ -908,8 +907,7 @@ jobs:
           # The write-capable credential is confined to this presentation step.
           GH_TOKEN: ${{ steps.target.outputs.eligible == 'true' && (steps.target.outputs.token || github.token) || '' }}
           TARGET_ELIGIBLE: ${{ steps.target.outputs.eligible }}
-          FINDINGS_FILE: /tmp/review.md
-          REVIEW_PUBLICATION_FILE: /tmp/review-meta.json
+          REVIEW_PUBLICATION_FILE: /tmp/review-publication.json
           REVIEW_RESULT_FILE: /tmp/review-result.json
           GITHUB_REPO: ${{ steps.target.outputs.repo }}
           PR_NUMBER: ${{ steps.target.outputs.pr }}
@@ -1398,7 +1396,9 @@ jobs:
               || publication === null
               || typeof publication !== "object"
               || Array.isArray(publication)
-              || publication.schema_version !== 1
+              || publication.schema_version !== 2
+              || !Array.isArray(publication.findings)
+              || Object.keys(publication).sort().join(",") !== "findings,metadata,schema_version,scope"
               || !/^[0-9a-f]{40}$/.test(trustedMetadata.base_sha)
               || !/^[0-9a-f]{40}$/.test(trustedMetadata.head_sha)
               || trustedMetadata.head_sha !== process.env.HEAD_SHA
@@ -1483,11 +1483,10 @@ jobs:
           name: agentic-review
           path: |
             /tmp/review.md
-            /tmp/review-meta.json
+            /tmp/review-publication.json
             /tmp/review-runner.out
             /tmp/review-runner.err
             /tmp/review-result.json
-            /tmp/review-scope.json
           retention-days: 7
           if-no-files-found: error
 

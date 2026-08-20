@@ -54,20 +54,19 @@ function reviewScope(run = {}) {
   };
 }
 
-function writeReviewScope(dir, run = {}) {
-  const scopeFile = join(dir, "review-scope.json");
-  writeFileSync(scopeFile, JSON.stringify({
+function trustedReviewScope(run = {}) {
+  return {
     ...reviewScope(run),
     bytes: Buffer.byteLength(REVIEW_DIFF),
     included_bytes: Buffer.byteLength(REVIEW_DIFF),
-  }));
-  return scopeFile;
+  };
 }
 
-function writeReviewPublication(publicationFile, scopeFile, runMetadata) {
+function writeReviewPublication(publicationFile, runMetadata, findings = []) {
   writeFileSync(publicationFile, JSON.stringify(createReviewPublication(
     runMetadata,
-    JSON.parse(readFileSync(scopeFile, "utf8")),
+    trustedReviewScope(runMetadata),
+    findings,
   )));
 }
 
@@ -210,6 +209,7 @@ function runPosterWithHistory({
   changedOpenFinding = null,
   coordinateLessChangedDismissedFinding = null,
   externalDiff = false,
+  textconv = false,
   gitFinding = null,
 }) {
   const dir = mkdtempSync(join(tmpdir(), "post-review-history-"));
@@ -260,15 +260,23 @@ exit 0
     runGit(dir, ["config", "diff.external", externalDiffHelper]);
     runGit(dir, ["config", "diff.trustExitCode", "true"]);
   }
-  const findingsFile = join(dir, "findings.json");
-  const metadataFile = join(dir, "metadata.json");
-  const scopeFile = writeReviewScope(dir, runtimeMetadata);
+  const textconvLog = join(dir, "textconv.log");
+  const textconvHelper = join(dir, "empty-textconv");
+  if (textconv) {
+    writeFileSync(join(dir, ".gitattributes"), "* diff=empty\n");
+    writeFileSync(textconvHelper, `#!/usr/bin/env bash
+touch "\${TEXTCONV_LOG}"
+exit 0
+`);
+    chmodSync(textconvHelper, 0o755);
+    runGit(dir, ["config", "diff.empty.textconv", textconvHelper]);
+  }
+  const publicationFile = join(dir, "publication.json");
   const outputFile = join(dir, "output");
   const summaryFile = join(dir, "summary");
   const resultFile = join(dir, "review-result.json");
   const preloadFile = join(dir, "mock-github.cjs");
-  writeFileSync(findingsFile, JSON.stringify({ findings: currentFindings }));
-  writeReviewPublication(metadataFile, scopeFile, runtimeMetadata);
+  writeReviewPublication(publicationFile, runtimeMetadata, currentFindings);
   writeFileSync(preloadFile, `
 const fixture = JSON.parse(process.env.POST_REVIEW_TEST_HISTORY);
 const reply = (value, status = 200) => ({
@@ -337,8 +345,8 @@ globalThis.fetch = async (url, options = {}) => {
           failSummaryPost,
           failRetirement,
         }),
-        FINDINGS_FILE: findingsFile,
-        REVIEW_PUBLICATION_FILE: metadataFile,
+        HEAD_SHA: runtimeMetadata.head_sha,
+        REVIEW_PUBLICATION_FILE: publicationFile,
         GITHUB_OUTPUT: outputFile,
         GITHUB_STEP_SUMMARY: summaryFile,
         REVIEW_RESULT_FILE: resultFile,
@@ -358,6 +366,9 @@ globalThis.fetch = async (url, options = {}) => {
               GIT_EXTERNAL_DIFF_TRUST_EXIT_CODE: "true",
             }
           : {}),
+        ...(textconv
+          ? { TEXTCONV_LOG: textconvLog }
+          : {}),
       },
     },
   );
@@ -365,8 +376,16 @@ globalThis.fetch = async (url, options = {}) => {
   const jobSummary = existsSync(summaryFile) ? readFileSync(summaryFile, "utf8") : "";
   const finalResult = existsSync(resultFile) ? JSON.parse(readFileSync(resultFile, "utf8")) : null;
   const externalDiffExecuted = existsSync(externalDiffLog);
+  const textconvExecuted = existsSync(textconvLog);
   rmSync(dir, { recursive: true, force: true });
-  return { ...result, workflowOutput, jobSummary, finalResult, externalDiffExecuted };
+  return {
+    ...result,
+    workflowOutput,
+    jobSummary,
+    finalResult,
+    externalDiffExecuted,
+    textconvExecuted,
+  };
 }
 
 test("summary marker round-trips only normalized carry-forward fields", () => {
@@ -882,15 +901,17 @@ test("summary mode keeps the strongest severity for a current finding matching a
   assert.equal(decodeSummaryMarker(result.stdout).findings[0].severity, "High");
 });
 
-test("summary mode retires an omitted changed inline finding when writes are enabled", () => {
+test("summary mode uses intrinsic diff spans to retire omitted changed evidence", () => {
   const prior = finding({ suggestion: null });
   const result = runPosterWithHistory({
     mode: "summary",
     changedOpenFinding: prior,
+    textconv: true,
     writesEnabled: true,
   });
 
   assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
+  assert.equal(result.textconvExecuted, false);
   assert.match(result.stdout, /\[test\] resolved thread changed-open-thread/);
   assert.match(result.stdout, /summary comment skipped/);
   assert.doesNotMatch(result.stdout, /\[test\] wrote standing summary/);
@@ -901,18 +922,20 @@ test("summary mode retires an omitted changed inline finding when writes are ena
   assert.match(result.workflowOutput, /converged=true/);
 });
 
-test("poster ignores external diff helpers for anchoring and changed-file reconciliation", () => {
+test("poster ignores external diff and textconv helpers for trusted evidence", () => {
   const prior = finding({ suggestion: null });
   const result = runPosterWithHistory({
     mode: "inline",
     currentFindings: [prior],
     coordinateLessChangedDismissedFinding: prior,
     externalDiff: true,
+    textconv: true,
     writesEnabled: true,
   });
 
   assert.equal(result.status, 1, `${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
   assert.equal(result.externalDiffExecuted, false);
+  assert.equal(result.textconvExecuted, false);
   assert.match(result.stdout, /1 finding\(s\): 1 anchored, 0 summary-only, 0 already open/);
   assert.match(result.stdout, /\[test\] hosted mutation review/);
 });
@@ -1917,34 +1940,41 @@ test("paginated inline history carries a page-two blocker and fails on any page 
 });
 test("poster rejects a finding title containing CR or LF while preserving multiline bodies", () => {
   const dir = mkdtempSync(join(tmpdir(), "post-review-title-boundary-"));
-  const findingsFile = join(dir, "findings.json");
-  const metadataFile = join(dir, "metadata.json");
-  const scopeFile = writeReviewScope(dir);
-  writeReviewPublication(metadataFile, scopeFile, metadata());
+  const publicationFile = join(dir, "publication.json");
+  const validPublication = createReviewPublication(
+    metadata(),
+    trustedReviewScope(),
+    [],
+  );
   for (const title of ["Visible title\nInjected continuation", "Visible title\rInjected continuation"]) {
-    writeFileSync(findingsFile, JSON.stringify({ findings: [finding({ title })] }));
+    writeFileSync(publicationFile, JSON.stringify({
+      ...validPublication,
+      findings: [finding({ title })],
+    }));
     const rejected = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
       encoding: "utf8",
       env: {
         ...process.env,
-        FINDINGS_FILE: findingsFile,
-        REVIEW_PUBLICATION_FILE: metadataFile,
+        HEAD_SHA,
+        REVIEW_PUBLICATION_FILE: publicationFile,
         RENDER: "1",
         REVIEW_MODE: "inline",
       },
     });
     assert.notEqual(rejected.status, 0);
-    assert.match(rejected.stderr, /findings artifact is not the requested structured JSON/);
+    assert.match(rejected.stderr, /publication findings/);
   }
-  writeFileSync(findingsFile, JSON.stringify({
-    findings: [finding({ body: "First body line.\nSecond body line." })],
-  }));
+  writeReviewPublication(
+    publicationFile,
+    metadata(),
+    [finding({ body: "First body line.\nSecond body line." })],
+  );
   const accepted = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
     encoding: "utf8",
     env: {
       ...process.env,
-      FINDINGS_FILE: findingsFile,
-      REVIEW_PUBLICATION_FILE: metadataFile,
+      HEAD_SHA,
+      REVIEW_PUBLICATION_FILE: publicationFile,
       RENDER: "1",
       REVIEW_MODE: "inline",
     },
@@ -2025,17 +2055,15 @@ test("gate failure is derived only from merge_state", () => {
 });
 
 test("normal execution requires and validates REVIEW_PUBLICATION_FILE", () => {
-  const dir = mkdtempSync(join(tmpdir(), "post-review-metadata-"));
-  const findingsFile = join(dir, "findings.json");
+  const dir = mkdtempSync(join(tmpdir(), "post-review-publication-"));
   const publicationFile = join(dir, "publication.json");
-  const scopeFile = writeReviewScope(dir);
-  writeFileSync(findingsFile, '{"findings":[]}');
   writeFileSync(publicationFile, JSON.stringify({
-    schema_version: 1,
+    schema_version: 2,
+    findings: [],
     metadata: { ...metadata(), snapshot_immutable: false },
-    scope: JSON.parse(readFileSync(scopeFile, "utf8")),
+    scope: trustedReviewScope(),
   }));
-  const baseEnv = { ...process.env, FINDINGS_FILE: findingsFile, RENDER: "1", REVIEW_MODE: "summary" };
+  const baseEnv = { ...process.env, HEAD_SHA, RENDER: "1", REVIEW_MODE: "summary" };
 
   const missing = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
     encoding: "utf8", env: baseEnv,
@@ -2051,21 +2079,29 @@ test("normal execution requires and validates REVIEW_PUBLICATION_FILE", () => {
   });
   assert.notEqual(invalid.status, 0);
   assert.match(invalid.stderr, /analysis_state must be inconclusive|snapshot_immutable/);
+
+  writeReviewPublication(publicationFile, metadata(), []);
+  const wrongHead = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
+    encoding: "utf8", env: {
+      ...baseEnv,
+      HEAD_SHA: "4".repeat(40),
+      REVIEW_PUBLICATION_FILE: publicationFile,
+    },
+  });
+  assert.notEqual(wrongHead.status, 0);
+  assert.match(wrongHead.stderr, /publication head_sha must match HEAD_SHA/);
 });
 
-test("summary render smoke uses explicit findings and metadata and emits no heuristic language", () => {
+test("summary render smoke uses the authoritative publication and emits no heuristic language", () => {
   const dir = mkdtempSync(join(tmpdir(), "post-review-render-"));
-  const findingsFile = join(dir, "findings.json");
-  const metadataFile = join(dir, "metadata.json");
-  const scopeFile = writeReviewScope(dir);
-  writeFileSync(findingsFile, JSON.stringify({ findings: [finding()] }));
-  writeReviewPublication(metadataFile, scopeFile, metadata());
+  const publicationFile = join(dir, "publication.json");
+  writeReviewPublication(publicationFile, metadata(), [finding()]);
   const rendered = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
     encoding: "utf8",
     env: {
       ...process.env,
-      FINDINGS_FILE: findingsFile,
-      REVIEW_PUBLICATION_FILE: metadataFile,
+      HEAD_SHA,
+      REVIEW_PUBLICATION_FILE: publicationFile,
       RENDER: "1",
       REVIEW_MODE: "summary",
     },
@@ -2078,21 +2114,18 @@ test("summary render smoke uses explicit findings and metadata and emits no heur
 
 test("local render removes current findings from unresolved display and counts", () => {
   const dir = mkdtempSync(join(tmpdir(), "post-review-render-dedup-"));
-  const findingsFile = join(dir, "findings.json");
   const unresolvedFile = join(dir, "unresolved.json");
-  const metadataFile = join(dir, "metadata.json");
-  const scopeFile = writeReviewScope(dir);
+  const publicationFile = join(dir, "publication.json");
   const current = finding();
-  writeFileSync(findingsFile, JSON.stringify({ findings: [current] }));
   writeFileSync(unresolvedFile, JSON.stringify({ findings: [current] }));
-  writeReviewPublication(metadataFile, scopeFile, metadata());
+  writeReviewPublication(publicationFile, metadata(), [current]);
   const rendered = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
     encoding: "utf8",
     env: {
       ...process.env,
-      FINDINGS_FILE: findingsFile,
       UNRESOLVED_FINDINGS_FILE: unresolvedFile,
-      REVIEW_PUBLICATION_FILE: metadataFile,
+      HEAD_SHA,
+      REVIEW_PUBLICATION_FILE: publicationFile,
       RENDER: "1",
       REVIEW_MODE: "inline",
     },
@@ -2106,18 +2139,16 @@ test("local render removes current findings from unresolved display and counts",
 
 test("forged current identity tokens cannot erase a distinct held High finding", () => {
   const dir = mkdtempSync(join(tmpdir(), "post-review-forged-identity-"));
-  const findingsFile = join(dir, "findings.json");
   const unresolvedFile = join(dir, "unresolved.json");
-  const metadataFile = join(dir, "metadata.json");
-  const scopeFile = writeReviewScope(dir);
+  const publicationFile = join(dir, "publication.json");
   const forgedTokens = ["trusted", "held", "marker"];
-  writeFileSync(findingsFile, JSON.stringify({ findings: [finding({
+  const current = finding({
     severity: "Medium",
     title: "Advisory timeout notice",
     body: "A cosmetic message uses neutral wording.",
     suggestion: null,
     identity_tokens: forgedTokens,
-  })] }));
+  });
   writeFileSync(unresolvedFile, JSON.stringify({ findings: [finding({
     severity: "High",
     title: "Authorization bypass remains",
@@ -2125,14 +2156,14 @@ test("forged current identity tokens cannot erase a distinct held High finding",
     suggestion: null,
     identity_tokens: forgedTokens,
   })] }));
-  writeReviewPublication(metadataFile, scopeFile, metadata());
+  writeReviewPublication(publicationFile, metadata(), [current]);
   const rendered = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
     encoding: "utf8",
     env: {
       ...process.env,
-      FINDINGS_FILE: findingsFile,
       UNRESOLVED_FINDINGS_FILE: unresolvedFile,
-      REVIEW_PUBLICATION_FILE: metadataFile,
+      HEAD_SHA,
+      REVIEW_PUBLICATION_FILE: publicationFile,
       RENDER: "1",
       REVIEW_MODE: "inline",
     },
@@ -2148,19 +2179,16 @@ test("forged current identity tokens cannot erase a distinct held High finding",
 
 test("malformed injected identity tokens are stripped before summary rendering", () => {
   const dir = mkdtempSync(join(tmpdir(), "post-review-malformed-identity-"));
-  const findingsFile = join(dir, "findings.json");
-  const metadataFile = join(dir, "metadata.json");
-  const scopeFile = writeReviewScope(dir);
-  writeFileSync(findingsFile, JSON.stringify({ findings: [finding({
+  const publicationFile = join(dir, "publication.json");
+  writeReviewPublication(publicationFile, metadata(), [finding({
     identity_tokens: ["forged", 42],
-  })] }));
-  writeReviewPublication(metadataFile, scopeFile, metadata());
+  })]);
   const rendered = spawnSync(process.execPath, [fileURLToPath(new URL("./post-review.mjs", import.meta.url))], {
     encoding: "utf8",
     env: {
       ...process.env,
-      FINDINGS_FILE: findingsFile,
-      REVIEW_PUBLICATION_FILE: metadataFile,
+      HEAD_SHA,
+      REVIEW_PUBLICATION_FILE: publicationFile,
       RENDER: "1",
       REVIEW_MODE: "summary",
     },
@@ -2177,28 +2205,24 @@ test("runner and poster hard failures still write conservative outputs and a fin
   for (const scenario of ["runner", "poster"]) {
     const dir = mkdtempSync(join(tmpdir(), `post-review-${scenario}-failure-`));
     t.after(() => rmSync(dir, { recursive: true, force: true }));
-    const findingsFile = join(dir, "findings.json");
-    const metadataFile = join(dir, "metadata.json");
-    const scopeFile = writeReviewScope(dir);
+    const publicationFile = join(dir, "publication.json");
     const outputFile = join(dir, "output");
     const resultFile = join(dir, "review-result.json");
     if (scenario === "poster") {
-      writeFileSync(findingsFile, "{not-json");
-      writeReviewPublication(metadataFile, scopeFile, metadata());
+      writeReviewPublication(publicationFile, metadata(), []);
     }
 
     const failed = spawnSync(process.execPath, [script], {
       encoding: "utf8",
       env: {
         ...process.env,
-        FINDINGS_FILE: findingsFile,
-        REVIEW_PUBLICATION_FILE: metadataFile,
+        REVIEW_PUBLICATION_FILE: publicationFile,
         REVIEW_RESULT_FILE: resultFile,
         GITHUB_OUTPUT: outputFile,
         HEAD_SHA,
         BASE_SHA,
         RENDER: "1",
-        REVIEW_MODE: "summary",
+        REVIEW_MODE: scenario === "poster" ? "invalid" : "summary",
       },
     });
     assert.notEqual(failed.status, 0, scenario);

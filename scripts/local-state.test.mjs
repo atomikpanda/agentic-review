@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -44,9 +45,18 @@ function createRepository(t, prefix) {
 
 test("open export uses the latest confirmed inclusive span for conservative retirement", (t) => {
   const repository = createRepository(t, "local-state-");
+  const textconv = join(repository, "empty-textconv");
+  const textconvLog = join(repository, "textconv.log");
+  writeFileSync(textconv, `#!/usr/bin/env bash
+touch "${textconvLog}"
+exit 0
+`);
+  chmodSync(textconv, 0o755);
+  git(repository, "config", "diff.empty.textconv", textconv);
+  writeFileSync(join(repository, ".gitattributes"), "*.txt diff=empty\n");
   const lines = Array.from({ length: 24 }, (_, index) => `line ${index + 1}`);
   writeFileSync(join(repository, "alpha.txt"), `${lines.join("\n")}\n`);
-  git(repository, "add", "alpha.txt");
+  git(repository, "add", ".gitattributes", "alpha.txt");
   git(repository, "commit", "-m", "base");
   const base = git(repository, "rev-parse", "HEAD");
   git(repository, "checkout", "-b", "feature");
@@ -96,6 +106,7 @@ test("open export uses the latest confirmed inclusive span for conservative reti
   const overlapping = run(repository, "export-open");
   assert.equal(overlapping.status, 0, overlapping.stderr);
   assert.deepEqual(JSON.parse(overlapping.stdout), { findings: [] });
+  assert.equal(existsSync(textconvLog), false);
 });
 
 test("inconclusive records retain omitted evidence until a complete overlapping review retires it", (t) => {

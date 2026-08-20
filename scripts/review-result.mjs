@@ -2,10 +2,10 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
-import { sameFinding } from "./lib-findings.mjs";
+import { isValidFinding, sameFinding } from "./lib-findings.mjs";
 
 export const REVIEW_RESULT_SCHEMA_VERSION = 1;
-export const REVIEW_PUBLICATION_SCHEMA_VERSION = 1;
+export const REVIEW_PUBLICATION_SCHEMA_VERSION = 2;
 export const DEFAULT_PASS_DESCRIPTORS = [
   { id: "general", lens: null },
   { id: "correctness", lens: "review/lenses/correctness.md" },
@@ -589,20 +589,24 @@ export function validateRunMetadata(value, trustedScope) {
 export function validateReviewPublication(value) {
   canonicalize(value, "publication");
   requirePlainObject(value, "publication");
-  const expectedKeys = ["metadata", "schema_version", "scope"];
+  const expectedKeys = ["findings", "metadata", "schema_version", "scope"];
   if (!arraysEqual(Object.keys(value).sort(), expectedKeys)) {
     throw new TypeError(`publication must contain exactly ${expectedKeys.join(", ")}`);
   }
   if (value.schema_version !== REVIEW_PUBLICATION_SCHEMA_VERSION) {
     throw new TypeError(`publication schema_version must be ${REVIEW_PUBLICATION_SCHEMA_VERSION}`);
   }
+  if (!Array.isArray(value.findings) || !value.findings.every(isValidFinding)) {
+    throw new TypeError("publication findings must be an array of valid findings");
+  }
   validateRunMetadata(value.metadata, value.scope);
   return value;
 }
 
-export function createReviewPublication(metadata, scope) {
+export function createReviewPublication(metadata, scope, findings) {
   const publication = {
     schema_version: REVIEW_PUBLICATION_SCHEMA_VERSION,
+    findings,
     metadata,
     scope,
   };

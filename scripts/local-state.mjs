@@ -397,6 +397,7 @@ function spanChangedSince(finding, head) {
         "diff",
         "--unified=0",
         "--no-ext-diff",
+        "--no-textconv",
         finding.lastCommit,
         head,
         "--",
