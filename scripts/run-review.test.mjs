@@ -1245,6 +1245,7 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
   const posterCallsFile = join(fixture.directory, "poster-calls.log");
   const outputFile = join(fixture.directory, "poster-output");
   const summaryFile = join(fixture.directory, "poster-summary");
+  const resultFile = join(fixture.directory, "poster-result.json");
   const preloadFile = join(fixture.directory, "fake-github.mjs");
   writeFileSync(preloadFile, `
 import { appendFileSync } from "node:fs";
@@ -1295,6 +1296,7 @@ globalThis.fetch = async (url, options = {}) => {
       BLOCK_SEVERITIES: "Critical,High",
       GITHUB_OUTPUT: outputFile,
       GITHUB_STEP_SUMMARY: summaryFile,
+      REVIEW_RESULT_FILE: resultFile,
     },
   });
   assert.equal(posterResult.status, 1, posterResult.stderr);
@@ -1315,6 +1317,7 @@ globalThis.fetch = async (url, options = {}) => {
   assert.deepEqual(JSON.parse(outputs.current_counts), { Critical: 0, High: 1, Medium: 1 });
   assert.deepEqual(JSON.parse(outputs.unresolved_counts), { Critical: 0, High: 0, Medium: 0 });
   assert.match(readFileSync(summaryFile, "utf8"), /\| Passes \| `3 requested \/ 3 completed` \|/);
+  assert.equal(JSON.parse(readFileSync(resultFile, "utf8")).merge_state, "blocked");
   const githubRequests = readFileSync(githubLogFile, "utf8").trim().split("\n").map(JSON.parse);
   assert.equal(githubRequests.length, 3);
   assert.equal(
