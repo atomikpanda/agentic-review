@@ -98,13 +98,16 @@ function expectedExecutionFailureResult(baseSha, headSha) {
 }
 
 function writeTrustedScopeArtifacts({
+  analysisState = "complete",
   baseSha,
   configurationFingerprint,
   completedPasses,
+  coverage = "bounded",
   headSha,
   metadataFile,
   requestedPasses,
   scopeFile,
+  remainingAnalysis = [],
 }) {
   writeFileSync(scopeFile, `${JSON.stringify({
     base_sha: baseSha,
@@ -120,11 +123,14 @@ function writeTrustedScopeArtifacts({
     { encoding: "utf8" },
   ).trim();
   writeFileSync(metadataFile, `${JSON.stringify({
+    analysis_state: analysisState,
     configuration_fingerprint: configurationFingerprint,
+    coverage,
     passes: {
       requested: requestedPasses,
       completed: completedPasses,
     },
+    remaining_analysis: remainingAnalysis,
     scope_hash: scopeHash,
   })}\n`);
   return scopeHash;
@@ -1125,6 +1131,148 @@ process.exit(29);
     ])),
   );
   assertFinalResultSummary(readFileSync(repairedSummary, "utf8"), emittedResult);
+});
+
+test("workflow failure fallback is bounded by trusted runner analysis", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hosted-result-analysis-boundary-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const trustedPoster = join(directory, "scripts", "post-review.mjs");
+  const scopeFile = join(directory, "review-scope.json");
+  const metadataFile = join(directory, "review-meta.json");
+  mkdirSync(dirname(trustedPoster), { recursive: true });
+  writeFileSync(trustedPoster, `
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.REVIEW_RESULT_FILE, process.env.EMITTED_RESULT);
+process.exit(41);
+`);
+
+  const baseSha = "1111111111111111111111111111111111111111";
+  const headSha = "2222222222222222222222222222222222222222";
+  const configurationFingerprint = "a".repeat(64);
+  const requestedPasses = ["general", "correctness", "boundaries"];
+  const expectedResult = expectedExecutionFailureResult(baseSha, headSha);
+  const env = {
+    ...process.env,
+    TARGET_ELIGIBLE: "true",
+    PR_NUMBER: "7",
+    GITHUB_REPO: "example/repository",
+    HEAD_SHA: headSha,
+    BASE_SHA: baseSha,
+    TRUSTED_DATA_ROOT: directory,
+    REVIEW_POSTER: trustedPoster,
+    REVIEW_SCOPE_FILE: scopeFile,
+    REVIEW_METADATA_FILE: metadataFile,
+    REVIEW_MODE: "summary",
+    POST_COMMENT: "false",
+    SUPPRESS_WRITES: "true",
+    RESOLVE_STALE: "false",
+    MAX_FINDINGS: "20",
+    FAIL_ON_FINDINGS: "false",
+    BLOCK_SEVERITIES: "Critical,High",
+  };
+  const incompleteRuns = [
+    ["truncated diff", ["diff_truncated"]],
+    ["finding cap", ["finding_cap_reached"]],
+    ["mutable snapshot", ["snapshot_mutable"]],
+    ["vote threshold", ["vote_threshold_applied"]],
+    ["merge failure", ["merge_failed"]],
+  ];
+
+  for (const [name, remainingAnalysis] of incompleteRuns) {
+    const trustedScopeHash = writeTrustedScopeArtifacts({
+      analysisState: "inconclusive",
+      baseSha,
+      configurationFingerprint,
+      completedPasses: requestedPasses,
+      coverage: "unknown",
+      headSha,
+      metadataFile,
+      remainingAnalysis,
+      requestedPasses,
+      scopeFile,
+    });
+    const strongerResult = {
+      ...expectedResult,
+      analysis_state: "complete",
+      configuration_fingerprint: configurationFingerprint,
+      passes_requested: requestedPasses.length,
+      passes_completed: requestedPasses.length,
+      sample_state: "clean",
+      bounded_converged: true,
+      coverage: "bounded",
+      remaining_analysis: [],
+      scope_hash: trustedScopeHash,
+      converged: true,
+    };
+    const suffix = name.replaceAll(" ", "-");
+    const outputFile = join(directory, `${suffix}-output`);
+    const resultFile = join(directory, `${suffix}-result.json`);
+    const summaryFile = join(directory, `${suffix}-summary`);
+    const finalized = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+      cwd: directory,
+      encoding: "utf8",
+      env: {
+        ...env,
+        GITHUB_OUTPUT: outputFile,
+        REVIEW_RESULT_FILE: resultFile,
+        GITHUB_STEP_SUMMARY: summaryFile,
+        EMITTED_RESULT: `${JSON.stringify(strongerResult, null, 2)}\n`,
+      },
+    });
+
+    assert.equal(finalized.status, 41, finalized.stderr);
+    assert.match(finalized.stderr, /must not strengthen trusted review metadata/);
+    assert.deepEqual(JSON.parse(readFileSync(resultFile, "utf8")), expectedResult);
+    assertFinalResultSummary(readFileSync(summaryFile, "utf8"), expectedResult);
+  }
+
+  const trustedScopeHash = writeTrustedScopeArtifacts({
+    baseSha,
+    configurationFingerprint,
+    completedPasses: requestedPasses,
+    headSha,
+    metadataFile,
+    requestedPasses,
+    scopeFile,
+  });
+  const reconciledResult = {
+    ...expectedResult,
+    analysis_state: "complete",
+    merge_state: "blocked",
+    sample_state: "findings",
+    configuration_fingerprint: configurationFingerprint,
+    passes_requested: requestedPasses.length,
+    passes_completed: requestedPasses.length,
+    unresolved_counts: { Critical: 0, High: 1, Medium: 0 },
+    scope_hash: trustedScopeHash,
+    remaining_analysis: ["reconciliation_unknown"],
+  };
+  const reconciledResultText = `${JSON.stringify(reconciledResult, null, 2)}\n`;
+  const reconciledOutput = join(directory, "reconciled-output");
+  const reconciledResultFile = join(directory, "reconciled-result.json");
+  const reconciledSummary = join(directory, "reconciled-summary");
+  const finalized = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...env,
+      GITHUB_OUTPUT: reconciledOutput,
+      REVIEW_RESULT_FILE: reconciledResultFile,
+      GITHUB_STEP_SUMMARY: reconciledSummary,
+      EMITTED_RESULT: reconciledResultText,
+    },
+  });
+
+  assert.equal(finalized.status, 41, finalized.stderr);
+  assert.equal(readFileSync(reconciledResultFile, "utf8"), reconciledResultText);
+  assert.deepEqual(
+    envFileValues(reconciledOutput),
+    Object.fromEntries(Object.entries(reconciledResult).map(([name, value]) => [
+      name,
+      typeof value === "object" ? JSON.stringify(value) : String(value),
+    ])),
+  );
+  assertFinalResultSummary(readFileSync(reconciledSummary, "utf8"), reconciledResult);
 });
 
 test("workflow boundary rejects a valid poster result for another trusted scope", (t) => {

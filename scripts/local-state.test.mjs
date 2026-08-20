@@ -365,6 +365,30 @@ test("an abandoned stale-lock reaper does not permanently block mutations", (t) 
   assert.equal(existsSync(lockDirectory), false);
 });
 
+test("an aged empty legacy reaper marker does not permanently block mutations", (t) => {
+  const repository = createRepository(t, "local-state-empty-reaper-");
+  const stateDirectory = join(repository, ".git", "agentic-review");
+  const lockDirectory = join(stateDirectory, "state.lock");
+  mkdirSync(lockDirectory, { recursive: true });
+  writeFileSync(join(stateDirectory, "state.json"), JSON.stringify({ findings: [] }));
+  writeFileSync(join(lockDirectory, "owner.json"), JSON.stringify({
+    pid: 2_147_483_647,
+    token: "abandoned-lock",
+    processIdentity: "linux:abandoned-lock",
+  }));
+  const emptyReaper = join(lockDirectory, "reaper");
+  writeFileSync(emptyReaper, "");
+  utimesSync(emptyReaper, new Date(0), new Date(0));
+
+  const mutation = spawnSync(process.execPath, [localState, "dismiss", "missing"], {
+    cwd: repository,
+    encoding: "utf8",
+    timeout: 1_000,
+  });
+  assert.equal(mutation.status, 0, mutation.error?.message ?? mutation.stderr);
+  assert.equal(existsSync(lockDirectory), false);
+});
+
 test("a live stale-lock reaper is not displaced by another mutation", (t) => {
   const repository = createRepository(t, "local-state-live-reaper-");
   const stateDirectory = join(repository, ".git", "agentic-review");
@@ -389,8 +413,8 @@ test("a live stale-lock reaper is not displaced by another mutation", (t) => {
   assert.equal(readFileSync(join(lockDirectory, "reaper"), "utf8"), liveReaper);
 });
 
-test("a young legacy reaper marker is not displaced", (t) => {
-  const repository = createRepository(t, "local-state-young-legacy-reaper-");
+test("a young empty legacy reaper marker is not displaced", (t) => {
+  const repository = createRepository(t, "local-state-young-empty-reaper-");
   const stateDirectory = join(repository, ".git", "agentic-review");
   const lockDirectory = join(stateDirectory, "state.lock");
   mkdirSync(lockDirectory, { recursive: true });
@@ -400,8 +424,8 @@ test("a young legacy reaper marker is not displaced", (t) => {
     token: "abandoned-lock",
     processIdentity: "linux:abandoned-lock",
   }));
-  const legacyReaper = "legacy-live-reaper";
-  writeFileSync(join(lockDirectory, "reaper"), legacyReaper);
+  const emptyReaper = join(lockDirectory, "reaper");
+  writeFileSync(emptyReaper, "");
 
   const mutation = spawnSync(process.execPath, [localState, "dismiss", "missing"], {
     cwd: repository,
@@ -410,7 +434,7 @@ test("a young legacy reaper marker is not displaced", (t) => {
   });
   assert.equal(mutation.status, null);
   assert.equal(mutation.error?.code, "ETIMEDOUT");
-  assert.equal(readFileSync(join(lockDirectory, "reaper"), "utf8"), legacyReaper);
+  assert.equal(readFileSync(emptyReaper, "utf8"), "");
 });
 
 test("runs with equal timestamps retain immutable history and list newest first", (t) => {

@@ -89,7 +89,7 @@ function readStateLockReaper() {
     try {
       return parseProcessOwner(marker);
     } catch (error) {
-      if (error instanceof SyntaxError && marker.length > 0) return { token: marker };
+      if (error instanceof SyntaxError) return { token: marker };
       throw error;
     }
   } catch (error) {

@@ -940,6 +940,9 @@ jobs:
           );
           const trustedPassesRequested = Number(process.env.TRUSTED_PASSES_REQUESTED ?? "0");
           const trustedPassesCompleted = Number(process.env.TRUSTED_PASSES_COMPLETED ?? "0");
+          const trustedAnalysisState = process.env.TRUSTED_ANALYSIS_STATE ?? "";
+          const trustedCoverage = process.env.TRUSTED_COVERAGE ?? "";
+          const trustedRemainingAnalysisText = process.env.TRUSTED_REMAINING_ANALYSIS ?? "";
           const conservativeResult = {
             analysis_state: "inconclusive",
             merge_state: "ready",
@@ -999,6 +1002,23 @@ jobs:
             "execution_failed",
           ];
           const remainingAnalysisReasonSet = new Set(remainingAnalysisReasons);
+          let trustedRemainingAnalysis = null;
+          try {
+            const parsed = JSON.parse(trustedRemainingAnalysisText);
+            if (
+              Array.isArray(parsed)
+              && parsed.every((reason) => remainingAnalysisReasonSet.has(reason))
+              && new Set(parsed).size === parsed.length
+            ) {
+              trustedRemainingAnalysis = parsed;
+            }
+          } catch {
+            // Invalid trusted evidence makes every poster candidate unpreservable.
+          }
+          const posterOwnedRemainingAnalysisReasons = new Set([
+            "reconciliation_unknown",
+            "execution_failed",
+          ]);
 
           function validateFinalResult(candidate) {
             if (
@@ -1126,6 +1146,28 @@ jobs:
               throw new TypeError(
                 "remaining_analysis must contain unique canonical ordered reason strings",
               );
+            }
+            if (
+              !stateValues.analysis_state.has(trustedAnalysisState)
+              || !stateValues.coverage.has(trustedCoverage)
+              || trustedRemainingAnalysis === null
+            ) {
+              throw new TypeError("trusted review analysis metadata is unavailable");
+            }
+            if (
+              (candidate.analysis_state === "complete" && trustedAnalysisState !== "complete")
+              || (candidate.coverage === "bounded" && trustedCoverage !== "bounded")
+              || trustedRemainingAnalysis.some(
+                (reason) => !candidate.remaining_analysis.includes(reason),
+              )
+              || candidate.remaining_analysis.some(
+                (reason) => (
+                  !trustedRemainingAnalysis.includes(reason)
+                  && !posterOwnedRemainingAnalysisReasons.has(reason)
+                ),
+              )
+            ) {
+              throw new TypeError("final result must not strengthen trusted review metadata");
             }
             if (
               candidate.analysis_state === "complete"
@@ -1272,6 +1314,9 @@ jobs:
           export TRUSTED_CONFIGURATION_FINGERPRINT=""
           export TRUSTED_PASSES_REQUESTED=0
           export TRUSTED_PASSES_COMPLETED=0
+          export TRUSTED_ANALYSIS_STATE=""
+          export TRUSTED_COVERAGE=""
+          export TRUSTED_REMAINING_ANALYSIS=""
 
           poster_configured=true
           for name in REVIEW_MODE POST_COMMENT SUPPRESS_WRITES RESOLVE_STALE \
@@ -1299,10 +1344,11 @@ jobs:
             exit 1
           fi
 
-          # Snapshot runner-produced identity and pass evidence before the poster
-          # runs. The trusted runner derived scope_hash from REVIEW_SCOPE_FILE
-          # and validated the two sidecars together. Reusing the metadata avoids
-          # importing the review module or duplicating its canonical contracts.
+          # Snapshot runner-produced identity, pass, and bounded-analysis
+          # evidence before the poster runs. The trusted runner derived these
+          # fields from REVIEW_SCOPE_FILE and validated the two sidecars
+          # together. Reusing the metadata avoids importing the review module
+          # or duplicating its canonical contracts.
           trusted_metadata_snapshot=""
           if [ -s "${REVIEW_SCOPE_FILE:-}" ] && [ -s "${REVIEW_METADATA_FILE:-}" ]; then
             if trusted_metadata_snapshot="$(
@@ -1321,6 +1367,12 @@ jobs:
               || Array.isArray(trustedMetadata.passes)
               || !Array.isArray(trustedMetadata.passes.requested)
               || !Array.isArray(trustedMetadata.passes.completed)
+              || !["complete", "inconclusive"].includes(trustedMetadata.analysis_state)
+              || !["bounded", "unknown"].includes(trustedMetadata.coverage)
+              || !Array.isArray(trustedMetadata.remaining_analysis)
+              || trustedMetadata.remaining_analysis.some(
+                (reason) => typeof reason !== "string",
+              )
             ) {
               process.exitCode = 1;
             } else {
@@ -1329,6 +1381,9 @@ jobs:
                 trustedMetadata.configuration_fingerprint,
                 trustedMetadata.passes.requested.length,
                 trustedMetadata.passes.completed.length,
+                trustedMetadata.analysis_state,
+                trustedMetadata.coverage,
+                JSON.stringify(trustedMetadata.remaining_analysis),
               ].join("\t"));
             }
           } catch {
@@ -1340,13 +1395,19 @@ jobs:
                 TRUSTED_SCOPE_HASH \
                 TRUSTED_CONFIGURATION_FINGERPRINT \
                 TRUSTED_PASSES_REQUESTED \
-                TRUSTED_PASSES_COMPLETED <<< "$trusted_metadata_snapshot"
+                TRUSTED_PASSES_COMPLETED \
+                TRUSTED_ANALYSIS_STATE \
+                TRUSTED_COVERAGE \
+                TRUSTED_REMAINING_ANALYSIS <<< "$trusted_metadata_snapshot"
               export TRUSTED_SCOPE_HASH
               export TRUSTED_CONFIGURATION_FINGERPRINT
               export TRUSTED_PASSES_REQUESTED
               export TRUSTED_PASSES_COMPLETED
+              export TRUSTED_ANALYSIS_STATE
+              export TRUSTED_COVERAGE
+              export TRUSTED_REMAINING_ANALYSIS
             else
-              echo "::warning::trusted review metadata has invalid identity or pass evidence"
+              echo "::warning::trusted review metadata has invalid identity, pass, or analysis evidence"
             fi
           fi
 
