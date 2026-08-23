@@ -470,6 +470,12 @@ if (cmd === "record") {
         known.severity = f.severity ?? known.severity;
         known.line = f.start_line ?? known.line;
         known.endLine = f.end_line ?? f.start_line ?? known.endLine;
+        // Basis only upgrades: a finding once traced or observed does not
+        // decay to inferred because a later sample omitted the field.
+        if (
+          known.evidenceKind !== "observed"
+          && (f.evidence_kind === "observed" || f.evidence_kind === "static-proof")
+        ) known.evidenceKind = f.evidence_kind;
         known.lastCommit = head;
         known.stagedTarget = Boolean(stagedTarget);
         if (known.status === "dismissed") { muted++; continue; }

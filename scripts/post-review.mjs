@@ -615,10 +615,10 @@ export function buildReviewComments(findings, ranges, { mode = REVIEW_MODE } = {
   }
   return { comments, unanchored };
 }
-
 // Severity vocabulary. P0/P1/P2 keeps existing inline comment presentation.
 const PRIORITY = { Critical: "P0", High: "P1", Medium: "P2" };
 const badge = (sev) => `\`${PRIORITY[sev] ?? "P2"}\` ${sev}`;
+
 
 // Issue #4: a finding that asserts runtime behaviour it did not observe is a
 // hypothesis however confident its prose — on this project's own PRs, every
@@ -628,6 +628,11 @@ const badge = (sev) => `\`${PRIORITY[sev] ?? "P2"}\` ${sev}`;
 // acts on it, not buried in metadata.
 const EVIDENCE_NOTE =
   "_Unverified: inferred from reading code, not confirmed against a running system._";
+// The note is our own boilerplate, not the model's description of the defect.
+// It must stay out of fuzzy-match tokens: its significant words dilute
+// Jaccard scores enough to push reworded duplicates below threshold and spawn
+// duplicate threads.
+const stripEvidenceNote = (text) => String(text ?? "").split(EVIDENCE_NOTE).join("");
 function evidenceNote(finding) {
   return finding.evidence_kind === "observed" || finding.evidence_kind === "static-proof"
     ? null
@@ -1120,7 +1125,7 @@ export async function fetchOurThreads({
           startLine: Number.isInteger(startLine) && startLine > 0 ? startLine : null,
           endLine: Number.isInteger(endLine) && endLine > 0 ? endLine : null,
           retired: RETIRED_RE.test(comment?.body ?? ""),
-          tokens: tokenSet(comment?.body ?? ""),
+          tokens: tokenSet(stripEvidenceNote(comment?.body ?? "")),
         });
       }
     }
@@ -1198,6 +1203,10 @@ export function findingFromThread(thread) {
     title: match[2],
     body: thread.body,
     suggestion: null,
+
+    // Identity from the note-free prose: the rendered comment carries our
+    // unverified boilerplate, which must not dilute future fuzzy matches.
+    identity_tokens: [...tokenSet(`${match[2]} ${stripEvidenceNote(thread.body)}`)],
 
     // A strong kind survives in the comment's stamp; anything else was posted
     // without a stated basis and stays inferred.
