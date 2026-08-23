@@ -470,6 +470,12 @@ if (cmd === "record") {
         known.severity = f.severity ?? known.severity;
         known.line = f.start_line ?? known.line;
         known.endLine = f.end_line ?? f.start_line ?? known.endLine;
+        // Basis only upgrades: a finding once traced or observed does not
+        // decay to inferred because a later sample omitted the field.
+        if (
+          known.evidenceKind !== "observed"
+          && (f.evidence_kind === "observed" || f.evidence_kind === "static-proof")
+        ) known.evidenceKind = f.evidence_kind;
         known.lastCommit = head;
         known.stagedTarget = Boolean(stagedTarget);
         if (known.status === "dismissed") { muted++; continue; }
@@ -482,6 +488,9 @@ if (cmd === "record") {
         seen.add(id);
         state.findings.push({
           id, file: f.file, title: f.title, body: f.body, severity: f.severity,
+          evidenceKind: f.evidence_kind === "observed" || f.evidence_kind === "static-proof"
+            ? f.evidence_kind
+            : "inferred",
           line: f.start_line, endLine: f.end_line ?? f.start_line, status: "open",
           firstSeen: now, lastSeen: now, firstCommit: head, lastCommit: head,
           stagedTarget: Boolean(stagedTarget), count: 1,
@@ -545,6 +554,7 @@ if (cmd === "export-open") {
       start_line: finding.line,
       end_line: finding.endLine,
       suggestion: null,
+      evidence_kind: finding.evidenceKind ?? "inferred",
     }));
   process.stdout.write(`${JSON.stringify({ findings })}\n`);
   process.exit(0);

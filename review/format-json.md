@@ -16,6 +16,7 @@ Otherwise:
           "severity": "Critical",
           "title": "One line, no trailing period",
           "body": "What breaks: the input or condition, and the wrong behaviour that results. Markdown is allowed here.",
+          "evidence_kind": "static-proof",
           "suggestion": "    the exact replacement text for lines 42-44\n    including every line\n"
         }
       ]
@@ -56,6 +57,22 @@ for `start_line` through `end_line` inclusive**:
   because the fix spans several files, needs a judgement call, or is "delete
   this and rethink it". A comment with no suggestion is a good outcome. A
   wrong suggestion is not: someone will click the button.
+
+`evidence_kind` states what you actually saw, and it is rendered for the
+reader:
+
+- `observed` — you confirmed the claim against state visible in this checkout
+  or the diff itself: a file's actual contents, an actual configuration value,
+  code you read on both sides of the contradiction.
+- `static-proof` — a complete trace from the diff to the failure, every step
+  of which is code you read; name that trace in `body`.
+- `inferred` — anything else. This includes **every** claim about how a
+  running system behaves — endpoints existing, headers present, status codes
+  returned — because you cannot execute anything. Guessing from priors is
+  `inferred`, and findings labelled `inferred` are shown to readers as
+  unverified.
+
+Omitting the field has the same effect as `inferred`.
 
 `severity` is one of `Critical`, `High`, `Medium`. Same bar as before — report
 only defects you verified by reading the relevant files, and state the concrete

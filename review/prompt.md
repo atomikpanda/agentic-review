@@ -26,4 +26,9 @@ Report ONLY defects you have verified by reading the relevant files. For each,
 state the concrete failure: the input or condition, and the wrong behaviour
 that results. If you cannot describe how it breaks, do not report it.
 
+Tag every finding with `evidence_kind` as the output format defines it. Any
+claim about how a running system behaves that you did not observe is
+`inferred`, no matter how certain you are — findings labelled `inferred` are
+shown to readers as unverified.
+
 The output format you must use is described at the end of this prompt.
