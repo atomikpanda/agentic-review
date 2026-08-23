@@ -1266,6 +1266,7 @@ function collapsedCommentBody(thread, head) {
   // The replacement stamp must repeat the evidence kind, or a strong finding
   // decays to unverified the moment its comment is folded for size.
   const evidenceKind = thread.evidenceKind ?? readStamp(thread.body)?.evidenceKind;
+  const collapseNote = evidenceNote({ evidence_kind: evidenceKind });
   const fp = readStamp(thread.body)?.fingerprint
     ?? (/^[0-9a-f]{16}$/.test(thread.fp ?? "") ? thread.fp : null);
   if (!fp) throw new RangeError("oversized stale comment has no authoritative identity marker");
@@ -1273,6 +1274,7 @@ function collapsedCommentBody(thread, head) {
   const original = fitUtf8Bytes(firstLine, COLLAPSED_ORIGINAL_LINE_MAX_BYTES, "…");
   const details =
     `<details><summary>Original finding</summary>\n\n${original}\n\n` +
+    (collapseNote ? `${collapseNote}\n\n` : "") +
     `_Original finding prose omitted to satisfy GitHub's PATCH byte limit._\n\n</details>` +
     stamp(fp, evidenceKind);
   const noteBudget = GITHUB_COMMENT_MAX_BYTES - Buffer.byteLength(details) - 2;
@@ -1526,10 +1528,17 @@ const EVIDENCE_RANK = { observed: 2, "static-proof": 1 };
 
 function preferredHistoricalFinding(left, right) {
   const severityDifference = SEVERITY_ORDER[left.severity] - SEVERITY_ORDER[right.severity];
-  if (severityDifference !== 0) return severityDifference < 0 ? left : right;
-  // A strong basis must not lose to a lexical tiebreak, or a verified
-  // finding decays to unverified when summary-held and inline-held
-  // histories describe the same defect.
+  if (severityDifference !== 0) {
+    // Severity decides which record survives, but a losing record's stronger
+    // basis must not be discarded along with it.
+    const winner = severityDifference < 0 ? left : right;
+    const loser = winner === left ? right : left;
+    if ((EVIDENCE_RANK[winner.evidence_kind] ?? 0) < (EVIDENCE_RANK[loser.evidence_kind] ?? 0)) {
+      return { ...winner, evidence_kind: loser.evidence_kind };
+    }
+    return winner;
+  }
+  // Equal severity: prefer the stronger basis before the lexical fallback.
   const evidenceDifference = (EVIDENCE_RANK[left.evidence_kind] ?? 0)
     - (EVIDENCE_RANK[right.evidence_kind] ?? 0);
   if (evidenceDifference !== 0) return evidenceDifference > 0 ? left : right;
