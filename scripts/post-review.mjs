@@ -1201,7 +1201,9 @@ export function findingFromThread(thread) {
     end_line: thread.endLine,
     severity: match[1],
     title: match[2],
-    body: thread.body,
+    // Strip our own unverified boilerplate: held findings are re-rendered
+    // through evidenceNote, and keeping the note here would duplicate it.
+    body: stripEvidenceNote(thread.body),
     suggestion: null,
 
     // Identity from the note-free prose: the rendered comment carries our
