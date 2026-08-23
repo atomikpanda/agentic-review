@@ -2845,3 +2845,59 @@ test("poster failure downgrades a reconciled clean sample to unknown", () => {
   assert.deepEqual(JSON.parse(outputs.unresolved_counts), { Critical: 0, High: 0, Medium: 0 });
   assert.equal(result.finalResult.sample_state, "unknown");
 });
+
+test("inferred findings carry an unverified note in inline and summary rendering", () => {
+  const ranges = new Map([["src/cache.mjs", [[20, 22]]]]);
+  for (const mode of ["inline", "suggest"]) {
+    const inferred = poster.buildReviewComments(
+      [finding({ evidence_kind: "inferred" })],
+      ranges,
+      { mode },
+    );
+    assert.equal(inferred.comments.length, 1);
+    assert.match(
+      inferred.comments[0].body,
+      /_Unverified: inferred from reading code, not confirmed against a running system\._/,
+    );
+  }
+
+  const observed = poster.buildReviewComments(
+    [finding({ evidence_kind: "observed" })],
+    ranges,
+    { mode: "inline" },
+  );
+  assert.doesNotMatch(observed.comments[0].body, /Unverified/);
+
+  const untagged = poster.buildReviewComments([finding()], ranges, { mode: "inline" });
+  assert.doesNotMatch(untagged.comments[0].body, /Unverified/);
+
+  const summary = renderReviewBody({
+    mode: "summary",
+    metadata: metadata(),
+    state: state(),
+    current: [finding({ evidence_kind: "inferred", suggestion: null })],
+    unresolved: [],
+  });
+  assert.match(summary, /Unverified: inferred from reading code/);
+});
+
+test("a static-proof finding renders without the unverified note in summary", () => {
+  const summary = renderReviewBody({
+    mode: "summary",
+    metadata: metadata(),
+    state: state(),
+    current: [finding({ evidence_kind: "static-proof", suggestion: null })],
+    unresolved: [],
+  });
+  assert.doesNotMatch(summary, /Unverified/);
+});
+
+test("the structured publication preserves evidence_kind through validation", () => {
+  const publication = createReviewPublication(
+    { ...metadata(), analysis_state: "complete" },
+    trustedReviewScope(),
+    [finding({ evidence_kind: "static-proof", suggestion: null })],
+  );
+  const parsed = JSON.parse(JSON.stringify(publication));
+  assert.equal(parsed.findings[0].evidence_kind, "static-proof");
+});

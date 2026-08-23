@@ -25,6 +25,13 @@ export const SIMILARITY_DEFAULT = 0.20;
 
 const FINDING_SEVERITIES = new Set(["Critical", "High", "Medium"]);
 const VERIFICATION_ID_RE = /^K[1-9][0-9]*$/;
+// Epistemic basis of a finding (issue #4). Models state concrete claims —
+// "this endpoint does not exist", "this header is missing" — with equal
+// confidence whether they traced the code or guessed from priors, and on this
+// project's own PRs every such guess failed a one-line check against reality.
+// The kind is declared by the model per finding so downstream rendering can
+// mark hypotheses as hypotheses instead of trusting prose confidence.
+export const EVIDENCE_KINDS = new Set(["observed", "static-proof", "inferred"]);
 
 export function isValidFinding(value) {
   return value !== null
@@ -53,6 +60,7 @@ export function isValidFinding(value) {
         && VERIFICATION_ID_RE.test(value.verification_of)
         && value.verification_classification === "linked_regression"
     )
+    && (value.evidence_kind === undefined || EVIDENCE_KINDS.has(value.evidence_kind))
     && (typeof value.suggestion === "string" || value.suggestion === null);
 }
 
@@ -65,6 +73,7 @@ export function projectPublicFinding(value) {
     file: value.file,
     start_line: value.start_line,
     end_line: value.end_line,
+    ...(value.evidence_kind === undefined ? {} : { evidence_kind: value.evidence_kind }),
     suggestion: value.suggestion,
     ...(value.verification_id === undefined
       ? {}

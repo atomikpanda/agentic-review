@@ -137,7 +137,7 @@ human reviewer, not a wall of prose at the bottom of the PR.
 This is a different mechanism, not a different format. A suggestion has to be
 an inline review comment attached to a line range **inside the pull request's
 diff**, so the agent emits structured findings (`file`, `start_line`,
-`end_line`, `suggestion`) rather than markdown, and
+`end_line`, `suggestion`, `evidence_kind`) rather than markdown, and
 [`scripts/post-review.mjs`](scripts/post-review.mjs) turns them into one
 `POST /pulls/{n}/reviews` call.
 
@@ -155,6 +155,18 @@ Three things that mechanism forces, all handled:
   perfectly good outcome.
 - **The review is never lost.** If the inline post is rejected anyway, it falls
   back to posting everything as a summary rather than failing silently.
+
+### Evidence basis
+
+Each finding also carries an `evidence_kind` from the agent: `observed`
+(confirmed against state visible in the checkout or diff), `static-proof` (a
+complete named trace from the diff to the failure), or `inferred` (everything
+else). Findings labelled `inferred` are shown with an explicit
+_unverified_ note rather than trusted on prose confidence — on this project's
+own pull requests, every confidently-stated claim about live runtime behaviour
+failed a one-line check against the running system, while structural
+contradictions held. When repeated passes merge into one finding, the strongest
+basis any pass claimed wins.
 
 ## Bounded ensemble and result states
 

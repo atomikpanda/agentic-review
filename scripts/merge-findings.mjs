@@ -101,9 +101,16 @@ function mergeVariant(target, candidate) {
       || (Number(left.end_line) || 0) - (Number(right.end_line) || 0))[0];
   const fix = fixSource ? { ...fixSource } : null;
   const representative = compareVariants(candidate, target) < 0 ? candidate : target;
+  // Strongest evidence basis wins. Passes describe the same defect with
+  // different confidence in what they actually saw; where one pass claims to
+  // have observed or traced it, the surviving finding should not inherit a
+  // weaker variant's guess — including via `representative` below.
+  const evidenceKind = [target.evidence_kind, candidate.evidence_kind]
+    .find((kind) => kind === "observed" || kind === "static-proof");
   Object.assign(target, representative);
   if (votes !== undefined) target.votes = votes;
   target.severity = severity;
+  if (evidenceKind) target.evidence_kind = evidenceKind;
   if (fix) {
     target.suggestion = fix.suggestion;
     target.start_line = fix.start_line;

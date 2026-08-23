@@ -525,6 +525,8 @@ function fenceFor(text) {
 
 function commentBody(f, withSuggestion) {
   const parts = [`${badge(f.severity)} — **${f.title}**`, "", f.body];
+  const note = evidenceNote(f);
+  if (note) parts.push("", note);
   if (withSuggestion && typeof f.suggestion === "string" && f.suggestion.length > 0) {
     // Trailing newline is stripped: the block's lines replace the target lines
     // exactly, and an extra blank line at the end inserts one into the file.
@@ -595,6 +597,16 @@ export function buildReviewComments(findings, ranges, { mode = REVIEW_MODE } = {
 // Severity vocabulary. P0/P1/P2 keeps existing inline comment presentation.
 const PRIORITY = { Critical: "P0", High: "P1", Medium: "P2" };
 const badge = (sev) => `\`${PRIORITY[sev] ?? "P2"}\` ${sev}`;
+
+// Issue #4: a finding that asserts runtime behaviour it did not observe is a
+// hypothesis however confident its prose — on this project's own PRs, every
+// such claim failed a one-line check against the running system. The note is
+// attached where a human acts on the finding, not buried in metadata.
+const EVIDENCE_NOTE =
+  "_Unverified: inferred from reading code, not confirmed against a running system._";
+function evidenceNote(finding) {
+  return finding.evidence_kind === "inferred" ? EVIDENCE_NOTE : null;
+}
 
 function formatCounts(counts) {
   return `Critical: ${counts.Critical} · High: ${counts.High} · Medium: ${counts.Medium}`;
@@ -676,6 +688,8 @@ function appendFindings(out, heading, findings, mode) {
       "",
       finding.body,
     );
+    const note = evidenceNote(finding);
+    if (note) out.push("", note);
     if (mode === "suggest" && typeof finding.suggestion === "string" && finding.suggestion.length > 0) {
       const replacement = finding.suggestion.replace(/\n+$/, "");
       const fence = fenceFor(replacement);
