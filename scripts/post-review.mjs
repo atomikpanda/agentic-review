@@ -36,6 +36,7 @@ import { pathToFileURL } from "node:url";
 import { deflateRawSync, inflateRawSync } from "node:zlib";
 
 import {
+  EVIDENCE_KINDS,
   identityTokens,
   isValidFinding,
   projectPublicFinding,
@@ -123,6 +124,9 @@ function normalizeSummaryFinding(value, index) {
   if (typeof value.title !== "string" || !value.title || typeof value.body !== "string" || !value.body) {
     throw new TypeError(`summary findings[${index}] must have a title and body`);
   }
+  if (value.evidence_kind !== undefined && !EVIDENCE_KINDS.has(value.evidence_kind)) {
+    throw new TypeError(`summary findings[${index}].evidence_kind is invalid`);
+  }
   return {
     file,
     start_line: startLine,
@@ -131,6 +135,12 @@ function normalizeSummaryFinding(value, index) {
     title: value.title.slice(0, SUMMARY_TITLE_MAX_CHARS),
     body: HELD_FINDING_BODY,
     identity_tokens: summaryIdentityTokens(value),
+
+    // Normalised to a definite kind so held findings keep their basis across
+    // runs; absence (older prompts, legacy markers) means inferred.
+    evidence_kind: value.evidence_kind === "observed" || value.evidence_kind === "static-proof"
+      ? value.evidence_kind
+      : "inferred",
   };
 }
 
@@ -143,11 +153,14 @@ function encodeSummaryFinding(value, index) {
     SUMMARY_SEVERITIES.indexOf(finding.severity),
     finding.title,
     finding.identity_tokens,
+    finding.evidence_kind,
   ];
 }
 
 function decodeSummaryFinding(value, index) {
-  if (!Array.isArray(value) || value.length !== 6 || !Array.isArray(value[5])) {
+  // Length 6 is a pre-evidence_kind v2 marker; its findings decode as inferred,
+  // which is what they are — carried forward without a stated basis.
+  if (!Array.isArray(value) || !(value.length === 6 || value.length === 7) || !Array.isArray(value[5])) {
     throw new TypeError(`summary findings[${index}] has an invalid compact shape`);
   }
   const severity = SUMMARY_SEVERITIES[value[3]];
@@ -159,8 +172,10 @@ function decodeSummaryFinding(value, index) {
     title: value[4],
     body: HELD_FINDING_BODY,
     identity_tokens: value[5],
+    evidence_kind: value.length === 7 ? value[6] : "inferred",
   }, index);
 }
+
 
 export function encodeSummaryMarker({ headSha, findings, cycle = null, runId = "" }) {
   if (!SHA_RE.test(headSha)) throw new TypeError("summary headSha must be a lowercase 40-character SHA");
@@ -600,12 +615,16 @@ const badge = (sev) => `\`${PRIORITY[sev] ?? "P2"}\` ${sev}`;
 
 // Issue #4: a finding that asserts runtime behaviour it did not observe is a
 // hypothesis however confident its prose — on this project's own PRs, every
-// such claim failed a one-line check against the running system. The note is
-// attached where a human acts on the finding, not buried in metadata.
+// such claim failed a one-line check against the running system. Omission of
+// the field means the same thing (the format says so), so anything short of an
+// explicit observed/static-proof claim is marked unverified where a human
+// acts on it, not buried in metadata.
 const EVIDENCE_NOTE =
   "_Unverified: inferred from reading code, not confirmed against a running system._";
 function evidenceNote(finding) {
-  return finding.evidence_kind === "inferred" ? EVIDENCE_NOTE : null;
+  return finding.evidence_kind === "observed" || finding.evidence_kind === "static-proof"
+    ? null
+    : EVIDENCE_NOTE;
 }
 
 function formatCounts(counts) {
@@ -749,7 +768,9 @@ function boundedCommentBody(finding, withSuggestion) {
   }
   const ending = "\n\n_Comment truncated; complete finding remains in the structured artifact._"
     + stamp(fingerprint(finding));
-  const visible = `${badge(finding.severity)} — **${finding.title}**\n\n${finding.body}`;
+  const note = evidenceNote(finding);
+  const visible = `${badge(finding.severity)} — **${finding.title}**\n\n${finding.body}`
+    + (note ? `\n\n${note}` : "");
   return fitUtf8Bytes(visible, GITHUB_COMMENT_MAX_BYTES, ending);
 }
 
@@ -761,7 +782,8 @@ function compactFindingLine(label, finding) {
     : "";
   const path = fitUtf8Bytes(String(finding.file ?? "").replace(/^\.\//, ""), 512, "…");
   const title = fitUtf8Bytes(String(finding.title ?? "").trim(), 512, "…");
-  return `- ${label} ${badge(finding.severity)} — **${title}** (\`${path}${span}\`)`;
+  return `- ${label} ${badge(finding.severity)} — **${title}** (\`${path}${span}\`)`
+    + (evidenceNote(finding) ? " · _unverified_" : "");
 }
 
 export function buildReviewTopBody({

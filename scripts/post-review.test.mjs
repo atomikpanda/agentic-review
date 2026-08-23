@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { deflateRawSync, inflateRawSync } from "node:zlib";
 import test from "node:test";
 
 import {
@@ -435,6 +436,7 @@ test("summary marker round-trips only normalized carry-forward fields", () => {
       title: "Cache entry survives invalidation",
       body: "Previously reported finding remains held from an earlier review sample.",
       identity_tokens: ["cache", "entry", "survives", "invalidation", "stale", "returned"],
+      evidence_kind: "inferred",
     }],
   });
   assert.ok(!marker.includes("replacement"));
@@ -2868,8 +2870,10 @@ test("inferred findings carry an unverified note in inline and summary rendering
   );
   assert.doesNotMatch(observed.comments[0].body, /Unverified/);
 
+  // Omission of evidence_kind means inferred (the format says so), so an
+  // untagged finding is rendered unverified exactly like a tagged one.
   const untagged = poster.buildReviewComments([finding()], ranges, { mode: "inline" });
-  assert.doesNotMatch(untagged.comments[0].body, /Unverified/);
+  assert.match(untagged.comments[0].body, /Unverified/);
 
   const summary = renderReviewBody({
     mode: "summary",
@@ -2891,6 +2895,43 @@ test("a static-proof finding renders without the unverified note in summary", ()
   });
   assert.doesNotMatch(summary, /Unverified/);
 });
+test("a pre-evidence_kind v2 marker decodes held findings as inferred", () => {
+  // Take an authentic v2 marker, then strip the seventh tuple element to
+  // simulate one written before evidence_kind existed. Held findings with no
+  // stated basis are unverified by definition: they must decode as inferred
+  // rather than crash or pass silently.
+  const cycle = {
+    schema_version: 1,
+    lineage_base_sha: BASE_SHA,
+    discovery_round: 1,
+    max_discovery_rounds: 2,
+    state: "active",
+    last_phase: "discovery",
+    next_phase: "verification",
+    last_reviewed_head: HEAD_SHA,
+    last_scope_hash: SCOPE_HASH,
+    last_analysis_state: "complete",
+    override: null,
+  };
+  const modern = poster.encodeSummaryMarker({
+    headSha: HEAD_SHA,
+    findings: [finding({ suggestion: null })],
+    cycle,
+  });
+  const [, payload] = modern.match(/^<!-- agentic-review-summary:v2:([A-Za-z0-9_-]+) -->$/);
+  const state = JSON.parse(inflateRawSync(Buffer.from(payload, "base64url")).toString("utf8"));
+  state.f = state.f.map(([file, start, end, severity, title, tokens]) => [
+    file, start, end, severity, title, tokens,
+  ]);
+  const legacy = "<!-- agentic-review-summary:v2:"
+    + deflateRawSync(Buffer.from(JSON.stringify(state))).toString("base64url")
+    + " -->";
+
+  const decoded = decodeSummaryMarker(legacy);
+  assert.equal(decoded.findings.length, 1);
+  assert.equal(decoded.findings[0].evidence_kind, "inferred");
+});
+
 
 test("the structured publication preserves evidence_kind through validation", () => {
   const publication = createReviewPublication(

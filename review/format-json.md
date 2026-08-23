@@ -14,6 +14,7 @@ Otherwise:
           "start_line": 42,
           "end_line": 44,
           "severity": "Critical",
+          "title": "One line, no trailing period",
           "body": "What breaks: the input or condition, and the wrong behaviour that results. Markdown is allowed here.",
           "evidence_kind": "static-proof",
           "suggestion": "    the exact replacement text for lines 42-44\n    including every line\n"

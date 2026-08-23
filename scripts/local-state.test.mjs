@@ -74,6 +74,7 @@ exit 0
     start_line: 8,
     end_line: 10,
     suggestion: null,
+    evidence_kind: "inferred",
   };
   writeFileSync(findingsFile, JSON.stringify({ findings: [finding] }));
   assert.equal(run(repository, "record", findingsFile, base, reportedHead, "complete").status, 0);
@@ -128,6 +129,7 @@ test("inconclusive records retain omitted evidence until a complete overlapping 
     start_line: 2,
     end_line: 2,
     suggestion: null,
+    evidence_kind: "inferred",
   };
   writeFileSync(findingsFile, JSON.stringify({ findings: [finding] }));
   assert.equal(run(repository, "record", findingsFile, base, reportedHead, "complete").status, 0);
@@ -162,6 +164,7 @@ test("malformed current findings fail before local state bytes change", (t) => {
     start_line: 1,
     end_line: 1,
     suggestion: null,
+    evidence_kind: "inferred",
   };
   writeFileSync(findingsFile, JSON.stringify({ findings: [valid] }));
   assert.equal(run(repository, "record", findingsFile, head, head, "complete").status, 0);
@@ -348,6 +351,7 @@ test("legacy state defaults the end span and latest commit without mutating on e
     start_line: 1,
     end_line: 1,
     suggestion: null,
+    evidence_kind: "inferred",
   }] });
   assert.equal(readFileSync(stateFile, "utf8"), legacy);
 });
