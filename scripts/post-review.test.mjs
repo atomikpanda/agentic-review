@@ -2942,3 +2942,42 @@ test("the structured publication preserves evidence_kind through validation", ()
   const parsed = JSON.parse(JSON.stringify(publication));
   assert.equal(parsed.findings[0].evidence_kind, "static-proof");
 });
+
+test("thread reconstruction preserves a strong evidence basis from the stamp", () => {
+  const observed = finding({ evidence_kind: "observed", suggestion: null });
+  const body = poster.buildReviewComments([observed], new Map([
+    [observed.file, [[observed.start_line, observed.end_line]]],
+  ]), { mode: "inline" }).comments[0].body;
+  assert.match(body, /:ek=observed -->/);
+
+  const thread = {
+    path: observed.file,
+    startLine: observed.start_line,
+    endLine: observed.end_line,
+    body,
+    evidenceKind: "observed",
+  };
+  assert.equal(poster.findingFromThread(thread).evidence_kind, "observed");
+
+  // A legacy thread without stamp data stays inferred.
+  const plain = poster.findingFromThread({
+    path: observed.file,
+    startLine: observed.start_line,
+    endLine: observed.end_line,
+    body,
+  });
+  assert.equal(plain.evidence_kind, undefined);
+});
+
+test("an oversized inferred comment keeps its unverified note under truncation", () => {
+  const oversized = finding({
+    evidence_kind: "inferred",
+    suggestion: null,
+    body: incompressible(GITHUB_COMMENT_MAX_BYTES + 8_000),
+  });
+  const built = poster.buildReviewComments([oversized], new Map([
+    ["src/cache.mjs", [[20, 22]]],
+  ]), { mode: "inline" });
+  assert.equal(built.comments.length, 1);
+  assert.match(built.comments[0].body, /^_Unverified: inferred from reading code/);
+});

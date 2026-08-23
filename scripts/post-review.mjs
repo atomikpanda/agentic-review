@@ -76,7 +76,13 @@ const fingerprint = (f) =>
     .update(`${String(f.file).trim()}::${String(f.title).trim().toLowerCase()}`)
     .digest("hex")
     .slice(0, 16);
-const stamp = (fp) => `\n\n<!-- ${MARKER}:${fp} -->`;
+// Strong kinds are recorded in the stamp so a finding reconstructed from an
+// inline thread keeps its evidence basis; anything else decodes as inferred,
+// which is what absence means. Old comments without the suffix stay readable.
+const stamp = (fp, evidenceKind) =>
+  "\n\n<!-- " + MARKER + ":" + fp
+  + (evidenceKind === "observed" || evidenceKind === "static-proof" ? `:ek=${evidenceKind}` : "")
+  + " -->";
 
 const SUMMARY_MARKER = "agentic-review-summary";
 const SUMMARY_MARKER_VERSION = 2;
@@ -423,8 +429,9 @@ export async function reconcileSummaryFindings({
 
 const SIMILARITY = Number(env("SIMILARITY", String(SIMILARITY_DEFAULT)));
 const readStamp = (body) => {
-  const m = String(body ?? "").match(new RegExp(`<!-- ${MARKER}:([0-9a-f]{16}) -->`));
-  return m ? m[1] : null;
+  const m = String(body ?? "")
+    .match(new RegExp(`<!-- ${MARKER}:([0-9a-f]{16})(?::ek=(observed|static-proof|inferred))? -->`));
+  return m ? { fingerprint: m[1], ...(m[2] ? { evidenceKind: m[2] } : {}) } : null;
 };
 const REVIEW_MODE = env("REVIEW_MODE", "suggest");
 // One switch blocks every pull-request mutation while preserving reads, state
@@ -549,7 +556,7 @@ function commentBody(f, withSuggestion) {
     const fence = fenceFor(body);
     parts.push("", `${fence}suggestion`, body, fence);
   }
-  return parts.join("\n") + stamp(fingerprint(f));
+  return parts.join("\n") + stamp(fingerprint(f), f.evidence_kind);
 }
 
 // ---------------------------------------------------------------------------
@@ -767,10 +774,12 @@ function boundedCommentBody(finding, withSuggestion) {
     return null;
   }
   const ending = "\n\n_Comment truncated; complete finding remains in the structured artifact._"
-    + stamp(fingerprint(finding));
+    + stamp(fingerprint(finding), finding.evidence_kind);
+  // The note leads instead of trailing: truncation cuts from the end, and a
+  // warning that only survives on short findings is not a warning.
   const note = evidenceNote(finding);
-  const visible = `${badge(finding.severity)} — **${finding.title}**\n\n${finding.body}`
-    + (note ? `\n\n${note}` : "");
+  const visible = (note ? `${note}\n\n` : "")
+    + `${badge(finding.severity)} — **${finding.title}**\n\n${finding.body}`;
   return fitUtf8Bytes(visible, GITHUB_COMMENT_MAX_BYTES, ending);
 }
 
@@ -1095,11 +1104,12 @@ export async function fetchOurThreads({
       const comment = thread.comments?.nodes?.[0];
       const startLine = Number(thread.originalStartLine ?? thread.originalLine);
       const endLine = Number(thread.originalLine);
-      const fp = comment?.author?.login === botLogin ? readStamp(comment?.body) : null;
-      if (fp) {
+      const stampInfo = comment?.author?.login === botLogin ? readStamp(comment?.body) : null;
+      if (stampInfo) {
         out.push({
           id: thread.id,
-          fp,
+          fp: stampInfo.fingerprint,
+          ...(stampInfo.evidenceKind ? { evidenceKind: stampInfo.evidenceKind } : {}),
           isResolved: thread.isResolved,
           commentId: comment?.databaseId,
           body: comment?.body ?? "",
@@ -1186,6 +1196,12 @@ export function findingFromThread(thread) {
     title: match[2],
     body: thread.body,
     suggestion: null,
+
+    // A strong kind survives in the comment's stamp; anything else was posted
+    // without a stated basis and stays inferred.
+    ...(thread.evidenceKind === "observed" || thread.evidenceKind === "static-proof"
+      ? { evidence_kind: thread.evidenceKind }
+      : {}),
   };
 }
 
@@ -1245,7 +1261,8 @@ function collapsedCommentBody(thread, head) {
     `<details><summary>Original finding</summary>\n\n${thread.body}\n\n</details>`;
   if (Buffer.byteLength(full) <= GITHUB_COMMENT_MAX_BYTES) return full;
 
-  const fp = readStamp(thread.body) ?? (/^[0-9a-f]{16}$/.test(thread.fp ?? "") ? thread.fp : null);
+  const fp = readStamp(thread.body)?.fingerprint
+    ?? (/^[0-9a-f]{16}$/.test(thread.fp ?? "") ? thread.fp : null);
   if (!fp) throw new RangeError("oversized stale comment has no authoritative identity marker");
   const firstLine = String(thread.body ?? "").split("\n", 1)[0];
   const original = fitUtf8Bytes(firstLine, COLLAPSED_ORIGINAL_LINE_MAX_BYTES, "…");
