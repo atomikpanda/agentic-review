@@ -2981,3 +2981,21 @@ test("an oversized inferred comment keeps its unverified note under truncation",
   assert.equal(built.comments.length, 1);
   assert.match(built.comments[0].body, /^_Unverified: inferred from reading code/);
 });
+
+test("reconciliation keeps a strong historical evidence basis over a weaker current one", async () => {
+  const prior = finding({ severity: "Medium", suggestion: null, evidence_kind: "static-proof" });
+  const current = finding({ severity: "High", suggestion: null });
+  const result = await reconcileSummaryFindings({
+    analysisState: "complete",
+    current: [current],
+    prior: [prior],
+    priorHeadSha: PRIOR_HEAD_SHA,
+    headSha: HEAD_SHA,
+    spanChanged: async () => false,
+  });
+  assert.equal(result.current.length, 1);
+  // Severity follows its own escalation rule and stays High; the basis
+  // must not decay to unverified just because this sample omitted it.
+  assert.equal(result.current[0].severity, "High");
+  assert.equal(result.current[0].evidence_kind, "static-proof");
+});

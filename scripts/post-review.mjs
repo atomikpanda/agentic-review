@@ -1524,10 +1524,20 @@ function preferredHistoricalFinding(left, right) {
 }
 
 function withStrongestSeverity(current, historical) {
+  // Severity carries over, and so does evidence basis: a finding whose
+  // history claims observed or static-proof must not decay to unverified
+  // just because this sample's wording was weaker.
+  const merged = { ...current };
   if (SEVERITY_ORDER[historical.severity] < SEVERITY_ORDER[current.severity]) {
-    return { ...current, severity: historical.severity };
+    merged.severity = historical.severity;
   }
-  return current;
+  if (
+    merged.evidence_kind !== "observed"
+    && (historical.evidence_kind === "observed" || historical.evidence_kind === "static-proof")
+  ) {
+    merged.evidence_kind = historical.evidence_kind;
+  }
+  return merged;
 }
 
 function mergeFindingSets(primary, secondary, resolveMatch) {
