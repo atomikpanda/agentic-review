@@ -775,11 +775,13 @@ function boundedCommentBody(finding, withSuggestion) {
   }
   const ending = "\n\n_Comment truncated; complete finding remains in the structured artifact._"
     + stamp(fingerprint(finding), finding.evidence_kind);
-  // The note leads instead of trailing: truncation cuts from the end, and a
-  // warning that only survives on short findings is not a warning.
+  // The note sits between the title line and the body: truncation cuts from
+  // the end so the note survives, and the badge stays on the first line where
+  // thread reconstruction parses it.
   const note = evidenceNote(finding);
-  const visible = (note ? `${note}\n\n` : "")
-    + `${badge(finding.severity)} — **${finding.title}**\n\n${finding.body}`;
+  const visible = `${badge(finding.severity)} — **${finding.title}**\n\n`
+    + (note ? `${note}\n\n` : "")
+    + finding.body;
   return fitUtf8Bytes(visible, GITHUB_COMMENT_MAX_BYTES, ending);
 }
 
@@ -1261,6 +1263,9 @@ function collapsedCommentBody(thread, head) {
     `<details><summary>Original finding</summary>\n\n${thread.body}\n\n</details>`;
   if (Buffer.byteLength(full) <= GITHUB_COMMENT_MAX_BYTES) return full;
 
+  // The replacement stamp must repeat the evidence kind, or a strong finding
+  // decays to unverified the moment its comment is folded for size.
+  const evidenceKind = thread.evidenceKind ?? readStamp(thread.body)?.evidenceKind;
   const fp = readStamp(thread.body)?.fingerprint
     ?? (/^[0-9a-f]{16}$/.test(thread.fp ?? "") ? thread.fp : null);
   if (!fp) throw new RangeError("oversized stale comment has no authoritative identity marker");
@@ -1269,7 +1274,7 @@ function collapsedCommentBody(thread, head) {
   const details =
     `<details><summary>Original finding</summary>\n\n${original}\n\n` +
     `_Original finding prose omitted to satisfy GitHub's PATCH byte limit._\n\n</details>` +
-    stamp(fp);
+    stamp(fp, evidenceKind);
   const noteBudget = GITHUB_COMMENT_MAX_BYTES - Buffer.byteLength(details) - 2;
   if (noteBudget < 1) throw new RangeError("stale comment identity history exceeds GitHub comment limit");
   return `${fitUtf8Bytes(note, noteBudget, "…")}\n\n${details}`;
@@ -1517,9 +1522,17 @@ function historicalFindingKey(finding) {
   ]);
 }
 
+const EVIDENCE_RANK = { observed: 2, "static-proof": 1 };
+
 function preferredHistoricalFinding(left, right) {
   const severityDifference = SEVERITY_ORDER[left.severity] - SEVERITY_ORDER[right.severity];
   if (severityDifference !== 0) return severityDifference < 0 ? left : right;
+  // A strong basis must not lose to a lexical tiebreak, or a verified
+  // finding decays to unverified when summary-held and inline-held
+  // histories describe the same defect.
+  const evidenceDifference = (EVIDENCE_RANK[left.evidence_kind] ?? 0)
+    - (EVIDENCE_RANK[right.evidence_kind] ?? 0);
+  if (evidenceDifference !== 0) return evidenceDifference > 0 ? left : right;
   return historicalFindingKey(left) <= historicalFindingKey(right) ? left : right;
 }
 

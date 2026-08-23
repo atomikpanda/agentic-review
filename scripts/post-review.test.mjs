@@ -2979,7 +2979,11 @@ test("an oversized inferred comment keeps its unverified note under truncation",
     ["src/cache.mjs", [[20, 22]]],
   ]), { mode: "inline" });
   assert.equal(built.comments.length, 1);
-  assert.match(built.comments[0].body, /^_Unverified: inferred from reading code/);
+  // The badge stays on the first line (thread reconstruction parses it) and
+  // the note follows before the body, where truncation cannot reach it.
+  const lines = built.comments[0].body.split("\n");
+  assert.match(lines[0], /^`P1` High — \*\*/);
+  assert.match(lines[2], /^_Unverified: inferred from reading code/);
 });
 
 test("reconciliation keeps a strong historical evidence basis over a weaker current one", async () => {
