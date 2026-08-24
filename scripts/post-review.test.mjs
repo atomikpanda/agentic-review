@@ -125,6 +125,8 @@ function finding(overrides = {}) {
     severity: "High",
     title: "Cache entry survives invalidation",
     body: "The stale entry is returned after invalidation.",
+    evidence_kind: "static-proof",
+    verification: "Static control-flow trace shows stale cache entries are reachable.",
     suggestion: "replacement();\n",
     ...overrides,
   };
@@ -1981,6 +1983,26 @@ test("rendered bodies remove confidence heuristics and exhaustive or safety word
   for (const forbidden of ["Review confidence", "whole diff reviewed", "Production ready", "safe to merge", "evidence of safety"]) {
     assert.equal(body.includes(forbidden), false, forbidden);
   }
+});
+
+test("rendered findings expose inferred evidence as unverified", () => {
+  const inferred = finding({
+    evidence_kind: "inferred",
+    verification: "Runtime HTTP status requires checking the deployed service.",
+    suggestion: null,
+  });
+  const body = renderReviewBody({
+    mode: "summary", metadata: metadata(), state: state(), current: [inferred], unresolved: [],
+  });
+  assert.match(body, /\*\*Evidence:\*\* inferred — unverified: Runtime HTTP status requires checking the deployed service\./);
+
+  const comments = poster.buildReviewComments(
+    [inferred],
+    new Map([[inferred.file, [[inferred.start_line, inferred.end_line]]]]),
+    { mode: "inline" },
+  );
+  assert.equal(comments.comments.length, 1);
+  assert.match(comments.comments[0].body, /\*\*Evidence:\*\* inferred — unverified: Runtime HTTP status requires checking the deployed service\./);
 });
 
 test("summary lifecycle appends pull-request reviews including a later clean state", async () => {

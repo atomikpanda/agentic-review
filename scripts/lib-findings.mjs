@@ -24,6 +24,7 @@
 export const SIMILARITY_DEFAULT = 0.20;
 
 const FINDING_SEVERITIES = new Set(["Critical", "High", "Medium"]);
+const FINDING_EVIDENCE_KINDS = new Set(["observed", "static-proof", "inferred"]);
 const VERIFICATION_ID_RE = /^K[1-9][0-9]*$/;
 
 export function isValidFinding(value) {
@@ -38,6 +39,9 @@ export function isValidFinding(value) {
     && typeof value.body === "string"
     && value.body.trim().length > 0
     && FINDING_SEVERITIES.has(value.severity)
+    && FINDING_EVIDENCE_KINDS.has(value.evidence_kind)
+    && typeof value.verification === "string"
+    && value.verification.trim().length > 0
     && Number.isInteger(value.start_line)
     && value.start_line > 0
     && Number.isInteger(value.end_line)
@@ -65,6 +69,8 @@ export function projectPublicFinding(value) {
     file: value.file,
     start_line: value.start_line,
     end_line: value.end_line,
+    evidence_kind: value.evidence_kind,
+    verification: value.verification,
     suggestion: value.suggestion,
     ...(value.verification_id === undefined
       ? {}

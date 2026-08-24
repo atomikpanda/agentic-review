@@ -523,8 +523,22 @@ function fenceFor(text) {
   return "`".repeat(Math.max(3, longest + 1));
 }
 
+function evidenceLine(finding) {
+  if (
+    !["observed", "static-proof", "inferred"].includes(finding.evidence_kind)
+    || typeof finding.verification !== "string"
+    || finding.verification.trim().length === 0
+  ) {
+    return null;
+  }
+  const qualifier = finding.evidence_kind === "inferred" ? "unverified: " : "";
+  return `**Evidence:** ${finding.evidence_kind} — ${qualifier}${finding.verification.trim()}`;
+}
+
 function commentBody(f, withSuggestion) {
   const parts = [`${badge(f.severity)} — **${f.title}**`, "", f.body];
+  const evidence = evidenceLine(f);
+  if (evidence) parts.push("", evidence);
   if (withSuggestion && typeof f.suggestion === "string" && f.suggestion.length > 0) {
     // Trailing newline is stripped: the block's lines replace the target lines
     // exactly, and an extra blank line at the end inserts one into the file.
@@ -675,6 +689,7 @@ function appendFindings(out, heading, findings, mode) {
       `\`${String(finding.file).replace(/^\.\//, "")}${span}\``,
       "",
       finding.body,
+      ...(evidenceLine(finding) ? ["", evidenceLine(finding)] : []),
     );
     if (mode === "suggest" && typeof finding.suggestion === "string" && finding.suggestion.length > 0) {
       const replacement = finding.suggestion.replace(/\n+$/, "");
