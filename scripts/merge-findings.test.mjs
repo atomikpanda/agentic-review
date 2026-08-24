@@ -325,3 +325,54 @@ test("output ordering is severity-first and deterministic across document order"
     ["Critical", "High A", "High B", "Medium"],
   );
 });
+
+test("merging duplicates keeps the strongest evidence basis regardless of order", () => {
+  const inferred = finding("Lifecycle finding duplicated", {
+    body: "The duplicated lifecycle finding drops the same queued retry.",
+    file: "src/queue.js",
+    evidence_kind: "inferred",
+  });
+  const observed = finding("Duplicate lifecycle finding", {
+    body: "The same queued retry is dropped by the duplicated lifecycle finding.",
+    file: "src/queue.js",
+    evidence_kind: "observed",
+  });
+
+  const forward = mergeFindingDocuments([{ findings: [inferred] }, { findings: [observed] }]);
+  const backward = mergeFindingDocuments([{ findings: [observed] }, { findings: [inferred] }]);
+
+  assert.equal(forward.findings.length, 1);
+  assert.equal(backward.findings.length, 1);
+  assert.equal(forward.findings[0].evidence_kind, "observed");
+  assert.equal(backward.findings[0].evidence_kind, "observed");
+});
+
+test("an unknown evidence kind rejects the finding instead of passing it through", () => {
+  const documents = [
+    { findings: [finding("Unverifiable claim", { evidence_kind: "certain" })] },
+  ];
+
+  const result = mergeFindingDocuments(documents);
+
+  assert.deepEqual(result.findings, []);
+  assert.equal(result.summary.distinct, 0);
+});
+
+test("observed evidence outranks static-proof regardless of pass order", () => {
+  const traced = finding("Lifecycle finding duplicated", {
+    body: "The duplicated lifecycle finding drops the same queued retry.",
+    file: "src/queue.js",
+    evidence_kind: "static-proof",
+  });
+  const seen = finding("Duplicate lifecycle finding", {
+    body: "The same queued retry is dropped by the duplicated lifecycle finding.",
+    file: "src/queue.js",
+    evidence_kind: "observed",
+  });
+
+  const forward = mergeFindingDocuments([{ findings: [traced] }, { findings: [seen] }]);
+  const backward = mergeFindingDocuments([{ findings: [seen] }, { findings: [traced] }]);
+
+  assert.equal(forward.findings[0].evidence_kind, "observed");
+  assert.equal(backward.findings[0].evidence_kind, "observed");
+});

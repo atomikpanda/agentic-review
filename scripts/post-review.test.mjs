@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { deflateRawSync, inflateRawSync } from "node:zlib";
 import test from "node:test";
 
 import {
@@ -437,6 +438,7 @@ test("summary marker round-trips only normalized carry-forward fields", () => {
       title: "Cache entry survives invalidation",
       body: "Previously reported finding remains held from an earlier review sample.",
       identity_tokens: ["cache", "entry", "survives", "invalidation", "stale", "returned"],
+      evidence_kind: "static-proof",
     }],
   });
   assert.ok(!marker.includes("replacement"));
@@ -2113,7 +2115,7 @@ test("oversized inline prose is UTF-8 bounded while its identity stamp remains i
   assert.equal(built.unanchored.length, 0);
   assert.ok(Buffer.byteLength(built.comments[0].body) <= GITHUB_COMMENT_MAX_BYTES);
   assert.match(built.comments[0].body, /complete finding.*structured artifact/i);
-  assert.match(built.comments[0].body, /<!-- agentic-review-fp:[0-9a-f]{16} -->$/);
+  assert.match(built.comments[0].body, /<!-- agentic-review-fp:[0-9a-f]{16}(?::ek=(?:observed|static-proof))? -->$/);
 });
 
 test("an oversized committable suggestion is omitted atomically and retained as a compact artifact note", () => {
@@ -2866,4 +2868,156 @@ test("poster failure downgrades a reconciled clean sample to unknown", () => {
   assert.deepEqual(JSON.parse(outputs.current_counts), { Critical: 0, High: 0, Medium: 0 });
   assert.deepEqual(JSON.parse(outputs.unresolved_counts), { Critical: 0, High: 0, Medium: 0 });
   assert.equal(result.finalResult.sample_state, "unknown");
+});
+
+test("inferred findings carry an unverified note in inline and summary rendering", () => {
+  const ranges = new Map([["src/cache.mjs", [[20, 22]]]]);
+  for (const mode of ["inline", "suggest"]) {
+    const inferred = poster.buildReviewComments(
+      [finding({ evidence_kind: "inferred" })],
+      ranges,
+      { mode },
+    );
+    assert.equal(inferred.comments.length, 1);
+    assert.match(
+      inferred.comments[0].body,
+      /_Unverified: inferred from reading code, not confirmed against a running system\._/,
+    );
+  }
+
+  const observed = poster.buildReviewComments(
+    [finding({ evidence_kind: "observed" })],
+    ranges,
+    { mode: "inline" },
+  );
+  assert.doesNotMatch(observed.comments[0].body, /Unverified/);
+
+
+  const summary = renderReviewBody({
+    mode: "summary",
+    metadata: metadata(),
+    state: state(),
+    current: [finding({ evidence_kind: "inferred", suggestion: null })],
+    unresolved: [],
+  });
+  assert.match(summary, /Unverified: inferred from reading code/);
+});
+
+test("a static-proof finding renders without the unverified note in summary", () => {
+  const summary = renderReviewBody({
+    mode: "summary",
+    metadata: metadata(),
+    state: state(),
+    current: [finding({ evidence_kind: "static-proof", suggestion: null })],
+    unresolved: [],
+  });
+  assert.doesNotMatch(summary, /Unverified/);
+});
+test("a pre-evidence_kind v2 marker decodes held findings as inferred", () => {
+  // Take an authentic v2 marker, then strip the seventh tuple element to
+  // simulate one written before evidence_kind existed. Held findings with no
+  // stated basis are unverified by definition: they must decode as inferred
+  // rather than crash or pass silently.
+  const cycle = {
+    schema_version: 1,
+    lineage_base_sha: BASE_SHA,
+    discovery_round: 1,
+    max_discovery_rounds: 2,
+    state: "active",
+    last_phase: "discovery",
+    next_phase: "verification",
+    last_reviewed_head: HEAD_SHA,
+    last_scope_hash: SCOPE_HASH,
+    last_analysis_state: "complete",
+    override: null,
+  };
+  const modern = poster.encodeSummaryMarker({
+    headSha: HEAD_SHA,
+    findings: [finding({ suggestion: null })],
+    cycle,
+  });
+  const [, payload] = modern.match(/^<!-- agentic-review-summary:v2:([A-Za-z0-9_-]+) -->$/);
+  const state = JSON.parse(inflateRawSync(Buffer.from(payload, "base64url")).toString("utf8"));
+  state.f = state.f.map(([file, start, end, severity, title, tokens]) => [
+    file, start, end, severity, title, tokens,
+  ]);
+  const legacy = "<!-- agentic-review-summary:v2:"
+    + deflateRawSync(Buffer.from(JSON.stringify(state))).toString("base64url")
+    + " -->";
+
+  const decoded = decodeSummaryMarker(legacy);
+  assert.equal(decoded.findings.length, 1);
+  assert.equal(decoded.findings[0].evidence_kind, "inferred");
+});
+
+
+test("the structured publication preserves evidence_kind through validation", () => {
+  const publication = createReviewPublication(
+    { ...metadata(), analysis_state: "complete" },
+    trustedReviewScope(),
+    [finding({ evidence_kind: "static-proof", suggestion: null })],
+  );
+  const parsed = JSON.parse(JSON.stringify(publication));
+  assert.equal(parsed.findings[0].evidence_kind, "static-proof");
+});
+
+test("thread reconstruction preserves a strong evidence basis from the stamp", () => {
+  const observed = finding({ evidence_kind: "observed", suggestion: null });
+  const body = poster.buildReviewComments([observed], new Map([
+    [observed.file, [[observed.start_line, observed.end_line]]],
+  ]), { mode: "inline" }).comments[0].body;
+  assert.match(body, /:ek=observed -->/);
+
+  const thread = {
+    path: observed.file,
+    startLine: observed.start_line,
+    endLine: observed.end_line,
+    body,
+    evidenceKind: "observed",
+  };
+  assert.equal(poster.findingFromThread(thread).evidence_kind, "observed");
+
+  // A legacy thread without stamp data stays inferred.
+  const plain = poster.findingFromThread({
+    path: observed.file,
+    startLine: observed.start_line,
+    endLine: observed.end_line,
+    body,
+  });
+  assert.equal(plain.evidence_kind, undefined);
+});
+
+test("an oversized inferred comment keeps its unverified note under truncation", () => {
+  const oversized = finding({
+    evidence_kind: "inferred",
+    suggestion: null,
+    body: incompressible(GITHUB_COMMENT_MAX_BYTES + 8_000),
+  });
+  const built = poster.buildReviewComments([oversized], new Map([
+    ["src/cache.mjs", [[20, 22]]],
+  ]), { mode: "inline" });
+  assert.equal(built.comments.length, 1);
+  // The badge stays on the first line (thread reconstruction parses it) and
+  // the note follows before the body, where truncation cannot reach it.
+  const lines = built.comments[0].body.split("\n");
+  assert.match(lines[0], /^`P1` High — \*\*/);
+  assert.match(lines[2], /^_Unverified: inferred from reading code/);
+});
+
+test("reconciliation keeps a strong historical evidence basis over a weaker current one", async () => {
+  const prior = finding({ severity: "Medium", suggestion: null, evidence_kind: "static-proof" });
+  const current = finding({ severity: "High", suggestion: null });
+  const result = await reconcileSummaryFindings({
+    analysisState: "complete",
+    current: [current],
+    prior: [prior],
+    priorHeadSha: PRIOR_HEAD_SHA,
+    headSha: HEAD_SHA,
+    spanChanged: async () => false,
+  });
+  assert.equal(result.current.length, 1);
+  // Severity follows its own escalation rule and stays High; the basis
+  // must not decay to unverified just because this sample omitted it.
+  assert.equal(result.current[0].severity, "High");
+  assert.equal(result.current[0].evidence_kind, "static-proof");
 });

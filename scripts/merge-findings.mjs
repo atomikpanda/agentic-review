@@ -101,9 +101,18 @@ function mergeVariant(target, candidate) {
       || (Number(left.end_line) || 0) - (Number(right.end_line) || 0))[0];
   const fix = fixSource ? { ...fixSource } : null;
   const representative = compareVariants(candidate, target) < 0 ? candidate : target;
+  // Strongest evidence basis wins under a fixed order — observed beats
+  // static-proof (a direct check of the actual state beats a reasoning trace),
+  // and both beat an inferred guess — so merged output does not depend on
+  // which pass happened to be processed first.
+  const evidenceKind = [target.evidence_kind, candidate.evidence_kind]
+    .includes("observed") ? "observed"
+    : [target.evidence_kind, candidate.evidence_kind].includes("static-proof") ? "static-proof"
+    : undefined;
   Object.assign(target, representative);
   if (votes !== undefined) target.votes = votes;
   target.severity = severity;
+  if (evidenceKind) target.evidence_kind = evidenceKind;
   if (fix) {
     target.suggestion = fix.suggestion;
     target.start_line = fix.start_line;

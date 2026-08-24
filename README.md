@@ -160,6 +160,18 @@ Three things that mechanism forces, all handled:
 - **The review is never lost.** If the inline post is rejected anyway, it falls
   back to posting everything as a summary rather than failing silently.
 
+### Evidence basis
+
+Each finding also carries an `evidence_kind` from the agent: `observed`
+(confirmed against state visible in the checkout or diff), `static-proof` (a
+complete named trace from the diff to the failure), or `inferred` (everything
+else). Findings labelled `inferred` are shown with an explicit
+_unverified_ note rather than trusted on prose confidence — on this project's
+own pull requests, every confidently-stated claim about live runtime behaviour
+failed a one-line check against the running system, while structural
+contradictions held. When repeated passes merge into one finding, the strongest
+basis any pass claimed wins.
+
 ## Bounded ensemble and result states
 
 The default local and hosted profile runs three sequential passes — **general**,

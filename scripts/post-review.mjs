@@ -36,6 +36,7 @@ import { pathToFileURL } from "node:url";
 import { deflateRawSync, inflateRawSync } from "node:zlib";
 
 import {
+  EVIDENCE_KINDS,
   identityTokens,
   isValidFinding,
   projectPublicFinding,
@@ -75,7 +76,13 @@ const fingerprint = (f) =>
     .update(`${String(f.file).trim()}::${String(f.title).trim().toLowerCase()}`)
     .digest("hex")
     .slice(0, 16);
-const stamp = (fp) => `\n\n<!-- ${MARKER}:${fp} -->`;
+// Strong kinds are recorded in the stamp so a finding reconstructed from an
+// inline thread keeps its evidence basis; anything else decodes as inferred,
+// which is what absence means. Old comments without the suffix stay readable.
+const stamp = (fp, evidenceKind) =>
+  "\n\n<!-- " + MARKER + ":" + fp
+  + (evidenceKind === "observed" || evidenceKind === "static-proof" ? `:ek=${evidenceKind}` : "")
+  + " -->";
 
 const SUMMARY_MARKER = "agentic-review-summary";
 const SUMMARY_MARKER_VERSION = 2;
@@ -123,6 +130,9 @@ function normalizeSummaryFinding(value, index) {
   if (typeof value.title !== "string" || !value.title || typeof value.body !== "string" || !value.body) {
     throw new TypeError(`summary findings[${index}] must have a title and body`);
   }
+  if (value.evidence_kind !== undefined && !EVIDENCE_KINDS.has(value.evidence_kind)) {
+    throw new TypeError(`summary findings[${index}].evidence_kind is invalid`);
+  }
   return {
     file,
     start_line: startLine,
@@ -131,6 +141,12 @@ function normalizeSummaryFinding(value, index) {
     title: value.title.slice(0, SUMMARY_TITLE_MAX_CHARS),
     body: HELD_FINDING_BODY,
     identity_tokens: summaryIdentityTokens(value),
+
+    // Normalised to a definite kind so held findings keep their basis across
+    // runs; absence (older prompts, legacy markers) means inferred.
+    evidence_kind: value.evidence_kind === "observed" || value.evidence_kind === "static-proof"
+      ? value.evidence_kind
+      : "inferred",
   };
 }
 
@@ -143,11 +159,14 @@ function encodeSummaryFinding(value, index) {
     SUMMARY_SEVERITIES.indexOf(finding.severity),
     finding.title,
     finding.identity_tokens,
+    finding.evidence_kind,
   ];
 }
 
 function decodeSummaryFinding(value, index) {
-  if (!Array.isArray(value) || value.length !== 6 || !Array.isArray(value[5])) {
+  // Length 6 is a pre-evidence_kind v2 marker; its findings decode as inferred,
+  // which is what they are — carried forward without a stated basis.
+  if (!Array.isArray(value) || !(value.length === 6 || value.length === 7) || !Array.isArray(value[5])) {
     throw new TypeError(`summary findings[${index}] has an invalid compact shape`);
   }
   const severity = SUMMARY_SEVERITIES[value[3]];
@@ -159,8 +178,10 @@ function decodeSummaryFinding(value, index) {
     title: value[4],
     body: HELD_FINDING_BODY,
     identity_tokens: value[5],
+    evidence_kind: value.length === 7 ? value[6] : "inferred",
   }, index);
 }
+
 
 export function encodeSummaryMarker({ headSha, findings, cycle = null, runId = "" }) {
   if (!SHA_RE.test(headSha)) throw new TypeError("summary headSha must be a lowercase 40-character SHA");
@@ -408,8 +429,9 @@ export async function reconcileSummaryFindings({
 
 const SIMILARITY = Number(env("SIMILARITY", String(SIMILARITY_DEFAULT)));
 const readStamp = (body) => {
-  const m = String(body ?? "").match(new RegExp(`<!-- ${MARKER}:([0-9a-f]{16}) -->`));
-  return m ? m[1] : null;
+  const m = String(body ?? "")
+    .match(new RegExp(`<!-- ${MARKER}:([0-9a-f]{16})(?::ek=(observed|static-proof|inferred))? -->`));
+  return m ? { fingerprint: m[1], ...(m[2] ? { evidenceKind: m[2] } : {}) } : null;
 };
 const REVIEW_MODE = env("REVIEW_MODE", "suggest");
 // One switch blocks every pull-request mutation while preserving reads, state
@@ -539,6 +561,8 @@ function commentBody(f, withSuggestion) {
   const parts = [`${badge(f.severity)} — **${f.title}**`, "", f.body];
   const evidence = evidenceLine(f);
   if (evidence) parts.push("", evidence);
+  const note = evidenceNote(f);
+  if (note) parts.push("", note);
   if (withSuggestion && typeof f.suggestion === "string" && f.suggestion.length > 0) {
     // Trailing newline is stripped: the block's lines replace the target lines
     // exactly, and an extra blank line at the end inserts one into the file.
@@ -546,7 +570,7 @@ function commentBody(f, withSuggestion) {
     const fence = fenceFor(body);
     parts.push("", `${fence}suggestion`, body, fence);
   }
-  return parts.join("\n") + stamp(fingerprint(f));
+  return parts.join("\n") + stamp(fingerprint(f), f.evidence_kind);
 }
 
 // ---------------------------------------------------------------------------
@@ -605,10 +629,29 @@ export function buildReviewComments(findings, ranges, { mode = REVIEW_MODE } = {
   }
   return { comments, unanchored };
 }
-
 // Severity vocabulary. P0/P1/P2 keeps existing inline comment presentation.
 const PRIORITY = { Critical: "P0", High: "P1", Medium: "P2" };
 const badge = (sev) => `\`${PRIORITY[sev] ?? "P2"}\` ${sev}`;
+
+
+// Issue #4: a finding that asserts runtime behaviour it did not observe is a
+// hypothesis however confident its prose — on this project's own PRs, every
+// such claim failed a one-line check against the running system. Omission of
+// the field means the same thing (the format says so), so anything short of an
+// explicit observed/static-proof claim is marked unverified where a human
+// acts on it, not buried in metadata.
+const EVIDENCE_NOTE =
+  "_Unverified: inferred from reading code, not confirmed against a running system._";
+// The note is our own boilerplate, not the model's description of the defect.
+// It must stay out of fuzzy-match tokens: its significant words dilute
+// Jaccard scores enough to push reworded duplicates below threshold and spawn
+// duplicate threads.
+const stripEvidenceNote = (text) => String(text ?? "").split(EVIDENCE_NOTE).join("");
+function evidenceNote(finding) {
+  return finding.evidence_kind === "observed" || finding.evidence_kind === "static-proof"
+    ? null
+    : EVIDENCE_NOTE;
+}
 
 function formatCounts(counts) {
   return `Critical: ${counts.Critical} · High: ${counts.High} · Medium: ${counts.Medium}`;
@@ -691,6 +734,8 @@ function appendFindings(out, heading, findings, mode) {
       finding.body,
       ...(evidenceLine(finding) ? ["", evidenceLine(finding)] : []),
     );
+    const note = evidenceNote(finding);
+    if (note) out.push("", note);
     if (mode === "suggest" && typeof finding.suggestion === "string" && finding.suggestion.length > 0) {
       const replacement = finding.suggestion.replace(/\n+$/, "");
       const fence = fenceFor(replacement);
@@ -749,8 +794,14 @@ function boundedCommentBody(finding, withSuggestion) {
     return null;
   }
   const ending = "\n\n_Comment truncated; complete finding remains in the structured artifact._"
-    + stamp(fingerprint(finding));
-  const visible = `${badge(finding.severity)} — **${finding.title}**\n\n${finding.body}`;
+    + stamp(fingerprint(finding), finding.evidence_kind);
+  // The note sits between the title line and the body: truncation cuts from
+  // the end so the note survives, and the badge stays on the first line where
+  // thread reconstruction parses it.
+  const note = evidenceNote(finding);
+  const visible = `${badge(finding.severity)} — **${finding.title}**\n\n`
+    + (note ? `${note}\n\n` : "")
+    + finding.body;
   return fitUtf8Bytes(visible, GITHUB_COMMENT_MAX_BYTES, ending);
 }
 
@@ -762,7 +813,8 @@ function compactFindingLine(label, finding) {
     : "";
   const path = fitUtf8Bytes(String(finding.file ?? "").replace(/^\.\//, ""), 512, "…");
   const title = fitUtf8Bytes(String(finding.title ?? "").trim(), 512, "…");
-  return `- ${label} ${badge(finding.severity)} — **${title}** (\`${path}${span}\`)`;
+  return `- ${label} ${badge(finding.severity)} — **${title}** (\`${path}${span}\`)`
+    + (evidenceNote(finding) ? " · _unverified_" : "");
 }
 
 export function buildReviewTopBody({
@@ -1074,11 +1126,12 @@ export async function fetchOurThreads({
       const comment = thread.comments?.nodes?.[0];
       const startLine = Number(thread.originalStartLine ?? thread.originalLine);
       const endLine = Number(thread.originalLine);
-      const fp = comment?.author?.login === botLogin ? readStamp(comment?.body) : null;
-      if (fp) {
+      const stampInfo = comment?.author?.login === botLogin ? readStamp(comment?.body) : null;
+      if (stampInfo) {
         out.push({
           id: thread.id,
-          fp,
+          fp: stampInfo.fingerprint,
+          ...(stampInfo.evidenceKind ? { evidenceKind: stampInfo.evidenceKind } : {}),
           isResolved: thread.isResolved,
           commentId: comment?.databaseId,
           body: comment?.body ?? "",
@@ -1087,7 +1140,7 @@ export async function fetchOurThreads({
           startLine: Number.isInteger(startLine) && startLine > 0 ? startLine : null,
           endLine: Number.isInteger(endLine) && endLine > 0 ? endLine : null,
           retired: RETIRED_RE.test(comment?.body ?? ""),
-          tokens: tokenSet(comment?.body ?? ""),
+          tokens: tokenSet(stripEvidenceNote(comment?.body ?? "")),
         });
       }
     }
@@ -1163,8 +1216,20 @@ export function findingFromThread(thread) {
     end_line: thread.endLine,
     severity: match[1],
     title: match[2],
-    body: thread.body,
+    // Strip our own unverified boilerplate: held findings are re-rendered
+    // through evidenceNote, and keeping the note here would duplicate it.
+    body: stripEvidenceNote(thread.body),
     suggestion: null,
+
+    // Identity from the note-free prose: the rendered comment carries our
+    // unverified boilerplate, which must not dilute future fuzzy matches.
+    identity_tokens: [...tokenSet(`${match[2]} ${stripEvidenceNote(thread.body)}`)],
+
+    // A strong kind survives in the comment's stamp; anything else was posted
+    // without a stated basis and stays inferred.
+    ...(thread.evidenceKind === "observed" || thread.evidenceKind === "static-proof"
+      ? { evidence_kind: thread.evidenceKind }
+      : {}),
   };
 }
 
@@ -1224,14 +1289,20 @@ function collapsedCommentBody(thread, head) {
     `<details><summary>Original finding</summary>\n\n${thread.body}\n\n</details>`;
   if (Buffer.byteLength(full) <= GITHUB_COMMENT_MAX_BYTES) return full;
 
-  const fp = readStamp(thread.body) ?? (/^[0-9a-f]{16}$/.test(thread.fp ?? "") ? thread.fp : null);
+  // The replacement stamp must repeat the evidence kind, or a strong finding
+  // decays to unverified the moment its comment is folded for size.
+  const evidenceKind = thread.evidenceKind ?? readStamp(thread.body)?.evidenceKind;
+  const collapseNote = evidenceNote({ evidence_kind: evidenceKind });
+  const fp = readStamp(thread.body)?.fingerprint
+    ?? (/^[0-9a-f]{16}$/.test(thread.fp ?? "") ? thread.fp : null);
   if (!fp) throw new RangeError("oversized stale comment has no authoritative identity marker");
   const firstLine = String(thread.body ?? "").split("\n", 1)[0];
   const original = fitUtf8Bytes(firstLine, COLLAPSED_ORIGINAL_LINE_MAX_BYTES, "…");
   const details =
     `<details><summary>Original finding</summary>\n\n${original}\n\n` +
+    (collapseNote ? `${collapseNote}\n\n` : "") +
     `_Original finding prose omitted to satisfy GitHub's PATCH byte limit._\n\n</details>` +
-    stamp(fp);
+    stamp(fp, evidenceKind);
   const noteBudget = GITHUB_COMMENT_MAX_BYTES - Buffer.byteLength(details) - 2;
   if (noteBudget < 1) throw new RangeError("stale comment identity history exceeds GitHub comment limit");
   return `${fitUtf8Bytes(note, noteBudget, "…")}\n\n${details}`;
@@ -1479,17 +1550,42 @@ function historicalFindingKey(finding) {
   ]);
 }
 
+const EVIDENCE_RANK = { observed: 2, "static-proof": 1 };
+
 function preferredHistoricalFinding(left, right) {
   const severityDifference = SEVERITY_ORDER[left.severity] - SEVERITY_ORDER[right.severity];
-  if (severityDifference !== 0) return severityDifference < 0 ? left : right;
+  if (severityDifference !== 0) {
+    // Severity decides which record survives, but a losing record's stronger
+    // basis must not be discarded along with it.
+    const winner = severityDifference < 0 ? left : right;
+    const loser = winner === left ? right : left;
+    if ((EVIDENCE_RANK[winner.evidence_kind] ?? 0) < (EVIDENCE_RANK[loser.evidence_kind] ?? 0)) {
+      return { ...winner, evidence_kind: loser.evidence_kind };
+    }
+    return winner;
+  }
+  // Equal severity: prefer the stronger basis before the lexical fallback.
+  const evidenceDifference = (EVIDENCE_RANK[left.evidence_kind] ?? 0)
+    - (EVIDENCE_RANK[right.evidence_kind] ?? 0);
+  if (evidenceDifference !== 0) return evidenceDifference > 0 ? left : right;
   return historicalFindingKey(left) <= historicalFindingKey(right) ? left : right;
 }
 
 function withStrongestSeverity(current, historical) {
+  // Severity carries over, and so does evidence basis: a finding whose
+  // history claims observed or static-proof must not decay to unverified
+  // just because this sample's wording was weaker.
+  const merged = { ...current };
   if (SEVERITY_ORDER[historical.severity] < SEVERITY_ORDER[current.severity]) {
-    return { ...current, severity: historical.severity };
+    merged.severity = historical.severity;
   }
-  return current;
+  if (
+    merged.evidence_kind !== "observed"
+    && (historical.evidence_kind === "observed" || historical.evidence_kind === "static-proof")
+  ) {
+    merged.evidence_kind = historical.evidence_kind;
+  }
+  return merged;
 }
 
 function mergeFindingSets(primary, secondary, resolveMatch) {
