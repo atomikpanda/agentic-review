@@ -73,8 +73,9 @@ exit 0
     severity: "High",
     start_line: 8,
     end_line: 10,
+    evidence_kind: "static-proof",
+    verification: "Static control-flow trace shows the defect remains observable.",
     suggestion: null,
-    evidence_kind: "inferred",
   };
   writeFileSync(findingsFile, JSON.stringify({ findings: [finding] }));
   assert.equal(run(repository, "record", findingsFile, base, reportedHead, "complete").status, 0);
@@ -128,8 +129,9 @@ test("inconclusive records retain omitted evidence until a complete overlapping 
     severity: "High",
     start_line: 2,
     end_line: 2,
+    evidence_kind: "static-proof",
+    verification: "Static control-flow trace shows the reported behavior remains blocking.",
     suggestion: null,
-    evidence_kind: "inferred",
   };
   writeFileSync(findingsFile, JSON.stringify({ findings: [finding] }));
   assert.equal(run(repository, "record", findingsFile, base, reportedHead, "complete").status, 0);
@@ -163,8 +165,9 @@ test("malformed current findings fail before local state bytes change", (t) => {
     severity: "High",
     start_line: 1,
     end_line: 1,
+    evidence_kind: "static-proof",
+    verification: "Static control-flow trace shows this finding has a valid public shape.",
     suggestion: null,
-    evidence_kind: "inferred",
   };
   writeFileSync(findingsFile, JSON.stringify({ findings: [valid] }));
   assert.equal(run(repository, "record", findingsFile, head, head, "complete").status, 0);
@@ -294,6 +297,8 @@ test("changing a gone finding to a non-gone status removes goneAt", (t) => {
     severity: "High",
     line: 1,
     endLine: 1,
+    evidence_kind: "static-proof",
+    verification: "Static control-flow trace shows the stored finding remains valid.",
     status: "gone",
     firstSeen: "2026-08-19T00:00:00.000Z",
     lastSeen: "2026-08-19T00:00:00.000Z",
@@ -350,8 +355,9 @@ test("legacy state defaults the end span and latest commit without mutating on e
     severity: "Medium",
     start_line: 1,
     end_line: 1,
-    suggestion: null,
     evidence_kind: "inferred",
+    verification: "Recorded before evidence metadata existed; re-run review to classify evidence.",
+    suggestion: null,
   }] });
   assert.equal(readFileSync(stateFile, "utf8"), legacy);
 });

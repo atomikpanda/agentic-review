@@ -17,6 +17,8 @@ function finding(title, overrides = {}) {
     file: `src/${title.toLowerCase().replaceAll(" ", "-")}.js`,
     start_line: 1,
     end_line: 1,
+    evidence_kind: "static-proof",
+    verification: "Static control-flow trace shows the reviewed branch reaches this failure.",
     suggestion: null,
     ...overrides,
   };
@@ -137,10 +139,32 @@ test("an explicit stricter min-votes filters findings without changing the defau
     JSON.parse(strict.stdout).findings.map(({ title, votes }) => ({ title, votes })),
     [{ title: "Repeated finding", votes: 2 }],
   );
-  assert.equal(JSON.parse(defaultUnion.stdout).findings.length, 2);
+  const defaultFindings = JSON.parse(defaultUnion.stdout).findings;
+  assert.equal(defaultFindings.length, 2);
+  assert.equal(defaultFindings[0].evidence_kind, "static-proof");
+  assert.equal(
+    defaultFindings[0].verification,
+    "Static control-flow trace shows the reviewed branch reaches this failure.",
+  );
 });
 
+test("finding schema requires explicit evidence metadata", () => {
+  const valid = finding("Valid finding");
+  const invalidFindings = [
+    { ...valid, evidence_kind: undefined },
+    { ...valid, evidence_kind: "confidence" },
+    { ...valid, verification: undefined },
+    { ...valid, verification: "" },
+    { ...valid, verification: " \n" },
+  ];
 
+  for (const invalid of invalidFindings) {
+    const result = mergeFindingDocuments([{ findings: [valid, invalid] }], { minVotes: 1 });
+    assert.deepEqual(result.statuses, [{ status: "malformed", finding_count: 0 }]);
+    assert.equal(result.passes, 0);
+    assert.deepEqual(result.findings, []);
+  }
+});
 test("verification output keeps known identities and explicitly linked regressions", () => {
   const known = {
     ...finding("Configured Bun version is ignored", {

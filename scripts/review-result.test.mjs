@@ -95,6 +95,8 @@ function finding(severity, title = `${severity} cache lifecycle failure`, body =
     severity,
     title,
     body,
+    evidence_kind: "static-proof",
+    verification: "Static control-flow trace shows cached state remains stale.",
     suggestion: null,
   };
 }

@@ -48,6 +48,9 @@ const RUNS_DIR = join(STATE_DIR, "runs");
 const STATE_FILE = join(STATE_DIR, "state.json");
 const STORED_STATUSES = new Set(["open", "dismissed", "gone"]);
 const STORED_SEVERITIES = new Set(["Critical", "High", "Medium"]);
+const STORED_EVIDENCE_KINDS = new Set(["observed", "static-proof", "inferred"]);
+const LEGACY_EVIDENCE_VERIFICATION = "Recorded before evidence metadata existed; re-run review to classify evidence.";
+const EVIDENCE_RANK = { inferred: 0, "static-proof": 1, observed: 2 };
 const NON_LOWERCASE_HEX = /[^0-9a-f]/;
 const STAGED_TARGET_REF_PREFIX = "refs/agentic-review/staged-targets/";
 // A fully populated directory is atomically published to serialize the state/ref
@@ -291,6 +294,20 @@ function isTimestamp(value) {
   return Number.isFinite(epoch) && new Date(epoch).toISOString() === value;
 }
 
+
+function normalizeEvidenceKind(value) {
+  return value === "observed" || value === "static-proof" ? value : "inferred";
+}
+
+function storedEvidenceKind(finding) {
+  return finding.evidenceKind ?? finding.evidence_kind ?? "inferred";
+}
+
+function storedVerification(finding) {
+  return finding.verification ?? LEGACY_EVIDENCE_VERIFICATION;
+}
+
+
 function migrateAndValidateStoredFinding(finding, index) {
   const label = `local review state findings[${index}]`;
   if (!finding || typeof finding !== "object" || Array.isArray(finding)) {
@@ -313,6 +330,12 @@ function migrateAndValidateStoredFinding(finding, index) {
   }
   if (!STORED_SEVERITIES.has(finding.severity)) {
     throw new TypeError(`${label}.severity is invalid`);
+  }
+  if (!STORED_EVIDENCE_KINDS.has(storedEvidenceKind(finding))) {
+    throw new TypeError(`${label}.evidenceKind is invalid`);
+  }
+  if (typeof storedVerification(finding) !== "string" || storedVerification(finding).trim().length === 0) {
+    throw new TypeError(`${label}.verification must be a non-empty string`);
   }
   if (!STORED_STATUSES.has(finding.status)) {
     throw new TypeError(`${label}.status is invalid`);
@@ -470,12 +493,17 @@ if (cmd === "record") {
         known.severity = f.severity ?? known.severity;
         known.line = f.start_line ?? known.line;
         known.endLine = f.end_line ?? f.start_line ?? known.endLine;
+        const incomingEvidenceKind = normalizeEvidenceKind(f.evidence_kind);
+        const incomingRank = EVIDENCE_RANK[incomingEvidenceKind] ?? 0;
+        const knownRank = EVIDENCE_RANK[storedEvidenceKind(known)] ?? 0;
         // Basis only upgrades: a finding once traced or observed does not
-        // decay to inferred because a later sample omitted the field.
-        if (
-          known.evidenceKind !== "observed"
-          && (f.evidence_kind === "observed" || f.evidence_kind === "static-proof")
-        ) known.evidenceKind = f.evidence_kind;
+        // decay to inferred because a later sample's basis is weaker.
+        if (incomingRank >= knownRank) {
+          known.evidenceKind = incomingEvidenceKind;
+          known.verification = f.verification;
+        } else if (storedVerification(known) === LEGACY_EVIDENCE_VERIFICATION) {
+          known.verification = f.verification;
+        }
         known.lastCommit = head;
         known.stagedTarget = Boolean(stagedTarget);
         if (known.status === "dismissed") { muted++; continue; }
@@ -488,9 +516,8 @@ if (cmd === "record") {
         seen.add(id);
         state.findings.push({
           id, file: f.file, title: f.title, body: f.body, severity: f.severity,
-          evidenceKind: f.evidence_kind === "observed" || f.evidence_kind === "static-proof"
-            ? f.evidence_kind
-            : "inferred",
+          evidenceKind: normalizeEvidenceKind(f.evidence_kind),
+          verification: f.verification,
           line: f.start_line, endLine: f.end_line ?? f.start_line, status: "open",
           firstSeen: now, lastSeen: now, firstCommit: head, lastCommit: head,
           stagedTarget: Boolean(stagedTarget), count: 1,
@@ -553,8 +580,9 @@ if (cmd === "export-open") {
       severity: finding.severity,
       start_line: finding.line,
       end_line: finding.endLine,
+      evidence_kind: storedEvidenceKind(finding),
+      verification: storedVerification(finding),
       suggestion: null,
-      evidence_kind: finding.evidenceKind ?? "inferred",
     }));
   process.stdout.write(`${JSON.stringify({ findings })}\n`);
   process.exit(0);

@@ -545,8 +545,22 @@ function fenceFor(text) {
   return "`".repeat(Math.max(3, longest + 1));
 }
 
+function evidenceLine(finding) {
+  if (
+    !["observed", "static-proof", "inferred"].includes(finding.evidence_kind)
+    || typeof finding.verification !== "string"
+    || finding.verification.trim().length === 0
+  ) {
+    return null;
+  }
+  const qualifier = finding.evidence_kind === "inferred" ? "unverified: " : "";
+  return `**Evidence:** ${finding.evidence_kind} — ${qualifier}${finding.verification.trim()}`;
+}
+
 function commentBody(f, withSuggestion) {
   const parts = [`${badge(f.severity)} — **${f.title}**`, "", f.body];
+  const evidence = evidenceLine(f);
+  if (evidence) parts.push("", evidence);
   const note = evidenceNote(f);
   if (note) parts.push("", note);
   if (withSuggestion && typeof f.suggestion === "string" && f.suggestion.length > 0) {
@@ -718,6 +732,7 @@ function appendFindings(out, heading, findings, mode) {
       `\`${String(finding.file).replace(/^\.\//, "")}${span}\``,
       "",
       finding.body,
+      ...(evidenceLine(finding) ? ["", evidenceLine(finding)] : []),
     );
     const note = evidenceNote(finding);
     if (note) out.push("", note);

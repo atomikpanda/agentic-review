@@ -126,6 +126,8 @@ function finding(overrides = {}) {
     severity: "High",
     title: "Cache entry survives invalidation",
     body: "The stale entry is returned after invalidation.",
+    evidence_kind: "static-proof",
+    verification: "Static control-flow trace shows stale cache entries are reachable.",
     suggestion: "replacement();\n",
     ...overrides,
   };
@@ -436,7 +438,7 @@ test("summary marker round-trips only normalized carry-forward fields", () => {
       title: "Cache entry survives invalidation",
       body: "Previously reported finding remains held from an earlier review sample.",
       identity_tokens: ["cache", "entry", "survives", "invalidation", "stale", "returned"],
-      evidence_kind: "inferred",
+      evidence_kind: "static-proof",
     }],
   });
   assert.ok(!marker.includes("replacement"));
@@ -1985,6 +1987,26 @@ test("rendered bodies remove confidence heuristics and exhaustive or safety word
   }
 });
 
+test("rendered findings expose inferred evidence as unverified", () => {
+  const inferred = finding({
+    evidence_kind: "inferred",
+    verification: "Runtime HTTP status requires checking the deployed service.",
+    suggestion: null,
+  });
+  const body = renderReviewBody({
+    mode: "summary", metadata: metadata(), state: state(), current: [inferred], unresolved: [],
+  });
+  assert.match(body, /\*\*Evidence:\*\* inferred — unverified: Runtime HTTP status requires checking the deployed service\./);
+
+  const comments = poster.buildReviewComments(
+    [inferred],
+    new Map([[inferred.file, [[inferred.start_line, inferred.end_line]]]]),
+    { mode: "inline" },
+  );
+  assert.equal(comments.comments.length, 1);
+  assert.match(comments.comments[0].body, /\*\*Evidence:\*\* inferred — unverified: Runtime HTTP status requires checking the deployed service\./);
+});
+
 test("summary lifecycle appends pull-request reviews including a later clean state", async () => {
   const calls = [];
   const fetchImpl = async (url, options) => {
@@ -2093,7 +2115,7 @@ test("oversized inline prose is UTF-8 bounded while its identity stamp remains i
   assert.equal(built.unanchored.length, 0);
   assert.ok(Buffer.byteLength(built.comments[0].body) <= GITHUB_COMMENT_MAX_BYTES);
   assert.match(built.comments[0].body, /complete finding.*structured artifact/i);
-  assert.match(built.comments[0].body, /<!-- agentic-review-fp:[0-9a-f]{16} -->$/);
+  assert.match(built.comments[0].body, /<!-- agentic-review-fp:[0-9a-f]{16}(?::ek=(?:observed|static-proof))? -->$/);
 });
 
 test("an oversized committable suggestion is omitted atomically and retained as a compact artifact note", () => {
@@ -2870,10 +2892,6 @@ test("inferred findings carry an unverified note in inline and summary rendering
   );
   assert.doesNotMatch(observed.comments[0].body, /Unverified/);
 
-  // Omission of evidence_kind means inferred (the format says so), so an
-  // untagged finding is rendered unverified exactly like a tagged one.
-  const untagged = poster.buildReviewComments([finding()], ranges, { mode: "inline" });
-  assert.match(untagged.comments[0].body, /Unverified/);
 
   const summary = renderReviewBody({
     mode: "summary",

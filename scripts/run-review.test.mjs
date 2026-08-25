@@ -179,6 +179,8 @@ function finding(title, overrides = {}) {
     severity: "Medium",
     file: `src/${title.toLowerCase().replaceAll(" ", "-")}.js`,
     start_line: 1,
+    evidence_kind: "static-proof",
+    verification: "Static control-flow trace shows the reviewed contract breaks.",
     end_line: 1,
     suggestion: null,
     ...overrides,

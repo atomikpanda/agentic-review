@@ -14,6 +14,8 @@ Otherwise:
           "start_line": 42,
           "end_line": 44,
           "severity": "Critical",
+          "evidence_kind": "observed",
+          "verification": "The command, static proof, or missing prerequisite that supports this finding.",
           "title": "One line, no trailing period",
           "body": "What breaks: the input or condition, and the wrong behaviour that results. Markdown is allowed here.",
           "evidence_kind": "static-proof",
@@ -44,6 +46,21 @@ Rules that decide whether a finding can be shown at all:
 - **Verify the numbers by reading the file.** Do not infer them from the diff
   or estimate. An off-by-one anchors the comment to the wrong code, and a
   suggestion that replaces the wrong lines is worse than no suggestion.
+- `evidence_kind` is required for every finding:
+  - `observed` means you directly ran a command or inspected concrete output that
+    proves the behavior.
+  - `static-proof` means the diff/tree proves the behavior without running the
+    system; `verification` must name the complete code path, data flow, lock
+    order, or contradictory files.
+  - `inferred` means the behavior is a hypothesis from code reading or priors.
+    Concrete runtime claims about HTTP status, endpoint existence, headers,
+    timing, deployed configuration, or external services must be `inferred`
+    unless you observed them directly. Phrase the finding body as unverified
+    and explain what must be checked.
+- `verification` is required and non-empty. For `observed`, name the command or
+  output. For `static-proof`, name the proof. For `inferred`, name the missing
+  runtime check or prerequisite.
+
 
 `suggestion` is the valuable part. It must be the **complete replacement text
 for `start_line` through `end_line` inclusive**:

@@ -137,9 +137,9 @@ human reviewer, not a wall of prose at the bottom of the PR.
 This is a different mechanism, not a different format. A suggestion has to be
 an inline review comment attached to a line range **inside the pull request's
 diff**, so the agent emits structured findings (`file`, `start_line`,
-`end_line`, `suggestion`, `evidence_kind`) rather than markdown, and
-[`scripts/post-review.mjs`](scripts/post-review.mjs) turns them into one
-`POST /pulls/{n}/reviews` call.
+`end_line`, `evidence_kind`, `verification`, `suggestion`) rather than
+markdown, and [`scripts/post-review.mjs`](scripts/post-review.mjs) turns them
+into one `POST /pulls/{n}/reviews` call.
 
 Three things that mechanism forces, all handled:
 
@@ -148,6 +148,10 @@ Three things that mechanism forces, all handled:
   is checked against the actual hunk ranges first. Findings that cannot anchor
   are moved into the summary instead of being dropped — a real defect in
   untouched code is still worth saying.
+- **Evidence basis is explicit.** Every finding declares whether its claim is
+  `observed`, a `static-proof`, or `inferred`, and includes `verification`
+  text. Rendered reviews mark `inferred` claims as unverified instead of
+  presenting runtime behavior as observed fact.
 - **A wrong suggestion is worse than none.** The fix has to be the complete
   replacement for the lines it spans, with original indentation, because
   someone will click the button. The prompt tells the agent to emit `null`

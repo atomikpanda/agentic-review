@@ -45,6 +45,9 @@ export function isValidFinding(value) {
     && typeof value.body === "string"
     && value.body.trim().length > 0
     && FINDING_SEVERITIES.has(value.severity)
+    && EVIDENCE_KINDS.has(value.evidence_kind)
+    && typeof value.verification === "string"
+    && value.verification.trim().length > 0
     && Number.isInteger(value.start_line)
     && value.start_line > 0
     && Number.isInteger(value.end_line)
@@ -60,7 +63,6 @@ export function isValidFinding(value) {
         && VERIFICATION_ID_RE.test(value.verification_of)
         && value.verification_classification === "linked_regression"
     )
-    && (value.evidence_kind === undefined || EVIDENCE_KINDS.has(value.evidence_kind))
     && (typeof value.suggestion === "string" || value.suggestion === null);
 }
 
@@ -73,7 +75,8 @@ export function projectPublicFinding(value) {
     file: value.file,
     start_line: value.start_line,
     end_line: value.end_line,
-    ...(value.evidence_kind === undefined ? {} : { evidence_kind: value.evidence_kind }),
+    evidence_kind: value.evidence_kind,
+    verification: value.verification,
     suggestion: value.suggestion,
     ...(value.verification_id === undefined
       ? {}
