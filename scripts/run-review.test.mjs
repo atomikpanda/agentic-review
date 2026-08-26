@@ -3177,6 +3177,7 @@ test("failed attempts publish bounded classified diagnostics without review inpu
         "provider overloaded",
         "sk-or-runner-test",
         "alpha head",
+        `403 Key limit exceeded. Manage it using https://openrouter.ai/workspaces/default/keys/${"a".repeat(64)}`,
         "x".repeat(10_000),
       ].join("\n"),
     }],
@@ -3210,8 +3211,15 @@ test("failed attempts publish bounded classified diagnostics without review inpu
     "findings[0].evidence_kind must be observed, static-proof, or inferred",
   );
   const serialized = JSON.stringify(run.diagnostics);
-  assert.doesNotMatch(serialized, /sk-or-runner-test|alpha head/);
+  assert.doesNotMatch(
+    serialized,
+    /sk-or-runner-test|alpha head|workspaces\/default\/keys|a{64}/,
+  );
   assert.match(run.diagnostics.passes[0].attempts[0].stderr_tail, /provider overloaded/);
+  assert.match(
+    run.diagnostics.passes[0].attempts[0].stderr_tail,
+    /https:\/\/openrouter\.ai\/settings\/keys/,
+  );
   for (const { attempts } of run.diagnostics.passes) {
     for (const { stderr_tail: stderrTail } of attempts) {
       assert.ok(Buffer.byteLength(stderrTail, "utf8") <= 4096);

@@ -1064,6 +1064,7 @@ write_pass_attempt_record() {
       line = line
         .replace(/\b(?:sk-or-v1|github_pat|gh[pousr])[-_A-Za-z0-9]{8,}\b/g, "<redacted token>")
         .replace(/(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s]+/ig, "$1<redacted token>")
+        .replace(/https:\/\/openrouter\.ai\/workspaces\/[^\s/]+\/keys\/[^\s]+/ig, "https://openrouter.ai/settings/keys")
         .replace(/(https?:\/\/[^\s?]+)\?[^\s]*/g, "$1");
       if (!safeDiagnostic.test(line)) return "<redacted stderr line>";
       return line.length > 512 ? `${line.slice(0, 509)}...` : line;
