@@ -486,6 +486,7 @@ function runReview(t, plan, {
   const logFile = join(fixture.directory, "omp.log");
   const codegraphLogFile = join(fixture.directory, "codegraph.log");
   const bunxLogFile = join(fixture.directory, "bunx.log");
+  const bunInstallLogFile = join(fixture.directory, "bun-install.log");
   let findingsFile = join(fixture.directory, "findings.json");
   let publicationFile = join(fixture.directory, "publication.json");
   let diagnosticsFile = join(fixture.directory, "pass-diagnostics.json");
@@ -579,6 +580,7 @@ exec "\$(dirname "$0")/omp" "$@"
     const bun = join(fixture.bin, "bun");
     writeFileSync(bun, `#!/usr/bin/env bash
 if [ "\${1:-}" = add ]; then
+  printf '%s\\n' "$*" >> "\${FAKE_BUN_INSTALL_LOG}"
   install_root=""
   for argument in "$@"; do
     case "$argument" in --cwd=*) install_root="\${argument#--cwd=}" ;; esac
@@ -619,6 +621,7 @@ printf '%s\\n' '1.3.14'
       FAKE_OMP_STATE: fixture.state,
       FAKE_CODEGRAPH_LOG: codegraphLogFile,
       FAKE_BUNX_LOG: bunxLogFile,
+      FAKE_BUN_INSTALL_LOG: bunInstallLogFile,
       REAL_NODE: process.execPath,
       ...(publicationViaEnv ? { AGENTIC_REVIEW_PUBLICATION_OUT: publicationFile } : {}),
       ...env,
@@ -645,6 +648,7 @@ printf '%s\\n' '1.3.14'
       ? JSON.parse(readFileSync(diagnosticsFile, "utf8"))
       : null,
     bunxLogFile,
+    bunInstallLogFile,
     findings: existsSync(findingsFile) ? JSON.parse(readFileSync(findingsFile, "utf8")) : null,
     publication,
     metadata: publication?.metadata ?? null,
@@ -762,7 +766,7 @@ test("hosted config allows harmless display flags and rejects prompt, parser, an
   assert.equal(valid.values.EXTRA_ARGS, "--print-thoughts --hide-thinking --no-title");
   assert.equal(valid.values.OMP_VERSION, "17.4.0-rc.1");
   assert.equal(valid.values.MAX_DISCOVERY_ROUNDS, "2");
-  assert.equal(valid.values.MAX_PARALLEL, "1");
+  assert.equal(valid.values.MAX_PARALLEL, "3");
   const customParallelism = runWorkflowConfig(t, { IN_MAX_PARALLEL: "2" });
   assert.equal(customParallelism.result.status, 0, customParallelism.result.stderr);
   assert.equal(customParallelism.values.MAX_PARALLEL, "2");
@@ -991,10 +995,11 @@ test("runner validates OMP package versions before bunx or OMP", (t) => {
       fakeBunx: true,
     });
     assert.equal(valid.result.status, 0, `${version}: ${valid.result.stderr}`);
-    assert.deepEqual(
-      readFileSync(valid.bunxLogFile, "utf8").trim().split("\n"),
-      Array(3).fill(`@oh-my-pi/pi-coding-agent@${version}`),
-    );
+    const installArgs = readFileSync(valid.bunInstallLogFile, "utf8").trim();
+    assert.match(installArgs, new RegExp(
+      `@oh-my-pi/pi-coding-agent@${version.replaceAll(".", "\\.")}$`,
+    ));
+    assert.equal(existsSync(valid.bunxLogFile), false);
   }
 });
 
@@ -2665,6 +2670,7 @@ test("parallel bunx passes install one private executable before workers launch"
   assert.equal(run.result.status, 0, run.result.stderr);
   assert.equal(existsSync(warmMarker), true);
   assert.equal(existsSync(run.bunxLogFile), false);
+  assert.equal(readFileSync(run.bunInstallLogFile, "utf8").trim().split("\n").length, 1);
 });
 
 test("max-parallel overlaps workers without exceeding the configured limit", (t) => {

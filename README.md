@@ -176,12 +176,13 @@ basis any pass claimed wins.
 ## Bounded ensemble and result states
 
 The default local and hosted profile runs **general**, **correctness**, and
-**boundaries** one at a time while hosted concurrency is revalidated. Set
-`max_parallel` above `1` to overlap independent passes against the same
-immutable base SHA, head SHA, and configuration fingerprint. Each pass keeps
-isolated retry and status state. Results are harvested and merged in descriptor
-order regardless of completion order. Every valid pass contributes
-to one union with `min_votes=1`, so a finding seen by only one pass survives.
+**boundaries** concurrently, up to the `max_parallel` limit, against one
+immutable base SHA, head SHA, and configuration fingerprint. When `bunx`
+supplies OMP, the runner installs the selected package once into private
+temporary storage so parallel workers share one immutable executable. Each pass
+keeps isolated retry and status state, and results merge in descriptor order.
+Every valid pass contributes to one union with `min_votes=1`, so a finding seen
+by only one pass survives.
 One result is rendered or posted: the union, or an explicitly inconclusive
 first-valid structured fallback if union fails.
 
@@ -435,7 +436,7 @@ cell means that surface does not expose the setting.
 | Reasoning effort | `high` | `thinking` | `--thinking` | `--thinking` |
 | Tool allowlist | `read,grep,glob` | `tools` | `--tools` | `--tools` |
 | Wall-clock cap | none | `max_time` | `--max-time` | `--max-time` |
-| Concurrent model passes | `1` | `max_parallel` | `--max-parallel` | `--max-parallel` |
+| Concurrent model passes | `3` | `max_parallel` | `--max-parallel` | `--max-parallel` |
 | Review prompt | `review/prompt.md` | `prompt_path` | `--prompt` | `--prompt` |
 | Injected knowledge | both skills | `skills_path` | `--skill` | `--skill` |
 | Review style | `suggest` | `review_mode` | `--review-mode` | `--review-mode` |
