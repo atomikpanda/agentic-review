@@ -422,21 +422,26 @@ tagged_pass_pids() {
     esac
   done
 }
-verify_tagged_pass_cleanup() {
-  local attempt pid probe_pids probe_pid seen=0
-  AGENTIC_REVIEW_RUN_TOKEN="$PASS_RUN_TOKEN" sleep 30 &
-  PASS_SCAN_PROBE_PID=$!
-  probe_pid="$PASS_SCAN_PROBE_PID"
+verify_tagged_pass_visibility() {
+  local attempt pid tagged_pids target_pid="${1:-}" owns_probe=0 seen=0
+  if [ -z "$target_pid" ]; then
+    AGENTIC_REVIEW_RUN_TOKEN="$PASS_RUN_TOKEN" sleep 30 &
+    PASS_SCAN_PROBE_PID=$!
+    target_pid="$PASS_SCAN_PROBE_PID"
+    owns_probe=1
+  fi
   for attempt in {1..20}; do
-    probe_pids="$(tagged_pass_pids || :)"
-    for pid in $probe_pids; do
-      if [ "$pid" = "$probe_pid" ]; then seen=1; break 2; fi
+    tagged_pids="$(tagged_pass_pids || :)"
+    for pid in $tagged_pids; do
+      if [ "$pid" = "$target_pid" ]; then seen=1; break 2; fi
     done
     sleep 0.05
   done
-  kill -KILL "$probe_pid" 2>/dev/null || :
-  wait "$probe_pid" 2>/dev/null || :
-  PASS_SCAN_PROBE_PID=""
+  if [ "$owns_probe" = 1 ]; then
+    kill -KILL "$target_pid" 2>/dev/null || :
+    wait "$target_pid" 2>/dev/null || :
+    PASS_SCAN_PROBE_PID=""
+  fi
   [ "$seen" = 1 ]
 }
 kill_tagged_passes() {
@@ -936,12 +941,14 @@ stop_pass_child() {
 
 run_pass() {
   local prompt_file="$1" out_file="$2" skill_file="$3" pass_id="$4" status
+  local attempt child_state=""
   local -a args=()
   if [ -s "$skill_file" ]; then args+=(--append-system-prompt="$skill_file"); fi
   if [ -n "$THINKING" ]; then args+=(--thinking="$THINKING"); fi
   if [ -n "$MAX_TIME" ]; then args+=(--max-time="$MAX_TIME"); fi
   if [ ${#PASSTHRU[@]} -gt 0 ]; then args+=("${PASSTHRU[@]}"); fi
-  AGENTIC_REVIEW_RUN_TOKEN="$PASS_RUN_TOKEN" AGENTIC_REVIEW_PASS_ID="$pass_id" "${OMP[@]}" -p \
+  AGENTIC_REVIEW_RUN_TOKEN="$PASS_RUN_TOKEN" AGENTIC_REVIEW_PASS_ID="$pass_id" \
+    bash -c 'kill -STOP "$$"; exec "$@"' agentic-review-pass "${OMP[@]}" -p \
     --model="$MODEL" \
     --no-session \
     "${args[@]+"${args[@]}"}" \
@@ -952,6 +959,30 @@ run_pass() {
     < /dev/null > "$out_file" 2>"$out_file.err" &
   PASS_CHILD_PID=$!
   printf '%s\n' "$PASS_CHILD_PID" > "$out_file.pid"
+  for attempt in {1..100}; do
+    child_state="$(ps -o stat= -p "$PASS_CHILD_PID" 2>/dev/null | tr -d ' ')"
+    case "$child_state" in T*) break ;; esac
+    sleep 0.01
+  done
+  case "$child_state" in
+    T*) ;;
+    *)
+      kill -KILL "$PASS_CHILD_PID" 2>/dev/null || :
+      wait "$PASS_CHILD_PID" 2>/dev/null || :
+      rm -f "$out_file.pid"
+      PASS_CHILD_PID=""
+      die "model process did not stop for cleanup verification in pass $pass_id"
+      ;;
+  esac
+  if ! verify_tagged_pass_visibility "$PASS_CHILD_PID"; then
+    kill -KILL "$PASS_CHILD_PID" 2>/dev/null || :
+    wait "$PASS_CHILD_PID" 2>/dev/null || :
+    rm -f "$out_file.pid"
+    PASS_CHILD_PID=""
+    die "could not verify cleanup access to model process for pass $pass_id"
+  fi
+  kill -CONT "$PASS_CHILD_PID" 2>/dev/null \
+    || die "could not start verified model process for pass $pass_id"
   if wait "$PASS_CHILD_PID"; then status=0; else status=$?; fi
   rm -f "$out_file.pid"
   PASS_CHILD_PID=""
@@ -1030,7 +1061,7 @@ PASS_COUNTS=()
 PASS_CAPPED=()
 PASS_OUTS=()
 VALID_OUTS=()
-verify_tagged_pass_cleanup \
+verify_tagged_pass_visibility \
   || die "could not verify detached-process cleanup before starting model work"
 
 set -m

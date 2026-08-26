@@ -2677,6 +2677,39 @@ PATH="$real_path" ps "$@"
   assert.deepEqual(run.logs, []);
 });
 
+test("runner verifies cleanup access to each model process before execution", (t) => {
+  const fixture = createFixture(t);
+  const psWrapper = join(fixture.bin, "ps");
+  const scanCount = join(fixture.directory, "ps-environment-scans");
+  writeFileSync(psWrapper, `#!/usr/bin/env bash
+if [ "\${1:-}" = "eww" ]; then
+  count=0
+  if [ -f "\${FAKE_PS_SCAN_COUNT}" ]; then read -r count < "\${FAKE_PS_SCAN_COUNT}"; fi
+  count=$((count + 1))
+  printf '%s\\n' "$count" > "\${FAKE_PS_SCAN_COUNT}"
+  if [ "$count" -gt 1 ]; then exit 1; fi
+fi
+real_path="\${PATH#*:}"
+PATH="$real_path" ps "$@"
+`);
+  chmodSync(psWrapper, 0o755);
+
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+  }, {
+    args: ["--passes", "1", "--lenses", "", "--json"],
+    existingFixture: fixture,
+    env: {
+      AGENTIC_REVIEW_FORCE_PS_SCAN: "1",
+      FAKE_PS_SCAN_COUNT: scanCount,
+    },
+  });
+
+  assert.notEqual(run.result.status, 0);
+  assert.match(run.result.stderr, /could not verify cleanup access to model process/);
+  assert.deepEqual(run.logs, []);
+});
+
 test("cancelling the runner terminates nested processes of active passes", async (t) => {
   const fixture = createFixture(t);
   const planFile = join(fixture.directory, "cancel-plan.json");
