@@ -2650,6 +2650,33 @@ test("pass completion order cannot change descriptor-ordered merge fallback", (t
   assert.deepEqual(run.findings.findings.map(({ title }) => title), [general.title]);
 });
 
+test("runner refuses model work when detached-process cleanup cannot be verified", (t) => {
+  const fixture = createFixture(t);
+  const psWrapper = join(fixture.bin, "ps");
+  writeFileSync(psWrapper, `#!/usr/bin/env bash
+if [ "\${1:-}" = "eww" ]; then
+  exit 1
+fi
+real_path="\${PATH#*:}"
+PATH="$real_path" ps "$@"
+`);
+  chmodSync(psWrapper, 0o755);
+
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+  }, {
+    args: ["--passes", "1", "--lenses", "", "--json"],
+    existingFixture: fixture,
+    env: {
+      AGENTIC_REVIEW_FORCE_PS_SCAN: "1",
+    },
+  });
+
+  assert.notEqual(run.result.status, 0);
+  assert.match(run.result.stderr, /could not verify detached-process cleanup/);
+  assert.deepEqual(run.logs, []);
+});
+
 test("cancelling the runner terminates nested processes of active passes", async (t) => {
   const fixture = createFixture(t);
   const planFile = join(fixture.directory, "cancel-plan.json");

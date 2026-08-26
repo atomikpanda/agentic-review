@@ -388,6 +388,7 @@ SNAPSHOT_IMMUTABLE=0
 PASS_WORKER_PIDS=()
 PASS_WORKER_PGIDS=()
 PASS_TREE_PIDS=()
+PASS_SCAN_PROBE_PID=""
 PASS_RUN_TOKEN="agentic-review-$$-$RANDOM-$RANDOM"
 RUNNER_PGID="$(ps -o pgid= -p "$$" | tr -d ' ')"
 freeze_pass_tree() {
@@ -421,6 +422,23 @@ tagged_pass_pids() {
     esac
   done
 }
+verify_tagged_pass_cleanup() {
+  local attempt pid probe_pids probe_pid seen=0
+  AGENTIC_REVIEW_RUN_TOKEN="$PASS_RUN_TOKEN" sleep 30 &
+  PASS_SCAN_PROBE_PID=$!
+  probe_pid="$PASS_SCAN_PROBE_PID"
+  for attempt in {1..20}; do
+    probe_pids="$(tagged_pass_pids || :)"
+    for pid in $probe_pids; do
+      if [ "$pid" = "$probe_pid" ]; then seen=1; break 2; fi
+    done
+    sleep 0.05
+  done
+  kill -KILL "$probe_pid" 2>/dev/null || :
+  wait "$probe_pid" 2>/dev/null || :
+  PASS_SCAN_PROBE_PID=""
+  [ "$seen" = 1 ]
+}
 kill_tagged_passes() {
   local attempt pid killed
   for attempt in {1..20}; do
@@ -433,6 +451,11 @@ kill_tagged_passes() {
 }
 stop_pass_workers() {
   local index pid pgid model_pid
+  if [ -n "$PASS_SCAN_PROBE_PID" ]; then
+    kill -KILL "$PASS_SCAN_PROBE_PID" 2>/dev/null || :
+    wait "$PASS_SCAN_PROBE_PID" 2>/dev/null || :
+    PASS_SCAN_PROBE_PID=""
+  fi
   PASS_TREE_PIDS=()
   for index in "${!PASS_WORKER_PIDS[@]}"; do
     pid="${PASS_WORKER_PIDS[index]:-}"
@@ -1007,6 +1030,9 @@ PASS_COUNTS=()
 PASS_CAPPED=()
 PASS_OUTS=()
 VALID_OUTS=()
+verify_tagged_pass_cleanup \
+  || die "could not verify detached-process cleanup before starting model work"
+
 set -m
 PASS_CANCEL_STATUS=0
 trap 'PASS_CANCEL_STATUS=130' INT
