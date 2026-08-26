@@ -564,6 +564,14 @@ exit "$status"
     const bunx = join(fixture.bin, "bunx");
     writeFileSync(bunx, `#!/usr/bin/env bash
 printf '%s\\n' "\${2:-}" >> "\${FAKE_BUNX_LOG}"
+if [ "\${FAKE_BUNX_REQUIRE_WARMUP:-0}" = 1 ]; then
+  if [ "\${3:-}" = "--version" ]; then
+    : > "\${FAKE_BUNX_WARM_MARKER}"
+  elif [ ! -e "\${FAKE_BUNX_WARM_MARKER}" ]; then
+    printf '%s\\n' 'error: package executable is not ready' >&2
+    exit 9
+  fi
+fi
 shift 2
 exec "\$(dirname "$0")/omp" "$@"
 `);
@@ -2624,6 +2632,28 @@ function diffFileOrder(prompt) {
   assert.ok(diff, "prompt must contain a diff block");
   return [...diff[1].matchAll(/^diff --git a\/(.+?) b\/.+$/gm)].map((match) => match[1]);
 }
+
+test("parallel bunx passes warm the package executable before workers launch", (t) => {
+  const fixture = createFixture(t);
+  const warmMarker = join(fixture.directory, "bunx-warm");
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    args: ["--max-parallel", "3", "--omp-version", "next", "--json"],
+    existingFixture: fixture,
+    fakeBunx: true,
+    env: {
+      FAKE_BUNX_REQUIRE_WARMUP: "1",
+      FAKE_BUNX_WARM_MARKER: warmMarker,
+    },
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.equal(existsSync(warmMarker), true);
+  assert.equal(readFileSync(run.bunxLogFile, "utf8").trim().split("\n").length, 4);
+});
 
 test("max-parallel overlaps workers without exceeding the configured limit", (t) => {
   const fixture = createFixture(t);
