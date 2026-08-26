@@ -280,13 +280,21 @@ if (choice?.__spawn_child) {
   await new Promise((resolve) => nested.on("exit", resolve));
   process.exit(0);
 }
+if (choice?.__kill_worker) {
+  appendFileSync(process.env.FAKE_OMP_WORKER_KILL_LOG, JSON.stringify({
+    ompPid: process.pid,
+    workerPid: process.ppid,
+  }) + "\\n");
+  process.kill(process.ppid, "SIGKILL");
+  await new Promise(() => {});
+}
 if (choice && typeof choice === "object" && Object.hasOwn(choice, "__exit")) {
   if (choice.output) process.stdout.write(choice.output);
   process.exit(choice.__exit);
 }
 const output = choice && typeof choice === "object"
   ? Object.fromEntries(Object.entries(choice).filter(
-      ([key]) => key !== "__delay_ms" && key !== "__spawn_child",
+      ([key]) => !["__delay_ms", "__spawn_child", "__kill_worker"].includes(key),
     ))
   : choice;
 process.stdout.write(typeof output === "string" ? output : JSON.stringify(output));
@@ -2703,6 +2711,75 @@ test("cancelling the runner terminates nested processes of active passes", async
     await delay(10);
   }
   assert.deepEqual(nestedPids.filter(processIsRunning), []);
+});
+
+test("unexpected worker death exits instead of blocking pass harvesting", async (t) => {
+  const fixture = createFixture(t);
+  const planFile = join(fixture.directory, "worker-death-plan.json");
+  const logFile = join(fixture.directory, "worker-death-omp.log");
+  const killedFile = join(fixture.directory, "worker-death.log");
+  writeFileSync(planFile, JSON.stringify({
+    general: [{ __kill_worker: true }],
+  }));
+
+  const review = spawn("bash", [
+    runner,
+    "--base", "main",
+    "--no-codegraph",
+    "--no-state",
+    "--no-fail",
+    "--passes", "1",
+    "--lenses", "",
+    "--max-parallel", "1",
+    "--json",
+  ], {
+    cwd: fixture.repository,
+    env: {
+      ...process.env,
+      AGENTIC_REVIEW_LENSES: "",
+      AGENTIC_REVIEW_MAX_PARALLEL: "",
+      AGENTIC_REVIEW_PASSES: "",
+      OPENROUTER_API_KEY: "sk-or-runner-test",
+      PATH: `${fixture.bin}:${process.env.PATH}`,
+      FAKE_OMP_PLAN: planFile,
+      FAKE_OMP_LOG: logFile,
+      FAKE_OMP_STATE: fixture.state,
+      FAKE_OMP_WORKER_KILL_LOG: killedFile,
+    },
+  });
+  let stderr = "";
+  let ompPid = null;
+  review.stderr.on("data", (chunk) => { stderr += chunk; });
+  review.stdout.resume();
+  t.after(() => {
+    if (review.exitCode === null) review.kill("SIGKILL");
+    if (ompPid !== null) {
+      try { process.kill(ompPid, "SIGKILL"); } catch {}
+    }
+  });
+
+  const closed = once(review, "close");
+  const killedDeadline = Date.now() + 5_000;
+  while (!existsSync(killedFile) && Date.now() < killedDeadline) {
+    await delay(10);
+  }
+  assert.equal(existsSync(killedFile), true, `worker was not killed\n${stderr}`);
+  ({ ompPid } = JSON.parse(readFileSync(killedFile, "utf8").trim()));
+
+  let timeout;
+  const closeResult = await Promise.race([
+    closed,
+    new Promise((resolve) => { timeout = setTimeout(() => resolve(null), 2_000); }),
+  ]);
+  clearTimeout(timeout);
+  if (closeResult === null) {
+    review.kill("SIGKILL");
+    try { process.kill(ompPid, "SIGKILL"); } catch {}
+    await closed;
+  }
+  assert.notEqual(closeResult, null, "runner deadlocked after its worker died");
+  assert.notEqual(closeResult[0], 0, stderr);
+  assert.match(stderr, /pass worker 0 exited unexpectedly/);
 });
 
 test("malformed output receives one retry and records the successful second attempt", (t) => {

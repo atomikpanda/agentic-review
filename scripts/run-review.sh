@@ -908,7 +908,7 @@ run_pass_worker() {
   local pass_index="$1" out_file="$RUN_TMP/out.$1" record="$RUN_TMP/pass.$1.record"
   local record_tmp="$RUN_TMP/pass.$1.record.tmp" diagnostics="$RUN_TMP/pass.$1.diagnostics"
   local attempt attempts=0 status=failed count=0 capped=false
-  trap 'stop_pass_child; printf "%s\n" "$pass_index" >&9 || :' EXIT
+  trap stop_pass_child EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
   : > "$diagnostics"
@@ -932,15 +932,40 @@ run_pass_worker() {
 
 ACTIVE_PASS_WORKERS=0
 reap_completed_pass() {
-  local completed_index pid
-  if ! IFS= read -r completed_index <&9; then die "pass completion channel closed"; fi
-  case "$completed_index" in ''|*[!0-9]*) die "invalid pass completion index" ;; esac
-  pid="${PASS_WORKER_PIDS[completed_index]:-}"
-  [ -n "$pid" ] || die "pass $completed_index completed more than once"
-  if ! wait "$pid"; then die "pass worker $completed_index exited unexpectedly"; fi
-  PASS_WORKER_PIDS[completed_index]=""
-  PASS_WORKER_PGIDS[completed_index]=""
-  ACTIVE_PASS_WORKERS=$((ACTIVE_PASS_WORKERS - 1))
+  local index pid record running_pid worker_running completed status running_workers
+  while :; do
+    running_workers="$(jobs -pr)"
+    for index in "${!PASS_WORKER_PIDS[@]}"; do
+      pid="${PASS_WORKER_PIDS[index]:-}"
+      if [ -z "$pid" ]; then continue; fi
+      record="$RUN_TMP/pass.$index.record"
+      completed=0
+      if [ -f "$record" ]; then
+        completed=1
+      else
+        worker_running=0
+        for running_pid in $running_workers; do
+          if [ "$running_pid" = "$pid" ]; then worker_running=1; break; fi
+        done
+        if [ "$worker_running" = 0 ]; then
+          if [ -f "$record" ]; then
+            completed=1
+          else
+            if wait "$pid"; then status=0; else status=$?; fi
+            die "pass worker $index exited unexpectedly (status $status)"
+          fi
+        fi
+      fi
+      if [ "$completed" = 1 ]; then
+        wait "$pid" 2>/dev/null || :
+        PASS_WORKER_PIDS[index]=""
+        PASS_WORKER_PGIDS[index]=""
+        ACTIVE_PASS_WORKERS=$((ACTIVE_PASS_WORKERS - 1))
+        return
+      fi
+    done
+    sleep 0.05
+  done
 }
 
 PASS_STATUSES=()
@@ -949,9 +974,6 @@ PASS_COUNTS=()
 PASS_CAPPED=()
 PASS_OUTS=()
 VALID_OUTS=()
-PASS_COMPLETION_PIPE="$RUN_TMP/pass-completions"
-mkfifo "$PASS_COMPLETION_PIPE"
-exec 9<> "$PASS_COMPLETION_PIPE"
 set -m
 for ((i = 0; i < ${#PASS_IDS[@]}; i++)); do
   PASS_OUTS+=("$RUN_TMP/out.$i")
@@ -962,7 +984,6 @@ for ((i = 0; i < ${#PASS_IDS[@]}; i++)); do
   if [ "$ACTIVE_PASS_WORKERS" -ge "$MAX_PARALLEL" ]; then reap_completed_pass; fi
 done
 while [ "$ACTIVE_PASS_WORKERS" -gt 0 ]; do reap_completed_pass; done
-exec 9>&-
 set +m
 
 for ((i = 0; i < ${#PASS_IDS[@]}; i++)); do
