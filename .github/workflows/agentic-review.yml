@@ -126,7 +126,7 @@ on:
       max_parallel:
         description: Maximum independent model passes to execute concurrently.
         type: number
-        default: 3
+        default: 1
       # --- prompt and injected knowledge ------------------------------------
       prompt_path:
         description: >-
@@ -287,6 +287,10 @@ on:
         description: Pull request number to review.
         type: string
         required: true
+      max_parallel:
+        description: Maximum independent model passes to execute concurrently.
+        type: number
+        default: 1
       max_discovery_rounds:
         description: Maximum broad discovery rounds in one cross-run review cycle.
         type: number
@@ -730,7 +734,7 @@ jobs:
           case "$MAX_DISCOVERY_ROUNDS" in
             ''|*[!0-9]*|0) echo "::error::max_discovery_rounds must be a positive integer"; exit 1 ;;
           esac
-          MAX_PARALLEL="${IN_MAX_PARALLEL:-3}"
+          MAX_PARALLEL="${IN_MAX_PARALLEL:-1}"
           case "$MAX_PARALLEL" in
             ''|*[!0-9]*) echo "::error::max_parallel must be a positive integer"; exit 1 ;;
             *[1-9]*) ;;
@@ -986,6 +990,7 @@ jobs:
             --omp-version "$OMP_VERSION"
             --out /tmp/review.md
             --publication-out /tmp/review-publication.json
+            --diagnostics-out /tmp/review-pass-diagnostics.json
             --no-state
             --no-fail
             --json
@@ -1531,5 +1536,6 @@ jobs:
             /tmp/review-publication.json
             /tmp/review-runner.out
             /tmp/review-runner.err
+            /tmp/review-pass-diagnostics.json
           retention-days: 7
           if-no-files-found: ignore

@@ -32,6 +32,7 @@ const runner = fileURLToPath(new URL("./run-review.sh", import.meta.url));
 const resultCli = fileURLToPath(new URL("./review-result.mjs", import.meta.url));
 const localState = fileURLToPath(new URL("./local-state.mjs", import.meta.url));
 const poster = fileURLToPath(new URL("./post-review.mjs", import.meta.url));
+const outputFormat = fileURLToPath(new URL("../review/format-json.md", import.meta.url));
 const workflow = fileURLToPath(new URL("../.github/workflows/agentic-review.yml", import.meta.url));
 const installer = fileURLToPath(new URL("./install-review.sh", import.meta.url));
 const trustedRoot = dirname(dirname(runner));
@@ -321,6 +322,7 @@ if (choice?.__replace_pid_with_sentinel) {
   writeFileSync(process.env.FAKE_OMP_SENTINEL_LOG, String(sentinel.pid) + "\\n");
 }
 if (choice && typeof choice === "object" && Object.hasOwn(choice, "__exit")) {
+  if (choice.stderr) process.stderr.write(choice.stderr);
   if (choice.output) process.stdout.write(choice.output);
   process.exit(choice.__exit);
 }
@@ -486,12 +488,14 @@ function runReview(t, plan, {
   const bunxLogFile = join(fixture.directory, "bunx.log");
   let findingsFile = join(fixture.directory, "findings.json");
   let publicationFile = join(fixture.directory, "publication.json");
+  let diagnosticsFile = join(fixture.directory, "pass-diagnostics.json");
   if (outputPaths) {
     const outputFiles = outputPaths({
       ...fixture,
       findingsFile,
       publicationFile,
     });
+    diagnosticsFile = outputFiles.diagnosticsFile ?? diagnosticsFile;
     findingsFile = outputFiles.findingsFile;
     publicationFile = outputFiles.publicationFile;
   }
@@ -513,8 +517,8 @@ function runReview(t, plan, {
   if (failMerge) {
     const node = join(fixture.bin, "node");
     writeFileSync(node, `#!/usr/bin/env bash
-if [ "\${1##*/}" = "merge-findings.mjs" ] && [ "\${2:-}" != "--check" ]; then
-  exit 1
+if [ "\${1##*/}" = "merge-findings.mjs" ]; then
+  case "\${2:-}" in --check|--diagnose|--known-only) ;; *) exit 1 ;; esac
 fi
 exec "\${REAL_NODE}" "$@"
 `);
@@ -581,6 +585,7 @@ printf '%s\\n' '1.3.14'
       AGENTIC_REVIEW_MAX_FINDINGS: "",
       AGENTIC_REVIEW_MAX_PARALLEL: "",
       AGENTIC_REVIEW_PUBLICATION_OUT: "",
+      AGENTIC_REVIEW_DIAGNOSTICS_OUT: diagnosticsFile,
       AGENTIC_REVIEW_PASSES: "",
       AGENTIC_REVIEW_PROMPT: "",
       AGENTIC_REVIEW_SKILL: "",
@@ -615,6 +620,10 @@ printf '%s\\n' '1.3.14'
     codegraphLogs,
     findingsFile,
     publicationFile,
+    diagnosticsFile,
+    diagnostics: existsSync(diagnosticsFile)
+      ? JSON.parse(readFileSync(diagnosticsFile, "utf8"))
+      : null,
     bunxLogFile,
     findings: existsSync(findingsFile) ? JSON.parse(readFileSync(findingsFile, "utf8")) : null,
     publication,
@@ -733,7 +742,7 @@ test("hosted config allows harmless display flags and rejects prompt, parser, an
   assert.equal(valid.values.EXTRA_ARGS, "--print-thoughts --hide-thinking --no-title");
   assert.equal(valid.values.OMP_VERSION, "17.4.0-rc.1");
   assert.equal(valid.values.MAX_DISCOVERY_ROUNDS, "2");
-  assert.equal(valid.values.MAX_PARALLEL, "3");
+  assert.equal(valid.values.MAX_PARALLEL, "1");
   const customParallelism = runWorkflowConfig(t, { IN_MAX_PARALLEL: "2" });
   assert.equal(customParallelism.result.status, 0, customParallelism.result.stderr);
   assert.equal(customParallelism.values.MAX_PARALLEL, "2");
@@ -1136,6 +1145,25 @@ test("workflow skips the write-capable poster after cancellation but not ordinar
   assert.match(posterStep, /^\s+if: \$\{\{ !cancelled\(\) \}\}$/m);
 });
 
+test("workflow uploads pass diagnostics and exposes an explicit concurrency probe", () => {
+  const source = readFileSync(workflow, "utf8");
+  const dispatch = source.match(
+    /^  workflow_dispatch:\n[\s\S]*?(?=^  pull_request_target:)/m,
+  )?.[0];
+  const runnerStep = source.match(
+    /^      - name: run agentic review \(read-only\)\n[\s\S]*?(?=^      - (?:name:|uses:))/m,
+  )?.[0];
+
+  assert.ok(dispatch);
+  assert.match(dispatch, /^\s+max_parallel:$/m);
+  assert.ok(runnerStep);
+  assert.match(runnerStep, /--diagnostics-out \/tmp\/review-pass-diagnostics\.json/);
+  assert.match(
+    source,
+    /^\s+\/tmp\/review-pass-diagnostics\.json$/m,
+  );
+});
+
 test("workflow independently retains the required result and optional diagnostics", () => {
   const source = readFileSync(workflow, "utf8");
   const resultStep = source.match(
@@ -1169,6 +1197,7 @@ test("workflow independently retains the required result and optional diagnostic
     "/tmp/review-publication.json",
     "/tmp/review-runner.out",
     "/tmp/review-runner.err",
+    "/tmp/review-pass-diagnostics.json",
   ]) {
     assert.match(diagnosticsStep, new RegExp(`^\\s+${path.replaceAll(".", "\\.")}$`, "m"));
   }
@@ -2627,6 +2656,35 @@ test("max-parallel overlaps workers without exceeding the configured limit", (t)
   ]));
 });
 
+test("serial and parallel schedules publish the same validated shape", (t) => {
+  const fixture = createFixture(t);
+  const plan = {
+    general: [{ findings: [finding("General scheduling finding")] }],
+    correctness: [{ findings: [finding("Correctness scheduling finding")] }],
+    boundaries: [{ findings: [] }],
+  };
+  const destinations = (label) => ({ directory }) => ({
+    findingsFile: join(directory, `${label}-findings.json`),
+    publicationFile: join(directory, `${label}-publication.json`),
+  });
+  const serial = runReview(t, plan, {
+    args: ["--max-parallel", "1", "--json"],
+    existingFixture: fixture,
+    outputPaths: destinations("serial"),
+  });
+  const parallel = runReview(t, plan, {
+    args: ["--max-parallel", "3", "--json"],
+    existingFixture: fixture,
+    outputPaths: destinations("parallel"),
+  });
+
+  assert.equal(serial.result.status, 0, serial.result.stderr);
+  assert.equal(parallel.result.status, 0, parallel.result.stderr);
+  assert.equal(validatePublication(serial.publicationFile).status, 0);
+  assert.equal(validatePublication(parallel.publicationFile).status, 0);
+  assert.deepEqual(parallel.publication, serial.publication);
+});
+
 test("pass completion order cannot change descriptor-ordered merge fallback", (t) => {
   const fixture = createFixture(t);
   const activeDirectory = join(fixture.directory, "active-omp");
@@ -3031,6 +3089,27 @@ test("malformed output receives one retry and records the successful second atte
   );
   assert.equal(run.metadata.passes.results[0].attempts, 2);
   assert.equal(run.metadata.passes.results[0].status, "valid");
+  assert.deepEqual(run.diagnostics.passes.map(({ id, final_status, attempts }) => ({
+    id,
+    final_status,
+    attempt_statuses: attempts.map(({ status }) => status),
+  })), [
+    {
+      id: "general",
+      final_status: "valid",
+      attempt_statuses: ["invalid_json", "valid"],
+    },
+    {
+      id: "correctness",
+      final_status: "valid",
+      attempt_statuses: ["valid"],
+    },
+    {
+      id: "boundaries",
+      final_status: "valid",
+      attempt_statuses: ["valid"],
+    },
+  ]);
   assert.deepEqual(run.findings.findings.map(({ title }) => title), [recovered.title]);
 });
 
@@ -3086,6 +3165,88 @@ test("a permanently malformed pass is failed while valid pass findings survive t
     [boundaries.title, general.title],
   );
   assert.equal(validatePublication(run.publicationFile).status, 0);
+});
+
+test("failed attempts publish bounded classified diagnostics without review input", (t) => {
+  const schemaInvalid = finding("Schema invalid");
+  delete schemaInvalid.evidence_kind;
+  const run = runReview(t, {
+    general: [{
+      __exit: 75,
+      stderr: [
+        "provider overloaded",
+        "sk-or-runner-test",
+        "alpha head",
+        "x".repeat(10_000),
+      ].join("\n"),
+    }],
+    correctness: [""],
+    boundaries: ["{bad json", { findings: [schemaInvalid] }],
+  });
+
+  assert.notEqual(run.result.status, 0);
+  assert.equal(run.diagnostics.schema_version, 1);
+  assert.deepEqual(run.diagnostics.passes.map(({ id, final_status }) => ({
+    id, final_status,
+  })), [
+    { id: "general", final_status: "failed" },
+    { id: "correctness", final_status: "failed" },
+    { id: "boundaries", final_status: "failed" },
+  ]);
+  assert.deepEqual(
+    run.diagnostics.passes.map(({ attempts }) => attempts.map(({ status }) => status)),
+    [
+      ["process_exit", "process_exit"],
+      ["empty_stdout", "empty_stdout"],
+      ["invalid_json", "schema_invalid"],
+    ],
+  );
+  assert.deepEqual(
+    run.diagnostics.passes[0].attempts.map(({ process_exit_status }) => process_exit_status),
+    [75, 75],
+  );
+  assert.equal(
+    run.diagnostics.passes[2].attempts[1].validator_error,
+    "findings[0].evidence_kind must be observed, static-proof, or inferred",
+  );
+  const serialized = JSON.stringify(run.diagnostics);
+  assert.doesNotMatch(serialized, /sk-or-runner-test|alpha head/);
+  assert.match(run.diagnostics.passes[0].attempts[0].stderr_tail, /provider overloaded/);
+  for (const { attempts } of run.diagnostics.passes) {
+    for (const { stderr_tail: stderrTail } of attempts) {
+      assert.ok(Buffer.byteLength(stderrTail, "utf8") <= 4096);
+    }
+  }
+});
+
+test("pass diagnostics publish across filesystem boundaries", {
+  skip: !existsSync("/dev/shm")
+    || lstatSync("/dev/shm").dev === lstatSync(tmpdir()).dev,
+}, (t) => {
+  const fixture = createFixture(t);
+  const diagnosticsFile = join(
+    "/dev/shm",
+    `agentic-review-diagnostics-${process.pid}-${Date.now()}.json`,
+  );
+  t.after(() => rmSync(diagnosticsFile, { force: true }));
+  const run = runReview(t, {
+    general: ["not json", "still not json"],
+  }, {
+    args: ["--passes", "1", "--lenses", "", "--json"],
+    existingFixture: fixture,
+    outputPaths: ({ findingsFile, publicationFile }) => ({
+      findingsFile,
+      publicationFile,
+      diagnosticsFile,
+    }),
+  });
+
+  assert.notEqual(run.result.status, 0);
+  assert.equal(existsSync(diagnosticsFile), true, run.result.stderr);
+  assert.deepEqual(run.diagnostics.passes[0].attempts.map(({ status }) => status), [
+    "invalid_json",
+    "invalid_json",
+  ]);
 });
 
 test("all-pass failure writes validated findings and publication diagnostics before exiting nonzero", (t) => {
@@ -4849,6 +5010,12 @@ test("codegraph snapshot initialization failure omits optional context without f
       { type: "file", contents: "{\"target\":\"after-failure\"}\n" },
     );
   }
+});
+
+test("the output contract requires one explicit evidence basis", () => {
+  const source = readFileSync(outputFormat, "utf8");
+  assert.equal(source.match(/"evidence_kind":/g)?.length, 1);
+  assert.doesNotMatch(source, /Omitting the field has the same effect/);
 });
 
 test("summary, inline, and suggest all ask OMP for the structured JSON contract", (t) => {

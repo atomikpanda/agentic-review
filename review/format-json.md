@@ -18,7 +18,6 @@ Otherwise:
           "verification": "The command, static proof, or missing prerequisite that supports this finding.",
           "title": "One line, no trailing period",
           "body": "What breaks: the input or condition, and the wrong behaviour that results. Markdown is allowed here.",
-          "evidence_kind": "static-proof",
           "suggestion": "    the exact replacement text for lines 42-44\n    including every line\n"
         }
       ]
@@ -89,7 +88,6 @@ reader:
   `inferred`, and findings labelled `inferred` are shown to readers as
   unverified.
 
-Omitting the field has the same effect as `inferred`.
 
 `severity` is one of `Critical`, `High`, `Medium`. Same bar as before — report
 only defects you verified by reading the relevant files, and state the concrete

@@ -302,7 +302,7 @@ YAML
 #   central_ref:      main          # pin support files to the same ref
 #   max_findings:     20            # 0 disables the cap
 #   max_discovery_rounds: 2           # broad rounds; verification retries do not count
-#   max_parallel:     3             # concurrent model pass limit
+#   max_parallel:     1             # concurrent model pass limit
 #   post_comment:     true
 #   fail_on_findings: false         # true makes this a blocking check
 #   timeout_minutes:  20

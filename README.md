@@ -176,12 +176,11 @@ basis any pass claimed wins.
 ## Bounded ensemble and result states
 
 The default local and hosted profile runs **general**, **correctness**, and
-**boundaries** concurrently, up to the `max_parallel` limit, against one
-immutable base SHA, head SHA, and configuration fingerprint. It performs
-approximately three times the model work of one general pass while wall time
-tracks the slowest pass rather than their sum. Each pass keeps its own retry,
-status, attempts, diagnostics, and output. Results are harvested and merged in
-descriptor order regardless of completion order. Every valid pass contributes
+**boundaries** one at a time while hosted concurrency is revalidated. Set
+`max_parallel` above `1` to overlap independent passes against the same
+immutable base SHA, head SHA, and configuration fingerprint. Each pass keeps
+isolated retry and status state. Results are harvested and merged in descriptor
+order regardless of completion order. Every valid pass contributes
 to one union with `min_votes=1`, so a finding seen by only one pass survives.
 One result is rendered or posted: the union, or an explicitly inconclusive
 first-valid structured fallback if union fails.
@@ -309,11 +308,14 @@ The same values appear in the review body and GitHub job summary. The hosted
 (`review-result.json`) for seven days. When available, the separate
 `agentic-review-diagnostics` artifact retains the human-readable structured
 findings (`review.md`), the authoritative atomic findings-metadata-scope
-publication (`review-publication.json`), and runner stdout and stderr. Missing
-optional diagnostics never prevent upload of the final result. The poster writes
-that result at `/tmp/review-result.json` before artifact upload. Locally, `--out`
-and `--publication-out` write the human-readable findings and authoritative
-publication artifacts directly.
+publication (`review-publication.json`), and runner stdout and stderr. When any
+attempt fails, it also includes `review-pass-diagnostics.json`: status, exit
+code, validator reason, and a redacted stderr tail bounded to 4096 bytes per
+attempt. It never includes raw model stdout or prompt content. Missing optional
+diagnostics never prevent upload of the final result. The poster writes that
+result at `/tmp/review-result.json` before artifact upload. Locally, `--out`,
+`--publication-out`, and `--diagnostics-out` write the corresponding artifacts
+directly.
 
 ### Standing summaries and finding history
 
@@ -433,7 +435,7 @@ cell means that surface does not expose the setting.
 | Reasoning effort | `high` | `thinking` | `--thinking` | `--thinking` |
 | Tool allowlist | `read,grep,glob` | `tools` | `--tools` | `--tools` |
 | Wall-clock cap | none | `max_time` | `--max-time` | `--max-time` |
-| Concurrent model passes | `3` | `max_parallel` | `--max-parallel` | `--max-parallel` |
+| Concurrent model passes | `1` | `max_parallel` | `--max-parallel` | `--max-parallel` |
 | Review prompt | `review/prompt.md` | `prompt_path` | `--prompt` | `--prompt` |
 | Injected knowledge | both skills | `skills_path` | `--skill` | `--skill` |
 | Review style | `suggest` | `review_mode` | `--review-mode` | `--review-mode` |

@@ -23,6 +23,7 @@
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import {
+  findingValidationError,
   isValidFinding,
   projectPublicFinding,
   sameFinding,
@@ -32,12 +33,34 @@ import {
 const SEVERITY_RANK = { Critical: 0, High: 1, Medium: 2 };
 
 
+function findingDocumentValidationError(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return "response must be a JSON object";
+  }
+  if (!Array.isArray(value.findings)) return "findings must be an array";
+  for (let index = 0; index < value.findings.length; index += 1) {
+    const reason = findingValidationError(value.findings[index], `findings[${index}]`);
+    if (reason !== null) return reason;
+  }
+  return null;
+}
+
 function isValidDocument(value) {
-  return value !== null
-    && typeof value === "object"
-    && !Array.isArray(value)
-    && Array.isArray(value.findings)
-    && value.findings.every(isValidFinding);
+  return findingDocumentValidationError(value) === null;
+}
+
+export function diagnoseFindingDocument(text) {
+  const trimmed = String(text ?? "").trim();
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return { status: "invalid_json", reason: "response is not valid JSON" };
+  }
+  const reason = findingDocumentValidationError(parsed);
+  return reason === null
+    ? { status: "valid", reason: null }
+    : { status: "schema_invalid", reason };
 }
 
 function extractJson(text, { strict = false } = {}) {
@@ -194,13 +217,27 @@ export function filterKnownFindings(knownDocument, currentDocument) {
 function main(args) {
   let minVotes = 1;
   let checkOnly = false;
+  let diagnoseOnly = false;
   let knownOnly = false;
   const files = [];
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--min-votes") { minVotes = Number(args[++i]) || 1; continue; }
     if (args[i] === "--check") { checkOnly = true; continue; }
+    if (args[i] === "--diagnose") { diagnoseOnly = true; continue; }
     if (args[i] === "--known-only") { knownOnly = true; continue; }
     files.push(args[i]);
+  }
+
+  if (diagnoseOnly) {
+    if (files.length !== 1) return 2;
+    let text;
+    try {
+      text = readFileSync(files[0], "utf8");
+    } catch {
+      return 2;
+    }
+    process.stdout.write(JSON.stringify(diagnoseFindingDocument(text)));
+    return 0;
   }
 
   // --check: exit 0 if every file holds a structured findings document. omp

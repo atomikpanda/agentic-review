@@ -33,37 +33,70 @@ const VERIFICATION_ID_RE = /^K[1-9][0-9]*$/;
 // mark hypotheses as hypotheses instead of trusting prose confidence.
 export const EVIDENCE_KINDS = new Set(["observed", "static-proof", "inferred"]);
 
-export function isValidFinding(value) {
-  return value !== null
-    && typeof value === "object"
-    && !Array.isArray(value)
-    && typeof value.file === "string"
-    && value.file.trim().length > 0
-    && typeof value.title === "string"
-    && value.title.trim().length > 0
-    && !/[\r\n]/.test(value.title)
-    && typeof value.body === "string"
-    && value.body.trim().length > 0
-    && FINDING_SEVERITIES.has(value.severity)
-    && EVIDENCE_KINDS.has(value.evidence_kind)
-    && typeof value.verification === "string"
-    && value.verification.trim().length > 0
-    && Number.isInteger(value.start_line)
-    && value.start_line > 0
-    && Number.isInteger(value.end_line)
-    && value.end_line >= value.start_line
-    && (value.verification_id === undefined || (
-      typeof value.verification_id === "string"
-      && VERIFICATION_ID_RE.test(value.verification_id)
-    ))
+export function findingValidationError(value, path = "finding") {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return `${path} must be an object`;
+  }
+  if (typeof value.file !== "string" || value.file.trim().length === 0) {
+    return `${path}.file must be a non-empty string`;
+  }
+  if (
+    typeof value.title !== "string"
+    || value.title.trim().length === 0
+    || /[\r\n]/.test(value.title)
+  ) {
+    return `${path}.title must be a non-empty single-line string`;
+  }
+  if (typeof value.body !== "string" || value.body.trim().length === 0) {
+    return `${path}.body must be a non-empty string`;
+  }
+  if (!FINDING_SEVERITIES.has(value.severity)) {
+    return `${path}.severity must be Critical, High, or Medium`;
+  }
+  if (!EVIDENCE_KINDS.has(value.evidence_kind)) {
+    return `${path}.evidence_kind must be observed, static-proof, or inferred`;
+  }
+  if (typeof value.verification !== "string" || value.verification.trim().length === 0) {
+    return `${path}.verification must be a non-empty string`;
+  }
+  if (!Number.isInteger(value.start_line) || value.start_line <= 0) {
+    return `${path}.start_line must be a positive integer`;
+  }
+  if (!Number.isInteger(value.end_line) || value.end_line < value.start_line) {
+    return `${path}.end_line must be an integer at least start_line`;
+  }
+  if (
+    value.verification_id !== undefined
     && (
-      value.verification_of === undefined
-      ? value.verification_classification === undefined
-      : typeof value.verification_of === "string"
-        && VERIFICATION_ID_RE.test(value.verification_of)
-        && value.verification_classification === "linked_regression"
+      typeof value.verification_id !== "string"
+      || !VERIFICATION_ID_RE.test(value.verification_id)
     )
-    && (typeof value.suggestion === "string" || value.suggestion === null);
+  ) {
+    return `${path}.verification_id must match K<positive integer>`;
+  }
+  if (value.verification_of === undefined) {
+    if (value.verification_classification !== undefined) {
+      return `${path}.verification_classification requires verification_of`;
+    }
+  } else {
+    if (
+      typeof value.verification_of !== "string"
+      || !VERIFICATION_ID_RE.test(value.verification_of)
+    ) {
+      return `${path}.verification_of must match K<positive integer>`;
+    }
+    if (value.verification_classification !== "linked_regression") {
+      return `${path}.verification_classification must be linked_regression`;
+    }
+  }
+  if (typeof value.suggestion !== "string" && value.suggestion !== null) {
+    return `${path}.suggestion must be a string or null`;
+  }
+  return null;
+}
+
+export function isValidFinding(value) {
+  return findingValidationError(value) === null;
 }
 
 export function projectPublicFinding(value) {
