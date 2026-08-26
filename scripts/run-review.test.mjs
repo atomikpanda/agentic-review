@@ -190,7 +190,7 @@ function finding(title, overrides = {}) {
 const fakeOmp = `#!/usr/bin/env node
 import { appendFileSync, lstatSync, mkdirSync, readFileSync, readlinkSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { spawn as spawnChild } from "node:child_process";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 if (process.argv.includes("--version")) {
   process.stdout.write("fake-omp 1.0.0\\n");
@@ -262,7 +262,26 @@ if (delayMs > 0 && process.env.FAKE_OMP_ACTIVE_DIR) {
   await new Promise((resolve) => setTimeout(resolve, delayMs));
   rmSync(activeMarker, { force: true });
 }
-if (choice?.__spawn_child) {
+if (choice?.__spawn_reparented_child) {
+  const grandchildSource = [
+    'const { appendFileSync } = require("node:fs");',
+    'appendFileSync(process.env.FAKE_OMP_READY_LOG, String(process.pid) + "\\\\n");',
+    'setInterval(() => {}, 1000);',
+  ].join("\\n");
+  const launcherSource = [
+    'const { spawn } = require("node:child_process");',
+    'const child = spawn(process.execPath, ["-e", process.env.FAKE_OMP_REPARENTED_SOURCE],',
+    '  { detached: true, env: process.env, stdio: "ignore" });',
+    'child.unref();',
+  ].join("\\n");
+  const launcher = spawnChild(process.execPath, ["-e", launcherSource], {
+    env: { ...process.env, FAKE_OMP_REPARENTED_SOURCE: grandchildSource },
+    stdio: "ignore",
+  });
+  await new Promise((resolve) => launcher.on("exit", resolve));
+  await new Promise(() => {});
+}
+if (choice?.__spawn_child || choice?.__spawn_detached_child) {
   const childSource = [
     'const { appendFileSync } = require("node:fs"); const { spawn } = require("node:child_process");',
     'appendFileSync(process.env.FAKE_OMP_READY_LOG, String(process.pid) + "\\\\n");',
@@ -274,6 +293,7 @@ if (choice?.__spawn_child) {
     'setInterval(() => {}, 1000);',
   ].join("\\n");
   const nested = spawnChild(process.execPath, ["-e", childSource], {
+    detached: choice.__spawn_detached_child === true,
     env: process.env,
     stdio: "ignore",
   });
@@ -288,13 +308,32 @@ if (choice?.__kill_worker) {
   process.kill(process.ppid, "SIGKILL");
   await new Promise(() => {});
 }
+if (choice?.__replace_pid_with_sentinel) {
+  const sentinelEnv = { ...process.env };
+  delete sentinelEnv.AGENTIC_REVIEW_RUN_TOKEN;
+  const sentinel = spawnChild(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
+    detached: true,
+    env: sentinelEnv,
+    stdio: "ignore",
+  });
+  sentinel.unref();
+  writeFileSync(join(dirname(promptPath), "out.0.pid"), String(sentinel.pid) + "\\n");
+  writeFileSync(process.env.FAKE_OMP_SENTINEL_LOG, String(sentinel.pid) + "\\n");
+}
 if (choice && typeof choice === "object" && Object.hasOwn(choice, "__exit")) {
   if (choice.output) process.stdout.write(choice.output);
   process.exit(choice.__exit);
 }
 const output = choice && typeof choice === "object"
   ? Object.fromEntries(Object.entries(choice).filter(
-      ([key]) => !["__delay_ms", "__spawn_child", "__kill_worker"].includes(key),
+      ([key]) => ![
+        "__delay_ms",
+        "__spawn_child",
+        "__spawn_detached_child",
+        "__spawn_reparented_child",
+        "__kill_worker",
+        "__replace_pid_with_sentinel",
+      ].includes(key),
     ))
   : choice;
 process.stdout.write(typeof output === "string" ? output : JSON.stringify(output));
@@ -2690,13 +2729,6 @@ test("cancelling the runner terminates nested processes of active passes", async
   }
   assert.notEqual(closeResult, null, "runner ignored cancellation");
 
-  const escapeDeadline = Date.now() + 2_000;
-  while (readFileSync(readyFile, "utf8").trim().split("\n").length < 2
-      && Date.now() < escapeDeadline) {
-    await delay(10);
-  }
-  nestedPids = readFileSync(readyFile, "utf8").trim().split("\n").map(Number);
-  assert.equal(nestedPids.length, 2, "SIGTERM handler did not create the escapee process");
   const processIsRunning = (pid) => {
     try {
       process.kill(pid, 0);
@@ -2713,6 +2745,110 @@ test("cancelling the runner terminates nested processes of active passes", async
   assert.deepEqual(nestedPids.filter(processIsRunning), []);
 });
 
+test("cancelling the runner terminates reparented detached model descendants", async (t) => {
+  const fixture = createFixture(t);
+  const planFile = join(fixture.directory, "detached-cancel-plan.json");
+  const logFile = join(fixture.directory, "detached-cancel-omp.log");
+  const readyFile = join(fixture.directory, "detached-cancel-ready.log");
+  const terminatedFile = join(fixture.directory, "detached-cancel-terminated.log");
+  writeFileSync(planFile, JSON.stringify({
+    general: [{ __spawn_reparented_child: true }],
+  }));
+
+  const review = spawn("bash", [
+    runner,
+    "--base", "main",
+    "--no-codegraph",
+    "--no-state",
+    "--no-fail",
+    "--passes", "1",
+    "--lenses", "",
+    "--max-parallel", "1",
+    "--json",
+  ], {
+    cwd: fixture.repository,
+    env: {
+      ...process.env,
+      AGENTIC_REVIEW_LENSES: "",
+      AGENTIC_REVIEW_MAX_PARALLEL: "",
+      AGENTIC_REVIEW_PASSES: "",
+      AGENTIC_REVIEW_FORCE_PS_SCAN: "1",
+      OPENROUTER_API_KEY: "sk-or-runner-test",
+      PATH: `${fixture.bin}:${process.env.PATH}`,
+      FAKE_OMP_PLAN: planFile,
+      FAKE_OMP_LOG: logFile,
+      FAKE_OMP_STATE: fixture.state,
+      FAKE_OMP_READY_LOG: readyFile,
+      FAKE_OMP_TERMINATED_LOG: terminatedFile,
+      FAKE_OMP_ESCAPEE_SOURCE: "process.exit(0);",
+    },
+  });
+  let stderr = "";
+  let detachedPid = null;
+  review.stderr.on("data", (chunk) => { stderr += chunk; });
+  review.stdout.resume();
+  t.after(() => {
+    if (review.exitCode === null) review.kill("SIGKILL");
+    if (detachedPid !== null) {
+      try { process.kill(detachedPid, "SIGKILL"); } catch {}
+    }
+  });
+
+  const readyDeadline = Date.now() + 5_000;
+  while (!existsSync(readyFile) && Date.now() < readyDeadline) {
+    await delay(10);
+  }
+  assert.equal(existsSync(readyFile), true, `detached pass process did not start\n${stderr}`);
+  detachedPid = Number(readFileSync(readyFile, "utf8").trim());
+  if (existsSync(`/proc/${detachedPid}/environ`)) {
+    assert.equal(
+      readFileSync(`/proc/${detachedPid}/environ`).includes(
+        Buffer.from("AGENTIC_REVIEW_RUN_TOKEN="),
+      ),
+      true,
+      "detached descendant did not inherit the run token",
+    );
+  }
+
+  const closed = once(review, "close");
+  review.kill("SIGTERM");
+  let timeout;
+  let closeResult = await Promise.race([
+    closed,
+    new Promise((resolve) => { timeout = setTimeout(() => resolve(null), 3_000); }),
+  ]);
+  clearTimeout(timeout);
+  if (closeResult === null) {
+    review.kill("SIGKILL");
+    closeResult = await closed;
+  }
+  assert.notEqual(closeResult, null, "runner ignored cancellation");
+
+  const processIsRunning = (pid) => {
+    if (existsSync("/proc/self/stat")) {
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        if (stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z")) return false;
+      } catch (error) {
+        if (error.code === "ENOENT") return false;
+        throw error;
+      }
+    }
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      if (error.code === "ESRCH") return false;
+      throw error;
+    }
+  };
+  const terminationDeadline = Date.now() + 2_000;
+  while (processIsRunning(detachedPid) && Date.now() < terminationDeadline) {
+    await delay(10);
+  }
+  assert.equal(processIsRunning(detachedPid), false, stderr);
+});
+
 test("unexpected worker death exits instead of blocking pass harvesting", async (t) => {
   const fixture = createFixture(t);
   const planFile = join(fixture.directory, "worker-death-plan.json");
@@ -2721,6 +2857,7 @@ test("unexpected worker death exits instead of blocking pass harvesting", async 
   writeFileSync(planFile, JSON.stringify({
     general: [{ __kill_worker: true }],
   }));
+
 
   const review = spawn("bash", [
     runner,
@@ -2780,6 +2917,36 @@ test("unexpected worker death exits instead of blocking pass harvesting", async 
   assert.notEqual(closeResult, null, "runner deadlocked after its worker died");
   assert.notEqual(closeResult[0], 0, stderr);
   assert.match(stderr, /pass worker 0 exited unexpectedly/);
+});
+test("normal completion ignores stale model PID records", (t) => {
+  const fixture = createFixture(t);
+  const sentinelLog = join(fixture.directory, "stale-pid-sentinel.log");
+  const run = runReview(t, {
+    general: [{ findings: [], __replace_pid_with_sentinel: true }],
+  }, {
+    args: ["--passes", "1", "--lenses", "", "--json"],
+    existingFixture: fixture,
+    env: { FAKE_OMP_SENTINEL_LOG: sentinelLog },
+  });
+  assert.equal(run.result.status, 0, run.result.stderr);
+  const sentinelPid = Number(readFileSync(sentinelLog, "utf8").trim());
+  t.after(() => {
+    try { process.kill(sentinelPid, "SIGKILL"); } catch {}
+  });
+  const sentinelIsRunning = () => {
+    if (existsSync(`/proc/${sentinelPid}/stat`)) {
+      const stat = readFileSync(`/proc/${sentinelPid}/stat`, "utf8");
+      if (stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z")) return false;
+    }
+    try {
+      process.kill(sentinelPid, 0);
+      return true;
+    } catch (error) {
+      if (error.code === "ESRCH") return false;
+      throw error;
+    }
+  };
+  assert.equal(sentinelIsRunning(), true);
 });
 
 test("malformed output receives one retry and records the successful second attempt", (t) => {

@@ -387,35 +387,64 @@ RUN_TMP=""
 SNAPSHOT_IMMUTABLE=0
 PASS_WORKER_PIDS=()
 PASS_WORKER_PGIDS=()
+PASS_TREE_PIDS=()
+PASS_RUN_TOKEN="agentic-review-$$-$RANDOM-$RANDOM"
 RUNNER_PGID="$(ps -o pgid= -p "$$" | tr -d ' ')"
+freeze_pass_tree() {
+  local parent="$1" child
+  if ! kill -STOP "$parent" 2>/dev/null; then return; fi
+  for child in $(ps -eo pid=,ppid= | while read -r pid ppid; do
+    if [ "$ppid" = "$parent" ]; then printf '%s\n' "$pid"; fi
+  done); do
+    freeze_pass_tree "$child"
+  done
+  PASS_TREE_PIDS+=("$parent")
+}
+tagged_pass_pids() {
+  if [ -r /proc/self/environ ] && [ "${AGENTIC_REVIEW_FORCE_PS_SCAN:-0}" != 1 ]; then
+    node -e '
+      const fs = require("node:fs");
+      const needle = Buffer.from(`AGENTIC_REVIEW_RUN_TOKEN=${process.argv[1]}\0`);
+      for (const entry of fs.readdirSync("/proc")) {
+        if (!/^[0-9]+$/.test(entry)) continue;
+        try {
+          if (fs.readFileSync(`/proc/${entry}/environ`).includes(needle)) {
+            process.stdout.write(`${entry}\n`);
+          }
+        } catch {}
+      }
+    ' "$PASS_RUN_TOKEN"
+    return
+  fi
+  ps eww -A -o pid= -o command= 2>/dev/null | while read -r pid command; do
+    case "$command" in
+      *"AGENTIC_REVIEW_RUN_TOKEN=$PASS_RUN_TOKEN"*) printf '%s\n' "$pid" ;;
+    esac
+  done
+}
+kill_tagged_passes() {
+  local attempt pid killed
+  for attempt in {1..20}; do
+    killed=0
+    for pid in $(tagged_pass_pids); do
+      if kill -KILL "$pid" 2>/dev/null; then killed=1; fi
+    done
+    if [ "$killed" = 0 ]; then return; fi
+  done
+}
 stop_pass_workers() {
-  local attempt index pid pgid alive
+  local index pid pgid model_pid
+  PASS_TREE_PIDS=()
   for index in "${!PASS_WORKER_PIDS[@]}"; do
     pid="${PASS_WORKER_PIDS[index]:-}"
-    pgid="${PASS_WORKER_PGIDS[index]:-}"
-    if [ -z "$pid" ]; then continue; fi
-    if [ -n "$pgid" ] && [ "$pgid" != "$RUNNER_PGID" ]; then
-      kill -TERM -- "-$pgid" 2>/dev/null || :
-    else
-      kill -TERM "$pid" 2>/dev/null || :
+    if [ -n "$pid" ]; then freeze_pass_tree "$pid"; fi
+    if [ -n "$pid" ] && [ -f "$RUN_TMP/out.$index.pid" ] \
+       && IFS= read -r model_pid < "$RUN_TMP/out.$index.pid"; then
+      freeze_pass_tree "$model_pid"
     fi
   done
-  for attempt in {1..20}; do
-    alive=0
-    for index in "${!PASS_WORKER_PIDS[@]}"; do
-      pid="${PASS_WORKER_PIDS[index]:-}"
-      pgid="${PASS_WORKER_PGIDS[index]:-}"
-      if [ -z "$pid" ]; then continue; fi
-      if [ -n "$pgid" ] && [ "$pgid" != "$RUNNER_PGID" ]; then
-        if kill -0 -- "-$pgid" 2>/dev/null; then alive=1; break; fi
-      elif kill -0 "$pid" 2>/dev/null; then
-        alive=1
-        break
-      fi
-    done
-    if [ "$alive" = 0 ]; then break; fi
-    sleep 0.05
-  done
+  kill_tagged_passes
+  for pid in "${PASS_TREE_PIDS[@]}"; do kill -KILL "$pid" 2>/dev/null || :; done
   for index in "${!PASS_WORKER_PIDS[@]}"; do
     pid="${PASS_WORKER_PIDS[index]:-}"
     pgid="${PASS_WORKER_PGIDS[index]:-}"
@@ -429,6 +458,7 @@ stop_pass_workers() {
   for pid in "${PASS_WORKER_PIDS[@]+"${PASS_WORKER_PIDS[@]}"}"; do
     if [ -n "$pid" ]; then wait "$pid" 2>/dev/null || :; fi
   done
+  PASS_TREE_PIDS=()
   PASS_WORKER_PIDS=()
   PASS_WORKER_PGIDS=()
 }
@@ -889,7 +919,7 @@ run_pass() {
   if [ -n "$THINKING" ]; then args+=(--thinking="$THINKING"); fi
   if [ -n "$MAX_TIME" ]; then args+=(--max-time="$MAX_TIME"); fi
   if [ ${#PASSTHRU[@]} -gt 0 ]; then args+=("${PASSTHRU[@]}"); fi
-  AGENTIC_REVIEW_PASS_ID="$pass_id" "${OMP[@]}" -p \
+  AGENTIC_REVIEW_RUN_TOKEN="$PASS_RUN_TOKEN" AGENTIC_REVIEW_PASS_ID="$pass_id" "${OMP[@]}" -p \
     --model="$MODEL" \
     --no-session \
     "${args[@]+"${args[@]}"}" \
@@ -899,7 +929,9 @@ run_pass() {
     "@$prompt_file" \
     < /dev/null > "$out_file" 2>"$out_file.err" &
   PASS_CHILD_PID=$!
+  printf '%s\n' "$PASS_CHILD_PID" > "$out_file.pid"
   if wait "$PASS_CHILD_PID"; then status=0; else status=$?; fi
+  rm -f "$out_file.pid"
   PASS_CHILD_PID=""
   return "$status"
 }
@@ -958,6 +990,7 @@ reap_completed_pass() {
       fi
       if [ "$completed" = 1 ]; then
         wait "$pid" 2>/dev/null || :
+        rm -f "$RUN_TMP/out.$index.pid"
         PASS_WORKER_PIDS[index]=""
         PASS_WORKER_PGIDS[index]=""
         ACTIVE_PASS_WORKERS=$((ACTIVE_PASS_WORKERS - 1))
