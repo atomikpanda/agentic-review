@@ -30,6 +30,7 @@ import {
 } from "./post-review.mjs";
 import * as poster from "./post-review.mjs";
 import { createReviewPublication, deriveReviewState, scopeHash } from "./review-result.mjs";
+import { isValidFinding } from "./lib-findings.mjs";
 
 const BASE_SHA = "1".repeat(40);
 const HEAD_SHA = "2".repeat(40);
@@ -572,6 +573,11 @@ test("terminal cycle planning emits conservative evidence without another review
   assert.equal(result.cyclePlan.should_run, false);
   assert.equal(result.knownFindings[0].title, priorFinding.title);
   assert.equal(result.knownFindings[0].suggestion, null);
+  assert.equal(result.knownFindings.every(isValidFinding), true);
+  assert.equal(
+    result.knownFindings[0].verification,
+    "Persisted review history did not retain verification detail; re-check this finding against the current head.",
+  );
   assert.equal(result.finalResult.analysis_state, "inconclusive");
   assert.equal(result.finalResult.merge_state, "blocked");
   assert.equal(result.finalResult.sample_state, "findings");

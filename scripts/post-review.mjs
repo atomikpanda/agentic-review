@@ -95,6 +95,8 @@ const SUMMARY_TITLE_MAX_CHARS = 240;
 const SUMMARY_IDENTITY_MAX_TOKENS = 32;
 const SUMMARY_IDENTITY_TOKEN_MAX_CHARS = 64;
 const HELD_FINDING_BODY = "Previously reported finding remains held from an earlier review sample.";
+const CARRIED_FINDING_VERIFICATION =
+  "Persisted review history did not retain verification detail; re-check this finding against the current head.";
 const SHA_RE = /^[0-9a-f]{40}$/;
 const RUN_ID_RE = /^[1-9][0-9]*$/;
 
@@ -1977,6 +1979,9 @@ async function runCyclePlanMode() {
   writeFileSync(planFile, `${JSON.stringify(plan, null, 2)}\n`);
   const verificationFindings = plan.known_findings.map((finding, index) => ({
     ...finding,
+    verification: typeof finding.verification === "string" && finding.verification.trim()
+      ? finding.verification
+      : CARRIED_FINDING_VERIFICATION,
     suggestion: finding.suggestion ?? null,
     verification_id: `K${index + 1}`,
   }));
