@@ -165,6 +165,34 @@ test("finding schema requires explicit evidence metadata", () => {
     assert.deepEqual(result.findings, []);
   }
 });
+
+test("diagnostic validation separates invalid JSON from schema errors", () => {
+  const invalidJson = runCli(["not json"], ["--diagnose"]);
+  const missingEvidenceKind = finding("Missing evidence kind");
+  delete missingEvidenceKind.evidence_kind;
+  const schemaInvalid = runCli([
+    { findings: [missingEvidenceKind] },
+  ], ["--diagnose"]);
+  const valid = runCli([
+    { findings: [finding("Valid diagnostic document")] },
+  ], ["--diagnose"]);
+
+  assert.equal(invalidJson.status, 0, invalidJson.stderr);
+  assert.deepEqual(JSON.parse(invalidJson.stdout), {
+    status: "invalid_json",
+    reason: "response is not valid JSON",
+  });
+  assert.equal(schemaInvalid.status, 0, schemaInvalid.stderr);
+  assert.deepEqual(JSON.parse(schemaInvalid.stdout), {
+    status: "schema_invalid",
+    reason: "findings[0].evidence_kind must be observed, static-proof, or inferred",
+  });
+  assert.equal(valid.status, 0, valid.stderr);
+  assert.deepEqual(JSON.parse(valid.stdout), {
+    status: "valid",
+    reason: null,
+  });
+});
 test("verification output keeps known identities and explicitly linked regressions", () => {
   const known = {
     ...finding("Configured Bun version is ignored", {

@@ -34,6 +34,8 @@
 #   --out FILE          write a human-readable findings document here
 #   --publication-out FILE atomically write findings, metadata, and reviewed scope here
 #                                                     $AGENTIC_REVIEW_PUBLICATION_OUT
+#   --diagnostics-out FILE write bounded per-attempt failure diagnostics
+#                                                     $AGENTIC_REVIEW_DIAGNOSTICS_OUT
 #   --no-state          do not update local review history
 #   --open              list findings still open from previous runs
 #   --all               list every tracked finding, including dismissed
@@ -98,9 +100,12 @@ MAX_DIFF_BYTES="${AGENTIC_REVIEW_MAX_DIFF_BYTES:-400000}"
 PASSES="${AGENTIC_REVIEW_PASSES:-1}"
 # The bounded default is one general review plus two additive specialist passes.
 LENSES="${AGENTIC_REVIEW_LENSES:-correctness,boundaries}"
-MAX_PARALLEL="${AGENTIC_REVIEW_MAX_PARALLEL:-3}"
+MAX_PARALLEL="${AGENTIC_REVIEW_MAX_PARALLEL:-1}"
 MIN_VOTES="${AGENTIC_REVIEW_MIN_VOTES:-1}"
 PUBLICATION_OUT="${AGENTIC_REVIEW_PUBLICATION_OUT:-}"
+DIAGNOSTICS_OUT="${AGENTIC_REVIEW_DIAGNOSTICS_OUT:-}"
+PASS_DIAGNOSTIC_STDERR_BYTES=4096
+PASS_DIAGNOSTIC_STDERR_LINES=64
 TRUSTED_DATA_ROOT="${AGENTIC_REVIEW_TRUSTED_DATA_ROOT:-}"
 STAGED=0; OUT=""; FAIL_ON_FINDINGS=1; AS_JSON=0; USE_CODEGRAPH=1; VIEW=""; TRUST_REPO="${TRUST_REPO:-0}"; RECORD_STATE=1
 PASSTHRU=()
@@ -123,6 +128,7 @@ while [ $# -gt 0 ]; do
     --omp-version)  OMP_VERSION="${2:-}"; shift 2 ;;
     --out)          OUT="${2:-}"; shift 2 ;;
     --publication-out) PUBLICATION_OUT="${2:-}"; shift 2 ;;
+    --diagnostics-out) DIAGNOSTICS_OUT="${2:-}"; shift 2 ;;
     --staged)       STAGED=1; shift ;;
     --no-fail)      FAIL_ON_FINDINGS=0; shift ;;
     --no-codegraph) USE_CODEGRAPH=0; shift ;;
@@ -273,6 +279,9 @@ fi
 if [ -n "$PUBLICATION_OUT" ] && [ -L "$PUBLICATION_OUT" ]; then
   die "--publication-out cannot be a symlink destination"
 fi
+if [ -n "$DIAGNOSTICS_OUT" ] && [ -L "$DIAGNOSTICS_OUT" ]; then
+  die "--diagnostics-out cannot be a symlink destination"
+fi
 
 if [ -n "$OUT" ]; then
   OUT_IDENTITY="$(destination_identity "$OUT")"
@@ -280,10 +289,25 @@ fi
 if [ -n "$PUBLICATION_OUT" ]; then
   PUBLICATION_IDENTITY="$(destination_identity "$PUBLICATION_OUT")"
 fi
+if [ -n "$DIAGNOSTICS_OUT" ]; then
+  DIAGNOSTICS_IDENTITY="$(destination_identity "$DIAGNOSTICS_OUT")"
+fi
 
 if [ -n "$OUT" ] && [ -n "$PUBLICATION_OUT" ] \
    && [ "$OUT_IDENTITY" = "$PUBLICATION_IDENTITY" ]; then
   die "--out and --publication-out resolve to the same destination"
+fi
+if [ -n "$DIAGNOSTICS_OUT" ] && {
+  { [ -n "$OUT" ] && [ "$DIAGNOSTICS_IDENTITY" = "$OUT_IDENTITY" ]; } \
+    || { [ -n "$PUBLICATION_OUT" ] \
+      && [ "$DIAGNOSTICS_IDENTITY" = "$PUBLICATION_IDENTITY" ]; }
+}; then
+  die "--diagnostics-out must be distinct from review output destinations"
+fi
+
+if [ -n "$DIAGNOSTICS_OUT" ]; then
+  rm -f -- "$DIAGNOSTICS_OUT" \
+    || die "could not clear stale diagnostics at $DIAGNOSTICS_OUT"
 fi
 
 step "Checking prerequisites"
@@ -992,10 +1016,90 @@ run_pass() {
   return "$status"
 }
 
+write_pass_attempt_record() {
+  local pass_index="$1" pass_id="$2" attempt="$3" attempt_status="$4"
+  local process_status="$5" validator_error="$6" stderr_file="$7" prompt_file="$8"
+  local record="$RUN_TMP/attempt.$pass_index.$attempt.json"
+  local record_tmp="$record.tmp.$$"
+  [ -n "$DIAGNOSTICS_OUT" ] || return 0
+  node -e '
+    const { readFileSync, renameSync, writeFileSync } = require("node:fs");
+    const [
+      recordTmp, record, passIndex, passId, attempt, status, processStatus,
+      validatorError, stderrFile, promptFile, maxBytes, maxLines,
+    ] = process.argv.slice(1);
+    const read = (path) => {
+      try { return readFileSync(path, "utf8"); } catch { return ""; }
+    };
+    const prompt = read(promptFile);
+    const safeDiagnostic = /(?:^|\b)(?:error|failed|failure|provider|model|request|response|rate|quota|timeout|status|http|openrouter|unauthori[sz]ed|forbidden|connection|network|socket|too many|overload|429|5\d\d)(?:\b|:)/i;
+    const secrets = [
+      process.env.OPENROUTER_API_KEY,
+      process.env.GH_TOKEN,
+      process.env.GITHUB_TOKEN,
+      process.env.AGENTIC_REVIEW_RUN_TOKEN,
+    ].filter((value) => typeof value === "string" && value.length >= 4);
+    const overlapsPrompt = (line) => {
+      const stripped = line.replace(
+        /^(?:\[[^\]]+\]\s*)?(?:error|failed|failure|provider|model|request|response)\s*[:=-]\s*/i,
+        "",
+      ).trim();
+      for (const candidate of [line.trim(), stripped]) {
+        if (candidate.length < 8) continue;
+        if (prompt.includes(candidate)) return true;
+        for (let index = 0; index + 24 <= candidate.length; index += 12) {
+          if (prompt.includes(candidate.slice(index, index + 24))) return true;
+        }
+      }
+      return false;
+    };
+    const sanitize = (source) => {
+      let line = source
+        .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+        .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+        .trim();
+      if (!line) return "";
+      if (overlapsPrompt(line)) return "<redacted review input>";
+      for (const secret of secrets) line = line.split(secret).join("<redacted secret>");
+      line = line
+        .replace(/\b(?:sk-or-v1|github_pat|gh[pousr])[-_A-Za-z0-9]{8,}\b/g, "<redacted token>")
+        .replace(/(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s]+/ig, "$1<redacted token>")
+        .replace(/(https?:\/\/[^\s?]+)\?[^\s]*/g, "$1");
+      if (!safeDiagnostic.test(line)) return "<redacted stderr line>";
+      return line.length > 512 ? `${line.slice(0, 509)}...` : line;
+    };
+    const raw = status === "valid" ? "" : read(stderrFile);
+    const sanitized = raw
+      .split(/\r?\n/)
+      .slice(-Number(maxLines))
+      .map(sanitize)
+      .filter(Boolean);
+    let stderrTail = sanitized.join("\n");
+    while (Buffer.byteLength(stderrTail, "utf8") > Number(maxBytes)) {
+      stderrTail = stderrTail.slice(1);
+    }
+    const value = {
+      pass_index: Number(passIndex),
+      pass_id: passId,
+      attempt: Number(attempt),
+      status,
+      process_exit_status: Number(processStatus),
+      stderr_tail: stderrTail,
+      validator_error: validatorError || null,
+    };
+    writeFileSync(recordTmp, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+    renameSync(recordTmp, record);
+  ' "$record_tmp" "$record" "$pass_index" "$pass_id" "$attempt" "$attempt_status" \
+    "$process_status" "$validator_error" "$stderr_file" "$prompt_file" \
+    "$PASS_DIAGNOSTIC_STDERR_BYTES" "$PASS_DIAGNOSTIC_STDERR_LINES" \
+    || die "could not record bounded diagnostics for pass $pass_id attempt $attempt"
+}
+
 run_pass_worker() {
   local pass_index="$1" out_file="$RUN_TMP/out.$1" record="$RUN_TMP/pass.$1.record"
   local record_tmp="$RUN_TMP/pass.$1.record.tmp" diagnostics="$RUN_TMP/pass.$1.diagnostics"
   local attempt attempts=0 status=failed count=0 capped=false
+  local process_status attempt_status validator_error classification diagnosis
   trap stop_pass_child EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
@@ -1003,12 +1107,52 @@ run_pass_worker() {
   for attempt in 1 2; do
     attempts="$attempt"
     if run_pass "$RUN_TMP/prompt.$pass_index" "$out_file" \
-       "$RUN_TMP/skill.$pass_index" "${PASS_IDS[pass_index]}" \
-       && [ -s "$out_file" ] && node "$MERGE" --check "$out_file" 2>/dev/null; then
-      status=valid
-      break
+       "$RUN_TMP/skill.$pass_index" "${PASS_IDS[pass_index]}"; then
+      process_status=0
+    else
+      process_status=$?
     fi
-    printf 'output unparseable (attempt %s)\n' "$attempt" >> "$diagnostics"
+    validator_error=""
+    if [ "$process_status" -ne 0 ]; then
+      attempt_status=process_exit
+    elif [ ! -s "$out_file" ]; then
+      attempt_status=empty_stdout
+    else
+      diagnosis="$(node "$MERGE" --diagnose "$out_file")" \
+        || die "could not classify output for pass ${PASS_IDS[pass_index]}"
+      classification="$(node -e '
+        const value = JSON.parse(process.argv[1]);
+        process.stdout.write(`${value.status}\t${value.reason ?? ""}`);
+      ' "$diagnosis")"
+      attempt_status="${classification%%$'\t'*}"
+      validator_error="${classification#*$'\t'}"
+    fi
+    write_pass_attempt_record "$pass_index" "${PASS_IDS[pass_index]}" "$attempt" \
+      "$attempt_status" "$process_status" "$validator_error" "$out_file.err" \
+      "$RUN_TMP/prompt.$pass_index"
+    case "$attempt_status" in
+      valid)
+        status=valid
+        break
+        ;;
+      process_exit)
+        printf 'model process exited %s (attempt %s)\n' \
+          "$process_status" "$attempt" >> "$diagnostics"
+        ;;
+      empty_stdout)
+        printf 'empty model stdout (attempt %s)\n' "$attempt" >> "$diagnostics"
+        ;;
+      invalid_json)
+        printf 'invalid JSON (attempt %s)\n' "$attempt" >> "$diagnostics"
+        ;;
+      schema_invalid)
+        printf 'schema invalid: %s (attempt %s)\n' \
+          "$validator_error" "$attempt" >> "$diagnostics"
+        ;;
+      *)
+        die "unknown output classification for pass ${PASS_IDS[pass_index]}: $attempt_status"
+        ;;
+    esac
   done
   if [ "$status" = valid ]; then
     count="$(node -e 'const fs=require("node:fs"); process.stdout.write(String(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).findings.length))' "$out_file")"
@@ -1057,6 +1201,62 @@ reap_completed_pass() {
     sleep 0.05
   done
 }
+publish_pass_diagnostics() {
+  [ -n "$DIAGNOSTICS_OUT" ] || return 0
+  local manifest_tmp="$RUN_TMP/pass-diagnostics.json"
+  node -e '
+    const { readFileSync, readdirSync, writeFileSync } = require("node:fs");
+    const [runTmp, manifestTmp, maxBytes, maxLines] = process.argv.slice(1);
+    const attempts = readdirSync(runTmp)
+      .filter((name) => /^attempt\.[0-9]+\.[0-9]+\.json$/.test(name))
+      .map((name) => JSON.parse(readFileSync(`${runTmp}/${name}`, "utf8")))
+      .sort((left, right) =>
+        left.pass_index - right.pass_index || left.attempt - right.attempt);
+    if (!attempts.some(({ status }) => status !== "valid")) process.exit(0);
+    const passIds = readFileSync(`${runTmp}/pass-ids`, "utf8")
+      .trimEnd()
+      .split("\n");
+    const passes = passIds.map((id, passIndex) => {
+      const [finalStatus] = readFileSync(
+        `${runTmp}/pass.${passIndex}.record`,
+        "utf8",
+      ).trim().split("\t");
+      return {
+        id,
+        final_status: finalStatus,
+        attempts: attempts
+          .filter((value) => value.pass_index === passIndex)
+          .map(({
+            attempt, status, process_exit_status, stderr_tail, validator_error,
+          }) => ({
+            attempt,
+            status,
+            process_exit_status,
+            stderr_tail,
+            validator_error,
+          })),
+      };
+    });
+    const manifest = {
+      schema_version: 1,
+      stderr_limit_bytes: Number(maxBytes),
+      stderr_limit_lines: Number(maxLines),
+      passes,
+    };
+    writeFileSync(manifestTmp, `${JSON.stringify(manifest, null, 2)}\n`, {
+      mode: 0o600,
+    });
+  ' "$RUN_TMP" "$manifest_tmp" "$PASS_DIAGNOSTIC_STDERR_BYTES" \
+    "$PASS_DIAGNOSTIC_STDERR_LINES" \
+    || die "could not assemble bounded pass diagnostics"
+  if [ -s "$manifest_tmp" ]; then
+    node -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' \
+      "$manifest_tmp" "$DIAGNOSTICS_OUT" \
+      || die "could not atomically publish pass diagnostics at $DIAGNOSTICS_OUT"
+    ok "pass diagnostics written to $DIAGNOSTICS_OUT"
+  fi
+}
+
 
 PASS_STATUSES=()
 PASS_ATTEMPTS=()
@@ -1106,6 +1306,8 @@ for ((i = 0; i < ${#PASS_IDS[@]}; i++)); do
     say "pass ${PASS_IDS[i]} failed after $attempts attempts"
   fi
 done
+publish_pass_diagnostics
+
 
 TMP_OUT="$RUN_TMP/merged.json"
 write_publication() {
