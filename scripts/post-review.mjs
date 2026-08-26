@@ -95,6 +95,8 @@ const SUMMARY_TITLE_MAX_CHARS = 240;
 const SUMMARY_IDENTITY_MAX_TOKENS = 32;
 const SUMMARY_IDENTITY_TOKEN_MAX_CHARS = 64;
 const HELD_FINDING_BODY = "Previously reported finding remains held from an earlier review sample.";
+const CARRIED_FINDING_VERIFICATION =
+  "Persisted review history did not retain verification detail; re-check this finding against the current head.";
 const SHA_RE = /^[0-9a-f]{40}$/;
 const RUN_ID_RE = /^[1-9][0-9]*$/;
 
@@ -127,8 +129,15 @@ function normalizeSummaryFinding(value, index) {
   if (!SUMMARY_SEVERITY_SET.has(value.severity)) {
     throw new TypeError(`summary findings[${index}].severity is invalid`);
   }
-  if (typeof value.title !== "string" || !value.title || typeof value.body !== "string" || !value.body) {
-    throw new TypeError(`summary findings[${index}] must have a title and body`);
+  if (
+    typeof value.title !== "string"
+    || value.title.trim().length === 0
+    || /[\r\n]/.test(value.title)
+  ) {
+    throw new TypeError(`summary findings[${index}].title is invalid`);
+  }
+  if (typeof value.body !== "string" || !value.body) {
+    throw new TypeError(`summary findings[${index}].body is invalid`);
   }
   if (value.evidence_kind !== undefined && !EVIDENCE_KINDS.has(value.evidence_kind)) {
     throw new TypeError(`summary findings[${index}].evidence_kind is invalid`);
@@ -1977,6 +1986,9 @@ async function runCyclePlanMode() {
   writeFileSync(planFile, `${JSON.stringify(plan, null, 2)}\n`);
   const verificationFindings = plan.known_findings.map((finding, index) => ({
     ...finding,
+    verification: typeof finding.verification === "string" && finding.verification.trim()
+      ? finding.verification
+      : CARRIED_FINDING_VERIFICATION,
     suggestion: finding.suggestion ?? null,
     verification_id: `K${index + 1}`,
   }));
