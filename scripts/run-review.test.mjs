@@ -2772,7 +2772,6 @@ test("cancelling the runner terminates reparented detached model descendants", a
       AGENTIC_REVIEW_LENSES: "",
       AGENTIC_REVIEW_MAX_PARALLEL: "",
       AGENTIC_REVIEW_PASSES: "",
-      AGENTIC_REVIEW_FORCE_PS_SCAN: "1",
       OPENROUTER_API_KEY: "sk-or-runner-test",
       PATH: `${fixture.bin}:${process.env.PATH}`,
       FAKE_OMP_PLAN: planFile,
