@@ -402,7 +402,10 @@ freeze_pass_tree() {
   PASS_TREE_PIDS+=("$parent")
 }
 tagged_pass_pids() {
-  if [ -r /proc/self/environ ] && [ "${AGENTIC_REVIEW_FORCE_PS_SCAN:-0}" != 1 ]; then
+  # Each model PID is held in SIGSTOP until this scan can rediscover that exact
+  # other process. OMP descendants inherit the verified credentials and
+  # dumpability; a host that hides same-credential processes fails before exec.
+  if [ -d /proc ] && [ "${AGENTIC_REVIEW_FORCE_PS_SCAN:-0}" != 1 ]; then
     node -e '
       const fs = require("node:fs");
       const needle = Buffer.from(`AGENTIC_REVIEW_RUN_TOKEN=${process.argv[1]}\0`);
