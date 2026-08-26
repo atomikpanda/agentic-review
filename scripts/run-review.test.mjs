@@ -188,8 +188,9 @@ function finding(title, overrides = {}) {
 }
 
 const fakeOmp = `#!/usr/bin/env node
-import { appendFileSync, lstatSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, lstatSync, mkdirSync, readFileSync, readlinkSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { spawn as spawnChild } from "node:child_process";
+import { dirname, join } from "node:path";
 
 if (process.argv.includes("--version")) {
   process.stdout.write("fake-omp 1.0.0\\n");
@@ -212,7 +213,8 @@ const id = instructions.includes("# This pass: correctness")
       : instructions.includes("# This pass: documentation")
         ? "docs"
         : "general";
-const attemptFile = join(process.env.FAKE_OMP_STATE, id);
+const passId = process.env.AGENTIC_REVIEW_PASS_ID ?? id;
+const attemptFile = join(process.env.FAKE_OMP_STATE, passId);
 let attempt = 1;
 try { attempt = Number(readFileSync(attemptFile, "utf8")) + 1; } catch {}
 writeFileSync(attemptFile, String(attempt));
@@ -234,6 +236,7 @@ try {
 }
 appendFileSync(process.env.FAKE_OMP_LOG, JSON.stringify({
   id,
+  pass_id: passId,
   attempt,
   promptPath,
   prompt,
@@ -245,13 +248,95 @@ appendFileSync(process.env.FAKE_OMP_LOG, JSON.stringify({
   argv: process.argv.slice(2),
 }) + "\\n");
 const plan = JSON.parse(readFileSync(process.env.FAKE_OMP_PLAN, "utf8"));
-const choices = plan[id] ?? plan.default ?? [{ findings: [] }];
+const choices = plan[passId] ?? plan[id] ?? plan.default ?? [{ findings: [] }];
 const choice = choices[Math.min(attempt - 1, choices.length - 1)];
+const delayMs = Number(choice?.__delay_ms ?? 0);
+if (delayMs > 0 && process.env.FAKE_OMP_ACTIVE_DIR) {
+  mkdirSync(process.env.FAKE_OMP_ACTIVE_DIR, { recursive: true });
+  const activeMarker = join(process.env.FAKE_OMP_ACTIVE_DIR, String(process.pid));
+  writeFileSync(activeMarker, "");
+  appendFileSync(process.env.FAKE_OMP_CONCURRENCY_LOG, JSON.stringify({
+    id,
+    active: readdirSync(process.env.FAKE_OMP_ACTIVE_DIR).length,
+  }) + "\\n");
+  await new Promise((resolve) => setTimeout(resolve, delayMs));
+  rmSync(activeMarker, { force: true });
+}
+if (choice?.__spawn_reparented_child) {
+  const grandchildSource = [
+    'const { appendFileSync } = require("node:fs");',
+    'appendFileSync(process.env.FAKE_OMP_READY_LOG, String(process.pid) + "\\\\n");',
+    'setInterval(() => {}, 1000);',
+  ].join("\\n");
+  const launcherSource = [
+    'const { spawn } = require("node:child_process");',
+    'const child = spawn(process.execPath, ["-e", process.env.FAKE_OMP_REPARENTED_SOURCE],',
+    '  { detached: true, env: process.env, stdio: "ignore" });',
+    'child.unref();',
+  ].join("\\n");
+  const launcher = spawnChild(process.execPath, ["-e", launcherSource], {
+    env: { ...process.env, FAKE_OMP_REPARENTED_SOURCE: grandchildSource },
+    stdio: "ignore",
+  });
+  await new Promise((resolve) => launcher.on("exit", resolve));
+  await new Promise(() => {});
+}
+if (choice?.__spawn_child || choice?.__spawn_detached_child) {
+  const childSource = [
+    'const { appendFileSync } = require("node:fs"); const { spawn } = require("node:child_process");',
+    'appendFileSync(process.env.FAKE_OMP_READY_LOG, String(process.pid) + "\\\\n");',
+    'process.on("SIGTERM", () => {',
+    '  spawn(process.execPath, ["-e", process.env.FAKE_OMP_ESCAPEE_SOURCE], { env: process.env, stdio: "ignore" });',
+    '  appendFileSync(process.env.FAKE_OMP_TERMINATED_LOG, String(process.pid) + "\\\\n");',
+    '  process.exit(0);',
+    '});',
+    'setInterval(() => {}, 1000);',
+  ].join("\\n");
+  const nested = spawnChild(process.execPath, ["-e", childSource], {
+    detached: choice.__spawn_detached_child === true,
+    env: process.env,
+    stdio: "ignore",
+  });
+  await new Promise((resolve) => nested.on("exit", resolve));
+  process.exit(0);
+}
+if (choice?.__kill_worker) {
+  appendFileSync(process.env.FAKE_OMP_WORKER_KILL_LOG, JSON.stringify({
+    ompPid: process.pid,
+    workerPid: process.ppid,
+  }) + "\\n");
+  process.kill(process.ppid, "SIGKILL");
+  await new Promise(() => {});
+}
+if (choice?.__replace_pid_with_sentinel) {
+  const sentinelEnv = { ...process.env };
+  delete sentinelEnv.AGENTIC_REVIEW_RUN_TOKEN;
+  const sentinel = spawnChild(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
+    detached: true,
+    env: sentinelEnv,
+    stdio: "ignore",
+  });
+  sentinel.unref();
+  writeFileSync(join(dirname(promptPath), "out.0.pid"), String(sentinel.pid) + "\\n");
+  writeFileSync(process.env.FAKE_OMP_SENTINEL_LOG, String(sentinel.pid) + "\\n");
+}
 if (choice && typeof choice === "object" && Object.hasOwn(choice, "__exit")) {
   if (choice.output) process.stdout.write(choice.output);
   process.exit(choice.__exit);
 }
-process.stdout.write(typeof choice === "string" ? choice : JSON.stringify(choice));
+const output = choice && typeof choice === "object"
+  ? Object.fromEntries(Object.entries(choice).filter(
+      ([key]) => ![
+        "__delay_ms",
+        "__spawn_child",
+        "__spawn_detached_child",
+        "__spawn_reparented_child",
+        "__kill_worker",
+        "__replace_pid_with_sentinel",
+      ].includes(key),
+    ))
+  : choice;
+process.stdout.write(typeof output === "string" ? output : JSON.stringify(output));
 `;
 
 const fakeCodegraph = `#!/usr/bin/env node
@@ -494,6 +579,7 @@ printf '%s\\n' '1.3.14'
       AGENTIC_REVIEW_LENSES: "",
       AGENTIC_REVIEW_MAX_DIFF_BYTES: "",
       AGENTIC_REVIEW_MAX_FINDINGS: "",
+      AGENTIC_REVIEW_MAX_PARALLEL: "",
       AGENTIC_REVIEW_PUBLICATION_OUT: "",
       AGENTIC_REVIEW_PASSES: "",
       AGENTIC_REVIEW_PROMPT: "",
@@ -555,6 +641,7 @@ function runWorkflowConfig(t, overrides = {}) {
     IN_TOOLS: "",
     IN_CENTRAL_REPO: "atomikpanda/agentic-review",
     IN_MAX_TIME: "",
+    IN_MAX_PARALLEL: "",
     IN_PROMPT_PATH: "",
     IN_SKILLS_PATH: "",
     IN_MAX_FINDINGS: "",
@@ -646,6 +733,17 @@ test("hosted config allows harmless display flags and rejects prompt, parser, an
   assert.equal(valid.values.EXTRA_ARGS, "--print-thoughts --hide-thinking --no-title");
   assert.equal(valid.values.OMP_VERSION, "17.4.0-rc.1");
   assert.equal(valid.values.MAX_DISCOVERY_ROUNDS, "2");
+  assert.equal(valid.values.MAX_PARALLEL, "3");
+  const customParallelism = runWorkflowConfig(t, { IN_MAX_PARALLEL: "2" });
+  assert.equal(customParallelism.result.status, 0, customParallelism.result.stderr);
+  assert.equal(customParallelism.values.MAX_PARALLEL, "2");
+  for (const invalid of ["0", "00", "-1", "two"]) {
+    assert.notEqual(
+      runWorkflowConfig(t, { IN_MAX_PARALLEL: invalid }).result.status,
+      0,
+      invalid,
+    );
+  }
   const customCycle = runWorkflowConfig(t, { IN_MAX_DISCOVERY_ROUNDS: "3" });
   assert.equal(customCycle.result.status, 0, customCycle.result.stderr);
   assert.equal(customCycle.values.MAX_DISCOVERY_ROUNDS, "3");
@@ -731,6 +829,7 @@ exit 1
     "--ref", sha,
     "--extra-omp-args", "--print-thoughts --no-title",
     "--max-discovery-rounds", "3",
+    "--max-parallel", "2",
     "--no-pr-agent",
     "--yes",
   ], { encoding: "utf8", env: baseEnv });
@@ -749,6 +848,7 @@ exit 1
   assert.match(generated, new RegExp(`central_ref: ${sha}`));
   assert.match(generated, /extra_omp_args: --print-thoughts --no-title/);
   assert.match(generated, /max_discovery_rounds: 3/);
+  assert.match(generated, /max_parallel: 2/);
   assert.match(generated, /^  pull-requests: write$/m);
 
   const outputFile = join(directory, "sha-output");
@@ -881,7 +981,11 @@ test("the default profile runs general, correctness, and boundaries into one val
   });
 
   assert.equal(run.result.status, 0, run.result.stderr);
-  assert.deepEqual(run.logs.map(({ id }) => id), ["general", "correctness", "boundaries"]);
+  assert.deepEqual(new Set(run.logs.map(({ pass_id }) => pass_id)), new Set([
+    "general",
+    "correctness",
+    "boundaries",
+  ]));
   assert.deepEqual(
     run.findings.findings.map(({ title }) => title).sort(),
     ["Boundaries only", "Correctness only", "General only", "Shared lifecycle defect"],
@@ -1994,10 +2098,12 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
 
   const planFile = join(fixture.directory, "plan.json");
   const logFile = join(fixture.directory, "omp.log");
+  const activeDirectory = join(fixture.directory, "hosted-active-omp");
+  const concurrencyLog = join(fixture.directory, "hosted-concurrency.log");
   writeFileSync(planFile, JSON.stringify({
-    general: [{ findings: [shared] }],
-    correctness: [{ findings: [medium] }],
-    boundaries: [{ findings: [shared] }],
+    general: [{ findings: [shared], __delay_ms: 250 }],
+    correctness: [{ findings: [medium], __delay_ms: 250 }],
+    boundaries: [{ findings: [shared], __delay_ms: 250 }],
   }));
 
   const failedSupportSelection = spawnSync("bash", ["-c", workflowRunStep("select trusted support")], {
@@ -2110,6 +2216,8 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
       OPENROUTER_API_KEY: "sk-or-hosted-test",
       FAKE_OMP_PLAN: planFile,
       FAKE_OMP_LOG: logFile,
+      FAKE_OMP_ACTIVE_DIR: activeDirectory,
+      FAKE_OMP_CONCURRENCY_LOG: concurrencyLog,
       FAKE_OMP_STATE: fixture.state,
       MALICIOUS_EXEC_MARKER: maliciousExecutableMarker,
       BASE: fixture.baseSha,
@@ -2119,6 +2227,7 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
       TOOLS: "read,grep,glob",
       MAX_TIME: "7m",
       MAX_FINDINGS: "5",
+      MAX_PARALLEL: "2",
       MAX_DIFF_BYTES: "400000",
       REVIEW_MODE: "summary",
       OMP_VERSION: "latest",
@@ -2132,7 +2241,9 @@ test("hosted contract runs one trusted ensemble and one suppressed poster gate",
   const findingsDocument = JSON.parse(readFileSync(findingsFile, "utf8"));
   const { findings, metadata } = JSON.parse(readFileSync(publicationFile, "utf8"));
   assert.equal(logs.length, 3);
-  assert.deepEqual(logs.map(({ id }) => id), ["general", "correctness", "boundaries"]);
+  assert.deepEqual(new Set(logs.map(({ id }) => id)), new Set(["general", "correctness", "boundaries"]));
+  const concurrencySamples = readFileSync(concurrencyLog, "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(Math.max(...concurrencySamples.map(({ active }) => active)), 2);
   assert.ok(logs.every(({ attempt }) => attempt === 1));
   assert.ok(logs.every(({ argv }) => argv.includes("--print-thoughts")));
   assert.ok(logs.every(({ prompt }) => prompt.includes("Output a single JSON object and nothing else")));
@@ -2485,6 +2596,418 @@ function diffFileOrder(prompt) {
   return [...diff[1].matchAll(/^diff --git a\/(.+?) b\/.+$/gm)].map((match) => match[1]);
 }
 
+test("max-parallel overlaps workers without exceeding the configured limit", (t) => {
+  const fixture = createFixture(t);
+  const activeDirectory = join(fixture.directory, "active-omp");
+  const concurrencyLog = join(fixture.directory, "omp-concurrency.log");
+  const delayed = (title) => ({
+    findings: [finding(title)],
+    __delay_ms: 250,
+  });
+  const run = runReview(t, {
+    general: [delayed("General parallel finding")],
+    correctness: [delayed("Correctness parallel finding")],
+    boundaries: [delayed("Boundaries parallel finding")],
+  }, {
+    args: ["--max-parallel", "2", "--json"],
+    existingFixture: fixture,
+    env: {
+      FAKE_OMP_ACTIVE_DIR: activeDirectory,
+      FAKE_OMP_CONCURRENCY_LOG: concurrencyLog,
+    },
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  const samples = readFileSync(concurrencyLog, "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(Math.max(...samples.map(({ active }) => active)), 2);
+  assert.deepEqual(new Set(samples.map(({ id }) => id)), new Set([
+    "general",
+    "correctness",
+    "boundaries",
+  ]));
+});
+
+test("pass completion order cannot change descriptor-ordered merge fallback", (t) => {
+  const fixture = createFixture(t);
+  const activeDirectory = join(fixture.directory, "active-omp");
+  const concurrencyLog = join(fixture.directory, "omp-concurrency.log");
+  const general = finding("First descriptor survives merge fallback");
+  const run = runReview(t, {
+    general: [{ findings: [general], __delay_ms: 300 }],
+    correctness: [{ findings: [finding("Fast second descriptor")], __delay_ms: 25 }],
+    boundaries: [{ findings: [finding("Third descriptor")], __delay_ms: 75 }],
+  }, {
+    args: ["--max-parallel", "3", "--json"],
+    existingFixture: fixture,
+    failMerge: true,
+    env: {
+      FAKE_OMP_ACTIVE_DIR: activeDirectory,
+      FAKE_OMP_CONCURRENCY_LOG: concurrencyLog,
+    },
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.deepEqual(run.findings.findings.map(({ title }) => title), [general.title]);
+});
+
+test("runner refuses model work when detached-process cleanup cannot be verified", (t) => {
+  const fixture = createFixture(t);
+  const psWrapper = join(fixture.bin, "ps");
+  writeFileSync(psWrapper, `#!/usr/bin/env bash
+if [ "\${1:-}" = "eww" ]; then
+  exit 1
+fi
+real_path="\${PATH#*:}"
+PATH="$real_path" ps "$@"
+`);
+  chmodSync(psWrapper, 0o755);
+
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+  }, {
+    args: ["--passes", "1", "--lenses", "", "--json"],
+    existingFixture: fixture,
+    env: {
+      AGENTIC_REVIEW_FORCE_PS_SCAN: "1",
+    },
+  });
+
+  assert.notEqual(run.result.status, 0);
+  assert.match(run.result.stderr, /could not verify detached-process cleanup/);
+  assert.deepEqual(run.logs, []);
+});
+
+test("runner verifies cleanup access to each model process before execution", (t) => {
+  const fixture = createFixture(t);
+  const psWrapper = join(fixture.bin, "ps");
+  const scanCount = join(fixture.directory, "ps-environment-scans");
+  writeFileSync(psWrapper, `#!/usr/bin/env bash
+if [ "\${1:-}" = "eww" ]; then
+  count=0
+  if [ -f "\${FAKE_PS_SCAN_COUNT}" ]; then read -r count < "\${FAKE_PS_SCAN_COUNT}"; fi
+  count=$((count + 1))
+  printf '%s\\n' "$count" > "\${FAKE_PS_SCAN_COUNT}"
+  if [ "$count" -gt 1 ]; then exit 1; fi
+fi
+real_path="\${PATH#*:}"
+PATH="$real_path" ps "$@"
+`);
+  chmodSync(psWrapper, 0o755);
+
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+  }, {
+    args: ["--passes", "1", "--lenses", "", "--json"],
+    existingFixture: fixture,
+    env: {
+      AGENTIC_REVIEW_FORCE_PS_SCAN: "1",
+      FAKE_PS_SCAN_COUNT: scanCount,
+    },
+  });
+
+  assert.notEqual(run.result.status, 0);
+  assert.match(run.result.stderr, /could not verify cleanup access to model process/);
+  assert.deepEqual(run.logs, []);
+});
+
+test("cancelling the runner terminates nested processes of active passes", async (t) => {
+  const fixture = createFixture(t);
+  const planFile = join(fixture.directory, "cancel-plan.json");
+  const logFile = join(fixture.directory, "cancel-omp.log");
+  const readyFile = join(fixture.directory, "cancel-ready.log");
+  const terminatedFile = join(fixture.directory, "cancel-terminated.log");
+  const escapeeSource = [
+    'const { appendFileSync } = require("node:fs");',
+    'appendFileSync(process.env.FAKE_OMP_READY_LOG, String(process.pid) + "\\n");',
+    'process.on("SIGTERM", () => {',
+    '  appendFileSync(process.env.FAKE_OMP_TERMINATED_LOG, String(process.pid) + "\\n");',
+    '  process.exit(0);',
+    '});',
+    'setInterval(() => {}, 1000);',
+  ].join("\n");
+  writeFileSync(planFile, JSON.stringify({
+    general: [{ __spawn_child: true }],
+  }));
+
+  const review = spawn("bash", [
+    runner,
+    "--base", "main",
+    "--no-codegraph",
+    "--no-state",
+    "--no-fail",
+    "--passes", "1",
+    "--lenses", "",
+    "--max-parallel", "1",
+    "--json",
+  ], {
+    cwd: fixture.repository,
+    env: {
+      ...process.env,
+      AGENTIC_REVIEW_LENSES: "",
+      AGENTIC_REVIEW_MAX_PARALLEL: "",
+      AGENTIC_REVIEW_PASSES: "",
+      OPENROUTER_API_KEY: "sk-or-runner-test",
+      PATH: `${fixture.bin}:${process.env.PATH}`,
+      FAKE_OMP_PLAN: planFile,
+      FAKE_OMP_LOG: logFile,
+      FAKE_OMP_STATE: fixture.state,
+      FAKE_OMP_READY_LOG: readyFile,
+      FAKE_OMP_TERMINATED_LOG: terminatedFile,
+      FAKE_OMP_ESCAPEE_SOURCE: escapeeSource,
+    },
+  });
+  let stderr = "";
+  let nestedPids = [];
+  review.stderr.on("data", (chunk) => { stderr += chunk; });
+  review.stdout.resume();
+  t.after(() => {
+    if (review.exitCode === null) review.kill("SIGKILL");
+    for (const pid of nestedPids) {
+      try { process.kill(pid, "SIGKILL"); } catch {}
+    }
+  });
+
+  const readyDeadline = Date.now() + 5_000;
+  while ((!existsSync(readyFile) || readFileSync(readyFile, "utf8").trim() === "")
+      && Date.now() < readyDeadline) {
+    await delay(10);
+  }
+  assert.equal(existsSync(readyFile), true, `nested pass process did not start\n${stderr}`);
+  nestedPids = readFileSync(readyFile, "utf8").trim().split("\n").map(Number);
+
+  const closed = once(review, "close");
+  review.kill("SIGTERM");
+  let timeout;
+  let closeResult = await Promise.race([
+    closed,
+    new Promise((resolve) => { timeout = setTimeout(() => resolve(null), 3_000); }),
+  ]);
+  clearTimeout(timeout);
+  if (closeResult === null) {
+    review.kill("SIGKILL");
+    closeResult = await closed;
+  }
+  assert.notEqual(closeResult, null, "runner ignored cancellation");
+
+  const processIsRunning = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      if (error.code === "ESRCH") return false;
+      throw error;
+    }
+  };
+  const terminationDeadline = Date.now() + 2_000;
+  while (nestedPids.some(processIsRunning) && Date.now() < terminationDeadline) {
+    await delay(10);
+  }
+  assert.deepEqual(nestedPids.filter(processIsRunning), []);
+});
+
+test("cancelling the runner terminates reparented detached model descendants", async (t) => {
+  const fixture = createFixture(t);
+  const planFile = join(fixture.directory, "detached-cancel-plan.json");
+  const logFile = join(fixture.directory, "detached-cancel-omp.log");
+  const readyFile = join(fixture.directory, "detached-cancel-ready.log");
+  const terminatedFile = join(fixture.directory, "detached-cancel-terminated.log");
+  writeFileSync(planFile, JSON.stringify({
+    general: [{ __spawn_reparented_child: true }],
+  }));
+
+  const review = spawn("bash", [
+    runner,
+    "--base", "main",
+    "--no-codegraph",
+    "--no-state",
+    "--no-fail",
+    "--passes", "1",
+    "--lenses", "",
+    "--max-parallel", "1",
+    "--json",
+  ], {
+    cwd: fixture.repository,
+    env: {
+      ...process.env,
+      AGENTIC_REVIEW_LENSES: "",
+      AGENTIC_REVIEW_MAX_PARALLEL: "",
+      AGENTIC_REVIEW_PASSES: "",
+      OPENROUTER_API_KEY: "sk-or-runner-test",
+      PATH: `${fixture.bin}:${process.env.PATH}`,
+      FAKE_OMP_PLAN: planFile,
+      FAKE_OMP_LOG: logFile,
+      FAKE_OMP_STATE: fixture.state,
+      FAKE_OMP_READY_LOG: readyFile,
+      FAKE_OMP_TERMINATED_LOG: terminatedFile,
+      FAKE_OMP_ESCAPEE_SOURCE: "process.exit(0);",
+    },
+  });
+  let stderr = "";
+  let detachedPid = null;
+  review.stderr.on("data", (chunk) => { stderr += chunk; });
+  review.stdout.resume();
+  t.after(() => {
+    if (review.exitCode === null) review.kill("SIGKILL");
+    if (detachedPid !== null) {
+      try { process.kill(detachedPid, "SIGKILL"); } catch {}
+    }
+  });
+
+  const readyDeadline = Date.now() + 5_000;
+  while (!existsSync(readyFile) && Date.now() < readyDeadline) {
+    await delay(10);
+  }
+  assert.equal(existsSync(readyFile), true, `detached pass process did not start\n${stderr}`);
+  detachedPid = Number(readFileSync(readyFile, "utf8").trim());
+  if (existsSync(`/proc/${detachedPid}/environ`)) {
+    assert.equal(
+      readFileSync(`/proc/${detachedPid}/environ`).includes(
+        Buffer.from("AGENTIC_REVIEW_RUN_TOKEN="),
+      ),
+      true,
+      "detached descendant did not inherit the run token",
+    );
+  }
+
+  const closed = once(review, "close");
+  review.kill("SIGTERM");
+  let timeout;
+  let closeResult = await Promise.race([
+    closed,
+    new Promise((resolve) => { timeout = setTimeout(() => resolve(null), 3_000); }),
+  ]);
+  clearTimeout(timeout);
+  if (closeResult === null) {
+    review.kill("SIGKILL");
+    closeResult = await closed;
+  }
+  assert.notEqual(closeResult, null, "runner ignored cancellation");
+
+  const processIsRunning = (pid) => {
+    if (existsSync("/proc/self/stat")) {
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        if (stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z")) return false;
+      } catch (error) {
+        if (error.code === "ENOENT") return false;
+        throw error;
+      }
+    }
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      if (error.code === "ESRCH") return false;
+      throw error;
+    }
+  };
+  const terminationDeadline = Date.now() + 2_000;
+  while (processIsRunning(detachedPid) && Date.now() < terminationDeadline) {
+    await delay(10);
+  }
+  assert.equal(processIsRunning(detachedPid), false, stderr);
+});
+
+test("unexpected worker death exits instead of blocking pass harvesting", async (t) => {
+  const fixture = createFixture(t);
+  const planFile = join(fixture.directory, "worker-death-plan.json");
+  const logFile = join(fixture.directory, "worker-death-omp.log");
+  const killedFile = join(fixture.directory, "worker-death.log");
+  writeFileSync(planFile, JSON.stringify({
+    general: [{ __kill_worker: true }],
+  }));
+
+
+  const review = spawn("bash", [
+    runner,
+    "--base", "main",
+    "--no-codegraph",
+    "--no-state",
+    "--no-fail",
+    "--passes", "1",
+    "--lenses", "",
+    "--max-parallel", "1",
+    "--json",
+  ], {
+    cwd: fixture.repository,
+    env: {
+      ...process.env,
+      AGENTIC_REVIEW_LENSES: "",
+      AGENTIC_REVIEW_MAX_PARALLEL: "",
+      AGENTIC_REVIEW_PASSES: "",
+      OPENROUTER_API_KEY: "sk-or-runner-test",
+      PATH: `${fixture.bin}:${process.env.PATH}`,
+      FAKE_OMP_PLAN: planFile,
+      FAKE_OMP_LOG: logFile,
+      FAKE_OMP_STATE: fixture.state,
+      FAKE_OMP_WORKER_KILL_LOG: killedFile,
+    },
+  });
+  let stderr = "";
+  let ompPid = null;
+  review.stderr.on("data", (chunk) => { stderr += chunk; });
+  review.stdout.resume();
+  t.after(() => {
+    if (review.exitCode === null) review.kill("SIGKILL");
+    if (ompPid !== null) {
+      try { process.kill(ompPid, "SIGKILL"); } catch {}
+    }
+  });
+
+  const closed = once(review, "close");
+  const killedDeadline = Date.now() + 5_000;
+  while (!existsSync(killedFile) && Date.now() < killedDeadline) {
+    await delay(10);
+  }
+  assert.equal(existsSync(killedFile), true, `worker was not killed\n${stderr}`);
+  ({ ompPid } = JSON.parse(readFileSync(killedFile, "utf8").trim()));
+
+  let timeout;
+  const closeResult = await Promise.race([
+    closed,
+    new Promise((resolve) => { timeout = setTimeout(() => resolve(null), 2_000); }),
+  ]);
+  clearTimeout(timeout);
+  if (closeResult === null) {
+    review.kill("SIGKILL");
+    try { process.kill(ompPid, "SIGKILL"); } catch {}
+    await closed;
+  }
+  assert.notEqual(closeResult, null, "runner deadlocked after its worker died");
+  assert.notEqual(closeResult[0], 0, stderr);
+  assert.match(stderr, /pass worker 0 exited unexpectedly/);
+});
+test("normal completion ignores stale model PID records", (t) => {
+  const fixture = createFixture(t);
+  const sentinelLog = join(fixture.directory, "stale-pid-sentinel.log");
+  const run = runReview(t, {
+    general: [{ findings: [], __replace_pid_with_sentinel: true }],
+  }, {
+    args: ["--passes", "1", "--lenses", "", "--json"],
+    existingFixture: fixture,
+    env: { FAKE_OMP_SENTINEL_LOG: sentinelLog },
+  });
+  assert.equal(run.result.status, 0, run.result.stderr);
+  const sentinelPid = Number(readFileSync(sentinelLog, "utf8").trim());
+  t.after(() => {
+    try { process.kill(sentinelPid, "SIGKILL"); } catch {}
+  });
+  const sentinelIsRunning = () => {
+    if (existsSync(`/proc/${sentinelPid}/stat`)) {
+      const stat = readFileSync(`/proc/${sentinelPid}/stat`, "utf8");
+      if (stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z")) return false;
+    }
+    try {
+      process.kill(sentinelPid, 0);
+      return true;
+    } catch (error) {
+      if (error.code === "ESRCH") return false;
+      throw error;
+    }
+  };
+  assert.equal(sentinelIsRunning(), true);
+});
+
 test("malformed output receives one retry and records the successful second attempt", (t) => {
   const recovered = finding("Recovered after retry");
   const run = runReview(t, {
@@ -2495,13 +3018,16 @@ test("malformed output receives one retry and records the successful second atte
 
   assert.equal(run.result.status, 0, run.result.stderr);
   assert.deepEqual(
-    run.logs.map(({ id, attempt }) => ({ id, attempt })),
-    [
-      { id: "general", attempt: 1 },
-      { id: "general", attempt: 2 },
-      { id: "correctness", attempt: 1 },
-      { id: "boundaries", attempt: 1 },
-    ],
+    run.logs.filter(({ id }) => id === "general").map(({ attempt }) => attempt),
+    [1, 2],
+  );
+  assert.deepEqual(
+    run.logs.filter(({ id }) => id === "correctness").map(({ attempt }) => attempt),
+    [1],
+  );
+  assert.deepEqual(
+    run.logs.filter(({ id }) => id === "boundaries").map(({ attempt }) => attempt),
+    [1],
   );
   assert.equal(run.metadata.passes.results[0].attempts, 2);
   assert.equal(run.metadata.passes.results[0].status, "valid");
@@ -2701,7 +3227,8 @@ test("scope hashes distinguish invalid UTF-8 diff bytes while the raw review run
     head_sha: run.scope.head_sha,
   });
   assert.notEqual(run.metadata.scope_hash, alternateScopeHash);
-  assert.equal(Buffer.from(run.logs[0].prompt_base64, "base64").includes(expectedDiff), true);
+  const generalLog = run.logs.find(({ pass_id }) => pass_id === "general");
+  assert.equal(Buffer.from(generalLog.prompt_base64, "base64").includes(expectedDiff), true);
   for (const log of run.logs) {
     assert.equal(Buffer.from(log.prompt_base64, "base64").includes(0x80), true);
   }
@@ -2804,11 +3331,14 @@ test("each pass receives the complete available diff in deterministic rotated fi
   });
 
   assert.equal(run.result.status, 0, run.result.stderr);
-  assert.deepEqual(run.logs.map(({ prompt }) => diffFileOrder(prompt)), [
-    ["alpha.txt", "beta.txt", "gamma.txt"],
-    ["beta.txt", "gamma.txt", "alpha.txt"],
-    ["gamma.txt", "alpha.txt", "beta.txt"],
-  ]);
+  const ordersByPass = Object.fromEntries(
+    run.logs.map(({ pass_id, prompt }) => [pass_id, diffFileOrder(prompt)]),
+  );
+  assert.deepEqual(ordersByPass, {
+    general: ["alpha.txt", "beta.txt", "gamma.txt"],
+    correctness: ["beta.txt", "gamma.txt", "alpha.txt"],
+    boundaries: ["gamma.txt", "alpha.txt", "beta.txt"],
+  });
 });
 
 test("every rotated pass includes deletions and unusual filenames", (t) => {
@@ -4411,7 +4941,7 @@ test("legacy relative project data and local state remain available unless expli
   assert.equal(validatePublication(run.publicationFile).status, 0);
 });
 
-test("configuration fingerprint is shared before passes and excludes credentials", (t) => {
+test("configuration fingerprint excludes credentials and parallel scheduling", (t) => {
   const plan = {
     general: [{ findings: [] }],
     correctness: [{ findings: [] }],
@@ -4419,9 +4949,11 @@ test("configuration fingerprint is shared before passes and excludes credentials
   };
   const first = runReview(t, plan, {
     env: { OPENROUTER_API_KEY: "sk-or-first-credential" },
+    args: ["--max-parallel", "1", "--json"],
   });
   const second = runReview(t, plan, {
     env: { OPENROUTER_API_KEY: "sk-or-second-credential" },
+    args: ["--max-parallel", "3", "--json"],
   });
 
   assert.equal(first.result.status, 0, first.result.stderr);
@@ -4451,10 +4983,16 @@ test("advanced pass and lens overrides produce finite descriptors with stable un
     },
   });
   assert.equal(noSkillDeclaration.result.status, 0, noSkillDeclaration.result.stderr);
-  assert.deepEqual(noSkillDeclaration.logs.map(({ id }) => id), ["general", "general"]);
+  assert.deepEqual(
+    new Set(noSkillDeclaration.logs.map(({ pass_id }) => pass_id)),
+    new Set(["general", "empty-skills"]),
+  );
 
   assert.equal(run.result.status, 0, run.result.stderr);
-  assert.deepEqual(run.logs.map(({ id }) => id), ["general", "general", "security", "docs"]);
+  assert.deepEqual(
+    new Set(run.logs.map(({ pass_id }) => pass_id)),
+    new Set(["general", "general-2", "security", "docs"]),
+  );
   assert.deepEqual(run.metadata.passes.requested, ["general", "general-2", "security", "docs"]);
   assert.deepEqual(run.metadata.passes.completed, run.metadata.passes.requested);
 
@@ -4465,6 +5003,18 @@ test("advanced pass and lens overrides produce finite descriptors with stable un
   assert.notEqual(invalid.result.status, 0);
   assert.equal(invalid.logs.length, 0);
   assert.match(invalid.result.stderr, /--passes/);
+});
+
+test("max-parallel rejects non-positive and non-numeric limits before OMP", (t) => {
+  for (const value of ["0", "00", "Infinity"]) {
+    const run = runReview(t, {}, {
+      args: ["--max-parallel", value, "--json"],
+      includeOutputs: false,
+    });
+    assert.notEqual(run.result.status, 0);
+    assert.equal(run.logs.length, 0);
+    assert.match(run.result.stderr, /--max-parallel must be a positive integer/);
+  }
 });
 
 test("min-votes filtering cannot hide one-pass blocking evidence or report convergence", (t) => {

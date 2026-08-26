@@ -120,9 +120,13 @@ on:
         type: string
         default: read,grep,glob
       max_time:
-        description: Hard wall-clock cap passed to omp (e.g. 600, 10m, 1h). Empty means no cap.
+        description: Hard wall-clock cap passed to each model pass (e.g. 600, 10m, 1h). Empty means no cap.
         type: string
         default: ''
+      max_parallel:
+        description: Maximum independent model passes to execute concurrently.
+        type: number
+        default: 3
       # --- prompt and injected knowledge ------------------------------------
       prompt_path:
         description: >-
@@ -615,6 +619,7 @@ jobs:
           IN_TOOLS: ${{ inputs.tools }}
           IN_CENTRAL_REPO: atomikpanda/agentic-review
           IN_MAX_TIME: ${{ inputs.max_time }}
+          IN_MAX_PARALLEL: ${{ inputs.max_parallel }}
           IN_PROMPT_PATH: ${{ inputs.prompt_path }}
           IN_SKILLS_PATH: ${{ inputs.skills_path }}
           IN_MAX_FINDINGS: ${{ inputs.max_findings }}
@@ -640,12 +645,13 @@ jobs:
           # passing $'--add-dir docs\nPOST_COMMENT=false' would set an
           # unrelated variable AFTER the allowlist checks in this step had
           # already passed. None of these values has any reason to span lines.
-          for v in IN_MODEL IN_THINKING IN_TOOLS IN_MAX_TIME IN_PROMPT_PATH \
-                   IN_SKILLS_PATH IN_MAX_FINDINGS IN_MAX_DISCOVERY_ROUNDS \
-                   IN_REVIEW_CYCLE_OVERRIDE_REASON IN_REVIEW_MODE IN_POST_COMMENT \
-                   IN_FAIL_ON_FINDINGS IN_BUN_VERSION IN_OMP_VERSION IN_EXTRA_ARGS \
-                   IN_CENTRAL_REPO IN_MAX_DIFF_BYTES IN_CODEGRAPH_VERSION \
-                   IN_BLOCK_SEVERITIES IN_SUPPRESS_WRITES IN_RESOLVE_STALE; do
+          for v in IN_MODEL IN_THINKING IN_TOOLS IN_MAX_TIME IN_MAX_PARALLEL \
+                   IN_PROMPT_PATH IN_SKILLS_PATH IN_MAX_FINDINGS \
+                   IN_MAX_DISCOVERY_ROUNDS IN_REVIEW_CYCLE_OVERRIDE_REASON \
+                   IN_REVIEW_MODE IN_POST_COMMENT IN_FAIL_ON_FINDINGS \
+                   IN_BUN_VERSION IN_OMP_VERSION IN_EXTRA_ARGS IN_CENTRAL_REPO \
+                   IN_MAX_DIFF_BYTES IN_CODEGRAPH_VERSION IN_BLOCK_SEVERITIES \
+                   IN_SUPPRESS_WRITES IN_RESOLVE_STALE; do
             if [ "${!v}" != "${!v//[$'\n\r']/}" ]; then
               echo "::error::$v must not contain a newline"
               exit 1
@@ -724,6 +730,12 @@ jobs:
           case "$MAX_DISCOVERY_ROUNDS" in
             ''|*[!0-9]*|0) echo "::error::max_discovery_rounds must be a positive integer"; exit 1 ;;
           esac
+          MAX_PARALLEL="${IN_MAX_PARALLEL:-3}"
+          case "$MAX_PARALLEL" in
+            ''|*[!0-9]*) echo "::error::max_parallel must be a positive integer"; exit 1 ;;
+            *[1-9]*) ;;
+            *) echo "::error::max_parallel must be a positive integer"; exit 1 ;;
+          esac
 
 
           {
@@ -733,6 +745,7 @@ jobs:
             echo "TOOLS=$TOOLS"
             echo "CENTRAL_REPO=${IN_CENTRAL_REPO:-atomikpanda/agentic-review}"
             echo "MAX_TIME=${IN_MAX_TIME:-}"
+            echo "MAX_PARALLEL=$MAX_PARALLEL"
             echo "PROMPT_PATH=${IN_PROMPT_PATH:-review/prompt.md}"
             echo "SKILLS_PATH=${IN_SKILLS_PATH:-skills/infra-review/SKILL.md,skills/security-review/SKILL.md}"
             echo "MAX_FINDINGS=${IN_MAX_FINDINGS:-20}"
@@ -968,6 +981,7 @@ jobs:
             --prompt "$PROMPT_FILE"
             --skill "$SKILL_FILE"
             --max-findings "$MAX_FINDINGS"
+            --max-parallel "$MAX_PARALLEL"
             --review-mode "$REVIEW_MODE"
             --omp-version "$OMP_VERSION"
             --out /tmp/review.md

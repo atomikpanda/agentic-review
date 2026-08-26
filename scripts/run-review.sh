@@ -19,13 +19,14 @@
 #   --thinking LEVEL    off|minimal|low|medium|high|xhigh|max|auto
 #                                                     $AGENTIC_REVIEW_THINKING
 #   --tools LIST        comma-separated omp tools     $AGENTIC_REVIEW_TOOLS
-#   --max-time DUR      hard cap, e.g. 600, 10m, 1h   $AGENTIC_REVIEW_MAX_TIME
+#   --max-time DUR      per-pass cap, e.g. 600, 10m, 1h $AGENTIC_REVIEW_MAX_TIME
 #   --prompt FILE       review instructions           $AGENTIC_REVIEW_PROMPT
 #   --skill FILE        appended to the system prompt $AGENTIC_REVIEW_SKILL
 #   --max-findings N    0 disables the cap            $AGENTIC_REVIEW_MAX_FINDINGS
 #   --passes N          repeat the review N times and merge   $AGENTIC_REVIEW_PASSES
 #   --lenses a,b,c      one pass per concern, e.g. security,correctness,docs
 #                                                     $AGENTIC_REVIEW_LENSES
+#   --max-parallel N    concurrent pass limit         $AGENTIC_REVIEW_MAX_PARALLEL
 #   --min-votes N       experimental threshold; always inconclusive, preserves unsafe drops
 #   --review-mode M     summary|inline|suggest        $AGENTIC_REVIEW_MODE
 #                       suggest prints the fixes it would offer on a PR
@@ -97,6 +98,7 @@ MAX_DIFF_BYTES="${AGENTIC_REVIEW_MAX_DIFF_BYTES:-400000}"
 PASSES="${AGENTIC_REVIEW_PASSES:-1}"
 # The bounded default is one general review plus two additive specialist passes.
 LENSES="${AGENTIC_REVIEW_LENSES:-correctness,boundaries}"
+MAX_PARALLEL="${AGENTIC_REVIEW_MAX_PARALLEL:-3}"
 MIN_VOTES="${AGENTIC_REVIEW_MIN_VOTES:-1}"
 PUBLICATION_OUT="${AGENTIC_REVIEW_PUBLICATION_OUT:-}"
 TRUSTED_DATA_ROOT="${AGENTIC_REVIEW_TRUSTED_DATA_ROOT:-}"
@@ -116,6 +118,7 @@ while [ $# -gt 0 ]; do
     --review-mode)  REVIEW_MODE="${2:-}"; shift 2 ;;
     --passes)       PASSES="${2:-}"; shift 2 ;;
     --lenses)       LENSES="${2:-}"; shift 2 ;;
+    --max-parallel) MAX_PARALLEL="${2:-}"; shift 2 ;;
     --min-votes)    MIN_VOTES="${2:-}"; shift 2 ;;
     --omp-version)  OMP_VERSION="${2:-}"; shift 2 ;;
     --out)          OUT="${2:-}"; shift 2 ;;
@@ -140,6 +143,11 @@ done
 
 case "$PASSES" in
   ''|*[!0-9]*|0) printf '%s\n' "--passes must be a positive integer (got '$PASSES')" >&2; exit 2 ;;
+esac
+case "$MAX_PARALLEL" in
+  ''|*[!0-9]*) printf '%s\n' "--max-parallel must be a positive integer (got '$MAX_PARALLEL')" >&2; exit 2 ;;
+  *[1-9]*) ;;
+  *) printf '%s\n' "--max-parallel must be a positive integer (got '$MAX_PARALLEL')" >&2; exit 2 ;;
 esac
 case "$MAX_FINDINGS" in
   ''|*[!0-9]*) printf '%s\n' "--max-findings must be a non-negative integer (got '$MAX_FINDINGS')" >&2; exit 2 ;;
@@ -377,7 +385,115 @@ REVIEW_ROOT="$REPO_ROOT"
 WORKTREE=""
 RUN_TMP=""
 SNAPSHOT_IMMUTABLE=0
+PASS_WORKER_PIDS=()
+PASS_WORKER_PGIDS=()
+PASS_TREE_PIDS=()
+PASS_SCAN_PROBE_PID=""
+PASS_RUN_TOKEN="agentic-review-$$-$RANDOM-$RANDOM"
+RUNNER_PGID="$(ps -o pgid= -p "$$" | tr -d ' ')"
+freeze_pass_tree() {
+  local parent="$1" child
+  if ! kill -STOP "$parent" 2>/dev/null; then return; fi
+  for child in $(ps -eo pid=,ppid= | while read -r pid ppid; do
+    if [ "$ppid" = "$parent" ]; then printf '%s\n' "$pid"; fi
+  done); do
+    freeze_pass_tree "$child"
+  done
+  PASS_TREE_PIDS+=("$parent")
+}
+tagged_pass_pids() {
+  # Each model PID is held in SIGSTOP until this scan can rediscover that exact
+  # other process. OMP descendants inherit the verified credentials and
+  # dumpability; a host that hides same-credential processes fails before exec.
+  if [ -d /proc ] && [ "${AGENTIC_REVIEW_FORCE_PS_SCAN:-0}" != 1 ]; then
+    node -e '
+      const fs = require("node:fs");
+      const needle = Buffer.from(`AGENTIC_REVIEW_RUN_TOKEN=${process.argv[1]}\0`);
+      for (const entry of fs.readdirSync("/proc")) {
+        if (!/^[0-9]+$/.test(entry)) continue;
+        try {
+          if (fs.readFileSync(`/proc/${entry}/environ`).includes(needle)) {
+            process.stdout.write(`${entry}\n`);
+          }
+        } catch {}
+      }
+    ' "$PASS_RUN_TOKEN"
+  fi
+  ps eww -A -o pid= -o command= 2>/dev/null | while read -r pid command; do
+    case "$command" in
+      *"AGENTIC_REVIEW_RUN_TOKEN=$PASS_RUN_TOKEN"*) printf '%s\n' "$pid" ;;
+    esac
+  done
+}
+verify_tagged_pass_visibility() {
+  local attempt pid tagged_pids target_pid="${1:-}" owns_probe=0 seen=0
+  if [ -z "$target_pid" ]; then
+    AGENTIC_REVIEW_RUN_TOKEN="$PASS_RUN_TOKEN" sleep 30 &
+    PASS_SCAN_PROBE_PID=$!
+    target_pid="$PASS_SCAN_PROBE_PID"
+    owns_probe=1
+  fi
+  for attempt in {1..20}; do
+    tagged_pids="$(tagged_pass_pids || :)"
+    for pid in $tagged_pids; do
+      if [ "$pid" = "$target_pid" ]; then seen=1; break 2; fi
+    done
+    sleep 0.05
+  done
+  if [ "$owns_probe" = 1 ]; then
+    kill -KILL "$target_pid" 2>/dev/null || :
+    wait "$target_pid" 2>/dev/null || :
+    PASS_SCAN_PROBE_PID=""
+  fi
+  [ "$seen" = 1 ]
+}
+kill_tagged_passes() {
+  local attempt pid killed
+  for attempt in {1..20}; do
+    killed=0
+    for pid in $(tagged_pass_pids); do
+      if kill -KILL "$pid" 2>/dev/null; then killed=1; fi
+    done
+    if [ "$killed" = 0 ]; then return; fi
+  done
+}
+stop_pass_workers() {
+  local index pid pgid model_pid
+  if [ -n "$PASS_SCAN_PROBE_PID" ]; then
+    kill -KILL "$PASS_SCAN_PROBE_PID" 2>/dev/null || :
+    wait "$PASS_SCAN_PROBE_PID" 2>/dev/null || :
+    PASS_SCAN_PROBE_PID=""
+  fi
+  PASS_TREE_PIDS=()
+  for index in "${!PASS_WORKER_PIDS[@]}"; do
+    pid="${PASS_WORKER_PIDS[index]:-}"
+    if [ -n "$pid" ]; then freeze_pass_tree "$pid"; fi
+    if [ -n "$pid" ] && [ -f "$RUN_TMP/out.$index.pid" ] \
+       && IFS= read -r model_pid < "$RUN_TMP/out.$index.pid"; then
+      freeze_pass_tree "$model_pid"
+    fi
+  done
+  kill_tagged_passes
+  for pid in "${PASS_TREE_PIDS[@]}"; do kill -KILL "$pid" 2>/dev/null || :; done
+  for index in "${!PASS_WORKER_PIDS[@]}"; do
+    pid="${PASS_WORKER_PIDS[index]:-}"
+    pgid="${PASS_WORKER_PGIDS[index]:-}"
+    if [ -z "$pid" ]; then continue; fi
+    if [ -n "$pgid" ] && [ "$pgid" != "$RUNNER_PGID" ]; then
+      kill -KILL -- "-$pgid" 2>/dev/null || :
+    else
+      kill -KILL "$pid" 2>/dev/null || :
+    fi
+  done
+  for pid in "${PASS_WORKER_PIDS[@]+"${PASS_WORKER_PIDS[@]}"}"; do
+    if [ -n "$pid" ]; then wait "$pid" 2>/dev/null || :; fi
+  done
+  PASS_TREE_PIDS=()
+  PASS_WORKER_PIDS=()
+  PASS_WORKER_PGIDS=()
+}
 cleanup_worktree() {
+  stop_pass_workers
   if [ -n "$WORKTREE" ]; then
     git worktree remove --force "$WORKTREE" 2>/dev/null || rm -rf -- "$WORKTREE"
     WORKTREE=""
@@ -385,6 +501,8 @@ cleanup_worktree() {
   if [ -n "$RUN_TMP" ]; then rm -rf -- "$RUN_TMP"; RUN_TMP=""; fi
 }
 trap cleanup_worktree EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 step "Working out what changed"
 STAGED_TARGET_SHA=""
@@ -814,16 +932,26 @@ node "$RESULT_HELPER" scope "$SCOPE_FILE" >/dev/null \
   || die "could not validate review scope"
 
 step "Reviewing with $MODEL"
-say "read-only tools: $TOOLS${THINKING:+ | thinking: $THINKING} | passes: ${#PASS_IDS[@]}"
+say "read-only tools: $TOOLS${THINKING:+ | thinking: $THINKING} | passes: ${#PASS_IDS[@]} | max parallel: $MAX_PARALLEL"
+
+PASS_CHILD_PID=""
+stop_pass_child() {
+  if [ -z "$PASS_CHILD_PID" ]; then return; fi
+  kill -TERM "$PASS_CHILD_PID" 2>/dev/null || :
+  wait "$PASS_CHILD_PID" 2>/dev/null || :
+  PASS_CHILD_PID=""
+}
 
 run_pass() {
-  local prompt_file="$1" out_file="$2" skill_file="$3"
+  local prompt_file="$1" out_file="$2" skill_file="$3" pass_id="$4" status
+  local attempt child_state=""
   local -a args=()
   if [ -s "$skill_file" ]; then args+=(--append-system-prompt="$skill_file"); fi
   if [ -n "$THINKING" ]; then args+=(--thinking="$THINKING"); fi
   if [ -n "$MAX_TIME" ]; then args+=(--max-time="$MAX_TIME"); fi
   if [ ${#PASSTHRU[@]} -gt 0 ]; then args+=("${PASSTHRU[@]}"); fi
-  "${OMP[@]}" -p \
+  AGENTIC_REVIEW_RUN_TOKEN="$PASS_RUN_TOKEN" AGENTIC_REVIEW_PASS_ID="$pass_id" \
+    bash -c 'kill -STOP "$$"; exec "$@"' agentic-review-pass "${OMP[@]}" -p \
     --model="$MODEL" \
     --no-session \
     "${args[@]+"${args[@]}"}" \
@@ -831,21 +959,103 @@ run_pass() {
     --approval-mode=always-ask \
     --cwd="$REVIEW_ROOT" \
     "@$prompt_file" \
-    < /dev/null > "$out_file" 2>"$out_file.err"
+    < /dev/null > "$out_file" 2>"$out_file.err" &
+  PASS_CHILD_PID=$!
+  printf '%s\n' "$PASS_CHILD_PID" > "$out_file.pid"
+  for attempt in {1..100}; do
+    child_state="$(ps -o stat= -p "$PASS_CHILD_PID" 2>/dev/null | tr -d ' ')"
+    case "$child_state" in T*) break ;; esac
+    sleep 0.01
+  done
+  case "$child_state" in
+    T*) ;;
+    *)
+      kill -KILL "$PASS_CHILD_PID" 2>/dev/null || :
+      wait "$PASS_CHILD_PID" 2>/dev/null || :
+      rm -f "$out_file.pid"
+      PASS_CHILD_PID=""
+      die "model process did not stop for cleanup verification in pass $pass_id"
+      ;;
+  esac
+  if ! verify_tagged_pass_visibility "$PASS_CHILD_PID"; then
+    kill -KILL "$PASS_CHILD_PID" 2>/dev/null || :
+    wait "$PASS_CHILD_PID" 2>/dev/null || :
+    rm -f "$out_file.pid"
+    PASS_CHILD_PID=""
+    die "could not verify cleanup access to model process for pass $pass_id"
+  fi
+  kill -CONT "$PASS_CHILD_PID" 2>/dev/null \
+    || die "could not start verified model process for pass $pass_id"
+  if wait "$PASS_CHILD_PID"; then status=0; else status=$?; fi
+  rm -f "$out_file.pid"
+  PASS_CHILD_PID=""
+  return "$status"
 }
 
-run_pass_checked() {
-  local prompt_file="$1" out_file="$2" skill_file="$3" attempt
-  LAST_ATTEMPTS=0
+run_pass_worker() {
+  local pass_index="$1" out_file="$RUN_TMP/out.$1" record="$RUN_TMP/pass.$1.record"
+  local record_tmp="$RUN_TMP/pass.$1.record.tmp" diagnostics="$RUN_TMP/pass.$1.diagnostics"
+  local attempt attempts=0 status=failed count=0 capped=false
+  trap stop_pass_child EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  : > "$diagnostics"
   for attempt in 1 2; do
-    LAST_ATTEMPTS="$attempt"
-    if run_pass "$prompt_file" "$out_file" "$skill_file" && [ -s "$out_file" ] \
-       && node "$MERGE" --check "$out_file" 2>/dev/null; then
-      return 0
+    attempts="$attempt"
+    if run_pass "$RUN_TMP/prompt.$pass_index" "$out_file" \
+       "$RUN_TMP/skill.$pass_index" "${PASS_IDS[pass_index]}" \
+       && [ -s "$out_file" ] && node "$MERGE" --check "$out_file" 2>/dev/null; then
+      status=valid
+      break
     fi
-    say "output unparseable (attempt $attempt)"
+    printf 'output unparseable (attempt %s)\n' "$attempt" >> "$diagnostics"
   done
-  return 1
+  if [ "$status" = valid ]; then
+    count="$(node -e 'const fs=require("node:fs"); process.stdout.write(String(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).findings.length))' "$out_file")"
+    if [ "$MAX_FINDINGS" != "0" ] && [ "$count" -ge "$MAX_FINDINGS" ]; then capped=true; fi
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$status" "$attempts" "$count" "$capped" > "$record_tmp"
+  mv "$record_tmp" "$record"
+}
+
+ACTIVE_PASS_WORKERS=0
+reap_completed_pass() {
+  local index pid record running_pid worker_running completed status running_workers
+  while :; do
+    if [ "${PASS_CANCEL_STATUS:-0}" != 0 ]; then exit "$PASS_CANCEL_STATUS"; fi
+    running_workers="$(jobs -pr)"
+    for index in "${!PASS_WORKER_PIDS[@]}"; do
+      pid="${PASS_WORKER_PIDS[index]:-}"
+      if [ -z "$pid" ]; then continue; fi
+      record="$RUN_TMP/pass.$index.record"
+      completed=0
+      if [ -f "$record" ]; then
+        completed=1
+      else
+        worker_running=0
+        for running_pid in $running_workers; do
+          if [ "$running_pid" = "$pid" ]; then worker_running=1; break; fi
+        done
+        if [ "$worker_running" = 0 ]; then
+          if [ -f "$record" ]; then
+            completed=1
+          else
+            if wait "$pid"; then status=0; else status=$?; fi
+            die "pass worker $index exited unexpectedly (status $status)"
+          fi
+        fi
+      fi
+      if [ "$completed" = 1 ]; then
+        wait "$pid" 2>/dev/null || :
+        rm -f "$RUN_TMP/out.$index.pid"
+        PASS_WORKER_PIDS[index]=""
+        PASS_WORKER_PGIDS[index]=""
+        ACTIVE_PASS_WORKERS=$((ACTIVE_PASS_WORKERS - 1))
+        return
+      fi
+    done
+    sleep 0.05
+  done
 }
 
 PASS_STATUSES=()
@@ -854,25 +1064,46 @@ PASS_COUNTS=()
 PASS_CAPPED=()
 PASS_OUTS=()
 VALID_OUTS=()
+verify_tagged_pass_visibility \
+  || die "could not verify detached-process cleanup before starting model work"
+
+set -m
+PASS_CANCEL_STATUS=0
+trap 'PASS_CANCEL_STATUS=130' INT
+trap 'PASS_CANCEL_STATUS=143' TERM
 for ((i = 0; i < ${#PASS_IDS[@]}; i++)); do
-  out="$RUN_TMP/out.$i"
-  PASS_OUTS+=("$out")
-  if run_pass_checked "$RUN_TMP/prompt.$i" "$out" "$RUN_TMP/skill.$i"; then
-    count="$(node -e 'const fs=require("node:fs"); process.stdout.write(String(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).findings.length))' "$out")"
-    capped=false
-    if [ "$MAX_FINDINGS" != "0" ] && [ "$count" -ge "$MAX_FINDINGS" ]; then capped=true; fi
-    PASS_STATUSES+=("valid")
-    PASS_ATTEMPTS+=("$LAST_ATTEMPTS")
-    PASS_COUNTS+=("$count")
-    PASS_CAPPED+=("$capped")
-    VALID_OUTS+=("$out")
-    say "pass ${PASS_IDS[i]} valid (${count} finding(s), attempt $LAST_ATTEMPTS)"
+  if [ "$PASS_CANCEL_STATUS" != 0 ]; then exit "$PASS_CANCEL_STATUS"; fi
+  PASS_OUTS+=("$RUN_TMP/out.$i")
+  AGENTIC_REVIEW_RUN_TOKEN="$PASS_RUN_TOKEN" run_pass_worker "$i" &
+  PASS_WORKER_PIDS[i]=$!
+  PASS_WORKER_PGIDS[i]="$(ps -o pgid= -p "${PASS_WORKER_PIDS[i]}" | tr -d ' ')"
+  ACTIVE_PASS_WORKERS=$((ACTIVE_PASS_WORKERS + 1))
+  if [ "$PASS_CANCEL_STATUS" != 0 ]; then exit "$PASS_CANCEL_STATUS"; fi
+  if [ "$ACTIVE_PASS_WORKERS" -ge "$MAX_PARALLEL" ]; then reap_completed_pass; fi
+done
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if [ "$PASS_CANCEL_STATUS" != 0 ]; then exit "$PASS_CANCEL_STATUS"; fi
+while [ "$ACTIVE_PASS_WORKERS" -gt 0 ]; do reap_completed_pass; done
+set +m
+
+for ((i = 0; i < ${#PASS_IDS[@]}; i++)); do
+  if [ -s "$RUN_TMP/pass.$i.diagnostics" ]; then
+    while IFS= read -r diagnostic; do say "pass ${PASS_IDS[i]}: $diagnostic"; done \
+      < "$RUN_TMP/pass.$i.diagnostics"
+  fi
+  if ! IFS=$'\t' read -r status attempts count capped < "$RUN_TMP/pass.$i.record"; then
+    die "pass ${PASS_IDS[i]} did not produce a result"
+  fi
+  PASS_STATUSES+=("$status")
+  PASS_ATTEMPTS+=("$attempts")
+  PASS_COUNTS+=("$count")
+  PASS_CAPPED+=("$capped")
+  if [ "$status" = valid ]; then
+    VALID_OUTS+=("${PASS_OUTS[i]}")
+    say "pass ${PASS_IDS[i]} valid (${count} finding(s), attempt $attempts)"
   else
-    PASS_STATUSES+=("failed")
-    PASS_ATTEMPTS+=("$LAST_ATTEMPTS")
-    PASS_COUNTS+=("0")
-    PASS_CAPPED+=("false")
-    say "pass ${PASS_IDS[i]} failed after $LAST_ATTEMPTS attempts"
+    say "pass ${PASS_IDS[i]} failed after $attempts attempts"
   fi
 done
 

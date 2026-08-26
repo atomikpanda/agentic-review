@@ -25,12 +25,13 @@
 #   --model SLUG             provider-prefixed model slug
 #   --thinking LEVEL         off|minimal|low|medium|high|xhigh|max|auto
 #   --tools LIST             comma-separated read-only omp tools
-#   --max-time DUR           hard cap per review, e.g. 600, 10m, 1h
+#   --max-time DUR           hard cap per model pass, e.g. 600, 10m, 1h
 #   --prompt FILE            review instructions path
 #   --skill FILE             file appended to the system prompt
 #   --review-mode M          suggest|inline|summary (default suggest)
 #   --max-findings N         0 disables the cap
 #   --max-discovery-rounds N  broad review rounds before human override is required
+#   --max-parallel N         concurrent model pass limit
 #   --fail-on-findings       make the review a blocking check
 #   --no-comment             don't post a PR comment (artifact only)
 #   --omp-version V          pin @oh-my-pi/pi-coding-agent
@@ -62,7 +63,7 @@ fi
 REPO=""; OR_KEY=""; ASSUME_YES=0; WITH_PR_AGENT=""; PR_AGENT_MODEL=""
 # Reviewer knobs. Empty means "not specified" — omitted from `with:` entirely.
 I_MODEL=""; I_THINKING=""; I_TOOLS=""; I_MAX_TIME=""; I_PROMPT=""; I_SKILL=""
-I_MAX_FINDINGS=""; I_MAX_DISCOVERY_ROUNDS=""; I_FAIL=""; I_COMMENT=""
+I_MAX_FINDINGS=""; I_MAX_DISCOVERY_ROUNDS=""; I_MAX_PARALLEL=""; I_FAIL=""; I_COMMENT=""
 I_OMP_VERSION=""; I_BUN_VERSION=""; I_REVIEW_MODE=""
 I_EXTRA_ARGS=""
 
@@ -82,6 +83,7 @@ while [ $# -gt 0 ]; do
     --skill)            I_SKILL="${2:-}"; shift 2 ;;
     --max-findings)     I_MAX_FINDINGS="${2:-}"; shift 2 ;;
     --max-discovery-rounds) I_MAX_DISCOVERY_ROUNDS="${2:-}"; shift 2 ;;
+    --max-parallel)      I_MAX_PARALLEL="${2:-}"; shift 2 ;;
     --review-mode)      I_REVIEW_MODE="${2:-}"; shift 2 ;;
     --fail-on-findings) I_FAIL="true"; shift ;;
     --no-comment)       I_COMMENT="false"; shift ;;
@@ -122,6 +124,13 @@ if [ -n "$I_MAX_DISCOVERY_ROUNDS" ]; then
   esac
   [ "$I_MAX_DISCOVERY_ROUNDS" -ge 1 ] \
     || { printf '%s\n' "--max-discovery-rounds must be a positive integer" >&2; exit 2; }
+fi
+if [ -n "$I_MAX_PARALLEL" ]; then
+  case "$I_MAX_PARALLEL" in
+    *[!0-9]*|'') printf '%s\n' "--max-parallel must be a positive integer" >&2; exit 2 ;;
+  esac
+  [ "$I_MAX_PARALLEL" -ge 1 ] \
+    || { printf '%s\n' "--max-parallel must be a positive integer" >&2; exit 2; }
 fi
 
 _c() { if [ -t 1 ]; then printf '\033[%sm' "$1"; fi; }
@@ -266,6 +275,7 @@ YAML
   if [ "$CENTRAL_REF" != "main" ]; then emit central_ref "$CENTRAL_REF"; fi
   emit max_findings     "$I_MAX_FINDINGS"
   emit max_discovery_rounds "$I_MAX_DISCOVERY_ROUNDS"
+  emit max_parallel     "$I_MAX_PARALLEL"
   emit fail_on_findings "$I_FAIL"
   emit post_comment     "$I_COMMENT"
   emit omp_version      "$I_OMP_VERSION"
@@ -292,6 +302,7 @@ YAML
 #   central_ref:      main          # pin support files to the same ref
 #   max_findings:     20            # 0 disables the cap
 #   max_discovery_rounds: 2           # broad rounds; verification retries do not count
+#   max_parallel:     3             # concurrent model pass limit
 #   post_comment:     true
 #   fail_on_findings: false         # true makes this a blocking check
 #   timeout_minutes:  20

@@ -95,10 +95,11 @@ existing history for the
 rendered state and exit status but never mutates it. Advanced local experiments
 can change the ensemble with `--passes N`, `--lenses a,b,c`, and
 `--min-votes N`; pass/lens changes appear in the metadata identifiers, and all
-three change the configuration fingerprint. A vote threshold above one is
-experimental and always inconclusive. If it would hide any valid finding, the
-runner emits the complete union instead so state, history, and safety gating
-retain that evidence.
+three change the configuration fingerprint. `--max-parallel N` changes only
+how many independent passes execute at once, not the review identity or merge
+order. A vote threshold above one is experimental and always inconclusive. If
+it would hide any valid finding, the runner emits the complete union instead
+so state, history, and safety gating retain that evidence.
 
 **Works from any repository.** The prompt, output format and skill file are
 resolved relative to the script itself (symlinks followed), then overridden by
@@ -174,13 +175,16 @@ basis any pass claimed wins.
 
 ## Bounded ensemble and result states
 
-The default local and hosted profile runs three sequential passes — **general**,
-**correctness**, and **boundaries** — against one immutable base SHA, head SHA,
-and configuration fingerprint. It performs approximately three times the model
-work of one general pass. Each pass gets one retry if its output is malformed.
-Every valid pass contributes to one union with `min_votes=1`, so a finding seen
-by only one pass survives. One result is rendered or posted: the union, or an
-explicitly inconclusive first-valid structured fallback if union fails.
+The default local and hosted profile runs **general**, **correctness**, and
+**boundaries** concurrently, up to the `max_parallel` limit, against one
+immutable base SHA, head SHA, and configuration fingerprint. It performs
+approximately three times the model work of one general pass while wall time
+tracks the slowest pass rather than their sum. Each pass keeps its own retry,
+status, attempts, diagnostics, and output. Results are harvested and merged in
+descriptor order regardless of completion order. Every valid pass contributes
+to one union with `min_votes=1`, so a finding seen by only one pass survives.
+One result is rendered or posted: the union, or an explicitly inconclusive
+first-valid structured fallback if union fails.
 
 Hosted reviews add a bounded **cross-run cycle** around that per-run ensemble:
 
@@ -429,6 +433,7 @@ cell means that surface does not expose the setting.
 | Reasoning effort | `high` | `thinking` | `--thinking` | `--thinking` |
 | Tool allowlist | `read,grep,glob` | `tools` | `--tools` | `--tools` |
 | Wall-clock cap | none | `max_time` | `--max-time` | `--max-time` |
+| Concurrent model passes | `3` | `max_parallel` | `--max-parallel` | `--max-parallel` |
 | Review prompt | `review/prompt.md` | `prompt_path` | `--prompt` | `--prompt` |
 | Injected knowledge | both skills | `skills_path` | `--skill` | `--skill` |
 | Review style | `suggest` | `review_mode` | `--review-mode` | `--review-mode` |
