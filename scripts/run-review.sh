@@ -374,19 +374,17 @@ ver_ge() { # ver_ge A B  -> 0 when A >= B
 # otherwise --omp-version / AGENTIC_REVIEW_OMP_VERSION would be silently
 # ignored on every machine that happens to have omp on PATH, which is most of
 # them, and a "pinned" review would not be pinned at all.
+OMP_USES_BUNX=0
+OMP_PACKAGE=""
 if [ "$OMP_VERSION" = "latest" ] && command -v omp >/dev/null 2>&1; then
   OMP=(omp); ok "omp $(omp --version 2>/dev/null | head -1)"
 elif command -v bunx >/dev/null 2>&1; then
   bunv="$(bun --version 2>/dev/null || echo 0)"
   ver_ge "$bunv" "$BUN_MIN" \
     || die "bun $bunv is too old — omp needs >= $BUN_MIN (it crashes with a minified SyntaxError otherwise). Upgrade with: bun upgrade"
-  OMP=(bunx --bun "@oh-my-pi/pi-coding-agent@${OMP_VERSION}")
-  if [ "$MAX_PARALLEL" -gt 1 ]; then
-    omp_version_output="$("${OMP[@]}" --version 2>/dev/null)" \
-      || die "could not resolve omp@$OMP_VERSION before parallel passes"
-    [ -n "$omp_version_output" ] \
-      || die "omp@$OMP_VERSION returned an empty version during parallel warmup"
-  fi
+  OMP_PACKAGE="@oh-my-pi/pi-coding-agent@${OMP_VERSION}"
+  OMP=(bunx --bun "$OMP_PACKAGE")
+  OMP_USES_BUNX=1
   ok "using bunx (bun $bunv)"
 else
   # There is deliberately no npx fallback. omp's entrypoint is
@@ -666,6 +664,17 @@ case "$REVIEW_PHASE" in
 esac
 
 RUN_TMP="$(mktemp -d)"
+if [ "$OMP_USES_BUNX" = 1 ] && [ "$MAX_PARALLEL" -gt 1 ]; then
+  OMP_INSTALL_ROOT="$RUN_TMP/omp-package"
+  mkdir -p "$OMP_INSTALL_ROOT"
+  bun add --cwd="$OMP_INSTALL_ROOT" --no-save --silent "$OMP_PACKAGE" \
+    || die "could not install omp@$OMP_VERSION before parallel passes"
+  OMP_BINARY="$OMP_INSTALL_ROOT/node_modules/.bin/omp"
+  [ -x "$OMP_BINARY" ] \
+    || die "omp@$OMP_VERSION did not install its executable"
+  OMP=("$OMP_BINARY")
+  ok "prepared one private omp executable for parallel passes"
+fi
 CODEGRAPH_READY=0
 CG=""
 CODEGRAPH_VERSION_FILE="$RUN_TMP/codegraph-version"

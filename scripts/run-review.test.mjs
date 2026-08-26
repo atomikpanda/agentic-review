@@ -578,6 +578,18 @@ exec "\$(dirname "$0")/omp" "$@"
     chmodSync(bunx, 0o755);
     const bun = join(fixture.bin, "bun");
     writeFileSync(bun, `#!/usr/bin/env bash
+if [ "\${1:-}" = add ]; then
+  install_root=""
+  for argument in "$@"; do
+    case "$argument" in --cwd=*) install_root="\${argument#--cwd=}" ;; esac
+  done
+  [ -n "$install_root" ] || exit 8
+  mkdir -p "$install_root/node_modules/.bin"
+  cp "\$(dirname "$0")/omp" "$install_root/node_modules/.bin/omp"
+  chmod +x "$install_root/node_modules/.bin/omp"
+  : > "\${FAKE_BUNX_WARM_MARKER}"
+  exit 0
+fi
 printf '%s\\n' '1.3.14'
 `);
     chmodSync(bun, 0o755);
@@ -2633,7 +2645,7 @@ function diffFileOrder(prompt) {
   return [...diff[1].matchAll(/^diff --git a\/(.+?) b\/.+$/gm)].map((match) => match[1]);
 }
 
-test("parallel bunx passes warm the package executable before workers launch", (t) => {
+test("parallel bunx passes install one private executable before workers launch", (t) => {
   const fixture = createFixture(t);
   const warmMarker = join(fixture.directory, "bunx-warm");
   const run = runReview(t, {
@@ -2652,7 +2664,7 @@ test("parallel bunx passes warm the package executable before workers launch", (
 
   assert.equal(run.result.status, 0, run.result.stderr);
   assert.equal(existsSync(warmMarker), true);
-  assert.equal(readFileSync(run.bunxLogFile, "utf8").trim().split("\n").length, 4);
+  assert.equal(existsSync(run.bunxLogFile), false);
 });
 
 test("max-parallel overlaps workers without exceeding the configured limit", (t) => {
