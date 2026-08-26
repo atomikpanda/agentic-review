@@ -965,6 +965,7 @@ ACTIVE_PASS_WORKERS=0
 reap_completed_pass() {
   local index pid record running_pid worker_running completed status running_workers
   while :; do
+    if [ "${PASS_CANCEL_STATUS:-0}" != 0 ]; then exit "$PASS_CANCEL_STATUS"; fi
     running_workers="$(jobs -pr)"
     for index in "${!PASS_WORKER_PIDS[@]}"; do
       pid="${PASS_WORKER_PIDS[index]:-}"
@@ -1007,14 +1008,22 @@ PASS_CAPPED=()
 PASS_OUTS=()
 VALID_OUTS=()
 set -m
+PASS_CANCEL_STATUS=0
+trap 'PASS_CANCEL_STATUS=130' INT
+trap 'PASS_CANCEL_STATUS=143' TERM
 for ((i = 0; i < ${#PASS_IDS[@]}; i++)); do
+  if [ "$PASS_CANCEL_STATUS" != 0 ]; then exit "$PASS_CANCEL_STATUS"; fi
   PASS_OUTS+=("$RUN_TMP/out.$i")
   AGENTIC_REVIEW_RUN_TOKEN="$PASS_RUN_TOKEN" run_pass_worker "$i" &
   PASS_WORKER_PIDS[i]=$!
   PASS_WORKER_PGIDS[i]="$(ps -o pgid= -p "${PASS_WORKER_PIDS[i]}" | tr -d ' ')"
   ACTIVE_PASS_WORKERS=$((ACTIVE_PASS_WORKERS + 1))
+  if [ "$PASS_CANCEL_STATUS" != 0 ]; then exit "$PASS_CANCEL_STATUS"; fi
   if [ "$ACTIVE_PASS_WORKERS" -ge "$MAX_PARALLEL" ]; then reap_completed_pass; fi
 done
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if [ "$PASS_CANCEL_STATUS" != 0 ]; then exit "$PASS_CANCEL_STATUS"; fi
 while [ "$ACTIVE_PASS_WORKERS" -gt 0 ]; do reap_completed_pass; done
 set +m
 
