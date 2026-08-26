@@ -488,13 +488,14 @@ function runReview(t, plan, {
   const bunxLogFile = join(fixture.directory, "bunx.log");
   let findingsFile = join(fixture.directory, "findings.json");
   let publicationFile = join(fixture.directory, "publication.json");
-  const diagnosticsFile = join(fixture.directory, "pass-diagnostics.json");
+  let diagnosticsFile = join(fixture.directory, "pass-diagnostics.json");
   if (outputPaths) {
     const outputFiles = outputPaths({
       ...fixture,
       findingsFile,
       publicationFile,
     });
+    diagnosticsFile = outputFiles.diagnosticsFile ?? diagnosticsFile;
     findingsFile = outputFiles.findingsFile;
     publicationFile = outputFiles.publicationFile;
   }
@@ -3216,6 +3217,36 @@ test("failed attempts publish bounded classified diagnostics without review inpu
       assert.ok(Buffer.byteLength(stderrTail, "utf8") <= 4096);
     }
   }
+});
+
+test("pass diagnostics publish across filesystem boundaries", {
+  skip: !existsSync("/dev/shm")
+    || lstatSync("/dev/shm").dev === lstatSync(tmpdir()).dev,
+}, (t) => {
+  const fixture = createFixture(t);
+  const diagnosticsFile = join(
+    "/dev/shm",
+    `agentic-review-diagnostics-${process.pid}-${Date.now()}.json`,
+  );
+  t.after(() => rmSync(diagnosticsFile, { force: true }));
+  const run = runReview(t, {
+    general: ["not json", "still not json"],
+  }, {
+    args: ["--passes", "1", "--lenses", "", "--json"],
+    existingFixture: fixture,
+    outputPaths: ({ findingsFile, publicationFile }) => ({
+      findingsFile,
+      publicationFile,
+      diagnosticsFile,
+    }),
+  });
+
+  assert.notEqual(run.result.status, 0);
+  assert.equal(existsSync(diagnosticsFile), true, run.result.stderr);
+  assert.deepEqual(run.diagnostics.passes[0].attempts.map(({ status }) => status), [
+    "invalid_json",
+    "invalid_json",
+  ]);
 });
 
 test("all-pass failure writes validated findings and publication diagnostics before exiting nonzero", (t) => {

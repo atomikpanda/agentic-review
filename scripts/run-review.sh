@@ -1250,8 +1250,40 @@ publish_pass_diagnostics() {
     "$PASS_DIAGNOSTIC_STDERR_LINES" \
     || die "could not assemble bounded pass diagnostics"
   if [ -s "$manifest_tmp" ]; then
-    node -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' \
-      "$manifest_tmp" "$DIAGNOSTICS_OUT" \
+    node -e '
+      const fs = require("node:fs");
+      const { randomBytes } = require("node:crypto");
+      const { basename, dirname, join } = require("node:path");
+      const [source, destination] = process.argv.slice(1);
+      const directory = dirname(destination);
+      let descriptor;
+      let temporary;
+      try {
+        for (let attempt = 0; attempt < 10; attempt += 1) {
+          temporary = join(
+            directory,
+            `.${basename(destination)}.tmp-${randomBytes(8).toString("hex")}`,
+          );
+          try {
+            descriptor = fs.openSync(temporary, "wx", 0o600);
+            break;
+          } catch (error) {
+            if (error.code !== "EEXIST") throw error;
+          }
+        }
+        if (descriptor === undefined) throw new Error("could not allocate diagnostics staging file");
+        fs.writeFileSync(descriptor, fs.readFileSync(source));
+        fs.closeSync(descriptor);
+        descriptor = undefined;
+        fs.renameSync(temporary, destination);
+        temporary = undefined;
+      } finally {
+        if (descriptor !== undefined) fs.closeSync(descriptor);
+        if (temporary !== undefined) {
+          try { fs.unlinkSync(temporary); } catch {}
+        }
+      }
+    ' "$manifest_tmp" "$DIAGNOSTICS_OUT" \
       || die "could not atomically publish pass diagnostics at $DIAGNOSTICS_OUT"
     ok "pass diagnostics written to $DIAGNOSTICS_OUT"
   fi
