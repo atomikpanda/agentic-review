@@ -380,7 +380,14 @@ elif command -v bunx >/dev/null 2>&1; then
   bunv="$(bun --version 2>/dev/null || echo 0)"
   ver_ge "$bunv" "$BUN_MIN" \
     || die "bun $bunv is too old — omp needs >= $BUN_MIN (it crashes with a minified SyntaxError otherwise). Upgrade with: bun upgrade"
-  OMP=(bunx --bun "@oh-my-pi/pi-coding-agent@${OMP_VERSION}"); ok "using bunx (bun $bunv)"
+  OMP=(bunx --bun "@oh-my-pi/pi-coding-agent@${OMP_VERSION}")
+  if [ "$MAX_PARALLEL" -gt 1 ]; then
+    omp_version_output="$("${OMP[@]}" --version 2>/dev/null)" \
+      || die "could not resolve omp@$OMP_VERSION before parallel passes"
+    [ -n "$omp_version_output" ] \
+      || die "omp@$OMP_VERSION returned an empty version during parallel warmup"
+  fi
+  ok "using bunx (bun $bunv)"
 else
   # There is deliberately no npx fallback. omp's entrypoint is
   # `#!/usr/bin/env bun` and it imports `bun:` builtins, so node exits with
