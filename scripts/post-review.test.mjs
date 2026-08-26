@@ -446,6 +446,18 @@ test("summary marker round-trips only normalized carry-forward fields", () => {
   assert.ok(!marker.includes("discard me"));
 });
 
+test("summary markers reject titles invalid for public findings", () => {
+  for (const title of ["   ", "Line one\nLine two", "Line one\rLine two"]) {
+    assert.throws(
+      () => encodeSummaryMarker({
+        headSha: PRIOR_HEAD_SHA,
+        findings: [finding({ title })],
+      }),
+      /title/,
+    );
+  }
+});
+
 test("summary marker v2 round-trips hosted cycle state while v1 remains readable", () => {
   const cycle = {
     schema_version: 1,

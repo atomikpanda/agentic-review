@@ -129,8 +129,15 @@ function normalizeSummaryFinding(value, index) {
   if (!SUMMARY_SEVERITY_SET.has(value.severity)) {
     throw new TypeError(`summary findings[${index}].severity is invalid`);
   }
-  if (typeof value.title !== "string" || !value.title || typeof value.body !== "string" || !value.body) {
-    throw new TypeError(`summary findings[${index}] must have a title and body`);
+  if (
+    typeof value.title !== "string"
+    || value.title.trim().length === 0
+    || /[\r\n]/.test(value.title)
+  ) {
+    throw new TypeError(`summary findings[${index}].title is invalid`);
+  }
+  if (typeof value.body !== "string" || !value.body) {
+    throw new TypeError(`summary findings[${index}].body is invalid`);
   }
   if (value.evidence_kind !== undefined && !EVIDENCE_KINDS.has(value.evidence_kind)) {
     throw new TypeError(`summary findings[${index}].evidence_kind is invalid`);
