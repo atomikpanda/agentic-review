@@ -414,7 +414,6 @@ tagged_pass_pids() {
         } catch {}
       }
     ' "$PASS_RUN_TOKEN"
-    return
   fi
   ps eww -A -o pid= -o command= 2>/dev/null | while read -r pid command; do
     case "$command" in
@@ -1010,7 +1009,7 @@ VALID_OUTS=()
 set -m
 for ((i = 0; i < ${#PASS_IDS[@]}; i++)); do
   PASS_OUTS+=("$RUN_TMP/out.$i")
-  run_pass_worker "$i" &
+  AGENTIC_REVIEW_RUN_TOKEN="$PASS_RUN_TOKEN" run_pass_worker "$i" &
   PASS_WORKER_PIDS[i]=$!
   PASS_WORKER_PGIDS[i]="$(ps -o pgid= -p "${PASS_WORKER_PIDS[i]}" | tr -d ' ')"
   ACTIVE_PASS_WORKERS=$((ACTIVE_PASS_WORKERS + 1))
