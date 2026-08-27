@@ -391,16 +391,22 @@ function maximumSummaryFindingMatching(current, prior) {
 
 export async function reconcileSummaryFindings({
   analysisState,
+  phase = null,
   current,
   prior,
   priorHeadSha,
   headSha,
+  verificationFindings = [],
   spanChanged,
 }) {
   const matchedPriorByCurrent = maximumSummaryFindingMatching(current, prior);
   const matchedPrior = new Set(
     matchedPriorByCurrent.filter((index) => index !== null),
   );
+  const verifiedPrior = phase === "verification"
+    ? new Set(maximumSummaryFindingMatching(verificationFindings, prior)
+      .filter((index) => index !== null))
+    : new Set();
   const reconciledCurrent = current.map((candidate, index) => {
     const priorIndex = matchedPriorByCurrent[index];
     return priorIndex === null
@@ -413,6 +419,10 @@ export async function reconcileSummaryFindings({
   let reconciliationKnown = true;
   for (const [index, previous] of prior.entries()) {
     if (matchedPrior.has(index)) continue;
+    if (analysisState === "complete" && verifiedPrior.has(index)) {
+      retired.push(previous);
+      continue;
+    }
     let changed = null;
     try {
       changed = await spanChanged(previous, priorHeadSha, headSha);
@@ -1614,16 +1624,24 @@ function mergeFindingSets(primary, secondary, resolveMatch) {
   return merged;
 }
 
-export async function reconcileHostedFindings({ metadata, findings, history, writesEnabled }) {
+export async function reconcileHostedFindings({
+  metadata,
+  findings,
+  history,
+  writesEnabled,
+  cyclePlan = null,
+}) {
   const standing = history.threads.filter((thread) => !thread.isResolved && !thread.retired);
   const dismissed = history.threads.filter((thread) => thread.isResolved);
   const summaryReconciled = history.summary.reconciliationKnown
     ? await reconcileSummaryFindings({
-      analysisState: metadata.analysis_state,
+      analysisState: history.threadsKnown ? metadata.analysis_state : "inconclusive",
+      phase: history.threadsKnown ? cyclePlan?.phase : null,
       current: findings,
       prior: history.summary.findings,
       priorHeadSha: history.summary.headSha,
       headSha: metadata.head_sha,
+      verificationFindings: history.threadsKnown ? cyclePlan?.known_findings : [],
       spanChanged: summarySpanChanged,
     })
     : { current: findings, held: [], retired: [], reconciliationKnown: false };
@@ -1685,6 +1703,7 @@ export async function runSummaryMode({
     findings,
     history,
     writesEnabled: WRITES_ENABLED,
+    cyclePlan,
   });
   if (suppressed) {
     console.log(`  ${suppressed} finding(s) previously resolved and unchanged — not re-raised`);
@@ -1855,6 +1874,7 @@ async function runInlineMode({
     findings,
     history,
     writesEnabled: WRITES_ENABLED,
+    cyclePlan,
   });
   if (suppressed) {
     console.log(`  ${suppressed} finding(s) previously resolved and unchanged — not re-raised`);

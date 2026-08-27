@@ -176,9 +176,13 @@ and suggest modes retain their existing anchoring behavior.
 Summary mode maintains one bot-authored standing comment with an embedded state
 marker. Each run edits that comment rather than appending another. A prior
 finding omitted by the current sample stays held while its original code span is
-unchanged or indeterminate, and is retired only after that span changes. Deleting
-the standing comment explicitly resets summary-mode history. Suppressed-write
-runs read this state for gating but do not edit it.
+unchanged or indeterminate, and is retired only after that span changes, except
+in a complete current-lineage verification. That verification may retire only an
+identity persisted in its plan when no verification evidence was withheld and
+both summary and thread history are known. A clean verification schedules one
+final discovery; the cycle becomes ready only when that discovery is clean.
+Deleting the standing comment explicitly resets summary-mode history.
+Suppressed-write runs read this state for gating but do not edit it.
 
 ## Fixer contract
 

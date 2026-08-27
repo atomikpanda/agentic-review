@@ -1399,6 +1399,88 @@ test("inline fresh findings use the severity reconciled against summary history"
   assert.deepEqual(reconciled.fresh.map(({ severity }) => severity), ["High"]);
 });
 
+test("complete verification clears a discovery-held finding after remediation and manual resolution", () => {
+  const held = finding({ suggestion: null });
+  const priorCycle = {
+    schema_version: 1,
+    lineage_base_sha: BASE_SHA,
+    discovery_round: 1,
+    max_discovery_rounds: 2,
+    state: "active",
+    last_phase: "discovery",
+    next_phase: "verification",
+    last_reviewed_head: PRIOR_HEAD_SHA,
+    last_scope_hash: SCOPE_HASH,
+    last_analysis_state: "complete",
+    override: null,
+  };
+  const result = runPosterWithHistory({
+    mode: "summary",
+    currentFindings: [],
+    summaryComments: [botComment(
+      1,
+      encodeSummaryMarker({ headSha: PRIOR_HEAD_SHA, findings: [held], cycle: priorCycle }),
+    )],
+    coordinateLessChangedDismissedFinding: held,
+    reviewCyclePlan: {
+      should_run: true,
+      phase: "verification",
+      discovery_round: 1,
+      lineage_base_sha: BASE_SHA,
+      max_discovery_rounds: 2,
+      cycle: priorCycle,
+      known_findings: [held],
+      override: null,
+    },
+  });
+
+  assert.equal(result.status, 1, `${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
+  assert.deepEqual(result.finalResult.current_counts, EMPTY_COUNTS);
+  assert.deepEqual(result.finalResult.unresolved_counts, EMPTY_COUNTS);
+  assert.equal(result.finalResult.review_cycle.state, "active");
+  assert.equal(result.finalResult.review_cycle.next_phase, "discovery");
+});
+
+test("thread-history uncertainty retains planned findings during complete verification", () => {
+  const held = finding({ suggestion: null });
+  const priorCycle = {
+    schema_version: 1,
+    lineage_base_sha: BASE_SHA,
+    discovery_round: 1,
+    max_discovery_rounds: 2,
+    state: "active",
+    last_phase: "discovery",
+    next_phase: "verification",
+    last_reviewed_head: PRIOR_HEAD_SHA,
+    last_scope_hash: SCOPE_HASH,
+    last_analysis_state: "complete",
+    override: null,
+  };
+  const result = runPosterWithHistory({
+    mode: "summary",
+    summaryComments: [botComment(
+      1,
+      encodeSummaryMarker({ headSha: PRIOR_HEAD_SHA, findings: [held], cycle: priorCycle }),
+    )],
+    failThreadHistory: true,
+    reviewCyclePlan: {
+      should_run: true,
+      phase: "verification",
+      discovery_round: 1,
+      lineage_base_sha: BASE_SHA,
+      max_discovery_rounds: 2,
+      cycle: priorCycle,
+      known_findings: [held],
+      override: null,
+    },
+  });
+
+  assert.equal(result.status, 1, `${result.stderr}\n${result.stdout}\n${result.workflowOutput}`);
+  assert.deepEqual(result.finalResult.current_counts, EMPTY_COUNTS);
+  assert.deepEqual(result.finalResult.unresolved_counts, { Critical: 0, High: 1, Medium: 0 });
+  assert.equal(result.finalResult.review_cycle.next_phase, "verification");
+});
+
 test("summary mode keeps an unchanged dismissed inline finding suppressed", () => {
   const dismissed = finding({ suggestion: null });
   const inlineBody = poster.buildReviewComments(
@@ -1780,12 +1862,30 @@ test("omitted summary finding retires only after its original span changes", asy
   assert.deepEqual(result.retired, [prior]);
 });
 
+test("complete verification retires an omitted planned finding without a changed-span match", async () => {
+  const prior = finding({ severity: "Medium" });
+  const result = await reconcileSummaryFindings({
+    analysisState: "complete",
+    phase: "verification",
+    current: [],
+    prior: [prior],
+    priorHeadSha: PRIOR_HEAD_SHA,
+    headSha: HEAD_SHA,
+    verificationFindings: [prior],
+    spanChanged: async () => assert.fail("complete verification is authoritative for planned findings"),
+  });
+  assert.deepEqual(result.held, []);
+  assert.deepEqual(result.retired, [prior]);
+});
+
 test("inconclusive summary reconciliation holds omitted findings despite confirmed overlap", async () => {
   const prior = finding({ severity: "High" });
   const result = await reconcileSummaryFindings({
+    phase: "verification",
     analysisState: "inconclusive",
     current: [],
     prior: [prior],
+    verificationFindings: [prior],
     priorHeadSha: PRIOR_HEAD_SHA,
     headSha: HEAD_SHA,
     spanChanged: async () => true,

@@ -345,11 +345,15 @@ Human- or attacker-authored markers never affect the cycle.
 A prior finding omitted by a later stochastic sample remains held while the run
 is inconclusive or its original span is unchanged or indeterminate, and still
 affects `merge_state`/`sample_state`. It is retired only when a complete run
-confirms that span changed. Suppressed-write runs read and reconcile the standing
-state for outputs and gating but do not append a review. If identity lookup,
-pull-request review history, or reconciliation fails, summary-derived
-dismissals are not applied, the state is not changed, and the result cannot be
-clean or converged.
+confirms that span changed, except during verification: a complete
+current-lineage verification may retire only an identity persisted in that
+verification plan when no verification evidence was withheld and both summary
+and thread history are known. A clean verification advances to one final
+discovery; only that clean final discovery makes the cycle ready. Suppressed-write
+runs read and reconcile the standing state for outputs and gating but do not
+append a review. If identity lookup, pull-request review history, thread
+history, or reconciliation fails, summary-derived dismissals are not applied,
+the state is not changed, and the result cannot be clean or converged.
 
 Only the currently authenticated **Bot** identity can own standing state. A
 human user's manual PAT or an unrecognized viewer makes identity unknown; the
