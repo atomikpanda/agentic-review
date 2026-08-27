@@ -853,6 +853,64 @@ test("review cycles progress from discovery through verification to one final di
   assert.equal(finalState.next_phase, null);
 });
 
+test("a clean verification advances to a final clean discovery that remains ready", () => {
+  const discovery = planReviewCycle({
+    baseSha: BASE_SHA,
+    headSha: HEAD_SHA,
+    maxDiscoveryRounds: 2,
+  });
+  const afterDiscovery = advanceReviewCycle({
+    plan: discovery,
+    analysisState: "complete",
+    headSha: HEAD_SHA,
+    scopeHash: SCOPE_HASH,
+    findings: [finding("High")],
+  });
+  const verification = planReviewCycle({
+    priorCycle: afterDiscovery,
+    priorFindings: [finding("High")],
+    baseSha: BASE_SHA,
+    headSha: HEAD_SHA,
+    maxDiscoveryRounds: 2,
+  });
+  const afterVerification = advanceReviewCycle({
+    plan: verification,
+    analysisState: "complete",
+    headSha: HEAD_SHA,
+    scopeHash: SCOPE_HASH,
+    findings: [],
+  });
+  assert.equal(afterVerification.next_phase, "discovery");
+
+  const finalDiscovery = planReviewCycle({
+    priorCycle: afterVerification,
+    priorFindings: [],
+    baseSha: BASE_SHA,
+    headSha: HEAD_SHA,
+    maxDiscoveryRounds: 2,
+  });
+  assert.equal(finalDiscovery.phase, "discovery");
+  const ready = advanceReviewCycle({
+    plan: finalDiscovery,
+    analysisState: "complete",
+    headSha: HEAD_SHA,
+    scopeHash: SCOPE_HASH,
+    findings: [],
+  });
+  assert.equal(ready.state, "ready");
+  assert.equal(ready.next_phase, null);
+
+  const rerun = planReviewCycle({
+    priorCycle: ready,
+    priorFindings: [],
+    baseSha: BASE_SHA,
+    headSha: HEAD_SHA,
+    maxDiscoveryRounds: 2,
+  });
+  assert.equal(rerun.should_run, false);
+  assert.equal(rerun.cycle.state, "ready");
+});
+
 test("an inconclusive retry of one immutable head does not consume another discovery round", () => {
   const firstPlan = planReviewCycle({
     baseSha: BASE_SHA,
