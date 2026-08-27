@@ -1117,6 +1117,35 @@ test("verification phase restricts review to persisted findings and affected inv
   assert.match(run.result.stderr, /withheld 1 unrelated verification finding/);
 });
 
+test("verification withholds materially reworded findings without treating the sample as complete", (t) => {
+  const fixture = createFixture(t);
+  const known = finding("Eviction queue skips deferred commit", {
+    file: "alpha.txt",
+    body: "Retry ledger omits pending cohort.",
+    verification_id: "K1",
+  });
+  const reworded = finding("Delayed batch never reaches storage compactor", {
+    file: "alpha.txt",
+    body: "Flush scheduler loses the queued partition.",
+  });
+  const knownFindingsFile = join(fixture.directory, "known-findings.json");
+  writeFileSync(knownFindingsFile, JSON.stringify({ findings: [known] }));
+  const run = runReview(t, { general: [{ findings: [reworded] }] }, {
+    existingFixture: fixture,
+    args: ["--passes", "1", "--lenses", "", "--json"],
+    env: {
+      AGENTIC_REVIEW_PHASE: "verification",
+      AGENTIC_REVIEW_KNOWN_FINDINGS: knownFindingsFile,
+    },
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.deepEqual(JSON.parse(run.result.stdout).findings, []);
+  assert.match(run.result.stderr, /withheld 1 unrelated verification finding/);
+  assert.equal(run.metadata.analysis_state, "inconclusive");
+  assert.deepEqual(run.metadata.remaining_analysis, ["merge_failed"]);
+});
+
 test("workflow exposes and always retains the additive final result contract", () => {
   const source = readFileSync(workflow, "utf8");
   for (const field of [

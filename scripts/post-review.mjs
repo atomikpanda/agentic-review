@@ -1635,13 +1635,13 @@ export async function reconcileHostedFindings({
   const dismissed = history.threads.filter((thread) => thread.isResolved);
   const summaryReconciled = history.summary.reconciliationKnown
     ? await reconcileSummaryFindings({
-      analysisState: metadata.analysis_state,
-      phase: cyclePlan?.phase,
+      analysisState: history.threadsKnown ? metadata.analysis_state : "inconclusive",
+      phase: history.threadsKnown ? cyclePlan?.phase : null,
       current: findings,
       prior: history.summary.findings,
       priorHeadSha: history.summary.headSha,
       headSha: metadata.head_sha,
-      verificationFindings: cyclePlan?.known_findings,
+      verificationFindings: history.threadsKnown ? cyclePlan?.known_findings : [],
       spanChanged: summarySpanChanged,
     })
     : { current: findings, held: [], retired: [], reconciliationKnown: false };

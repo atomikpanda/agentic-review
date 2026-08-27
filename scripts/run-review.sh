@@ -1491,9 +1491,15 @@ else
   fi
 fi
 if [ "$REVIEW_PHASE" = "verification" ]; then
+  verification_input_count="$(node -e 'process.stdout.write(String(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).findings.length))' "$TMP_OUT")"
   verification_out="$RUN_TMP/verification.json"
   node "$MERGE" --known-only "$KNOWN_FINDINGS_FILE" "$TMP_OUT" > "$verification_out" \
     || die "could not enforce verification finding identities"
+  verification_output_count="$(node -e 'process.stdout.write(String(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).findings.length))' "$verification_out")"
+  if [ "$verification_output_count" -lt "$verification_input_count" ]; then
+    MERGE_SUCCEEDED=false
+    say "verification identity filtering withheld evidence — preserving inconclusive analysis"
+  fi
   mv -f "$verification_out" "$TMP_OUT"
 fi
 publish_findings
