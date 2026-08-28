@@ -1237,6 +1237,51 @@ exec "\${REAL_NODE}" "$@"
     assert.equal(validatePublication(run.publicationFile).status, 0);
   }
 });
+test("partition shadow reports execution-profile setup failures as bounded planner diagnostics", (t) => {
+  for (const [mode, expectedReason] of [
+    ["generation", "execution_profile_generation_failed"],
+    ["destination", "execution_profile_output_unavailable"],
+  ]) {
+    const fixture = createFixture(t);
+    const profileFile = join(fixture.directory, `${mode}-profile.json`);
+    if (mode === "generation") {
+      const nodeWrapper = join(fixture.bin, "node");
+      writeFileSync(nodeWrapper, `#!/usr/bin/env bash
+if [ "\${1:-}" = --input-type=module ] && [ "\${2:-}" = -e ] \
+  && [[ "\${3:-}" = *descriptor_content_hashes* ]]; then
+  exit 91
+fi
+exec "\${REAL_NODE}" "$@"
+`);
+      chmodSync(nodeWrapper, 0o755);
+    } else {
+      const target = join(fixture.directory, "profile-target.json");
+      writeFileSync(target, "operator-owned\n");
+      symlinkSync(target, profileFile);
+    }
+    const shadowFile = join(fixture.directory, `${mode}-shadow.json`);
+    const run = runReview(t, {
+      general: [{ findings: [] }],
+      correctness: [{ findings: [] }],
+      boundaries: [{ findings: [] }],
+    }, {
+      existingFixture: fixture,
+      args: [
+        "--partition-shadow",
+        "--partition-shadow-out", shadowFile,
+        "--execution-profile-out", profileFile,
+        "--json",
+      ],
+    });
+
+    assert.equal(run.result.status, 0, `${mode}: ${run.result.stderr}`);
+    assert.equal(run.logs.length, 3, `${mode}: profile setup must not skip model work`);
+    const diagnostic = JSON.parse(readFileSync(shadowFile, "utf8"));
+    assert.equal(diagnostic.status, "planner_failed", mode);
+    assert.deepEqual(diagnostic.reason_codes, [expectedReason], mode);
+    assert.ok(Buffer.byteLength(diagnostic.diagnostic) <= 512, mode);
+  }
+});
 
 test("profile-producing runs remove stale output on generation failure but final discovery preserves it", (t) => {
   const fixture = createFixture(t);
@@ -6311,6 +6356,41 @@ test("partition shadow is opt-in, preserves authoritative review bytes, and excl
   assert.deepEqual(shadow.manifest.execution_projection.descriptors,
     ["general", "correctness", "boundaries"]);
   assert.equal(shadow.manifest.execution_projection.max_output_attempts, 2);
+});
+test("partition shadow retains complete local output above the hosted artifact cap", (t) => {
+  const hostedArtifactCapBytes = 4 * 1024 * 1024;
+  const fixture = createFixture(t, {
+    targetFiles: { "large-local-shadow.txt": `${"x".repeat(hostedArtifactCapBytes)}\n` },
+  });
+  const gitWrapper = join(fixture.bin, "git");
+  writeFileSync(gitWrapper, `#!/usr/bin/env bash
+real_path="\${PATH#*:}"
+case " $* " in
+  *" --patch "*) ;;
+  *" --raw "*) ;;
+  *" diff "*" --no-color "*)
+    printf '%s\n' 'diff --git a/alpha.txt b/alpha.txt' '--- a/alpha.txt' '+++ b/alpha.txt' '@@ -1 +1 @@' '-alpha base' '+alpha head'
+    exit 0
+    ;;
+esac
+PATH="$real_path" git "$@"
+`);
+  chmodSync(gitWrapper, 0o755);
+  const shadowFile = join(fixture.directory, "partition-shadow.json");
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    existingFixture: fixture,
+    args: ["--partition-shadow", "--partition-shadow-out", shadowFile, "--json"],
+  });
+  assert.equal(run.result.status, 0, run.result.stderr);
+  const shadowBytes = readFileSync(shadowFile);
+  const shadow = JSON.parse(shadowBytes);
+  assert.equal(shadow.status, "complete", JSON.stringify(shadow));
+  assert.ok(shadowBytes.byteLength > hostedArtifactCapBytes);
+  assert.equal(shadow.manifest.configuration.max_shadow_artifact_bytes, hostedArtifactCapBytes);
 });
 
 test("partition shadow starts after workers stop and published authoritative artifacts exist", (t) => {

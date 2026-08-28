@@ -124,6 +124,8 @@ EXECUTION_PROFILE_OUT_REJECTED=0
 PASS_MAX_ATTEMPTS=2
 PASS_DIAGNOSTIC_STDERR_BYTES=4096
 PASS_DIAGNOSTIC_STDERR_LINES=64
+# Local complete shadows retain capture evidence beyond the hosted artifact cap.
+LOCAL_SHADOW_VALIDATION_MAX_BYTES=9007199254740991
 TRUSTED_DATA_ROOT="${AGENTIC_REVIEW_TRUSTED_DATA_ROOT:-}"
 STAGED=0; OUT=""; FAIL_ON_FINDINGS=1; AS_JSON=0; USE_CODEGRAPH=1; VIEW=""; TRUST_REPO="${TRUST_REPO:-0}"; RECORD_STATE=1
 PASSTHRU=()
@@ -1025,8 +1027,10 @@ node "$RESULT_HELPER" scope "$SCOPE_FILE" >/dev/null \
   || die "could not validate review scope"
 
 SHADOW_SETUP_STATUS=""
+SHADOW_SETUP_REASON=""
 if [ "$EXECUTION_PROFILE_OUT_REJECTED" = 1 ]; then
   SHADOW_SETUP_STATUS="planner_failed"
+  SHADOW_SETUP_REASON="execution_profile_output_unavailable"
 fi
 if [ "$PARTITION_SHADOW" = 1 ] || [ -n "$EXECUTION_PROFILE_OUT" ]; then
   SHADOW_LIMITS_FILE="$RUN_TMP/shadow-limits.json"
@@ -1074,12 +1078,14 @@ EOF
     SHADOW_PROFILE_READY=1
   else
     SHADOW_SETUP_STATUS="planner_failed"
+    SHADOW_SETUP_REASON="execution_profile_generation_failed"
     rm -f -- "$SHADOW_PROFILE_FILE"
   fi
   if [ -n "$EXECUTION_PROFILE_OUT" ] && [ "$SHADOW_PROFILE_READY" = 1 ]; then
     if [ -L "$EXECUTION_PROFILE_OUT" ] \
        || ! cp "$SHADOW_PROFILE_FILE" "$EXECUTION_PROFILE_OUT"; then
       SHADOW_SETUP_STATUS="planner_failed"
+      SHADOW_SETUP_REASON="execution_profile_output_unavailable"
     fi
   fi
 fi
@@ -1644,13 +1650,13 @@ stage_shadow_helper_diagnostic() {
 
 run_partition_shadow() {
   [ "$PARTITION_SHADOW" = 1 ] || return 0
-  local status="$SHADOW_SETUP_STATUS" capture_helper units_helper staged_local shadow_max_bytes
+  local status="$SHADOW_SETUP_STATUS" capture_helper units_helper staged_local
   local capture_stderr="$RUN_TMP/shadow-capture.stderr"
   local units_stderr="$RUN_TMP/shadow-units.stderr"
   staged_local="$RUN_TMP/shadow-local.staged.json"
   capture_helper="$(support_exec scripts/review-capture.mjs || :)"
   units_helper="$(support_exec scripts/review-units.mjs || :)"
-  if [ -n "$status" ] || [ -z "$capture_helper" ]; then
+  if [ -z "$capture_helper" ]; then
     stage_shadow_helper_diagnostic capture_failed capture_helper_unavailable \
       "$capture_stderr" "$staged_local" || :
   elif ! run_shadow_command "$capture_stderr" \
@@ -1663,6 +1669,9 @@ run_partition_shadow() {
   elif [ ! -s "$RUN_TMP/shadow-capture.json" ]; then
     stage_shadow_helper_diagnostic capture_failed capture_output_missing \
       "$capture_stderr" "$staged_local" || :
+  elif [ -n "$status" ]; then
+    stage_shadow_helper_diagnostic "$status" "$SHADOW_SETUP_REASON" \
+      "$units_stderr" "$staged_local" || :
   elif [ -z "$units_helper" ]; then
     stage_shadow_helper_diagnostic planner_failed planner_helper_unavailable \
       "$units_stderr" "$staged_local" || :
@@ -1679,22 +1688,15 @@ run_partition_shadow() {
       "$units_stderr" "$staged_local" || :
   fi
   if [ -s "$staged_local" ]; then
-    shadow_max_bytes="$(node -e '
-      const fs = require("node:fs");
-      const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-      if (!Number.isSafeInteger(value.max_shadow_artifact_bytes)
-        || value.max_shadow_artifact_bytes <= 0) process.exit(1);
-      process.stdout.write(String(value.max_shadow_artifact_bytes));
-    ' "$SHADOW_CONFIG_FILE" 2>/dev/null)" || shadow_max_bytes=0
     if ! node "$SELF_ROOT/scripts/review-units.mjs" validate-output \
       --input "$staged_local" --profile "$SHADOW_PROFILE_FILE" \
-      --config "$SHADOW_CONFIG_FILE" --max-bytes "$shadow_max_bytes" \
+      --config "$SHADOW_CONFIG_FILE" --max-bytes "$LOCAL_SHADOW_VALIDATION_MAX_BYTES" \
       >>"$units_stderr" 2>&1; then
       stage_shadow_helper_diagnostic planner_failed planner_output_invalid \
         "$units_stderr" "$staged_local" || :
       if ! node "$SELF_ROOT/scripts/review-units.mjs" validate-output \
         --input "$staged_local" --profile "$SHADOW_PROFILE_FILE" \
-        --config "$SHADOW_CONFIG_FILE" --max-bytes "$shadow_max_bytes" \
+        --config "$SHADOW_CONFIG_FILE" --max-bytes "$LOCAL_SHADOW_VALIDATION_MAX_BYTES" \
         >>"$units_stderr" 2>&1; then
         rm -f -- "$staged_local"
       fi
