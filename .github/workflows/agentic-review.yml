@@ -388,6 +388,7 @@ jobs:
       shadow_base: ${{ steps.target.outputs.base }}
       shadow_head: ${{ steps.target.outputs.head }}
       shadow_eligible: ${{ steps.target.outputs.eligible }}
+      shadow_ran: ${{ steps.cycle.outputs.should_run }}
     steps:
       # ONE place that answers "what am I reviewing, and with what credential".
       # Everything downstream reads these outputs instead of
@@ -1641,7 +1642,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: agentic-review
-          path: /tmp/review-result.json
           retention-days: 7
           if-no-files-found: error
 
@@ -1667,12 +1667,11 @@ jobs:
             /tmp/review-pass-diagnostics.json
           retention-days: 7
           if-no-files-found: ignore
-
   # This diagnostic-only job deliberately has no outputs and cannot influence
   # the authoritative review job that precedes it.
   partition-shadow:
     needs: review
-    if: ${{ always() && inputs.partition_shadow && needs.review.outputs.shadow_eligible == 'true' && (needs.review.result == 'success' || needs.review.result == 'failure') }}
+    if: ${{ always() && inputs.partition_shadow && needs.review.outputs.shadow_eligible == 'true' && needs.review.outputs.shadow_ran == 'true' && (needs.review.result == 'success' || needs.review.result == 'failure') }}
     continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1912,13 +1911,19 @@ jobs:
           const completeCapture = validated?.status === "complete"
             && typeof validated.capture_hash === "string"
             && /^[0-9a-f]{64}$/.test(validated.capture_hash);
+          const fallbackStatus = completeCapture
+            ? process.env.STATUS
+            : validated?.status ?? "capture_failed";
+          const fallbackReason = completeCapture
+            ? process.env.REASON
+            : validated?.capacity_reason ?? "capture_result_unavailable";
           writeShadowOutput(output, buildShadowDiagnostic({
-            status: completeCapture ? process.env.STATUS : "capture_failed",
+            status: fallbackStatus,
             base_sha: process.env.BASE_SHA,
             head_sha: process.env.HEAD_SHA,
             benchmark_revision: config.benchmark_revision,
             capture_hash: completeCapture ? validated.capture_hash : null,
-            reason_codes: [completeCapture ? process.env.REASON : "capture_result_unavailable"],
+            reason_codes: [fallbackReason],
             diagnostic: "Partition shadow helper failed; details redacted.",
             observed_lower_bounds,
             counts: {},
