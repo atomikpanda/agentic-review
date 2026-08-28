@@ -962,6 +962,29 @@ test("shadow CLI validates complete captures before atomization or manifest proj
     assert.ok(output.reason_codes.includes("capture_validation_failed"));
   }
 });
+test("shadow CLI reports raw-patch disagreement before a configured capacity downgrade", async (t) => {
+  const { root, complete } = await completeCaptureFixture(t);
+  const inconsistent = structuredClone(complete);
+  inconsistent.capture_configuration.max_patch_bytes = 1;
+  inconsistent.patch_base64 = Buffer.from("diff --git a/other.txt b/other.txt\n@@ -1 +1 @@\n-old\n+new\n").toString("base64");
+  delete inconsistent.capture_hash;
+  inconsistent.capture_hash = sha256(inconsistent);
+  const configPath = join(root, "config.json");
+  const profilePath = join(root, "profile.json");
+  const capturePath = join(root, "capture.json");
+  const localOutput = join(root, "local.json");
+  writeFileSync(configPath, JSON.stringify(CLI_SHADOW_CONFIG));
+  writeFileSync(profilePath, JSON.stringify(CLI_SHADOW_PROFILE));
+  writeFileSync(capturePath, JSON.stringify(inconsistent));
+  const child = spawnSync(process.execPath, [
+    "scripts/review-units.mjs", "shadow", "--capture", capturePath,
+    "--profile", profilePath, "--config", configPath, "--local-out", localOutput,
+  ], { cwd: process.cwd(), encoding: "utf8" });
+  assert.equal(child.status, 0, child.stderr);
+  const output = JSON.parse(readFileSync(localOutput, "utf8"));
+  assert.equal(output.status, "atom_coverage_mismatch");
+  assert.ok(output.reason_codes.includes("raw_patch_path_disagreement"));
+});
 
 test("shadow CLI emits a non-complete capture diagnostic before reading the profile", async (t) => {
   const { root, complete } = await completeCaptureFixture(t);

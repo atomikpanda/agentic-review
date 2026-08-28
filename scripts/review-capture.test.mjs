@@ -192,6 +192,11 @@ test("complete capture validation downgrades configured byte-limit violations", 
     assertDiagnostic(downgraded, reason);
     assert.deepEqual(downgraded.observed_lower_bounds, observed);
   }
+  const saturated = validateCapturedReviewInput(withLimits({ max_total_blob_bytes: 1 }));
+  assertDiagnostic(saturated, "blob_bytes");
+  assert.equal(saturated.observed_lower_bounds.blob_bytes, 2);
+  assert.equal(Number.isSafeInteger(saturated.observed_lower_bounds.blob_bytes), true);
+
 
   const forged = withLimits({ max_patch_bytes: patchBytes - 1 });
   forged.capture_hash = "0".repeat(64);

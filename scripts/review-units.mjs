@@ -1214,6 +1214,23 @@ function shadowDiagnosticFromCapture(capture, benchmarkRevision, maxBytes) {
     counts: {},
   }, maxBytes);
 }
+function atomizationDiagnostic(capture, atomization, benchmarkRevision, maxBytes) {
+  return buildShadowDiagnostic({
+    status: "atom_coverage_mismatch", capture, benchmark_revision: benchmarkRevision,
+    reason_codes: atomization.reasons, diagnostic: "Shadow atom coverage did not match capture.",
+    observed_lower_bounds: { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 },
+    counts: atomization.counts,
+  }, maxBytes);
+}
+
+function capacityDiagnosticAfterIntegrity(originalCapture, validatedCapture, benchmarkRevision, maxBytes, atomTargetBytes) {
+  if (originalCapture.status !== "complete" || validatedCapture.status === "complete") return null;
+  const atomization = atomizeCapturedReviewInput(originalCapture, atomTargetBytes);
+  return atomization.status === "complete"
+    ? null
+    : atomizationDiagnostic(originalCapture, atomization, benchmarkRevision, maxBytes);
+}
+
 
 function invalidCaptureDiagnostic(capture, benchmarkRevision, maxBytes, error) {
   const safeId = (value) => typeof value === "string" && GIT_ID.test(value) ? value : "0".repeat(40);
@@ -1327,10 +1344,19 @@ function main(argv) {
       writeDiagnosticOutputs(options, plannerFailureDiagnostic(capture, "", FALLBACK_SHADOW_DIAGNOSTIC_MAX_BYTES, error));
       return 0;
     }
+    const originalCapture = capture;
     try {
       capture = validateCapturedReviewInput(capture);
     } catch (error) {
       writeDiagnosticOutputs(options, invalidCaptureDiagnostic(capture, configValue.benchmark_revision, configValue.max_shadow_artifact_bytes, error));
+      return 0;
+    }
+    const integrityDiagnostic = capacityDiagnosticAfterIntegrity(
+      originalCapture, capture, configValue.benchmark_revision,
+      configValue.max_shadow_artifact_bytes, configValue.atom_target_bytes,
+    );
+    if (integrityDiagnostic !== null) {
+      writeDiagnosticOutputs(options, integrityDiagnostic);
       return 0;
     }
     if (capture.status !== "complete") {
@@ -1341,12 +1367,7 @@ function main(argv) {
       try {
         const profile = JSON.parse(readFileSync(options["--profile"], "utf8"));
         const atomization = atomizeCapturedReviewInput(capture, configValue.atom_target_bytes);
-        if (atomization.status !== "complete") return buildShadowDiagnostic({
-          status: "atom_coverage_mismatch", capture, benchmark_revision: configValue.benchmark_revision,
-          reason_codes: atomization.reasons, diagnostic: "Shadow atom coverage did not match capture.",
-          observed_lower_bounds: { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 },
-          counts: atomization.counts,
-        }, configValue.max_shadow_artifact_bytes);
+        if (atomization.status !== "complete") return atomizationDiagnostic(capture, atomization, configValue.benchmark_revision, configValue.max_shadow_artifact_bytes);
         const manifest = buildPathFallbackManifest({ capture, atomization, config, executionProfile: profile });
         if (options["--local-out"]) writeShadowOutput(options["--local-out"], buildLocalShadowOutput(capture, manifest));
         if (options["--diagnostics-out"]) writeShadowOutput(options["--diagnostics-out"], buildHostedShadowOutput(capture, manifest, configValue.max_shadow_artifact_bytes));

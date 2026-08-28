@@ -312,6 +312,10 @@ export function validateCapturedReviewInput(value) {
     const rawZ = base64Bytes(value.raw_z_base64, "raw_z_base64");
     const patch = base64Bytes(value.patch_base64, "patch_base64");
     const rawRecords = parseRawDiffZ(rawZ, value.repository_object_format);
+    const configuration = value.capture_configuration;
+    const blobLowerBoundCap = configuration.max_total_blob_bytes === Number.MAX_SAFE_INTEGER
+      ? Number.MAX_SAFE_INTEGER
+      : configuration.max_total_blob_bytes + 1;
     const observed = {
       patch_bytes: patch.length,
       raw_z_bytes: rawZ.length,
@@ -320,6 +324,7 @@ export function validateCapturedReviewInput(value) {
       elapsed_milliseconds: 0,
     };
     let maxBlobBytes = 0;
+    let totalBlobBytesExceeded = false;
     if (!Array.isArray(value.object_table)) throw new TypeError("object_table must be an array");
     const expected = expectedObjectModes(rawRecords);
     let previousObjectId = "";
@@ -337,19 +342,23 @@ export function validateCapturedReviewInput(value) {
       const content = base64Bytes(row.content_base64, "object table content_base64");
       if (!Number.isSafeInteger(row.size) || row.size < 0 || row.size !== content.length) throw new TypeError("object table size must match content");
       if (typeof row.content_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(row.content_sha256) || createHash("sha256").update(content).digest("hex") !== row.content_sha256) throw new TypeError("object table content hash does not match content");
-      observed.blob_bytes += content.length;
-      observed.blob_count += 1;
+      if (!totalBlobBytesExceeded && content.length > configuration.max_total_blob_bytes - observed.blob_bytes) totalBlobBytesExceeded = true;
+      if (observed.blob_bytes < blobLowerBoundCap) {
+        observed.blob_bytes += content.length > blobLowerBoundCap - observed.blob_bytes
+          ? blobLowerBoundCap - observed.blob_bytes
+          : content.length;
+      }
+      if (observed.blob_count < Number.MAX_SAFE_INTEGER) observed.blob_count += 1;
       if (content.length > maxBlobBytes) maxBlobBytes = content.length;
     }
     const unsigned = { ...value };
     delete unsigned.capture_hash;
     if (typeof value.capture_hash !== "string" || !/^[0-9a-f]{64}$/.test(value.capture_hash) || value.capture_hash !== canonicalSha256(unsigned)) throw new TypeError("capture hash does not match capture content");
-    const configuration = value.capture_configuration;
     const reason = observed.patch_bytes > configuration.max_patch_bytes
       ? "patch_bytes"
       : observed.raw_z_bytes > configuration.max_raw_z_bytes
         ? "raw_z_bytes"
-        : maxBlobBytes > configuration.max_single_blob_bytes || observed.blob_bytes > configuration.max_total_blob_bytes
+        : maxBlobBytes > configuration.max_single_blob_bytes || totalBlobBytesExceeded
           ? "blob_bytes"
           : undefined;
     if (reason !== undefined) {
