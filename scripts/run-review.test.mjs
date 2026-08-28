@@ -948,6 +948,12 @@ test("partition shadow is an isolated opt-in hosted diagnostic", () => {
   assert.match(shadowJob, /actions\/download-artifact@v4/);
   assert.match(shadowJob, /agentic-review-partition-shadow-profile/);
   assert.match(source, /--execution-profile-out "\$REVIEW_PARTITION_SHADOW_PROFILE"/);
+  const profileUpload = source.match(
+    /^      - name: upload partition shadow execution profile\n[\s\S]*?(?=^      - (?:name:|uses:))/m,
+  )?.[0];
+  assert.ok(profileUpload);
+  assert.match(profileUpload, /steps\.cycle\.outputs\.should_run == 'true'/);
+  assert.match(profileUpload, /if-no-files-found: ignore/);
   assert.doesNotMatch(source.match(/^  review:\n[\s\S]*?(?=^  [a-zA-Z][\w-]+:|\z)/m)?.[0] ?? "", /review-partition-shadow\.json/);
   assert.doesNotMatch(
     source.match(/^  workflow_call:\n    outputs:\n[\s\S]*?(?=^    inputs:)/m)?.[0] ?? "",
@@ -1510,6 +1516,10 @@ test("workflow continues clean verification through final discovery without anot
   assert.match(
     workflowRunStep("run automatic final discovery"),
     /REVIEW_PUBLICATION_FILE=\/tmp\/review-publication\.json[\s\S]*rm -f[\s\S]*"\$REVIEW_PUBLICATION_FILE"/,
+  );
+  assert.match(
+    workflowRunStep("run automatic final discovery"),
+    /\$\{PARTITION_SHADOW:-false\}/,
   );
   assert.ok(continuationPoster);
   assert.match(continuationPoster, /steps\.continuation_cycle\.outputs\.should_run == 'true'/);

@@ -1021,7 +1021,7 @@ jobs:
           )
           if [ -n "$MAX_TIME" ]; then RUNNER_ARGS+=(--max-time "$MAX_TIME"); fi
           if [ "${CODEGRAPH:-true}" != "true" ]; then RUNNER_ARGS+=(--no-codegraph); fi
-          if [ "$PARTITION_SHADOW" = "true" ]; then
+          if [ "${PARTITION_SHADOW:-false}" = "true" ]; then
             RUNNER_ARGS+=(--execution-profile-out "$REVIEW_PARTITION_SHADOW_PROFILE")
           fi
 
@@ -1641,13 +1641,13 @@ jobs:
           if-no-files-found: error
 
       - name: upload partition shadow execution profile
-        if: ${{ !cancelled() && inputs.partition_shadow && steps.target.outputs.eligible == 'true' }}
+        if: ${{ !cancelled() && inputs.partition_shadow && steps.target.outputs.eligible == 'true' && steps.cycle.outputs.should_run == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: agentic-review-partition-shadow-profile
           path: /tmp/review-partition-shadow-profile.json
           retention-days: 1
-          if-no-files-found: error
+          if-no-files-found: ignore
 
       - name: upload optional review diagnostics
         if: ${{ !cancelled() && steps.target.outputs.eligible == 'true' }}
