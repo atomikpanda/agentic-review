@@ -1221,8 +1221,10 @@ test("partition shadow strips target configuration and records bounded helper di
   assert.doesNotMatch(JSON.stringify(diagnostic), /content_base64/);
   assert.equal(readFileSync(resultFile, "utf8"), "authoritative result\n");
 
-  writeFileSync(join(support, "review-capture.mjs"), "#!/usr/bin/env bash\nexit 1\n");
-  chmodSync(join(support, "review-capture.mjs"), 0o755);
+  writeFileSync(
+    join(support, "review-capture.mjs"),
+    "export function validateCapturedReviewInput() {}\nif (import.meta.url === `file://${process.argv[1]}`) process.exit(1);\n",
+  );
   const failedCapture = spawnSync("bash", ["-c", workflowRunStep("capture partition shadow diagnostics")], {
     encoding: "utf8",
     env,
