@@ -383,6 +383,11 @@ jobs:
       review_next_phase: ${{ steps.continuation_poster.outputs.review_next_phase || steps.poster.outputs.review_next_phase || steps.cycle.outputs.next_phase }}
       discovery_round: ${{ steps.continuation_poster.outputs.discovery_round || steps.poster.outputs.discovery_round || steps.cycle.outputs.discovery_round }}
       max_discovery_rounds: ${{ steps.continuation_poster.outputs.max_discovery_rounds || steps.poster.outputs.max_discovery_rounds || inputs.max_discovery_rounds || 2 }}
+      shadow_repo: ${{ steps.target.outputs.repo }}
+      shadow_pr: ${{ steps.target.outputs.pr }}
+      shadow_base: ${{ steps.target.outputs.base }}
+      shadow_head: ${{ steps.target.outputs.head }}
+      shadow_eligible: ${{ steps.target.outputs.eligible }}
     steps:
       # ONE place that answers "what am I reviewing, and with what credential".
       # Everything downstream reads these outputs instead of
@@ -1681,8 +1686,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           APP_ID: ${{ secrets.APP_ID }}
           APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
-          IN_REPO: ${{ inputs.target_repo }}
-          IN_PR: ${{ inputs.target_pr }}
+          IN_REPO: ${{ needs.review.outputs.shadow_repo }}
+          IN_PR: ${{ needs.review.outputs.shadow_pr }}
+          IN_BASE: ${{ needs.review.outputs.shadow_base }}
+          IN_HEAD: ${{ needs.review.outputs.shadow_head }}
         run: |
           set -euo pipefail
           if [ -z "${IN_REPO:-}" ]; then
@@ -1702,10 +1709,25 @@ jobs:
             *) echo "::error::target_repo is not owner/name: $IN_REPO"; exit 1 ;;
           esac
           case "$IN_PR" in ''|*[!0-9]*) echo "::error::target_pr is not a number: $IN_PR"; exit 1 ;; esac
+          if [ -n "${IN_BASE:-}" ] && [ -n "${IN_HEAD:-}" ] && [ "$IN_REPO" = "$GITHUB_REPOSITORY" ]; then
+            {
+              echo "repo=$IN_REPO"
+              echo "pr=$IN_PR"
+              echo "base=$IN_BASE"
+              echo "head=$IN_HEAD"
+              echo "eligible=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           if [ "$IN_REPO" = "$GITHUB_REPOSITORY" ]; then
-            gh_t() { gh api "repos/${IN_REPO}/pulls/${IN_PR}" --jq "$1"; }
-            [ "$(gh_t .state)" = "open" ] || { echo "::error::${IN_REPO}#${IN_PR} is not open"; exit 1; }
+            gh_t() {
+              case "$1" in
+                .base.sha) printf '%s\n' "$IN_BASE" ;;
+                .head.sha) printf '%s\n' "$IN_HEAD" ;;
+                *) gh api "repos/${IN_REPO}/pulls/${IN_PR}" --jq "$1" ;;
+              esac
+            }
             if [ "$(gh_t .draft)" = "true" ] \
               || [ "$(gh_t '.head.repo.full_name == .base.repo.full_name')" != "true" ]; then
               echo "eligible=false" >> "$GITHUB_OUTPUT"
@@ -1758,7 +1780,13 @@ jobs:
             unset token auth
           }
           trap cleanup_token EXIT
-          gh_t() { GH_TOKEN="$token" gh api "repos/${IN_REPO}/pulls/${IN_PR}" --jq "$1"; }
+          gh_t() {
+            case "$1" in
+              .base.sha) printf '%s\n' "$IN_BASE" ;;
+              .head.sha) printf '%s\n' "$IN_HEAD" ;;
+              *) GH_TOKEN="$token" gh api "repos/${IN_REPO}/pulls/${IN_PR}" --jq "$1" ;;
+            esac
+          }
           [ "$(gh_t .state)" = "open" ] || { echo "::error::${IN_REPO}#${IN_PR} is not open"; exit 1; }
           if [ "$(gh_t .draft)" = "true" ] \
             || [ "$(gh_t '.head.repo.full_name == .base.repo.full_name')" != "true" ]; then
