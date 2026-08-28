@@ -117,13 +117,14 @@ test("atomizes a rename mode text record with independent literal identities", (
   assert.equal(atom_id, `a:${sha256({ atom_schema_version: 1, lineage_candidate, segment_ordinal, content_hash })}`);
 
   const textAtom = result.atoms.find((atom) => atom.kind === "text");
-  const { lineage_candidate: textLineage, segment_ordinal: textOrdinal, content_hash: textHash, atom_id: textId, ...textPayload } = textAtom;
+  const { lineage_candidate: textLineage, segment_ordinal: textOrdinal, content_hash: textHash, atom_id: textId, oversized, ...textPayload } = textAtom;
   assert.deepEqual(textPayload, {
     kind: "text", owner_path_base64: "bmV3LnR4dA==", old_path_base64: "b2xkLnR4dA==", new_path_base64: "bmV3LnR4dA==",
     old_start: 10, old_count: 1, new_start: 10, new_count: 1,
     old_lines: [{ bytes_base64: "b2xkDQ==", terminator: "lf" }], new_lines: [{ bytes_base64: "bmV3DQ==", terminator: "lf" }],
-    old_final_newline: true, new_final_newline: true, oversized: false,
+    old_final_newline: true, new_final_newline: true,
   });
+  assert.equal(oversized, false);
   assert.equal(textLineage, `t:${sha256({ kind: "text", old_path_base64: "b2xkLnR4dA==", new_path_base64: "bmV3LnR4dA==", old_start: 10, old_count: 1, new_start: 10, new_count: 1 })}`);
   assert.equal(textOrdinal, 0);
   assert.equal(textHash, sha256(textPayload));
@@ -325,12 +326,12 @@ function shadowAtom({ kind, path, ordinal = 0, rawStatus = "M", payload = "", ov
       kind, owner_path_base64: Buffer.from(path).toString("base64"), old_path_base64: Buffer.from(path).toString("base64"), new_path_base64: Buffer.from(path).toString("base64"),
       old_start: ordinal + 1, old_count: 0, new_start: ordinal + 1, new_count: 1,
       old_lines: [], new_lines: [{ bytes_base64: Buffer.from(payload).toString("base64"), terminator: "lf" }],
-      old_final_newline: true, new_final_newline: true, oversized,
+      old_final_newline: true, new_final_newline: true,
     };
   const content_hash = sha256(base);
   const lineage_candidate = `${kind === "path_event" ? "p" : "t"}:${sha256({ kind, path: Buffer.from(path).toString("base64"), ordinal })}`;
   const atom_id = `a:${sha256({ atom_schema_version: 1, lineage_candidate, segment_ordinal: ordinal, content_hash })}`;
-  return { ...base, lineage_candidate, segment_ordinal: ordinal, content_hash, atom_id };
+  return { ...base, oversized, lineage_candidate, segment_ordinal: ordinal, content_hash, atom_id };
 }
 
 function shadowAtomization(atoms) {
@@ -606,7 +607,7 @@ test("propagates final unterminated context newline state into changed text atom
     kind: "text", owner_path_base64: "b2xkLnR4dA==", old_path_base64: "b2xkLnR4dA==", new_path_base64: "b2xkLnR4dA==",
     old_start: 1, old_count: 1, new_start: 1, new_count: 1,
     old_lines: [{ bytes_base64: "b2xk", terminator: "lf" }], new_lines: [{ bytes_base64: "bmV3", terminator: "lf" }],
-    old_final_newline: false, new_final_newline: false, oversized: false,
+    old_final_newline: false, new_final_newline: false,
   }));
 });
 

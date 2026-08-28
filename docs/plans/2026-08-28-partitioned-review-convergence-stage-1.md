@@ -799,6 +799,7 @@ complete schema:
     ordered_atom_ids: ["a:64-hex"],
     coalesced_from: [],
     atom_payload_bytes: [100],
+    oversized_atom_ids: [],
     unit_payload_bytes: 100,
     atomic: true,
     oversized: false,

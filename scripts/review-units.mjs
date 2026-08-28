@@ -297,12 +297,12 @@ function pathPayload(record, section, rows) {
   };
 }
 
-function textPayload(record, oldStart, newStart, oldLines, newLines, oversized, oldFinalNewline, newFinalNewline) {
+function textPayload(record, oldStart, newStart, oldLines, newLines, oldFinalNewline, newFinalNewline) {
   return {
     kind: "text", owner_path_base64: (record.newPath ?? record.oldPath).toString("base64"), old_path_base64: record.oldPath?.toString("base64") ?? null, new_path_base64: record.newPath?.toString("base64") ?? null,
     old_start: oldStart, old_count: oldLines.length, new_start: newStart, new_count: newLines.length,
     old_lines: oldLines, new_lines: newLines,
-    old_final_newline: oldFinalNewline, new_final_newline: newFinalNewline, oversized,
+    old_final_newline: oldFinalNewline, new_final_newline: newFinalNewline,
   };
 }
 
@@ -310,7 +310,7 @@ function textLineage(payload) {
   return `t:${canonicalSha256({ kind: "text", old_path_base64: payload.old_path_base64, new_path_base64: payload.new_path_base64, old_start: payload.old_start, old_count: payload.old_count, new_start: payload.new_start, new_count: payload.new_count })}`;
 }
 
-function projectTextAtoms(record, section, sectionIndex) {
+function projectTextAtoms(record, section, sectionIndex, atomTargetBytes) {
   const atoms = [];
   for (const hunk of section.hunks) {
     for (const block of hunk.blocks) {
@@ -320,8 +320,8 @@ function projectTextAtoms(record, section, sectionIndex) {
       const start = () => ({ oldStart: oldCursor, newStart: newCursor, oldLines: [], newLines: [], owners: [] });
       const finish = () => {
         if (!candidate || candidate.owners.length === 0) return;
-        const payload = textPayload(record, candidate.oldStart, candidate.newStart, candidate.oldLines, candidate.newLines, candidate.oversized ?? false, section.oldFinalNewline, section.newFinalNewline);
-        atoms.push({ payload, lineage_candidate: textLineage(payload), sort: [payload.old_start, payload.old_count, payload.new_start, payload.new_count], owners: candidate.owners });
+        const payload = textPayload(record, candidate.oldStart, candidate.newStart, candidate.oldLines, candidate.newLines, section.oldFinalNewline, section.newFinalNewline);
+        atoms.push({ payload, oversized: candidate.oversized === true, lineage_candidate: textLineage(payload), sort: [payload.old_start, payload.old_count, payload.new_start, payload.new_count], owners: candidate.owners });
         candidate = undefined;
       };
       for (const event of block) {
@@ -329,16 +329,16 @@ function projectTextAtoms(record, section, sectionIndex) {
         const prospective = { ...candidate, oldLines: [...candidate.oldLines], newLines: [...candidate.newLines] };
         prospective[event.side === "old" ? "oldLines" : "newLines"].push(event.line);
         prospective.owners = [...candidate.owners, `${sectionIndex}:${hunk.index}:${event.side}:${event.lineIndex}`];
-        const prospectivePayload = textPayload(record, prospective.oldStart, prospective.newStart, prospective.oldLines, prospective.newLines, false, section.oldFinalNewline, section.newFinalNewline);
-        if (candidate.owners.length > 0 && Buffer.byteLength(canonicalJson(prospectivePayload)) > ATOM_TARGET_BYTES) {
+        const prospectivePayload = textPayload(record, prospective.oldStart, prospective.newStart, prospective.oldLines, prospective.newLines, section.oldFinalNewline, section.newFinalNewline);
+        if (candidate.owners.length > 0 && Buffer.byteLength(canonicalJson(prospectivePayload)) > atomTargetBytes) {
           finish();
           candidate = start();
         }
         candidate[event.side === "old" ? "oldLines" : "newLines"].push(event.line);
         candidate.owners.push(`${sectionIndex}:${hunk.index}:${event.side}:${event.lineIndex}`);
         if (candidate.owners.length === 1) {
-          const oneLine = textPayload(record, candidate.oldStart, candidate.newStart, candidate.oldLines, candidate.newLines, false, section.oldFinalNewline, section.newFinalNewline);
-          candidate.oversized = Buffer.byteLength(canonicalJson(oneLine)) > ATOM_TARGET_BYTES;
+          const oneLine = textPayload(record, candidate.oldStart, candidate.newStart, candidate.oldLines, candidate.newLines, section.oldFinalNewline, section.newFinalNewline);
+          candidate.oversized = Buffer.byteLength(canonicalJson(oneLine)) > atomTargetBytes;
         }
         if (event.side === "old") oldCursor += 1;
         else newCursor += 1;
@@ -369,7 +369,7 @@ function assignIdentities(bases) {
       base.atom_id = `a:${canonicalSha256({ atom_schema_version: 1, lineage_candidate: base.lineage_candidate, segment_ordinal: segmentOrdinal, content_hash: base.content_hash })}`;
     });
   }
-  return bases.map(({ payload, lineage_candidate, segment_ordinal, content_hash, atom_id }) => ({ ...payload, lineage_candidate, segment_ordinal, content_hash, atom_id }));
+  return bases.map(({ payload, oversized, lineage_candidate, segment_ordinal, content_hash, atom_id }) => ({ ...payload, ...(oversized === undefined ? {} : { oversized }), lineage_candidate, segment_ordinal, content_hash, atom_id }));
 }
 
 function expectedChangedLineKeys(sections) {
@@ -411,7 +411,8 @@ function modeObjectBlobDisagreement(records, rows) {
 }
 
 /** Atomizes only an immutable, complete capture. */
-export function atomizeCapturedReviewInput(capture) {
+export function atomizeCapturedReviewInput(capture, atomTargetBytes = ATOM_TARGET_BYTES) {
+  if (!Number.isSafeInteger(atomTargetBytes) || atomTargetBytes <= 0) throw new TypeError("atom target bytes must be a positive safe integer");
   const state = inputState(capture);
   if (state.diagnostic) return mismatch(["partial_diagnostic_capture"], counts([], [], 0, []));
   if (state.malformed) return mismatch(["raw_patch_path_disagreement"], counts([], [], 0, []));
@@ -423,7 +424,7 @@ export function atomizeCapturedReviewInput(capture) {
     const section = sections[sectionForRecord[index]];
     const payload = pathPayload(records[index], section, rows);
     bases.push({ payload, lineage_candidate: `p:${canonicalSha256({ kind: "path_event", raw_status: payload.raw_status, status_kind: payload.status_kind, content_kinds: payload.content_kinds, old_path_base64: payload.old_path_base64, new_path_base64: payload.new_path_base64 })}`, sort: [0, 0, 0, 0], rawRecordIndex: index, owners: [] });
-    if (section) bases.push(...projectTextAtoms(records[index], section, sectionForRecord[index]));
+    if (section) bases.push(...projectTextAtoms(records[index], section, sectionForRecord[index], atomTargetBytes));
   }
   const atoms = assignIdentities(bases);
   const rawRecordOwners = bases.filter((base) => base.rawRecordIndex !== undefined).map((base) => ({ raw_record_index: base.rawRecordIndex, atom_id: base.atom_id }));
@@ -531,7 +532,7 @@ function sortedObject(entries) {
 
 function atomPayload(atom) {
   const {
-    lineage_candidate, segment_ordinal, content_hash, atom_id, payload_bytes,
+    lineage_candidate, segment_ordinal, content_hash, atom_id, payload_bytes, oversized,
     ...payload
   } = atom;
   return payload;
@@ -606,6 +607,7 @@ function makeUnit({ lineage, atoms, coalescedFrom = [], oversized = atoms.some((
     ordered_atom_ids: atoms.map((atom) => atom.atom_id),
     coalesced_from: coalescedFrom,
     atom_payload_bytes: atomPayloadBytes,
+    oversized_atom_ids: atoms.filter((atom) => atom.oversized).map((atom) => atom.atom_id),
     unit_payload_bytes: atomPayloadBytes.reduce((total, value) => total + value, 0),
     atomic: atoms.length === 1,
     oversized,
@@ -663,6 +665,7 @@ function coalesceUnits(units, maxFrontierUnits) {
       ordered_atom_ids: [...left.ordered_atom_ids, ...right.ordered_atom_ids],
       coalesced_from: [left.unit_lineage, right.unit_lineage],
       atom_payload_bytes: atomPayloadBytes,
+      oversized_atom_ids: [...left.oversized_atom_ids, ...right.oversized_atom_ids],
       unit_payload_bytes: left.unit_payload_bytes + right.unit_payload_bytes,
       atomic: false,
       oversized: left.oversized || right.oversized,
@@ -683,8 +686,8 @@ function validateExecutionProjection(projection, unitCount) {
 }
 
 function validateUnit(unit) {
-  exactKeys(unit, ["unit_id", "unit_lineage", "ordered_atom_ids", "coalesced_from", "atom_payload_bytes", "unit_payload_bytes", "atomic", "oversized"], "manifest unit");
-  if (!SHA256.test(unit.unit_id) || typeof unit.unit_lineage !== "string" || !Array.isArray(unit.ordered_atom_ids) || unit.ordered_atom_ids.length === 0 || !Array.isArray(unit.coalesced_from) || !Array.isArray(unit.atom_payload_bytes) || unit.atom_payload_bytes.length !== unit.ordered_atom_ids.length || unit.atom_payload_bytes.some((value) => !Number.isSafeInteger(value) || value < 0) || !Number.isSafeInteger(unit.unit_payload_bytes) || unit.unit_payload_bytes < 0 || unit.atom_payload_bytes.reduce((total, value) => total + value, 0) !== unit.unit_payload_bytes || typeof unit.atomic !== "boolean" || typeof unit.oversized !== "boolean") throw new TypeError("manifest unit is invalid");
+  exactKeys(unit, ["unit_id", "unit_lineage", "ordered_atom_ids", "coalesced_from", "atom_payload_bytes", "oversized_atom_ids", "unit_payload_bytes", "atomic", "oversized"], "manifest unit");
+  if (!SHA256.test(unit.unit_id) || typeof unit.unit_lineage !== "string" || !Array.isArray(unit.ordered_atom_ids) || unit.ordered_atom_ids.length === 0 || !Array.isArray(unit.coalesced_from) || !Array.isArray(unit.atom_payload_bytes) || unit.atom_payload_bytes.length !== unit.ordered_atom_ids.length || unit.atom_payload_bytes.some((value) => !Number.isSafeInteger(value) || value < 0) || !Array.isArray(unit.oversized_atom_ids) || unit.oversized_atom_ids.some((id, index) => !unit.ordered_atom_ids.includes(id) || unit.oversized_atom_ids.indexOf(id) !== index) || !Number.isSafeInteger(unit.unit_payload_bytes) || unit.unit_payload_bytes < 0 || unit.atom_payload_bytes.reduce((total, value) => total + value, 0) !== unit.unit_payload_bytes || typeof unit.atomic !== "boolean" || typeof unit.oversized !== "boolean") throw new TypeError("manifest unit is invalid");
 }
 
 function validateManifest(manifest) {
@@ -693,8 +696,6 @@ function validateManifest(manifest) {
   exactKeys(manifest.configuration, ["atom_target_bytes", "unit_target_bytes", "max_frontier_units", "max_shadow_artifact_bytes"], "manifest configuration");
   validateExecutionProjection(manifest.execution_projection, Array.isArray(manifest.units) ? manifest.units.length : -1);
   if (!Array.isArray(manifest.atoms) || !Array.isArray(manifest.units)) throw new TypeError("manifest arrays are invalid");
-  exactKeys(manifest.counts, ["atoms", "path_events", "text_atoms", "oversized_atoms", "coalesced_units", "by_raw_status", "by_content_kind"], "manifest counts");
-  exactKeys(manifest.sizes, ["atom_payload_bytes", "unit_payload_bytes"], "manifest sizes");
   if (manifest.counts.atoms !== manifest.atoms.length || manifest.sizes.atom_payload_bytes !== manifest.atoms.reduce((total, atom) => total + atom.payload_bytes, 0) || manifest.sizes.unit_payload_bytes !== manifest.units.reduce((total, unit) => total + unit.unit_payload_bytes, 0)) throw new TypeError("manifest metrics are invalid");
   for (const unit of manifest.units) validateUnit(unit);
   const core = { ...manifest };
@@ -885,16 +886,20 @@ export function splitUnit(unit) {
       difference = candidate;
     }
   }
-  const child = (suffix, ids, bytes) => ({
-    unit_id: unitId(`${unit.unit_lineage}/${suffix}`, ids, []),
-    unit_lineage: `${unit.unit_lineage}/${suffix}`,
-    ordered_atom_ids: ids,
-    coalesced_from: [],
-    atom_payload_bytes: bytes,
-    unit_payload_bytes: bytes.reduce((total, value) => total + value, 0),
-    atomic: ids.length === 1,
-    oversized: false,
-  });
+  const child = (suffix, ids, bytes) => {
+    const oversizedAtomIds = (unit.oversized_atom_ids ?? []).filter((atomId) => ids.includes(atomId));
+    return {
+      unit_id: unitId(`${unit.unit_lineage}/${suffix}`, ids, []),
+      unit_lineage: `${unit.unit_lineage}/${suffix}`,
+      ordered_atom_ids: ids,
+      coalesced_from: [],
+      atom_payload_bytes: bytes,
+      oversized_atom_ids: oversizedAtomIds,
+      unit_payload_bytes: bytes.reduce((total, value) => total + value, 0),
+      atomic: ids.length === 1,
+      oversized: oversizedAtomIds.length > 0,
+    };
+  };
   return [
     child(0, unit.ordered_atom_ids.slice(0, best), payloadBytes.slice(0, best)),
     child(1, unit.ordered_atom_ids.slice(best), payloadBytes.slice(best)),
@@ -986,40 +991,45 @@ function main(argv) {
   }
   try {
     const capture = JSON.parse(readFileSync(options["--capture"], "utf8"));
-    const profile = JSON.parse(readFileSync(options["--profile"], "utf8"));
     const config = JSON.parse(readFileSync(options["--config"], "utf8"));
+    const configValue = configuration(config);
     try {
       validateCapturedReviewInput(capture);
     } catch (error) {
-      const diagnostic = invalidCaptureDiagnostic(capture, config.benchmark_revision, config.max_shadow_artifact_bytes, error);
+      const diagnostic = invalidCaptureDiagnostic(capture, configValue.benchmark_revision, configValue.max_shadow_artifact_bytes, error);
       if (options["--local-out"]) writeShadowOutput(options["--local-out"], diagnostic);
       if (options["--diagnostics-out"]) writeShadowOutput(options["--diagnostics-out"], diagnostic);
       return 0;
     }
-    const diagnostic = capture.status === "complete"
-      ? (() => {
-        try {
-          const atomization = atomizeCapturedReviewInput(capture);
-          if (atomization.status !== "complete") return buildShadowDiagnostic({
-            status: "atom_coverage_mismatch", capture, benchmark_revision: config.benchmark_revision,
-            reason_codes: atomization.reasons, diagnostic: "Shadow atom coverage did not match capture.",
-            observed_lower_bounds: { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 },
-            counts: atomization.counts,
-          }, config.max_shadow_artifact_bytes);
-          const manifest = buildPathFallbackManifest({ capture, atomization, config, executionProfile: profile });
-          if (options["--local-out"]) writeShadowOutput(options["--local-out"], buildLocalShadowOutput(capture, manifest));
-          if (options["--diagnostics-out"]) writeShadowOutput(options["--diagnostics-out"], buildHostedShadowOutput(capture, manifest, config.max_shadow_artifact_bytes));
-          return null;
-        } catch (error) {
-          return buildShadowDiagnostic({
-            status: "planner_failed", capture, benchmark_revision: config.benchmark_revision,
-            reason_codes: ["planner_error"], diagnostic: error.message,
-            observed_lower_bounds: { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 },
-            counts: {},
-          }, config.max_shadow_artifact_bytes);
-        }
-      })()
-      : shadowDiagnosticFromCapture(capture, config.benchmark_revision, config.max_shadow_artifact_bytes);
+    if (capture.status !== "complete") {
+      const diagnostic = shadowDiagnosticFromCapture(capture, configValue.benchmark_revision, configValue.max_shadow_artifact_bytes);
+      if (options["--local-out"]) writeShadowOutput(options["--local-out"], diagnostic);
+      if (options["--diagnostics-out"]) writeShadowOutput(options["--diagnostics-out"], diagnostic);
+      return 0;
+    }
+    const profile = JSON.parse(readFileSync(options["--profile"], "utf8"));
+    const diagnostic = (() => {
+      try {
+        const atomization = atomizeCapturedReviewInput(capture, configValue.atom_target_bytes);
+        if (atomization.status !== "complete") return buildShadowDiagnostic({
+          status: "atom_coverage_mismatch", capture, benchmark_revision: configValue.benchmark_revision,
+          reason_codes: atomization.reasons, diagnostic: "Shadow atom coverage did not match capture.",
+          observed_lower_bounds: { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 },
+          counts: atomization.counts,
+        }, configValue.max_shadow_artifact_bytes);
+        const manifest = buildPathFallbackManifest({ capture, atomization, config, executionProfile: profile });
+        if (options["--local-out"]) writeShadowOutput(options["--local-out"], buildLocalShadowOutput(capture, manifest));
+        if (options["--diagnostics-out"]) writeShadowOutput(options["--diagnostics-out"], buildHostedShadowOutput(capture, manifest, configValue.max_shadow_artifact_bytes));
+        return null;
+      } catch (error) {
+        return buildShadowDiagnostic({
+          status: "planner_failed", capture, benchmark_revision: configValue.benchmark_revision,
+          reason_codes: ["planner_error"], diagnostic: error.message,
+          observed_lower_bounds: { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 },
+          counts: {},
+        }, configValue.max_shadow_artifact_bytes);
+      }
+    })();
     if (diagnostic !== null) {
       if (options["--local-out"]) writeShadowOutput(options["--local-out"], diagnostic);
       if (options["--diagnostics-out"]) writeShadowOutput(options["--diagnostics-out"], diagnostic);

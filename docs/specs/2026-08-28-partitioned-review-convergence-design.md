@@ -436,11 +436,11 @@ metrics without reusing coverage across heads.
 Stage 1 groups only by canonical owner path bytes. Semantic grouping is deferred.
 
 For each atom, `atom_payload_bytes` is the UTF-8 byte length of its canonical
-plain-JSON payload including base64 data and excluding derived IDs/hashes. Each
-unit row persists an aligned `atom_payload_bytes` array: it has one nonnegative
-safe integer per `ordered_atom_ids` entry and its sum is `unit_payload_bytes`.
-The public array survives manifest serialization so recursive splitting has no
-hidden byte state.
+plain-JSON payload including base64 data and excluding derived IDs/hashes.
+`oversized` is derived atom metadata and is excluded from the canonical content
+payload/hash. Each unit row persists aligned `atom_payload_bytes` and
+`oversized_atom_ids` arrays: each has one public entry per applicable owned
+atom, and atom payload bytes sum to `unit_payload_bytes`.
 
 Deterministic packing:
 
@@ -475,8 +475,8 @@ children are never collapsed.
 Shadow manifest binds capture hash, exact atom/unit schemas, ordered atoms,
 ordered path units, configuration, and projected sizes. Unit rows include
 `unit_id`, `unit_lineage`, `ordered_atom_ids`, `coalesced_from`,
-`atom_payload_bytes`, `unit_payload_bytes`, `atomic`, and `oversized`. Stage 1
-IDs are deterministic within the immutable capture.
+`atom_payload_bytes`, `oversized_atom_ids`, `unit_payload_bytes`, `atomic`, and
+`oversized`. Stage 1 IDs are deterministic within the immutable capture.
 
 Later execution separates:
 
