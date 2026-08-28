@@ -126,22 +126,18 @@ function removeDiffPrefix(path, prefix) {
   return path.subarray(2);
 }
 
-function gitTokens(bytes) {
-  const tokens = [];
-  for (let index = 0; index < bytes.length && tokens.length < 2;) {
-    while (bytes[index] === 0x20) index += 1;
-    const start = index;
-    if (bytes[index] === 0x22) {
-      index += 1;
-      while (index < bytes.length) {
-        if (bytes[index] === 0x5c) index += 2;
-        else if (bytes[index++] === 0x22) break;
-      }
-    } else while (index < bytes.length && bytes[index] !== 0x20) index += 1;
-    tokens.push(decodeGitPath(bytes.subarray(start, index)));
+function quoteGitPath(path) {
+  const escapes = { 0x07: "a", 0x08: "b", 0x0c: "f", 0x0a: "n", 0x0d: "r", 0x09: "t", 0x0b: "v", 0x5c: "\\", 0x22: "\"" };
+  const bytes = [0x22];
+  for (const byte of path) {
+    if (Object.hasOwn(escapes, byte)) {
+      bytes.push(0x5c, escapes[byte].charCodeAt(0));
+    } else if (byte < 0x20 || byte >= 0x7f) {
+      bytes.push(0x5c, ...byte.toString(8).padStart(3, "0").split("").map((value) => value.charCodeAt(0)));
+    } else bytes.push(byte);
   }
-  if (tokens.length !== 2) throw new TypeError("invalid diff header paths");
-  return tokens;
+  bytes.push(0x22);
+  return Buffer.from(bytes);
 }
 
 function parseHunkHeader(line) {
@@ -166,8 +162,7 @@ function parsePatch(bytes) {
   const startSection = (line) => {
     finishHunk();
     const headerPaths = line.subarray(Buffer.byteLength("diff --git "));
-    const [oldHeader, newHeader] = headerPaths.includes(0x22) ? gitTokens(headerPaths) : [null, null];
-    section = { oldPath: removeDiffPrefix(oldHeader, "a"), newPath: removeDiffPrefix(newHeader, "b"), headerOldPath: removeDiffPrefix(oldHeader, "a"), headerNewPath: removeDiffPrefix(newHeader, "b"), headerPaths: oldHeader === null ? headerPaths : null, hunks: [], binary: false, oldFinalNewline: true, newFinalNewline: true };
+    section = { oldPath: null, newPath: null, headerOldPath: null, headerNewPath: null, headerPaths, hunks: [], binary: false, oldFinalNewline: true, newFinalNewline: true };
     sections.push(section);
   };
   while (offset < bytes.length) {
@@ -240,10 +235,16 @@ function headerSectionKey(headerPaths) {
   return `header:${headerPaths.toString("base64")}`;
 }
 
-function recordHeaderKey(record) {
-  const oldPath = record.oldPath ?? record.newPath;
-  const newPath = record.newPath ?? record.oldPath;
-  return headerSectionKey(Buffer.concat([Buffer.from("a/"), oldPath, Buffer.from(" b/"), newPath]));
+function recordHeaderKeys(record) {
+  const oldPath = Buffer.concat([Buffer.from("a/"), record.oldPath ?? record.newPath]);
+  const newPath = Buffer.concat([Buffer.from("b/"), record.newPath ?? record.oldPath]);
+  const keys = new Set();
+  for (const oldHeader of [oldPath, quoteGitPath(oldPath)]) {
+    for (const newHeader of [newPath, quoteGitPath(newPath)]) {
+      keys.add(headerSectionKey(Buffer.concat([oldHeader, Buffer.from(" "), newHeader])));
+    }
+  }
+  return keys;
 }
 
 function sectionKeys(section) {
@@ -276,7 +277,7 @@ function correlate(records, sections) {
   });
   const queueOffsets = new Map();
   for (let recordIndex = 0; recordIndex < records.length; recordIndex += 1) {
-    for (const key of [recordSectionKey(records[recordIndex]), recordHeaderKey(records[recordIndex])]) {
+    for (const key of [recordSectionKey(records[recordIndex]), ...recordHeaderKeys(records[recordIndex])]) {
       const queue = indexedSections.get(key) ?? [];
       let offset = queueOffsets.get(key) ?? 0;
       while (offset < queue.length && recordForSection[queue[offset]] !== -1) offset += 1;

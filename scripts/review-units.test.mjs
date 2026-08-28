@@ -284,6 +284,33 @@ test("correlates unquoted space-containing binary and mode-only diff headers", (
   }
 });
 
+test("correlates mixed quoted and unquoted rename and copy header paths", () => {
+  for (const { oldMode, newMode, status, paths, patch, rows, expectedKind } of [
+    {
+      oldMode: "100644", newMode: "100644", status: "R100", paths: ["old\tname", "new name"],
+      patch: "diff --git \"a/old\\tname\" b/new name\nBinary files \"a/old\\tname\" and b/new name differ\n",
+      rows: [row(OLD_ID, Buffer.from("old\n")), row(NEW_ID, Buffer.from("new\n"))],
+      expectedKind: "binary",
+    },
+    {
+      oldMode: "100644", newMode: "100755", status: "C100", paths: ["old name", "new\tname"],
+      patch: "diff --git a/old name \"b/new\\tname\"\nold mode 100644\nnew mode 100755\n",
+      rows: [row(OLD_ID, Buffer.from("old\n"), ["100644"]), row(NEW_ID, Buffer.from("new\n"), ["100755"])],
+      expectedKind: "mode",
+    },
+  ]) {
+    const result = atomizeCapturedReviewInput(capture({
+      raw: rawRecord({ oldMode, newMode, status, paths }),
+      patch,
+      rows,
+    }));
+    assert.equal(result.status, "complete", expectedKind);
+    const pathAtom = result.atoms.find((atom) => atom.kind === "path_event");
+    assert.ok(pathAtom.content_kinds.includes(expectedKind), expectedKind);
+    assert.deepEqual([pathAtom.old_path_base64, pathAtom.new_path_base64], paths.map((path) => Buffer.from(path).toString("base64")));
+  }
+});
+
 test("rejects hunks whose old or new records do not match their headers", () => {
   for (const patch of [
     "diff --git a/old.txt b/old.txt\n@@ -1,2 +1 @@\n-old\n+new\n",
