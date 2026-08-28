@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { atomizeCapturedReviewInput, validateAtomization } from "./review-units.mjs";
+import { atomizeCapturedReviewInput, buildHostedShadowOutput, buildLocalShadowOutput, buildPathFallbackManifest, buildShadowDiagnostic, splitUnit, validateAtomization, validatePartitionShadowEvaluatorFixture } from "./review-units.mjs";
 
 const OLD_ID = "1".repeat(40);
 const NEW_ID = "2".repeat(40);
@@ -246,4 +247,266 @@ test("indexes many changed lines without rescanning prior hunk events", () => {
   } finally {
     Array.prototype.filter = originalFilter;
   }
+});
+
+const CAPTURE_HASH = "a".repeat(64);
+const BENCHMARK_REVISION = "partition-shadow-fixture-v1";
+const SHADOW_CONFIG = {
+  schema_version: 1,
+  benchmark_revision: BENCHMARK_REVISION,
+  atom_target_bytes: 16_000,
+  unit_target_bytes: 64_000,
+  max_frontier_units: 128,
+  max_shadow_artifact_bytes: 4_194_304,
+};
+const EXECUTION_PROFILE = {
+  schema_version: 1,
+  descriptors: ["general", "correctness", "boundaries"],
+  descriptor_content_hashes: ["1".repeat(64), "2".repeat(64), "3".repeat(64)],
+  max_output_attempts: 2,
+};
+
+function shadowCapture() {
+  return {
+    ...capture({ raw: rawRecord({}), patch: "diff --git a/a b/a\n" }),
+    capture_hash: CAPTURE_HASH,
+    base_sha: OLD_ID,
+    head_sha: NEW_ID,
+  };
+}
+
+function shadowAtom({ kind, path, ordinal = 0, rawStatus = "M", payload = "", oversized = false }) {
+  const base = kind === "path_event"
+    ? {
+      kind, raw_status: rawStatus, status_kind: "modify", content_kinds: ["text"],
+      owner_path_base64: Buffer.from(path).toString("base64"), old_path_base64: Buffer.from(path).toString("base64"), new_path_base64: Buffer.from(path).toString("base64"),
+      old_mode: "100644", new_mode: "100644", old_object_id: OLD_ID, new_object_id: NEW_ID, similarity: null,
+      old_blob_sha256: "4".repeat(64), new_blob_sha256: "5".repeat(64),
+    }
+    : {
+      kind, owner_path_base64: Buffer.from(path).toString("base64"), old_path_base64: Buffer.from(path).toString("base64"), new_path_base64: Buffer.from(path).toString("base64"),
+      old_start: ordinal + 1, old_count: 0, new_start: ordinal + 1, new_count: 1,
+      old_lines: [], new_lines: [{ bytes_base64: Buffer.from(payload).toString("base64"), terminator: "lf" }],
+      old_final_newline: true, new_final_newline: true, oversized,
+    };
+  const content_hash = sha256(base);
+  const lineage_candidate = `${kind === "path_event" ? "p" : "t"}:${sha256({ kind, path: Buffer.from(path).toString("base64"), ordinal })}`;
+  const atom_id = `a:${sha256({ atom_schema_version: 1, lineage_candidate, segment_ordinal: ordinal, content_hash })}`;
+  return { ...base, lineage_candidate, segment_ordinal: ordinal, content_hash, atom_id };
+}
+
+function shadowAtomization(atoms) {
+  return { status: "complete", atoms, coverage: { raw_record_owners: [], changed_line_owners: [] } };
+}
+
+test("builds a deterministic path-packed manifest with independent unit IDs", () => {
+  const atoms = [
+    shadowAtom({ kind: "text", path: "b", ordinal: 1, payload: "b".repeat(90) }),
+    shadowAtom({ kind: "path_event", path: "a" }),
+    shadowAtom({ kind: "text", path: "a", ordinal: 0, payload: "a".repeat(90) }),
+    shadowAtom({ kind: "path_event", path: Buffer.from([0xff]) }),
+    shadowAtom({ kind: "text", path: Buffer.from([0xff]), ordinal: 0, payload: "z".repeat(500), oversized: true }),
+    shadowAtom({ kind: "path_event", path: "b" }),
+  ];
+  const manifest = buildPathFallbackManifest({
+    capture: shadowCapture(),
+    atomization: shadowAtomization(atoms),
+    config: SHADOW_CONFIG,
+    executionProfile: EXECUTION_PROFILE,
+  });
+  assert.deepEqual(manifest.atoms.map((atom) => atom.owner_path_base64), [
+    Buffer.from("a").toString("base64"), Buffer.from("a").toString("base64"),
+    Buffer.from("b").toString("base64"), Buffer.from("b").toString("base64"),
+    Buffer.from([0xff]).toString("base64"), Buffer.from([0xff]).toString("base64"),
+  ]);
+  assert.deepEqual(manifest.units.map((unit) => unit.unit_lineage), [
+    `root:path:${createHash("sha256").update(Buffer.from("a")).digest("hex")}:0`,
+    `root:path:${createHash("sha256").update(Buffer.from("b")).digest("hex")}:0`,
+    `root:path:${createHash("sha256").update(Buffer.from([0xff])).digest("hex")}:0`,
+  ]);
+  assert.equal(manifest.units[2].oversized, true);
+  assert.equal(manifest.execution_projection.projected_batches, manifest.units.length);
+  assert.equal(manifest.execution_projection.projected_model_calls, 18);
+  assert.equal(manifest.manifest_hash, sha256(Object.fromEntries(Object.entries(manifest).filter(([key]) => key !== "manifest_hash"))));
+  const firstUnit = manifest.units[0];
+  assert.equal(firstUnit.unit_id, sha256({
+    unit_schema_version: 1,
+    unit_lineage: firstUnit.unit_lineage,
+    ordered_atom_ids: firstUnit.ordered_atom_ids,
+    coalesced_from: firstUnit.coalesced_from,
+  }));
+  const shuffled = buildPathFallbackManifest({
+    capture: shadowCapture(),
+    atomization: shadowAtomization([...atoms].reverse()),
+    config: SHADOW_CONFIG,
+    executionProfile: EXECUTION_PROFILE,
+  });
+  assert.equal(canonicalJson(shuffled), canonicalJson(manifest));
+  assert.deepEqual(new Set(manifest.units.flatMap((unit) => unit.ordered_atom_ids)), new Set(atoms.map((atom) => atom.atom_id)));
+});
+
+test("coalesces the minimum adjacent pair and splits non-atomic units deterministically", () => {
+  const atoms = ["a", "b", "c", "d"].map((path) => shadowAtom({ kind: "path_event", path }));
+  const manifest = buildPathFallbackManifest({
+    capture: shadowCapture(),
+    atomization: shadowAtomization(atoms),
+    config: { ...SHADOW_CONFIG, atom_target_bytes: 1, unit_target_bytes: 1, max_frontier_units: 3 },
+    executionProfile: EXECUTION_PROFILE,
+  });
+  assert.equal(manifest.counts.coalesced_units, 1);
+  assert.deepEqual(manifest.units[0].coalesced_from, [
+    `root:path:${createHash("sha256").update(Buffer.from("a")).digest("hex")}:0`,
+    `root:path:${createHash("sha256").update(Buffer.from("b")).digest("hex")}:0`,
+  ]);
+  const [left, right] = splitUnit(manifest.units[0]);
+  assert.equal(left.unit_lineage, `${manifest.units[0].unit_lineage}/0`);
+  assert.equal(right.unit_lineage, `${manifest.units[0].unit_lineage}/1`);
+  assert.deepEqual([...left.ordered_atom_ids, ...right.ordered_atom_ids], manifest.units[0].ordered_atom_ids);
+  assert.throws(() => splitUnit(manifest.units[1]), /atomic/);
+});
+
+test("validates evaluator metrics and produces redacted fixed-point hosted outputs", () => {
+  const atoms = [
+    shadowAtom({ kind: "path_event", path: "a" }),
+    shadowAtom({ kind: "text", path: "a", payload: "source bytes stay local" }),
+    shadowAtom({ kind: "path_event", path: "b" }),
+    shadowAtom({ kind: "text", path: "b", payload: "more source bytes" }),
+    shadowAtom({ kind: "path_event", path: Buffer.from([0xff]) }),
+    shadowAtom({ kind: "text", path: Buffer.from([0xff]), payload: "oversized".repeat(80) }),
+  ];
+  const manifest = buildPathFallbackManifest({
+    capture: shadowCapture(),
+    atomization: shadowAtomization(atoms),
+    config: SHADOW_CONFIG,
+    executionProfile: EXECUTION_PROFILE,
+  });
+  const fixture = validatePartitionShadowEvaluatorFixture(JSON.parse(readFileSync(new URL("./fixtures/partition-shadow-evaluator-v1.json", import.meta.url))));
+  assert.equal(fixture.expected.unit_count, manifest.units.length);
+  assert.equal(fixture.expected.projected_model_calls, manifest.execution_projection.projected_model_calls);
+  const local = buildLocalShadowOutput(shadowCapture(), manifest);
+  assert.equal(local.capture.object_table[0].content_base64, shadowCapture().object_table[0].content_base64);
+  const hosted = buildHostedShadowOutput(shadowCapture(), manifest, 100_000);
+  assert.equal(hosted.status, "complete");
+  assert.equal(hosted.sizes.encoded_output_bytes, Buffer.byteLength(`${canonicalJson(hosted)}\n`));
+  assert.equal(JSON.stringify(hosted).includes("source bytes stay local"), false);
+  assert.equal(Object.hasOwn(hosted.atoms.find((atom) => atom.kind === "text"), "old_lines"), false);
+  const compacted = buildHostedShadowOutput(shadowCapture(), manifest, 100);
+  assert.equal(compacted.status, "artifact_compacted");
+  assert.equal(compacted.sizes.encoded_output_bytes, Buffer.byteLength(`${canonicalJson(compacted)}\n`));
+  const diagnostic = buildShadowDiagnostic({
+    status: "atom_coverage_mismatch",
+    capture: shadowCapture(),
+    benchmark_revision: BENCHMARK_REVISION,
+    reason_codes: ["z", "a", "z"],
+    diagnostic: "x".repeat(1_000),
+    observed_lower_bounds: { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 },
+    counts: {},
+  }, 10_000);
+  assert.deepEqual(diagnostic.reason_codes, ["a", "z"]);
+  assert.equal(diagnostic.capture_hash, CAPTURE_HASH);
+  assert.equal(diagnostic.manifest_hash, null);
+  assert.ok(Buffer.byteLength(diagnostic.diagnostic) <= 512);
+  assert.equal(diagnostic.sizes.encoded_output_bytes, Buffer.byteLength(`${canonicalJson(diagnostic)}\n`));
+});
+
+test("keeps generated atom unions deterministic across canonical input shuffles", () => {
+  for (let count = 1; count <= 256; count += 1) {
+    const atoms = Array.from({ length: count }, (_, index) => shadowAtom({ kind: "path_event", path: `p-${String(index).padStart(3, "0")}` }));
+    const options = {
+      capture: shadowCapture(),
+      atomization: shadowAtomization(atoms),
+      config: { ...SHADOW_CONFIG, atom_target_bytes: 1, unit_target_bytes: 1, max_frontier_units: 128 },
+      executionProfile: EXECUTION_PROFILE,
+    };
+    const baseline = buildPathFallbackManifest(options);
+    for (let rotation = 1; rotation <= 3; rotation += 1) {
+      const shuffled = [...atoms.slice(rotation), ...atoms.slice(0, rotation)].reverse();
+      const actual = buildPathFallbackManifest({ ...options, atomization: shadowAtomization(shuffled) });
+      assert.equal(canonicalJson(actual), canonicalJson(baseline), `atom count ${count}, rotation ${rotation}`);
+    }
+    assert.deepEqual(
+      [...new Set(baseline.units.flatMap((unit) => unit.ordered_atom_ids))].sort(),
+      atoms.map((atom) => atom.atom_id).sort(),
+      `atom union ${count}`,
+    );
+  }
+});
+
+test("enforces literal evaluator metrics and complete diagnostic schemas", () => {
+  const atoms = [
+    shadowAtom({ kind: "path_event", path: "a" }),
+    shadowAtom({ kind: "text", path: "a", payload: "one" }),
+    shadowAtom({ kind: "path_event", path: "b" }),
+    shadowAtom({ kind: "text", path: "b", payload: "two" }),
+    shadowAtom({ kind: "path_event", path: Buffer.from([0xff]) }),
+    shadowAtom({ kind: "text", path: Buffer.from([0xff]), payload: "three", oversized: true }),
+  ];
+  const manifest = buildPathFallbackManifest({
+    capture: shadowCapture(), atomization: shadowAtomization(atoms), config: SHADOW_CONFIG, executionProfile: EXECUTION_PROFILE,
+  });
+  const fixture = validatePartitionShadowEvaluatorFixture(JSON.parse(readFileSync(new URL("./fixtures/partition-shadow-evaluator-v1.json", import.meta.url))));
+  assert.deepEqual({
+    atom_counts: { path_events: manifest.counts.path_events, text_atoms: manifest.counts.text_atoms },
+    unit_count: manifest.units.length,
+    oversized_atoms: manifest.counts.oversized_atoms,
+    coalesced_units: manifest.counts.coalesced_units,
+    projected_batches: manifest.execution_projection.projected_batches,
+    projected_model_calls: manifest.execution_projection.projected_model_calls,
+  }, fixture.expected);
+  for (const [status, captureHash, manifestHash] of [
+    ["capture_capacity_exceeded", null, null],
+    ["capture_failed", null, null],
+    ["atom_coverage_mismatch", CAPTURE_HASH, null],
+    ["planner_failed", CAPTURE_HASH, manifest.manifest_hash],
+  ]) {
+    const diagnostic = buildShadowDiagnostic({
+      status,
+      capture_hash: captureHash,
+      manifest_hash: manifestHash,
+      base_sha: OLD_ID,
+      head_sha: NEW_ID,
+      benchmark_revision: BENCHMARK_REVISION,
+      reason_codes: ["z", "a", "a"],
+      diagnostic: "🙂".repeat(300),
+      observed_lower_bounds: { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 },
+      counts: {},
+    }, 10_000);
+    assert.deepEqual(Object.keys(diagnostic).sort(), [
+      "base_sha", "benchmark_revision", "capture_hash", "counts", "diagnostic", "head_sha",
+      "manifest_hash", "mode", "observed_lower_bounds", "reason_codes", "schema_version", "sizes", "status",
+    ]);
+    assert.deepEqual(diagnostic.reason_codes, ["a", "z"]);
+    assert.equal(diagnostic.capture_hash, captureHash);
+    assert.equal(diagnostic.manifest_hash, manifestHash);
+    assert.ok(Buffer.byteLength(diagnostic.diagnostic) <= 512);
+    assert.equal(diagnostic.sizes.encoded_output_bytes, Buffer.byteLength(`${canonicalJson(diagnostic)}\n`));
+  }
+});
+
+test("splits byte-balanced unit boundaries with lower-index ties", () => {
+  const unit = {
+    unit_id: "f".repeat(64),
+    unit_lineage: "root:path:fixture:0",
+    ordered_atom_ids: ["a:1", "a:2", "a:3"],
+    coalesced_from: [],
+    unit_payload_bytes: 10,
+    atomic: false,
+    oversized: false,
+    atom_payload_bytes: [2, 6, 2],
+  };
+  const [left, right] = splitUnit(unit);
+  assert.deepEqual(left.ordered_atom_ids, ["a:1"]);
+  assert.deepEqual(right.ordered_atom_ids, ["a:2", "a:3"]);
+  assert.ok(left.unit_payload_bytes < unit.unit_payload_bytes);
+  assert.ok(right.unit_payload_bytes < unit.unit_payload_bytes);
+});
+
+test("allows the specified empty benchmark revision", () => {
+  const manifest = buildPathFallbackManifest({
+    capture: shadowCapture(),
+    atomization: shadowAtomization([shadowAtom({ kind: "path_event", path: "a" })]),
+    config: { ...SHADOW_CONFIG, benchmark_revision: "" },
+    executionProfile: EXECUTION_PROFILE,
+  });
+  assert.equal(manifest.benchmark_revision, "");
 });

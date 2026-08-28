@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "benchmark_revision": "partition-shadow-fixture-v1",
+  "repository_fixture": "review-units-literal-v1",
+  "capture_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "expected": {
+    "atom_counts": {
+      "path_events": 3,
+      "text_atoms": 3
+    },
+    "unit_count": 3,
+    "oversized_atoms": 1,
+    "coalesced_units": 0,
+    "projected_batches": 3,
+    "projected_model_calls": 18
+  }
+}

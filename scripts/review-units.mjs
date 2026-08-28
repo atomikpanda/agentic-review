@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { lstatSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import { canonicalJson, canonicalSha256 } from "./lib-canonical-json.mjs";
 
@@ -435,3 +437,523 @@ export function validateAtomization(result, capture, suppliedState = undefined) 
   const countValue = counts(records, result.atoms, expectedLines.length, lineOwners);
   return reasons.length === 0 ? result : mismatch(reasons, countValue);
 }
+
+const SHADOW_CONFIG_KEYS = Object.freeze([
+  "schema_version", "benchmark_revision", "atom_target_bytes", "unit_target_bytes",
+  "max_frontier_units", "max_shadow_artifact_bytes",
+]);
+const EXECUTION_PROFILE_KEYS = Object.freeze([
+  "schema_version", "descriptors", "descriptor_content_hashes", "max_output_attempts",
+]);
+const MANIFEST_KEYS = Object.freeze([
+  "schema_version", "status", "mode", "capture_hash", "benchmark_revision", "configuration",
+  "execution_projection", "atoms", "units", "counts", "sizes", "manifest_hash",
+]);
+const COMPLETE_OUTPUT_KEYS = Object.freeze([
+  "schema_version", "status", "capture_hash", "mode", "manifest_hash", "benchmark_revision",
+  "configuration", "execution_projection", "objects", "atoms", "units", "counts", "sizes",
+]);
+const COMPACT_OUTPUT_KEYS = Object.freeze([
+  "schema_version", "status", "mode", "capture_hash", "manifest_hash", "benchmark_revision",
+  "counts", "sizes", "omitted",
+]);
+const DIAGNOSTIC_KEYS = Object.freeze([
+  "schema_version", "status", "mode", "base_sha", "head_sha", "benchmark_revision",
+  "capture_hash", "manifest_hash", "reason_codes", "diagnostic", "observed_lower_bounds",
+  "counts", "sizes",
+]);
+const DIAGNOSTIC_STATUSES = new Set([
+  "capture_capacity_exceeded", "capture_failed", "planner_failed", "atom_coverage_mismatch",
+]);
+const SHA256 = /^[0-9a-f]{64}$/;
+const GIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const TRUNCATION_SUFFIX = "...[truncated]";
+
+function exactKeys(value, keys, label) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new TypeError(`${label} must be an object`);
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) throw new TypeError(`${label} keys are invalid`);
+}
+
+function positiveInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError(`${label} must be a positive safe integer`);
+  return value;
+}
+
+function nonnegativeInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${label} must be a nonnegative safe integer`);
+  return value;
+}
+
+function boundedString(value, label) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 256) throw new TypeError(`${label} must be a nonempty bounded string`);
+  return value;
+}
+
+function sha256Bytes(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function sortedObject(entries) {
+  return Object.fromEntries([...entries].sort(([left], [right]) => left.localeCompare(right)));
+}
+
+function atomPayload(atom) {
+  const {
+    lineage_candidate, segment_ordinal, content_hash, atom_id, payload_bytes,
+    ...payload
+  } = atom;
+  return payload;
+}
+
+function ownerPath(atom) {
+  if (typeof atom?.owner_path_base64 !== "string") throw new TypeError("atom owner path must be base64");
+  const bytes = Buffer.from(atom.owner_path_base64, "base64");
+  if (bytes.toString("base64") !== atom.owner_path_base64) throw new TypeError("atom owner path must be canonical base64");
+  return bytes;
+}
+
+function atomComparator(left, right) {
+  const path = Buffer.compare(ownerPath(left), ownerPath(right));
+  if (path !== 0) return path;
+  const leftKind = left.kind === "path_event" ? 0 : 1;
+  const rightKind = right.kind === "path_event" ? 0 : 1;
+  if (leftKind !== rightKind) return leftKind - rightKind;
+  if (leftKind === 1) {
+    for (const key of ["old_start", "old_count", "new_start", "new_count", "segment_ordinal"]) {
+      if (left[key] !== right[key]) return left[key] - right[key];
+    }
+  }
+  return left.atom_id.localeCompare(right.atom_id);
+}
+
+function unitId(unitLineage, orderedAtomIds, coalescedFrom) {
+  return canonicalSha256({
+    unit_schema_version: 1,
+    unit_lineage: unitLineage,
+    ordered_atom_ids: orderedAtomIds,
+    coalesced_from: coalescedFrom,
+  });
+}
+
+function attachPayloadBytes(unit, payloadBytes) {
+  Object.defineProperty(unit, "_atomPayloadBytes", { value: payloadBytes, enumerable: false });
+  return unit;
+}
+
+
+function configuration(config) {
+  exactKeys(config, SHADOW_CONFIG_KEYS, "shadow configuration");
+  if (config.schema_version !== 1) throw new TypeError("shadow configuration schema_version must be 1");
+  if (typeof config.benchmark_revision !== "string" || config.benchmark_revision.length > 256) throw new TypeError("benchmark_revision must be a bounded string");
+  const atomTarget = positiveInteger(config.atom_target_bytes, "atom_target_bytes");
+  const unitTarget = positiveInteger(config.unit_target_bytes, "unit_target_bytes");
+  if (unitTarget < atomTarget) throw new TypeError("unit_target_bytes must not be less than atom_target_bytes");
+  return {
+    benchmark_revision: config.benchmark_revision,
+    atom_target_bytes: atomTarget,
+    unit_target_bytes: unitTarget,
+    max_frontier_units: positiveInteger(config.max_frontier_units, "max_frontier_units"),
+    max_shadow_artifact_bytes: positiveInteger(config.max_shadow_artifact_bytes, "max_shadow_artifact_bytes"),
+  };
+}
+
+function executionProjection(profile, unitCount) {
+  exactKeys(profile, EXECUTION_PROFILE_KEYS, "execution profile");
+  if (profile.schema_version !== 1) throw new TypeError("execution profile schema_version must be 1");
+  if (!Array.isArray(profile.descriptors) || profile.descriptors.length === 0 || profile.descriptors.some((value) => typeof value !== "string" || value.length === 0 || value.length > 256)) throw new TypeError("execution descriptors are invalid");
+  if (!Array.isArray(profile.descriptor_content_hashes) || profile.descriptor_content_hashes.length !== profile.descriptors.length || profile.descriptor_content_hashes.some((value) => !SHA256.test(value))) throw new TypeError("execution descriptor hashes are invalid");
+  const maxOutputAttempts = positiveInteger(profile.max_output_attempts, "max_output_attempts");
+  return {
+    descriptors: [...profile.descriptors],
+    descriptor_content_hashes: [...profile.descriptor_content_hashes],
+    max_output_attempts: maxOutputAttempts,
+    projected_batches: unitCount,
+    projected_model_calls: unitCount * profile.descriptors.length * maxOutputAttempts,
+  };
+}
+
+function makeUnit({ lineage, atoms, coalescedFrom = [], oversized = atoms.some((atom) => atom.oversized) }) {
+  const atomPayloadBytes = atoms.map((atom) => atom.payload_bytes);
+  const unitPayloadBytes = atomPayloadBytes.reduce((total, value) => total + value, 0);
+  return attachPayloadBytes({
+    unit_id: unitId(lineage, atoms.map((atom) => atom.atom_id), coalescedFrom),
+    unit_lineage: lineage,
+    ordered_atom_ids: atoms.map((atom) => atom.atom_id),
+    coalesced_from: coalescedFrom,
+    unit_payload_bytes: unitPayloadBytes,
+    atomic: atoms.length === 1,
+    oversized,
+  }, atomPayloadBytes);
+}
+
+function packUnits(atoms, config) {
+  const packed = [];
+  let index = 0;
+  while (index < atoms.length) {
+    const path = ownerPath(atoms[index]);
+    const pathHash = sha256Bytes(path);
+    let ordinal = 0;
+    let candidate = [];
+    let candidateBytes = 0;
+    while (index < atoms.length && Buffer.compare(path, ownerPath(atoms[index])) === 0) {
+      const atom = atoms[index];
+      if (candidate.length > 0 && candidateBytes + atom.payload_bytes > config.unit_target_bytes) {
+        packed.push(makeUnit({ lineage: `root:path:${pathHash}:${ordinal}`, atoms: candidate }));
+        ordinal += 1;
+        candidate = [];
+        candidateBytes = 0;
+      }
+      candidate.push(atom);
+      candidateBytes += atom.payload_bytes;
+      index += 1;
+      if (candidate.length === 1 && (atom.oversized || candidateBytes > config.unit_target_bytes)) {
+        packed.push(makeUnit({ lineage: `root:path:${pathHash}:${ordinal}`, atoms: candidate, oversized: atom.oversized || candidateBytes > config.unit_target_bytes }));
+        ordinal += 1;
+        candidate = [];
+        candidateBytes = 0;
+      }
+    }
+    if (candidate.length > 0) packed.push(makeUnit({ lineage: `root:path:${pathHash}:${ordinal}`, atoms: candidate }));
+  }
+  return packed;
+}
+
+function coalesceUnits(units, maxFrontierUnits) {
+  const frontier = [...units];
+  while (frontier.length > maxFrontierUnits) {
+    let selected = 0;
+    for (let index = 1; index < frontier.length - 1; index += 1) {
+      const candidateBytes = frontier[index].unit_payload_bytes + frontier[index + 1].unit_payload_bytes;
+      const selectedBytes = frontier[selected].unit_payload_bytes + frontier[selected + 1].unit_payload_bytes;
+      if (candidateBytes < selectedBytes) selected = index;
+    }
+    const left = frontier[selected];
+    const right = frontier[selected + 1];
+    const atomPayloadBytes = [...left._atomPayloadBytes, ...right._atomPayloadBytes];
+    const lineage = `root:coalesced:${canonicalSha256([left.unit_lineage, right.unit_lineage])}`;
+    const merged = attachPayloadBytes({
+      unit_id: unitId(lineage, [...left.ordered_atom_ids, ...right.ordered_atom_ids], [left.unit_lineage, right.unit_lineage]),
+      unit_lineage: lineage,
+      ordered_atom_ids: [...left.ordered_atom_ids, ...right.ordered_atom_ids],
+      coalesced_from: [left.unit_lineage, right.unit_lineage],
+      unit_payload_bytes: left.unit_payload_bytes + right.unit_payload_bytes,
+      atomic: false,
+      oversized: left.oversized || right.oversized,
+    }, atomPayloadBytes);
+    frontier.splice(selected, 2, merged);
+  }
+  return frontier;
+}
+
+function validateManifest(manifest) {
+  exactKeys(manifest, MANIFEST_KEYS, "manifest");
+  if (manifest.schema_version !== 1 || manifest.status !== "complete" || manifest.mode !== "partition_shadow" || !SHA256.test(manifest.capture_hash) || !SHA256.test(manifest.manifest_hash)) throw new TypeError("manifest header is invalid");
+  exactKeys(manifest.configuration, ["atom_target_bytes", "unit_target_bytes", "max_frontier_units", "max_shadow_artifact_bytes"], "manifest configuration");
+  exactKeys(manifest.execution_projection, ["descriptors", "descriptor_content_hashes", "max_output_attempts", "projected_batches", "projected_model_calls"], "manifest execution projection");
+  if (!Array.isArray(manifest.atoms) || !Array.isArray(manifest.units) || manifest.execution_projection.projected_batches !== manifest.units.length) throw new TypeError("manifest arrays are invalid");
+  exactKeys(manifest.counts, ["atoms", "path_events", "text_atoms", "oversized_atoms", "coalesced_units", "by_raw_status", "by_content_kind"], "manifest counts");
+  exactKeys(manifest.sizes, ["atom_payload_bytes", "unit_payload_bytes"], "manifest sizes");
+  if (manifest.counts.atoms !== manifest.atoms.length || manifest.sizes.atom_payload_bytes !== manifest.atoms.reduce((total, atom) => total + atom.payload_bytes, 0) || manifest.sizes.unit_payload_bytes !== manifest.units.reduce((total, unit) => total + unit.unit_payload_bytes, 0)) throw new TypeError("manifest metrics are invalid");
+  const core = { ...manifest };
+  delete core.manifest_hash;
+  if (manifest.manifest_hash !== canonicalSha256(core)) throw new TypeError("manifest hash is invalid");
+  return manifest;
+}
+
+/** Builds the deterministic Stage 1 path-fallback shadow manifest. */
+export function buildPathFallbackManifest({ capture, atomization, config, executionProfile }) {
+  if (capture?.status !== "complete" || !SHA256.test(capture.capture_hash)) throw new TypeError("complete capture with capture_hash is required");
+  if (atomization?.status !== "complete" || !Array.isArray(atomization.atoms)) throw new TypeError("complete atomization is required");
+  const configValue = configuration(config);
+  const atoms = atomization.atoms.map((atom) => {
+    const payload = atomPayload(atom);
+    if (!SHA256.test(atom.content_hash) || !/^a:[0-9a-f]{64}$/.test(atom.atom_id) || canonicalSha256(payload) !== atom.content_hash) throw new TypeError("atom identity is invalid");
+    return { ...atom, oversized: atom.oversized === true, payload_bytes: Buffer.byteLength(canonicalJson(payload)) };
+  }).sort(atomComparator);
+  const units = coalesceUnits(packUnits(atoms, configValue), configValue.max_frontier_units);
+  const countsValue = {
+    atoms: atoms.length,
+    path_events: atoms.filter((atom) => atom.kind === "path_event").length,
+    text_atoms: atoms.filter((atom) => atom.kind === "text").length,
+    oversized_atoms: atoms.filter((atom) => atom.oversized).length,
+    coalesced_units: units.filter((unit) => unit.coalesced_from.length > 0).length,
+    by_raw_status: sortedObject(atoms.filter((atom) => atom.kind === "path_event").map((atom) => [atom.raw_status, 1]).reduce((entries, [key, value]) => entries.set(key, (entries.get(key) ?? 0) + value), new Map())),
+    by_content_kind: sortedObject(atoms.filter((atom) => atom.kind === "path_event").flatMap((atom) => atom.content_kinds).map((kind) => [kind, 1]).reduce((entries, [key, value]) => entries.set(key, (entries.get(key) ?? 0) + value), new Map())),
+  };
+  const manifestCore = {
+    schema_version: 1,
+    status: "complete",
+    mode: "partition_shadow",
+    capture_hash: capture.capture_hash,
+    benchmark_revision: configValue.benchmark_revision,
+    configuration: {
+      atom_target_bytes: configValue.atom_target_bytes,
+      unit_target_bytes: configValue.unit_target_bytes,
+      max_frontier_units: configValue.max_frontier_units,
+      max_shadow_artifact_bytes: configValue.max_shadow_artifact_bytes,
+    },
+    execution_projection: executionProjection(executionProfile, units.length),
+    atoms,
+    units,
+    counts: countsValue,
+    sizes: {
+      atom_payload_bytes: atoms.reduce((total, atom) => total + atom.payload_bytes, 0),
+      unit_payload_bytes: units.reduce((total, unit) => total + unit.unit_payload_bytes, 0),
+    },
+  };
+  return validateManifest({ ...manifestCore, manifest_hash: canonicalSha256(manifestCore) });
+}
+
+function withEncodedOutputSize(output) {
+  const sized = { ...output, sizes: { ...output.sizes, encoded_output_bytes: 0 } };
+  for (;;) {
+    const encodedLength = Buffer.byteLength(`${canonicalJson(sized)}\n`);
+    if (sized.sizes.encoded_output_bytes === encodedLength) return sized;
+    sized.sizes.encoded_output_bytes = encodedLength;
+  }
+}
+
+function redactedObjects(capture) {
+  return [...(capture.object_table ?? [])]
+    .map(({ object_id, object_type, modes, size, content_sha256 }) => ({ object_id, object_type, modes: [...modes], size, content_sha256 }))
+    .sort((left, right) => left.object_id.localeCompare(right.object_id));
+}
+
+function redactedAtoms(atoms) {
+  return atoms.map((atom) => ({
+    atom_id: atom.atom_id,
+    kind: atom.kind,
+    lineage_candidate: atom.lineage_candidate,
+    segment_ordinal: atom.segment_ordinal,
+    content_hash: atom.content_hash,
+    owner_path_base64: atom.owner_path_base64,
+    payload_bytes: atom.payload_bytes,
+    oversized: atom.oversized,
+    status_kind: atom.kind === "path_event" ? atom.status_kind : null,
+    content_kinds: atom.kind === "path_event" ? [...atom.content_kinds] : [],
+  }));
+}
+
+/** Returns the local-only complete capture and manifest envelope. */
+export function buildLocalShadowOutput(capture, manifest) {
+  validateManifest(manifest);
+  if (capture?.status !== "complete" || capture.capture_hash !== manifest.capture_hash) throw new TypeError("local output capture does not match manifest");
+  return { schema_version: 1, status: "complete", mode: "partition_shadow", capture, manifest };
+}
+
+/** Returns a source-redacted hosted complete or compacted shadow artifact. */
+export function buildHostedShadowOutput(capture, manifest, maxBytes) {
+  validateManifest(manifest);
+  positiveInteger(maxBytes, "maxBytes");
+  if (capture?.status !== "complete" || capture.capture_hash !== manifest.capture_hash) throw new TypeError("hosted output capture does not match manifest");
+  const complete = withEncodedOutputSize({
+    schema_version: 1,
+    status: "complete",
+    capture_hash: manifest.capture_hash,
+    mode: "partition_shadow",
+    manifest_hash: manifest.manifest_hash,
+    benchmark_revision: manifest.benchmark_revision,
+    configuration: manifest.configuration,
+    execution_projection: manifest.execution_projection,
+    objects: redactedObjects(capture),
+    atoms: redactedAtoms(manifest.atoms),
+    units: manifest.units.map((unit) => ({ ...unit })),
+    counts: manifest.counts,
+    sizes: { atom_payload_bytes: manifest.sizes.atom_payload_bytes, unit_payload_bytes: manifest.sizes.unit_payload_bytes },
+  });
+  exactKeys(complete, COMPLETE_OUTPUT_KEYS, "hosted complete output");
+  if (complete.sizes.encoded_output_bytes <= maxBytes) return complete;
+  const compacted = withEncodedOutputSize({
+    schema_version: 1,
+    status: "artifact_compacted",
+    mode: "partition_shadow",
+    capture_hash: manifest.capture_hash,
+    manifest_hash: manifest.manifest_hash,
+    benchmark_revision: manifest.benchmark_revision,
+    counts: manifest.counts,
+    sizes: {},
+    omitted: ["atoms", "units"],
+  });
+  exactKeys(compacted, COMPACT_OUTPUT_KEYS, "hosted compact output");
+  return compacted;
+}
+
+function truncateDiagnostic(value) {
+  const bytes = Buffer.from(String(value), "utf8");
+  if (bytes.length <= 512) return bytes.toString("utf8");
+  const maximum = 512 - Buffer.byteLength(TRUNCATION_SUFFIX);
+  let prefix = bytes.subarray(0, maximum).toString("utf8");
+  while (Buffer.byteLength(prefix) > maximum) prefix = prefix.slice(0, -1);
+  return `${prefix}${TRUNCATION_SUFFIX}`;
+}
+
+/** Builds a source-redacted, bounded diagnostic envelope. */
+export function buildShadowDiagnostic(details, maxBytes) {
+  positiveInteger(maxBytes, "maxBytes");
+  if (details === null || typeof details !== "object" || !DIAGNOSTIC_STATUSES.has(details.status)) throw new TypeError("shadow diagnostic status is invalid");
+  const captureHash = details.capture_hash ?? details.capture?.capture_hash ?? null;
+  const manifestHash = details.manifest_hash ?? details.manifest?.manifest_hash ?? null;
+  if (captureHash !== null && !SHA256.test(captureHash)) throw new TypeError("diagnostic capture hash is invalid");
+  if (manifestHash !== null && !SHA256.test(manifestHash)) throw new TypeError("diagnostic manifest hash is invalid");
+  if ((details.status === "capture_capacity_exceeded" || details.status === "capture_failed") && (captureHash !== null || manifestHash !== null)) throw new TypeError("capture diagnostics cannot have hashes");
+  if ((details.status === "atom_coverage_mismatch" || details.status === "planner_failed") && captureHash === null) throw new TypeError("complete-capture diagnostics require capture hash");
+  if (details.status === "atom_coverage_mismatch" && manifestHash !== null) throw new TypeError("atom diagnostics have invalid hashes");
+  const observed = details.observed_lower_bounds ?? {};
+  exactKeys(observed, ["patch_bytes", "raw_z_bytes", "blob_bytes", "blob_count", "elapsed_milliseconds"], "observed lower bounds");
+  for (const [key, value] of Object.entries(observed)) nonnegativeInteger(value, key);
+  const diagnostic = withEncodedOutputSize({
+    schema_version: 1,
+    status: details.status,
+    mode: "partition_shadow",
+    base_sha: details.base_sha ?? details.capture?.base_sha ?? "",
+    head_sha: details.head_sha ?? details.capture?.head_sha ?? "",
+    benchmark_revision: details.benchmark_revision ?? details.manifest?.benchmark_revision ?? "",
+    capture_hash: captureHash,
+    manifest_hash: manifestHash,
+    reason_codes: [...new Set(details.reason_codes ?? [])].sort(),
+    diagnostic: truncateDiagnostic(details.diagnostic ?? ""),
+    observed_lower_bounds: observed,
+    counts: details.counts ?? {},
+    sizes: {},
+  });
+  exactKeys(diagnostic, DIAGNOSTIC_KEYS, "shadow diagnostic");
+  if (!GIT_ID.test(diagnostic.base_sha) || !GIT_ID.test(diagnostic.head_sha) || typeof diagnostic.benchmark_revision !== "string" || diagnostic.benchmark_revision.length > 256 || diagnostic.reason_codes.some((reason) => typeof reason !== "string" || reason.length === 0)) throw new TypeError("shadow diagnostic fields are invalid");
+  return diagnostic;
+}
+
+/** Splits a non-atomic unit at its byte-balanced deterministic boundary. */
+export function splitUnit(unit) {
+  if (unit?.atomic || !Array.isArray(unit?.ordered_atom_ids) || unit.ordered_atom_ids.length < 2) throw new TypeError("atomic unit cannot be split");
+  const payloadBytes = unit._atomPayloadBytes ?? unit.atom_payload_bytes;
+  if (!Array.isArray(payloadBytes) || payloadBytes.length !== unit.ordered_atom_ids.length || payloadBytes.some((value) => !Number.isSafeInteger(value) || value < 0)) throw new TypeError("unit atom payload bytes are required for splitting");
+  let best = 1;
+  let prefix = payloadBytes[0];
+  let difference = Math.abs(prefix - (unit.unit_payload_bytes - prefix));
+  for (let index = 1; index < payloadBytes.length - 1; index += 1) {
+    prefix += payloadBytes[index];
+    const candidate = Math.abs(prefix - (unit.unit_payload_bytes - prefix));
+    if (candidate < difference) {
+      best = index + 1;
+      difference = candidate;
+    }
+  }
+  const child = (suffix, ids, bytes) => attachPayloadBytes({
+    unit_id: unitId(`${unit.unit_lineage}/${suffix}`, ids, []),
+    unit_lineage: `${unit.unit_lineage}/${suffix}`,
+    ordered_atom_ids: ids,
+    coalesced_from: [],
+    unit_payload_bytes: bytes.reduce((total, value) => total + value, 0),
+    atomic: ids.length === 1,
+    oversized: false,
+  }, bytes);
+  return [
+    child(0, unit.ordered_atom_ids.slice(0, best), payloadBytes.slice(0, best)),
+    child(1, unit.ordered_atom_ids.slice(best), payloadBytes.slice(best)),
+  ];
+}
+
+/** Validates the versioned literal evaluator fixture. */
+export function validatePartitionShadowEvaluatorFixture(value) {
+  exactKeys(value, ["schema_version", "benchmark_revision", "repository_fixture", "capture_hash", "expected"], "evaluator fixture");
+  if (value.schema_version !== 1 || !SHA256.test(value.capture_hash)) throw new TypeError("evaluator fixture header is invalid");
+  boundedString(value.benchmark_revision, "benchmark_revision");
+  boundedString(value.repository_fixture, "repository_fixture");
+  exactKeys(value.expected, ["atom_counts", "unit_count", "oversized_atoms", "coalesced_units", "projected_batches", "projected_model_calls"], "evaluator expected");
+  exactKeys(value.expected.atom_counts, ["path_events", "text_atoms"], "evaluator atom counts");
+  for (const [key, metric] of Object.entries(value.expected.atom_counts)) nonnegativeInteger(metric, key);
+  for (const [key, metric] of Object.entries(value.expected)) if (key !== "atom_counts") nonnegativeInteger(metric, key);
+  if (value.expected.unit_count === 0 || value.expected.projected_batches === 0 || value.expected.projected_model_calls === 0) throw new TypeError("evaluator expected positive metrics are invalid");
+  return value;
+}
+
+function writeShadowOutput(path, value) {
+  try {
+    if (lstatSync(path).isSymbolicLink()) throw new TypeError("output path must not be a symlink");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const temporary = join(dirname(path), `.${Date.now()}-${process.pid}-review-units.tmp`);
+  writeFileSync(temporary, `${canonicalJson(value)}\n`, { mode: 0o600 });
+  renameSync(temporary, path);
+}
+
+function shadowUsage() {
+  return "usage: node scripts/review-units.mjs shadow --capture CAPTURE_JSON --profile PROFILE_JSON --config CONFIG_JSON [--local-out LOCAL_JSON] [--diagnostics-out DIAGNOSTIC_JSON]\n";
+}
+
+function parseShadowArgs(argv) {
+  if (argv[0] !== "shadow") throw new TypeError(shadowUsage());
+  const options = {};
+  for (let index = 1; index < argv.length; index += 2) {
+    const key = argv[index];
+    const value = argv[index + 1];
+    if (!["--capture", "--profile", "--config", "--local-out", "--diagnostics-out"].includes(key) || !value || Object.hasOwn(options, key)) throw new TypeError(shadowUsage());
+    options[key] = value;
+  }
+  if (!options["--capture"] || !options["--profile"] || !options["--config"]) throw new TypeError(shadowUsage());
+  return options;
+}
+
+function shadowDiagnosticFromCapture(capture, benchmarkRevision) {
+  return buildShadowDiagnostic({
+    status: capture.status,
+    base_sha: capture.base_sha,
+    head_sha: capture.head_sha,
+    benchmark_revision: benchmarkRevision,
+    reason_codes: [capture.capacity_reason ?? "process_error"],
+    diagnostic: "Shadow capture did not complete.",
+    observed_lower_bounds: capture.observed_lower_bounds,
+    counts: {},
+  }, Number.MAX_SAFE_INTEGER);
+}
+
+function main(argv) {
+  let options;
+  try {
+    options = parseShadowArgs(argv);
+  } catch (error) {
+    process.stderr.write(`${error.message}\n`);
+    return 2;
+  }
+  try {
+    const capture = JSON.parse(readFileSync(options["--capture"], "utf8"));
+    const profile = JSON.parse(readFileSync(options["--profile"], "utf8"));
+    const config = JSON.parse(readFileSync(options["--config"], "utf8"));
+    const diagnostic = capture.status === "complete"
+      ? (() => {
+        try {
+          const atomization = atomizeCapturedReviewInput(capture);
+          if (atomization.status !== "complete") return buildShadowDiagnostic({
+            status: "atom_coverage_mismatch", capture, benchmark_revision: config.benchmark_revision,
+            reason_codes: atomization.reasons, diagnostic: "Shadow atom coverage did not match capture.",
+            observed_lower_bounds: { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 },
+            counts: atomization.counts,
+          }, config.max_shadow_artifact_bytes);
+          const manifest = buildPathFallbackManifest({ capture, atomization, config, executionProfile: profile });
+          if (options["--local-out"]) writeShadowOutput(options["--local-out"], buildLocalShadowOutput(capture, manifest));
+          if (options["--diagnostics-out"]) writeShadowOutput(options["--diagnostics-out"], buildHostedShadowOutput(capture, manifest, config.max_shadow_artifact_bytes));
+          return null;
+        } catch (error) {
+          return buildShadowDiagnostic({
+            status: "planner_failed", capture, benchmark_revision: config.benchmark_revision,
+            reason_codes: ["planner_error"], diagnostic: error.message,
+            observed_lower_bounds: { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 },
+            counts: {},
+          }, config.max_shadow_artifact_bytes);
+        }
+      })()
+      : shadowDiagnosticFromCapture(capture, config.benchmark_revision);
+    if (diagnostic !== null) {
+      if (options["--local-out"]) writeShadowOutput(options["--local-out"], diagnostic);
+      if (options["--diagnostics-out"]) writeShadowOutput(options["--diagnostics-out"], diagnostic);
+    }
+    return 0;
+  } catch (error) {
+    process.stderr.write(`${error.message}\n`);
+    return 1;
+  }
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) process.exitCode = main(process.argv.slice(2));
