@@ -912,6 +912,207 @@ exit 1
   assert.equal(envFileValues(outputFile).ref, sha);
 });
 
+test("partition shadow is an isolated opt-in hosted diagnostic", () => {
+  const source = readFileSync(workflow, "utf8");
+  const inputs = source.match(/^    inputs:\n[\s\S]*?(?=^    secrets:)/m)?.[0];
+  const shadowJob = source.slice(source.indexOf("  partition-shadow:\n"));
+
+  assert.ok(inputs);
+  assert.match(inputs, /^      partition_shadow:\n        description: Compute diagnostic-only partition manifests after review\.\n        type: boolean\n        default: false$/m);
+  assert.ok(shadowJob);
+  assert.match(shadowJob, /^    needs: review$/m);
+  assert.match(shadowJob, /^    if: \$\{\{ always\(\) && inputs\.partition_shadow \}\}$/m);
+  assert.match(shadowJob, /^    continue-on-error: true$/m);
+  assert.match(shadowJob, /^    timeout-minutes: 5$/m);
+  assert.match(shadowJob, /^    permissions:\n      contents: read$/m);
+  assert.doesNotMatch(shadowJob, /OPENROUTER_API_KEY|run-review\.sh|omp(?:_version|_VERSION)?|pull-requests:\s*write|pull_requests.*write/);
+  assert.match(shadowJob, /review-capture\.mjs/);
+  assert.match(shadowJob, /review-units\.mjs/);
+  assert.match(shadowJob, /review-partition-shadow\.json/);
+  assert.match(shadowJob, /name: agentic-review-partition-shadow/);
+  assert.match(shadowJob, /retention-days: 7/);
+  assert.match(shadowJob, /ref: \$\{\{ steps\.target\.outputs\.head \}\}/);
+  assert.match(shadowJob, /persist-credentials: false/);
+  assert.match(shadowJob, /permissions: \{ contents: "read", pull_requests: "read" \}/);
+  assert.match(shadowJob, /atomikpanda\/agentic-review/);
+  assert.ok(
+    shadowJob.indexOf("strip target agent configuration")
+      < shadowJob.indexOf("capture partition shadow diagnostics"),
+  );
+  assert.doesNotMatch(shadowJob, /^\s+outputs:/m);
+  assert.doesNotMatch(source.match(/^  review:\n[\s\S]*?(?=^  [a-zA-Z][\w-]+:|\z)/m)?.[0] ?? "", /review-partition-shadow\.json/);
+  assert.doesNotMatch(
+    source.match(/^  workflow_call:\n    outputs:\n[\s\S]*?(?=^    inputs:)/m)?.[0] ?? "",
+    /partition.shadow/i,
+  );
+});
+
+test("partition shadow independently resolves immutable same-repository and App targets", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "partition-shadow-target-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const bin = join(directory, "bin");
+  const outputFile = join(directory, "github-output");
+  mkdirSync(bin);
+  const gh = join(bin, "gh");
+  writeFileSync(gh, `#!/usr/bin/env bash
+case "$*" in
+  *'--jq .state') printf 'open\\n' ;;
+  *'--jq .draft') printf 'false\\n' ;;
+  *'--jq .head.repo.full_name == .base.repo.full_name') printf 'true\\n' ;;
+  *'--jq .base.sha') printf '%s\\n' "${"b".repeat(40)}" ;;
+  *'--jq .head.sha') printf '%s\\n' "${"h".repeat(40)}" ;;
+  *) exit 2 ;;
+esac
+`);
+  const node = join(bin, "node");
+  writeFileSync(node, `#!/usr/bin/env bash
+if [ "\${1##*/}" = partition-shadow-app-token.mjs ]; then
+  printf 'partition-shadow-read-token'
+  exit 0
+fi
+exec "$REAL_NODE" "$@"
+`);
+  chmodSync(gh, 0o755);
+  chmodSync(node, 0o755);
+  const resolve = (env) => {
+    rmSync(outputFile, { force: true });
+    const result = spawnSync("bash", ["-c", workflowRunStep("resolve partition shadow target")], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        ...env,
+        PATH: `${bin}:${process.env.PATH}`,
+        REAL_NODE: process.execPath,
+        GITHUB_OUTPUT: outputFile,
+        GITHUB_REPOSITORY: "owner/repo",
+        RUNNER_TEMP: directory,
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(existsSync(outputFile), `${result.stdout}\n${result.stderr}`);
+    return envFileValues(outputFile);
+  };
+
+  const sameRepository = resolve({ IN_REPO: "owner/repo", IN_PR: "7", GH_TOKEN: "read-token" });
+  assert.deepEqual(sameRepository, {
+    repo: "owner/repo",
+    pr: "7",
+    base: "b".repeat(40),
+    head: "h".repeat(40),
+    eligible: "true",
+  });
+
+  const app = resolve({
+    IN_REPO: "other/repo",
+    IN_PR: "9",
+    APP_ID: "1",
+    APP_PRIVATE_KEY: "test-key",
+  });
+  assert.deepEqual(app, {
+    repo: "other/repo",
+    pr: "9",
+    base: "b".repeat(40),
+    head: "h".repeat(40),
+    token: "partition-shadow-read-token",
+    eligible: "true",
+  });
+});
+
+test("partition shadow installer forwarding is explicit and defaults off", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "install-review-shadow-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const bin = join(directory, "bin");
+  const log = join(directory, "gh.log");
+  mkdirSync(bin);
+  const gh = join(bin, "gh");
+
+  writeFileSync(gh, `#!/usr/bin/env bash
+case "\${1:-} \${2:-}" in
+  "auth status") printf "Token scopes: 'repo', 'workflow'\\n"; exit 0 ;;
+  "repo view") exit 0 ;;
+  "secret list") printf "OPENROUTER_API_KEY\\n"; exit 0 ;;
+esac
+if [ "\${1:-}" = api ]; then
+  for arg in "$@"; do
+    if [ "$arg" = PUT ]; then printf '%s\\n' "$@" > "$GH_LOG"; exit 0; fi
+  done
+  exit 1
+fi
+exit 1
+`);
+  chmodSync(gh, 0o755);
+  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, GH_LOG: log };
+  const install = (args) => {
+    rmSync(log, { force: true });
+    const result = spawnSync("bash", [installer, "--repo", "owner/repo", "--no-pr-agent", "--yes", ...args], {
+      encoding: "utf8",
+      env,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const encoded = readFileSync(log, "utf8").split("\n")
+      .find((line) => line.startsWith("content="))?.slice("content=".length);
+    return Buffer.from(encoded, "base64").toString("utf8");
+  };
+
+  assert.doesNotMatch(install([]), /^      partition_shadow:/m);
+  assert.match(install(["--partition-shadow"]), /^      partition_shadow: true$/m);
+});
+test("partition shadow strips target configuration and records bounded helper diagnostics separately", (t) => {
+  const fixture = createFixture(t, {
+    targetFiles: { ".omp/mcp.json": '{"mcpServers":{"untrusted":{"command":"false"}}}\n' },
+  });
+  const support = join(fixture.repository, ".partition-shadow-support", "scripts");
+  mkdirSync(support, { recursive: true });
+  for (const name of [
+    "lib-canonical-json.mjs",
+    "review-capture.mjs",
+    "review-units.mjs",
+    "strip-agent-config.sh",
+  ]) {
+    copyFileSync(join(trustedRoot, "scripts", name), join(support, name));
+  }
+  const resultFile = join(fixture.directory, "authoritative-review-result.json");
+  const outputFile = join(fixture.directory, "review-partition-shadow.json");
+  writeFileSync(resultFile, "authoritative result\n");
+  const env = {
+    ...process.env,
+    GITHUB_WORKSPACE: fixture.repository,
+    RUNNER_TEMP: fixture.directory,
+    SUPPORT_ROOT: dirname(support),
+    BASE_SHA: fixture.baseSha,
+    HEAD_SHA: fixture.headSha,
+    PARTITION_SHADOW_OUTPUT: outputFile,
+  };
+
+  const stripped = spawnSync("bash", ["-c", workflowRunStep("strip target agent configuration")], {
+    encoding: "utf8",
+    env,
+  });
+  assert.equal(stripped.status, 0, stripped.stderr);
+  assert.equal(existsSync(join(fixture.repository, ".omp")), false);
+
+  const captured = spawnSync("bash", ["-c", workflowRunStep("capture partition shadow diagnostics")], {
+    encoding: "utf8",
+    env,
+  });
+  assert.equal(captured.status, 0, captured.stderr);
+  const diagnostic = JSON.parse(readFileSync(outputFile, "utf8"));
+  assert.ok(["complete", "artifact_compacted"].includes(diagnostic.status));
+  assert.ok(Buffer.byteLength(JSON.stringify(diagnostic)) <= 4194304);
+  assert.doesNotMatch(JSON.stringify(diagnostic), /content_base64/);
+  assert.equal(readFileSync(resultFile, "utf8"), "authoritative result\n");
+
+  writeFileSync(join(support, "review-capture.mjs"), "#!/usr/bin/env bash\nexit 1\n");
+  chmodSync(join(support, "review-capture.mjs"), 0o755);
+  const failedCapture = spawnSync("bash", ["-c", workflowRunStep("capture partition shadow diagnostics")], {
+    encoding: "utf8",
+    env,
+  });
+  assert.equal(failedCapture.status, 0, failedCapture.stderr);
+  assert.equal(JSON.parse(readFileSync(outputFile, "utf8")).status, "capture_failed");
+  assert.equal(readFileSync(resultFile, "utf8"), "authoritative result\n");
+});
+
 test("runner rejects passthrough prompt and envelope changes before OMP", (t) => {
   for (const extra of [
     ["--"],
