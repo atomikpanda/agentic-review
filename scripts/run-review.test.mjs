@@ -4750,6 +4750,46 @@ test("findings and publication destinations cannot resolve to the same file", (t
   assert.equal(symlinkAlias.logs.length, 0);
   assert.match(symlinkAlias.result.stderr, /--out.*--publication-out|same destination/);
 });
+test("execution profile destination cannot collide with review artifacts", (t) => {
+  const plan = {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  };
+  const fixture = createFixture(t);
+  const destinations = {
+    findings: join(fixture.directory, "findings.json"),
+    publication: join(fixture.directory, "publication.json"),
+    diagnostics: join(fixture.directory, "pass-diagnostics.json"),
+    shadow: join(fixture.directory, "partition-shadow.json"),
+  };
+  for (const [label, args] of [
+    ["findings", []],
+    ["publication", []],
+    ["diagnostics", ["--diagnostics-out", destinations.diagnostics]],
+    ["shadow", ["--partition-shadow", "--partition-shadow-out", destinations.shadow]],
+  ]) {
+    const destination = destinations[label];
+    const profileDestination = label === "findings"
+      ? `${fixture.directory}/./findings.json`
+      : destination;
+    const stale = `${JSON.stringify({ stale: label })}\n`;
+    writeFileSync(destination, stale);
+    const run = runReview(t, plan, {
+      existingFixture: fixture,
+      args: [...args, "--execution-profile-out", profileDestination, "--json"],
+    });
+
+    assert.notEqual(run.result.status, 0, `${label}: ${run.result.stderr}`);
+    assert.equal(run.logs.length, 0, `${label}: model execution must not start`);
+    assert.match(
+      run.result.stderr,
+      /--execution-profile-out must be distinct from review output destinations/,
+      label,
+    );
+    assert.equal(readFileSync(destination, "utf8"), stale, `${label}: output must remain intact`);
+  }
+});
 
 test("symlink artifact destinations are rejected before model work without replacing outputs", (t) => {
   const plan = {

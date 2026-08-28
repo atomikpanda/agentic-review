@@ -349,6 +349,18 @@ if [ "$PARTITION_SHADOW" = 1 ]; then
   fi
   PARTITION_SHADOW_OUT_FD_PATH="/proc/self/fd/$PARTITION_SHADOW_OUT_DIR_FD/$PARTITION_SHADOW_OUT_NAME"
 fi
+if [ -n "$EXECUTION_PROFILE_OUT" ] && [ ! -L "$EXECUTION_PROFILE_OUT" ]; then
+  EXECUTION_PROFILE_OUT_IDENTITY="$(destination_identity "$EXECUTION_PROFILE_OUT")"
+  if { [ -n "$OUT" ] && [ "$EXECUTION_PROFILE_OUT_IDENTITY" = "$OUT_IDENTITY" ]; } \
+     || { [ -n "$PUBLICATION_OUT" ] \
+       && [ "$EXECUTION_PROFILE_OUT_IDENTITY" = "$PUBLICATION_IDENTITY" ]; } \
+     || { [ -n "$DIAGNOSTICS_OUT" ] \
+       && [ "$EXECUTION_PROFILE_OUT_IDENTITY" = "$DIAGNOSTICS_IDENTITY" ]; } \
+     || { [ "$PARTITION_SHADOW" = 1 ] \
+       && [ "$EXECUTION_PROFILE_OUT_IDENTITY" = "$PARTITION_SHADOW_OUT_IDENTITY" ]; }; then
+    die "--execution-profile-out must be distinct from review output destinations"
+  fi
+fi
 if [ -n "$EXECUTION_PROFILE_OUT" ]; then
   if [ -L "$EXECUTION_PROFILE_OUT" ] \
      || ! rm -f -- "$EXECUTION_PROFILE_OUT"; then
