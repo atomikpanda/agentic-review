@@ -931,7 +931,7 @@ test("partition shadow is an isolated opt-in hosted diagnostic", () => {
   assert.match(dispatch, /^      partition_shadow:\n        description: Compute diagnostic-only partition manifests after review\.\n        type: boolean\n        default: false$/m);
   assert.ok(shadowJob);
   assert.match(shadowJob, /^    needs: review$/m);
-  assert.match(shadowJob, /^    if: \$\{\{ always\(\) && inputs\.partition_shadow && needs\.review\.outputs\.shadow_eligible == 'true' && \(needs\.review\.result == 'success' \|\| needs\.review\.result == 'failure'\) \}\}$/m);
+  assert.match(shadowJob, /^    if: \$\{\{ always\(\) && inputs\.partition_shadow && needs\.review\.outputs\.shadow_eligible == 'true' && needs\.review\.outputs\.shadow_ran == 'true' && \(needs\.review\.result == 'success' \|\| needs\.review\.result == 'failure'\) \}\}$/m);
   assert.match(shadowJob, /^    continue-on-error: true$/m);
   assert.match(shadowJob, /^    timeout-minutes: 5$/m);
   assert.match(shadowJob, /^    permissions:\n      contents: read\n      pull-requests: read$/m);
@@ -1437,7 +1437,7 @@ if (import.meta.url === \`file://\${process.argv[1]}\`) process.exit(1);
     });
     assert.equal(result.status, 0, `${profile === undefined ? "missing" : "malformed"} profile: ${result.stderr}`);
     const diagnostic = JSON.parse(readFileSync(outputFile, "utf8"));
-    assert.equal(diagnostic.status, "capture_failed");
+    assert.equal(diagnostic.status, "capture_capacity_exceeded");
     assert.equal(diagnostic.capture_hash, null);
     assert.equal(diagnostic.manifest_hash, null);
     assert.ok(Buffer.byteLength(JSON.stringify(diagnostic)) <= 4194304);
