@@ -6313,8 +6313,8 @@ test("partition shadow helper exits publish bounded redacted local diagnostics",
     const fixture = createFixture(t);
     const nodeWrapper = join(fixture.bin, "node");
     writeFileSync(nodeWrapper, `#!/usr/bin/env bash
-case "\${1##*/}:\${FAKE_SHADOW_FAIL_HELPER}" in
-  review-capture.mjs:capture|review-units.mjs:units)
+case "\${1##*/}:\${FAKE_SHADOW_FAIL_HELPER}:\${2:-}" in
+  review-capture.mjs:capture:capture|review-units.mjs:units:shadow)
     printf '%600s' x | tr ' ' x >&2
     printf '%s\\n' ' secret-reviewed-bytes' >&2
     exit 91
@@ -6341,4 +6341,38 @@ exec "\${REAL_NODE}" "$@"
     assert.ok(Buffer.byteLength(diagnostic.diagnostic) <= 512);
     assert.doesNotMatch(diagnostic.diagnostic, /secret-reviewed-bytes/);
   }
+});
+
+test("partition shadow rejects a zero-exit helper's forged staged output", (t) => {
+  const fixture = createFixture(t);
+  const nodeWrapper = join(fixture.bin, "node");
+  writeFileSync(nodeWrapper, `#!/usr/bin/env bash
+if [ "\${1##*/}" = review-units.mjs ] && [ "\${2:-}" = shadow ]; then
+  shift 2
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = --local-out ]; then
+      printf '%s\\n' '{"status":"complete","forged":true}' > "$2"
+      exit 0
+    fi
+    shift
+  done
+fi
+exec "\${REAL_NODE}" "$@"
+`);
+  chmodSync(nodeWrapper, 0o755);
+  const shadowFile = join(fixture.directory, "partition-shadow.json");
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    existingFixture: fixture,
+    args: ["--partition-shadow", "--partition-shadow-out", shadowFile, "--json"],
+  });
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.match(run.result.stderr, /partition shadow: planner_failed/);
+  const diagnostic = JSON.parse(readFileSync(shadowFile, "utf8"));
+  assert.equal(diagnostic.status, "planner_failed");
+  assert.equal(Object.hasOwn(diagnostic, "forged"), false);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
 });

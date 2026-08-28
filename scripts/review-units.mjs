@@ -317,7 +317,40 @@ function projectTextAtoms(record, section, sectionIndex, atomTargetBytes) {
       let oldCursor = block[0].oldBefore;
       let newCursor = block[0].newBefore;
       let candidate;
-      const start = () => ({ oldStart: oldCursor, newStart: newCursor, oldLines: [], newLines: [], owners: [] });
+      const start = () => {
+        const oldStart = oldCursor;
+        const newStart = newCursor;
+        return {
+          oldStart,
+          newStart,
+          oldLines: [],
+          newLines: [],
+          owners: [],
+          oldLineEntryBytes: 0,
+          newLineEntryBytes: 0,
+          emptyPayloadBytes: Buffer.byteLength(canonicalJson(
+            textPayload(record, oldStart, newStart, [], [], section.oldFinalNewline, section.newFinalNewline),
+          )),
+        };
+      };
+      const prospectivePayloadBytes = (value, side, lineEntryBytes) => {
+        const oldCount = value.oldLines.length + (side === "old" ? 1 : 0);
+        const newCount = value.newLines.length + (side === "new" ? 1 : 0);
+        const oldEntries = value.oldLineEntryBytes + (side === "old" ? lineEntryBytes : 0);
+        const newEntries = value.newLineEntryBytes + (side === "new" ? lineEntryBytes : 0);
+        return value.emptyPayloadBytes
+          + oldEntries + Math.max(0, oldCount - 1)
+          + newEntries + Math.max(0, newCount - 1)
+          + String(oldCount).length - 1
+          + String(newCount).length - 1;
+      };
+      const append = (value, event, lineEntryBytes, payloadBytes) => {
+        const lineKey = `${sectionIndex}:${hunk.index}:${event.side}:${event.lineIndex}`;
+        value[event.side === "old" ? "oldLines" : "newLines"].push(event.line);
+        value[event.side === "old" ? "oldLineEntryBytes" : "newLineEntryBytes"] += lineEntryBytes;
+        value.owners.push(lineKey);
+        value.payloadBytes = payloadBytes;
+      };
       const finish = () => {
         if (!candidate || candidate.owners.length === 0) return;
         const payload = textPayload(record, candidate.oldStart, candidate.newStart, candidate.oldLines, candidate.newLines, section.oldFinalNewline, section.newFinalNewline);
@@ -326,20 +359,15 @@ function projectTextAtoms(record, section, sectionIndex, atomTargetBytes) {
       };
       for (const event of block) {
         if (!candidate) candidate = start();
-        const prospective = { ...candidate, oldLines: [...candidate.oldLines], newLines: [...candidate.newLines] };
-        prospective[event.side === "old" ? "oldLines" : "newLines"].push(event.line);
-        prospective.owners = [...candidate.owners, `${sectionIndex}:${hunk.index}:${event.side}:${event.lineIndex}`];
-        const prospectivePayload = textPayload(record, prospective.oldStart, prospective.newStart, prospective.oldLines, prospective.newLines, section.oldFinalNewline, section.newFinalNewline);
-        if (candidate.owners.length > 0 && Buffer.byteLength(canonicalJson(prospectivePayload)) > atomTargetBytes) {
+        const lineEntryBytes = Buffer.byteLength(canonicalJson(event.line));
+        let payloadBytes = prospectivePayloadBytes(candidate, event.side, lineEntryBytes);
+        if (candidate.owners.length > 0 && payloadBytes > atomTargetBytes) {
           finish();
           candidate = start();
+          payloadBytes = prospectivePayloadBytes(candidate, event.side, lineEntryBytes);
         }
-        candidate[event.side === "old" ? "oldLines" : "newLines"].push(event.line);
-        candidate.owners.push(`${sectionIndex}:${hunk.index}:${event.side}:${event.lineIndex}`);
-        if (candidate.owners.length === 1) {
-          const oneLine = textPayload(record, candidate.oldStart, candidate.newStart, candidate.oldLines, candidate.newLines, section.oldFinalNewline, section.newFinalNewline);
-          candidate.oversized = Buffer.byteLength(canonicalJson(oneLine)) > atomTargetBytes;
-        }
+        append(candidate, event, lineEntryBytes, payloadBytes);
+        if (candidate.owners.length === 1) candidate.oversized = payloadBytes > atomTargetBytes;
         if (event.side === "old") oldCursor += 1;
         else newCursor += 1;
       }
@@ -480,6 +508,12 @@ const MANIFEST_KEYS = Object.freeze([
   "schema_version", "status", "mode", "capture_hash", "benchmark_revision", "configuration",
   "execution_projection", "atoms", "units", "counts", "sizes", "manifest_hash",
 ]);
+const MANIFEST_COUNT_KEYS = Object.freeze([
+  "atoms", "path_events", "text_atoms", "oversized_atoms", "coalesced_units",
+  "by_raw_status", "by_content_kind",
+]);
+const MANIFEST_SIZE_KEYS = Object.freeze(["atom_payload_bytes", "unit_payload_bytes"]);
+const LOCAL_OUTPUT_KEYS = Object.freeze(["schema_version", "status", "mode", "capture", "manifest"]);
 const COMPLETE_OUTPUT_KEYS = Object.freeze([
   "schema_version", "status", "capture_hash", "mode", "manifest_hash", "benchmark_revision",
   "configuration", "execution_projection", "objects", "atoms", "units", "counts", "sizes",
@@ -696,7 +730,21 @@ function validateManifest(manifest) {
   exactKeys(manifest.configuration, ["atom_target_bytes", "unit_target_bytes", "max_frontier_units", "max_shadow_artifact_bytes"], "manifest configuration");
   validateExecutionProjection(manifest.execution_projection, Array.isArray(manifest.units) ? manifest.units.length : -1);
   if (!Array.isArray(manifest.atoms) || !Array.isArray(manifest.units)) throw new TypeError("manifest arrays are invalid");
-  if (manifest.counts.atoms !== manifest.atoms.length || manifest.sizes.atom_payload_bytes !== manifest.atoms.reduce((total, atom) => total + atom.payload_bytes, 0) || manifest.sizes.unit_payload_bytes !== manifest.units.reduce((total, unit) => total + unit.unit_payload_bytes, 0)) throw new TypeError("manifest metrics are invalid");
+  exactKeys(manifest.counts, MANIFEST_COUNT_KEYS, "manifest counts");
+  exactKeys(manifest.sizes, MANIFEST_SIZE_KEYS, "manifest sizes");
+  for (const key of ["atoms", "path_events", "text_atoms", "oversized_atoms", "coalesced_units"]) nonnegativeInteger(manifest.counts[key], `manifest counts ${key}`);
+  for (const key of ["by_raw_status", "by_content_kind"]) {
+    if (manifest.counts[key] === null || typeof manifest.counts[key] !== "object" || Array.isArray(manifest.counts[key])) throw new TypeError(`manifest counts ${key} is invalid`);
+    for (const value of Object.values(manifest.counts[key])) nonnegativeInteger(value, `manifest counts ${key}`);
+  }
+  for (const key of MANIFEST_SIZE_KEYS) nonnegativeInteger(manifest.sizes[key], `manifest sizes ${key}`);
+  if (manifest.counts.atoms !== manifest.atoms.length
+    || manifest.counts.path_events !== manifest.atoms.filter((atom) => atom.kind === "path_event").length
+    || manifest.counts.text_atoms !== manifest.atoms.filter((atom) => atom.kind === "text").length
+    || manifest.counts.oversized_atoms !== manifest.atoms.filter((atom) => atom.oversized).length
+    || manifest.counts.coalesced_units !== manifest.units.filter((unit) => unit.coalesced_from.length > 0).length
+    || manifest.sizes.atom_payload_bytes !== manifest.atoms.reduce((total, atom) => total + atom.payload_bytes, 0)
+    || manifest.sizes.unit_payload_bytes !== manifest.units.reduce((total, unit) => total + unit.unit_payload_bytes, 0)) throw new TypeError("manifest metrics are invalid");
   for (const unit of manifest.units) validateUnit(unit);
   const core = { ...manifest };
   delete core.manifest_hash;
@@ -870,6 +918,89 @@ export function buildShadowDiagnostic(details, maxBytes) {
   return requireOutputWithinCap(diagnostic, maxBytes);
 }
 
+function validateManifestConfiguration(value) {
+  exactKeys(value, ["atom_target_bytes", "unit_target_bytes", "max_frontier_units", "max_shadow_artifact_bytes"], "manifest configuration");
+  const atomTarget = positiveInteger(value.atom_target_bytes, "manifest atom_target_bytes");
+  if (positiveInteger(value.unit_target_bytes, "manifest unit_target_bytes") < atomTarget) throw new TypeError("manifest unit target is invalid");
+  positiveInteger(value.max_frontier_units, "manifest max_frontier_units");
+  positiveInteger(value.max_shadow_artifact_bytes, "manifest max_shadow_artifact_bytes");
+}
+
+function validateOutputEncodedSize(value, maxBytes, sizeKeys = ["encoded_output_bytes"]) {
+  positiveInteger(maxBytes, "maxBytes");
+  exactKeys(value.sizes, sizeKeys, "output sizes");
+  const encodedBytes = Buffer.byteLength(`${canonicalJson(value)}\n`);
+  if (value.sizes.encoded_output_bytes !== encodedBytes) throw new TypeError("output encoded byte size is invalid");
+  requireOutputWithinCap(value, maxBytes);
+}
+
+function validateDiagnosticOutput(value, maxBytes) {
+  exactKeys(value, DIAGNOSTIC_KEYS, "shadow diagnostic");
+  if (value.schema_version !== 1 || !DIAGNOSTIC_STATUSES.has(value.status) || value.mode !== "partition_shadow") throw new TypeError("shadow diagnostic header is invalid");
+  if (!GIT_ID.test(value.base_sha) || !GIT_ID.test(value.head_sha) || typeof value.benchmark_revision !== "string" || value.benchmark_revision.length > 256) throw new TypeError("shadow diagnostic fields are invalid");
+  if (value.capture_hash !== null && !SHA256.test(value.capture_hash)) throw new TypeError("diagnostic capture hash is invalid");
+  if (value.manifest_hash !== null && !SHA256.test(value.manifest_hash)) throw new TypeError("diagnostic manifest hash is invalid");
+  if ((value.status === "capture_capacity_exceeded" || value.status === "capture_failed") && (value.capture_hash !== null || value.manifest_hash !== null)) throw new TypeError("capture diagnostics cannot have hashes");
+  if ((value.status === "atom_coverage_mismatch" || value.status === "planner_failed") && value.capture_hash === null) throw new TypeError("complete-capture diagnostics require capture hash");
+  if (value.status === "atom_coverage_mismatch" && value.manifest_hash !== null) throw new TypeError("atom diagnostics have invalid hashes");
+  if (!Array.isArray(value.reason_codes) || value.reason_codes.some((reason, index) => typeof reason !== "string" || reason.length === 0 || reason.length > 256 || (index > 0 && value.reason_codes[index - 1] >= reason))) throw new TypeError("diagnostic reason codes are invalid");
+  if (typeof value.diagnostic !== "string" || Buffer.byteLength(value.diagnostic) > 512 || value.counts === null || typeof value.counts !== "object" || Array.isArray(value.counts)) throw new TypeError("shadow diagnostic payload is invalid");
+  exactKeys(value.observed_lower_bounds, ["patch_bytes", "raw_z_bytes", "blob_bytes", "blob_count", "elapsed_milliseconds"], "observed lower bounds");
+  for (const [key, metric] of Object.entries(value.observed_lower_bounds)) nonnegativeInteger(metric, key);
+  validateOutputEncodedSize(value, maxBytes);
+}
+
+function validateHostedCompleteOutput(value, maxBytes) {
+  exactKeys(value, COMPLETE_OUTPUT_KEYS, "hosted complete output");
+  if (value.schema_version !== 1 || value.status !== "complete" || value.mode !== "partition_shadow" || !SHA256.test(value.capture_hash) || !SHA256.test(value.manifest_hash) || typeof value.benchmark_revision !== "string" || value.benchmark_revision.length > 256) throw new TypeError("hosted complete output header is invalid");
+  validateManifestConfiguration(value.configuration);
+  if (!Array.isArray(value.objects) || !Array.isArray(value.atoms) || !Array.isArray(value.units)) throw new TypeError("hosted complete output arrays are invalid");
+  validateExecutionProjection(value.execution_projection, value.units.length);
+  for (const object of value.objects) {
+    exactKeys(object, ["object_id", "object_type", "modes", "size", "content_sha256"], "hosted object");
+    if (!GIT_ID.test(object.object_id) || typeof object.object_type !== "string" || !Array.isArray(object.modes) || object.modes.some((mode) => typeof mode !== "string") || !Number.isSafeInteger(object.size) || object.size < 0 || !SHA256.test(object.content_sha256)) throw new TypeError("hosted object is invalid");
+  }
+  for (const atom of value.atoms) {
+    exactKeys(atom, ["atom_id", "kind", "lineage_candidate", "segment_ordinal", "content_hash", "owner_path_base64", "payload_bytes", "oversized", "status_kind", "content_kinds"], "hosted atom");
+    if (!/^a:[0-9a-f]{64}$/.test(atom.atom_id) || !["path_event", "text"].includes(atom.kind) || typeof atom.lineage_candidate !== "string" || !Number.isSafeInteger(atom.segment_ordinal) || atom.segment_ordinal < 0 || !SHA256.test(atom.content_hash) || !Number.isSafeInteger(atom.payload_bytes) || atom.payload_bytes < 0 || typeof atom.oversized !== "boolean" || !Array.isArray(atom.content_kinds)) throw new TypeError("hosted atom is invalid");
+  }
+  for (const unit of value.units) validateUnit(unit);
+  exactKeys(value.counts, MANIFEST_COUNT_KEYS, "manifest counts");
+  exactKeys(value.sizes, [...MANIFEST_SIZE_KEYS, "encoded_output_bytes"], "output sizes");
+  if (value.counts.atoms !== value.atoms.length || value.sizes.atom_payload_bytes !== value.atoms.reduce((total, atom) => total + atom.payload_bytes, 0) || value.sizes.unit_payload_bytes !== value.units.reduce((total, unit) => total + unit.unit_payload_bytes, 0)) throw new TypeError("hosted complete output metrics are invalid");
+  validateOutputEncodedSize(value, maxBytes, [...MANIFEST_SIZE_KEYS, "encoded_output_bytes"]);
+}
+
+/** Validates canonical local, hosted, compacted, and diagnostic shadow output. */
+export function validateShadowOutput(value, maxBytes) {
+  positiveInteger(maxBytes, "maxBytes");
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new TypeError("shadow output must be an object");
+  if (value.status === "complete" && Object.hasOwn(value, "capture")) {
+    exactKeys(value, LOCAL_OUTPUT_KEYS, "local shadow output");
+    if (value.schema_version !== 1 || value.mode !== "partition_shadow") throw new TypeError("local shadow output header is invalid");
+    validateCapturedReviewInput(value.capture);
+    validateManifest(value.manifest);
+    if (value.capture.status !== "complete" || value.capture.capture_hash !== value.manifest.capture_hash) throw new TypeError("local output capture does not match manifest");
+    if (Buffer.byteLength(`${canonicalJson(value)}\n`) > maxBytes) throw new RangeError("shadow output exceeds maxBytes");
+    return value;
+  }
+  if (value.status === "complete") {
+    validateHostedCompleteOutput(value, maxBytes);
+    return value;
+  }
+  if (value.status === "artifact_compacted") {
+    exactKeys(value, COMPACT_OUTPUT_KEYS, "hosted compact output");
+    if (value.schema_version !== 1 || value.mode !== "partition_shadow" || !SHA256.test(value.capture_hash) || !SHA256.test(value.manifest_hash) || typeof value.benchmark_revision !== "string" || value.benchmark_revision.length > 256 || !Array.isArray(value.omitted) || canonicalJson(value.omitted) !== canonicalJson(["atoms", "units"])) throw new TypeError("hosted compact output is invalid");
+    exactKeys(value.counts, MANIFEST_COUNT_KEYS, "manifest counts");
+    validateOutputEncodedSize(value, maxBytes);
+    return value;
+  }
+  if (DIAGNOSTIC_STATUSES.has(value.status)) {
+    validateDiagnosticOutput(value, maxBytes);
+    return value;
+  }
+  throw new TypeError("shadow output status is invalid");
+}
 /** Splits a non-atomic unit at its byte-balanced deterministic boundary. */
 export function splitUnit(unit) {
   if (unit?.atomic || !Array.isArray(unit?.ordered_atom_ids) || unit.ordered_atom_ids.length < 2) throw new TypeError("atomic unit cannot be split");
@@ -981,7 +1112,31 @@ function invalidCaptureDiagnostic(capture, benchmarkRevision, maxBytes, error) {
   }, maxBytes);
 }
 
+function validateOutputUsage() {
+  return "usage: node scripts/review-units.mjs validate-output --input OUTPUT_JSON --max-bytes MAX_BYTES\n";
+}
+
+function validateOutputMain(argv) {
+  if (argv.length !== 5 || argv[0] !== "validate-output" || argv[1] !== "--input" || argv[3] !== "--max-bytes") {
+    process.stderr.write(validateOutputUsage());
+    return 2;
+  }
+  try {
+    const maxBytes = Number(argv[4]);
+    if (!/^[1-9]\d*$/.test(argv[4]) || !Number.isSafeInteger(maxBytes)) throw new TypeError("maxBytes must be a positive safe integer");
+    const bytes = readFileSync(argv[2]);
+    const value = JSON.parse(bytes.toString("utf8"));
+    validateShadowOutput(value, maxBytes);
+    if (!bytes.equals(Buffer.from(`${canonicalJson(value)}\n`))) throw new TypeError("shadow output is not canonically encoded");
+    return 0;
+  } catch (error) {
+    process.stderr.write(`${error.message}\n`);
+    return 1;
+  }
+}
+
 function main(argv) {
+  if (argv[0] === "validate-output") return validateOutputMain(argv);
   let options;
   try {
     options = parseShadowArgs(argv);

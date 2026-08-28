@@ -6,7 +6,7 @@ import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { atomizeCapturedReviewInput, buildHostedShadowOutput, buildLocalShadowOutput, buildPathFallbackManifest, buildShadowDiagnostic, parseRawDiffZ, splitUnit, validateAtomization, validatePartitionShadowEvaluatorFixture, writeShadowOutput } from "./review-units.mjs";
+import { atomizeCapturedReviewInput, buildHostedShadowOutput, buildLocalShadowOutput, buildPathFallbackManifest, buildShadowDiagnostic, parseRawDiffZ, splitUnit, validateAtomization, validatePartitionShadowEvaluatorFixture, validateShadowOutput, writeShadowOutput } from "./review-units.mjs";
 import { captureReviewInput } from "./review-capture.mjs";
 
 const OLD_ID = "1".repeat(40);
@@ -288,6 +288,44 @@ test("indexes many changed lines without rescanning prior hunk events", () => {
   }
 });
 
+test("atomizes many short changed lines with linearly bounded array iteration", () => {
+  const changedLines = 2_000;
+  const raw = rawRecord({});
+  const patch = [
+    "diff --git a/old.txt b/old.txt",
+    `@@ -1,${changedLines} +1,${changedLines} @@`,
+    ...Array.from({ length: changedLines }, () => "-old\n+new").join("\n").split("\n"),
+    "",
+  ].join("\n");
+  const originalIterator = Array.prototype[Symbol.iterator];
+  let iteratedValues = 0;
+  Array.prototype[Symbol.iterator] = function* trackedArrayIteration() {
+    for (const value of originalIterator.call(this)) {
+      iteratedValues += 1;
+      yield value;
+    }
+  };
+  try {
+    const result = atomizeCapturedReviewInput(capture({ raw, patch }));
+    assert.equal(result.status, "complete");
+  } finally {
+    Array.prototype[Symbol.iterator] = originalIterator;
+  }
+  assert.ok(iteratedValues <= changedLines * 30,
+    `atomization iterated ${iteratedValues} values for ${changedLines} changed lines`);
+});
+
+test("applies the configured atom target during atomization", () => {
+  const changedLine = "x".repeat(1_000);
+  const result = atomizeCapturedReviewInput(capture({
+    raw: rawRecord({}),
+    patch: `diff --git a/old.txt b/old.txt\n@@ -1,0 +1 @@\n+${changedLine}\n`,
+    rows: [row(OLD_ID, Buffer.alloc(0)), row(NEW_ID, Buffer.from(changedLine))],
+  }), 500);
+  assert.equal(result.status, "complete");
+  assert.equal(result.atoms.find((atom) => atom.kind === "text").oversized, true);
+});
+
 const CAPTURE_HASH = "a".repeat(64);
 const BENCHMARK_REVISION = "partition-shadow-fixture-v1";
 const SHADOW_CONFIG = {
@@ -449,6 +487,70 @@ test("validates evaluator metrics and produces redacted fixed-point hosted outpu
   assert.ok(Buffer.byteLength(diagnostic.diagnostic) <= 512);
   assert.equal(diagnostic.sizes.encoded_output_bytes, Buffer.byteLength(`${canonicalJson(diagnostic)}\n`));
   assert.ok(diagnostic.sizes.encoded_output_bytes <= 10_000);
+});
+
+test("validates canonical local, hosted, and diagnostic output envelopes", async (t) => {
+  const { root, complete } = await completeCaptureFixture(t);
+  const atomization = atomizeCapturedReviewInput(complete, CLI_SHADOW_CONFIG.atom_target_bytes);
+  const manifest = buildPathFallbackManifest({
+    capture: complete,
+    atomization,
+    config: CLI_SHADOW_CONFIG,
+    executionProfile: CLI_SHADOW_PROFILE,
+  });
+  const local = buildLocalShadowOutput(complete, manifest);
+  const hosted = buildHostedShadowOutput(complete, manifest, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes);
+  const diagnostic = buildShadowDiagnostic({
+    status: "planner_failed",
+    capture: complete,
+    benchmark_revision: CLI_SHADOW_CONFIG.benchmark_revision,
+    reason_codes: ["planner_error"],
+    diagnostic: "Planner failed.",
+    observed_lower_bounds: { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 },
+    counts: {},
+  }, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes);
+  for (const output of [local, hosted, diagnostic]) {
+    assert.equal(validateShadowOutput(output, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes), output);
+  }
+
+  const outputPath = join(root, "local.json");
+  writeFileSync(outputPath, `${canonicalJson(local)}\n`);
+  const validCli = spawnSync(process.execPath, [
+    "scripts/review-units.mjs", "validate-output", "--input", outputPath,
+    "--max-bytes", String(CLI_SHADOW_CONFIG.max_shadow_artifact_bytes),
+  ], { cwd: process.cwd(), encoding: "utf8" });
+  assert.equal(validCli.status, 0, validCli.stderr);
+
+  const forged = structuredClone(local);
+  forged.manifest.manifest_hash = "0".repeat(64);
+  assert.throws(() => validateShadowOutput(forged, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes), /manifest hash/);
+  writeFileSync(outputPath, `${JSON.stringify(local)}\n`);
+  const noncanonicalCli = spawnSync(process.execPath, [
+    "scripts/review-units.mjs", "validate-output", "--input", outputPath,
+    "--max-bytes", String(CLI_SHADOW_CONFIG.max_shadow_artifact_bytes),
+  ], { cwd: process.cwd(), encoding: "utf8" });
+  assert.equal(noncanonicalCli.status, 1);
+});
+
+test("rejects self-hashed manifests with missing or extraneous metric keys", () => {
+  const manifest = buildPathFallbackManifest({
+    capture: shadowCapture(),
+    atomization: shadowAtomization([shadowAtom({ kind: "path_event", path: "a" })]),
+    config: SHADOW_CONFIG,
+    executionProfile: EXECUTION_PROFILE,
+  });
+  for (const mutate of [
+    (value) => { delete value.counts.text_atoms; },
+    (value) => { value.counts.untrusted_metric = 1; },
+    (value) => { delete value.sizes.unit_payload_bytes; },
+    (value) => { value.sizes.untrusted_metric = 1; },
+  ]) {
+    const forged = structuredClone(manifest);
+    mutate(forged);
+    forged.manifest_hash = sha256(Object.fromEntries(Object.entries(forged)
+      .filter(([key]) => key !== "manifest_hash")));
+    assert.throws(() => buildLocalShadowOutput(shadowCapture(), forged), /manifest (counts|sizes) keys/);
+  }
 });
 
 test("keeps generated atom unions deterministic across canonical input shuffles", () => {
@@ -639,6 +741,29 @@ test("shadow CLI validates complete captures before atomization or manifest proj
     assert.equal(Object.hasOwn(output, "manifest"), false);
     assert.ok(output.reason_codes.includes("capture_validation_failed"));
   }
+});
+
+test("shadow CLI emits a non-complete capture diagnostic before reading the profile", async (t) => {
+  const { root, complete } = await completeCaptureFixture(t);
+  const limited = await captureReviewInput({
+    repoRoot: join(root, "repo"),
+    baseSha: complete.base_sha,
+    headSha: complete.head_sha,
+    limits: { maxPatchBytes: 1, maxRawZBytes: 1_000_000, maxSingleBlobBytes: 1_000_000, maxTotalBlobBytes: 1_000_000, maxCaptureMilliseconds: 5_000 },
+  });
+  assert.notEqual(limited.status, "complete");
+  const configPath = join(root, "config.json");
+  const capturePath = join(root, "capture.json");
+  const localOutput = join(root, "local.json");
+  writeFileSync(configPath, JSON.stringify(CLI_SHADOW_CONFIG));
+  writeFileSync(capturePath, JSON.stringify(limited));
+  const child = spawnSync(process.execPath, [
+    "scripts/review-units.mjs", "shadow", "--capture", capturePath,
+    "--profile", join(root, "missing-profile.json"), "--config", configPath,
+    "--local-out", localOutput,
+  ], { cwd: process.cwd(), encoding: "utf8" });
+  assert.equal(child.status, 0, child.stderr);
+  assert.equal(JSON.parse(readFileSync(localOutput, "utf8")).status, limited.status);
 });
 
 test("runs shadow CLI from both relative and absolute script paths", async (t) => {

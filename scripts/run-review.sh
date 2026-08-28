@@ -1644,7 +1644,7 @@ stage_shadow_helper_diagnostic() {
 
 run_partition_shadow() {
   [ "$PARTITION_SHADOW" = 1 ] || return 0
-  local status="$SHADOW_SETUP_STATUS" capture_helper units_helper staged_local
+  local status="$SHADOW_SETUP_STATUS" capture_helper units_helper staged_local shadow_max_bytes
   local capture_stderr="$RUN_TMP/shadow-capture.stderr"
   local units_stderr="$RUN_TMP/shadow-units.stderr"
   staged_local="$RUN_TMP/shadow-local.staged.json"
@@ -1677,6 +1677,26 @@ run_partition_shadow() {
   elif [ ! -s "$staged_local" ]; then
     stage_shadow_helper_diagnostic planner_failed planner_output_missing \
       "$units_stderr" "$staged_local" || :
+  fi
+  if [ -s "$staged_local" ]; then
+    shadow_max_bytes="$(node -e '
+      const fs = require("node:fs");
+      const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      if (!Number.isSafeInteger(value.max_shadow_artifact_bytes)
+        || value.max_shadow_artifact_bytes <= 0) process.exit(1);
+      process.stdout.write(String(value.max_shadow_artifact_bytes));
+    ' "$SHADOW_CONFIG_FILE" 2>/dev/null)" || shadow_max_bytes=0
+    if ! node "$SELF_ROOT/scripts/review-units.mjs" validate-output \
+      --input "$staged_local" --max-bytes "$shadow_max_bytes" \
+      >>"$units_stderr" 2>&1; then
+      stage_shadow_helper_diagnostic planner_failed planner_output_invalid \
+        "$units_stderr" "$staged_local" || :
+      if ! node "$SELF_ROOT/scripts/review-units.mjs" validate-output \
+        --input "$staged_local" --max-bytes "$shadow_max_bytes" \
+        >>"$units_stderr" 2>&1; then
+        rm -f -- "$staged_local"
+      fi
+    fi
   fi
   if [ -s "$staged_local" ]; then
     status="$(node -e '
