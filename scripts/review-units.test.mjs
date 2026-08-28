@@ -421,6 +421,24 @@ test("builds a deterministic path-packed manifest with independent unit IDs", ()
   assert.equal(canonicalJson(shuffled), canonicalJson(manifest));
   assert.deepEqual(new Set(manifest.units.flatMap((unit) => unit.ordered_atom_ids)), new Set(atoms.map((atom) => atom.atom_id)));
 });
+test("never coalesces oversized atom units beyond the frontier cap", () => {
+  const config = { ...SHADOW_CONFIG, max_frontier_units: 2 };
+  const oversized = ["a", "b", "c"].map((path, ordinal) => shadowAtom({ kind: "text", path, ordinal, payload: "x".repeat(32), oversized: true }));
+  assert.throws(() => buildPathFallbackManifest({ capture: shadowCapture(), atomization: shadowAtomization(oversized), config, executionProfile: EXECUTION_PROFILE }), /frontier_capacity_limit/);
+
+  const mixedAtoms = [
+    shadowAtom({ kind: "text", path: "a", payload: "x".repeat(32), oversized: true }),
+    shadowAtom({ kind: "path_event", path: "b" }),
+    shadowAtom({ kind: "path_event", path: "c" }),
+  ];
+  const manifest = buildPathFallbackManifest({ capture: shadowCapture(), atomization: shadowAtomization(mixedAtoms), config, executionProfile: EXECUTION_PROFILE });
+  const oversizedUnit = manifest.units.find((unit) => unit.oversized_atom_ids.length > 0);
+  assert.equal(oversizedUnit.atomic, true);
+  assert.deepEqual(oversizedUnit.oversized_atom_ids, [mixedAtoms[0].atom_id]);
+  const [left, right] = splitUnit(structuredClone(manifest.units.find((unit) => !unit.atomic)));
+  assert.deepEqual([...left.oversized_atom_ids, ...right.oversized_atom_ids], []);
+});
+
 
 test("coalesces the minimum adjacent pair and splits non-atomic units deterministically", () => {
   const atoms = ["a", "b", "c", "d"].map((path) => shadowAtom({ kind: "path_event", path }));

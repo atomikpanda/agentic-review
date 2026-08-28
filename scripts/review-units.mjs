@@ -683,12 +683,12 @@ function packUnits(atoms, config) {
 function coalesceUnits(units, maxFrontierUnits) {
   const frontier = [...units];
   while (frontier.length > maxFrontierUnits) {
-    let selected = 0;
-    for (let index = 1; index < frontier.length - 1; index += 1) {
-      const candidateBytes = frontier[index].unit_payload_bytes + frontier[index + 1].unit_payload_bytes;
-      const selectedBytes = frontier[selected].unit_payload_bytes + frontier[selected + 1].unit_payload_bytes;
-      if (candidateBytes < selectedBytes) selected = index;
+    let selected = -1;
+    for (let index = 0; index < frontier.length - 1; index += 1) {
+      if (frontier[index].oversized_atom_ids.length > 0 || frontier[index + 1].oversized_atom_ids.length > 0) continue;
+      if (selected === -1 || frontier[index].unit_payload_bytes + frontier[index + 1].unit_payload_bytes < frontier[selected].unit_payload_bytes + frontier[selected + 1].unit_payload_bytes) selected = index;
     }
+    if (selected === -1) throw new RangeError("frontier_capacity_limit");
     const left = frontier[selected];
     const right = frontier[selected + 1];
     const atomPayloadBytes = [...left.atom_payload_bytes, ...right.atom_payload_bytes];
@@ -1231,7 +1231,7 @@ function main(argv) {
       } catch (error) {
         return buildShadowDiagnostic({
           status: "planner_failed", capture, benchmark_revision: configValue.benchmark_revision,
-          reason_codes: ["planner_error"], diagnostic: error.message,
+          reason_codes: [error.message === "frontier_capacity_limit" ? "frontier_capacity_limit" : "planner_error"], diagnostic: error.message,
           observed_lower_bounds: { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 },
           counts: {},
         }, configValue.max_shadow_artifact_bytes);

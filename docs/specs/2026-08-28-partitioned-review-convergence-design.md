@@ -449,12 +449,12 @@ Deterministic packing:
 3. Append toward `max_unit_payload_bytes=64000`.
 4. A single over-target atom is one oversized atomic unit.
 5. Root lineage is `root:path:<sha256(owner-path-bytes)>:<ordinal>`.
-6. `unit_id` is SHA-256 of canonical
-   `{unit_schema_version,unit_lineage,ordered_atom_ids,coalesced_from}`.
-7. A normal unit has `coalesced_from=[]`.
-8. If count exceeds `max_frontier_units=128`, repeatedly merge the adjacent pair
-   with minimum tuple `(combined_payload_bytes,left_index,right_index)`. The new
-   lineage is `root:coalesced:<sha256(ordered_child_lineages)>`, and
+8. If count exceeds `max_frontier_units=128`, repeatedly merge the eligible
+   adjacent pair with minimum tuple `(combined_payload_bytes,left_index,right_index)`.
+   A unit with `oversized_atom_ids` is never eligible for coalescing. If no
+   eligible pair can reduce the frontier, planning terminates
+   `frontier_capacity_limit`; no complete manifest is emitted.
+   The new lineage is `root:coalesced:<sha256(ordered_child_lineages)>`, and
    `coalesced_from` preserves those ordered child lineages.
 
 Path-event atoms for rename/copy group under new owner path; deletions use old
