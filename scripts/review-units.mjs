@@ -972,7 +972,7 @@ function validateHostedCompleteOutput(value, maxBytes) {
 }
 
 /** Validates canonical local, hosted, compacted, and diagnostic shadow output. */
-export function validateShadowOutput(value, maxBytes) {
+export function validateShadowOutput(value, maxBytes, trustedInputs = undefined) {
   positiveInteger(maxBytes, "maxBytes");
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw new TypeError("shadow output must be an object");
   if (value.status === "complete" && Object.hasOwn(value, "capture")) {
@@ -981,22 +981,36 @@ export function validateShadowOutput(value, maxBytes) {
     validateCapturedReviewInput(value.capture);
     validateManifest(value.manifest);
     if (value.capture.status !== "complete" || value.capture.capture_hash !== value.manifest.capture_hash) throw new TypeError("local output capture does not match manifest");
-    const atomization = atomizeCapturedReviewInput(value.capture, value.manifest.configuration.atom_target_bytes);
+    const trustedConfig = trustedInputs?.config ?? {
+      schema_version: 1,
+      benchmark_revision: value.manifest.benchmark_revision,
+      ...value.manifest.configuration,
+    };
+    const trustedProfile = trustedInputs?.profile ?? {
+      schema_version: 1,
+      descriptors: value.manifest.execution_projection.descriptors,
+      descriptor_content_hashes: value.manifest.execution_projection.descriptor_content_hashes,
+      max_output_attempts: value.manifest.execution_projection.max_output_attempts,
+    };
+    const trustedConfiguration = configuration(trustedConfig);
+    const trustedProjection = executionProjection(trustedProfile, value.manifest.units.length);
+    if (trustedInputs !== undefined && (
+      value.manifest.benchmark_revision !== trustedConfiguration.benchmark_revision
+      || canonicalJson(value.manifest.configuration) !== canonicalJson({
+        atom_target_bytes: trustedConfiguration.atom_target_bytes,
+        unit_target_bytes: trustedConfiguration.unit_target_bytes,
+        max_frontier_units: trustedConfiguration.max_frontier_units,
+        max_shadow_artifact_bytes: trustedConfiguration.max_shadow_artifact_bytes,
+      })
+      || canonicalJson(value.manifest.execution_projection) !== canonicalJson(trustedProjection)
+    )) throw new TypeError("local output manifest does not match trusted inputs");
+    const atomization = atomizeCapturedReviewInput(value.capture, trustedConfiguration.atom_target_bytes);
     if (atomization.status !== "complete") throw new TypeError("local output manifest does not match capture");
     const reconstructed = buildPathFallbackManifest({
       capture: value.capture,
       atomization,
-      config: {
-        schema_version: 1,
-        benchmark_revision: value.manifest.benchmark_revision,
-        ...value.manifest.configuration,
-      },
-      executionProfile: {
-        schema_version: 1,
-        descriptors: value.manifest.execution_projection.descriptors,
-        descriptor_content_hashes: value.manifest.execution_projection.descriptor_content_hashes,
-        max_output_attempts: value.manifest.execution_projection.max_output_attempts,
-      },
+      config: trustedConfig,
+      executionProfile: trustedProfile,
     });
     if (canonicalJson(reconstructed) !== canonicalJson(value.manifest)) throw new TypeError("local output manifest does not match capture");
     if (Buffer.byteLength(`${canonicalJson(value)}\n`) > maxBytes) throw new RangeError("shadow output exceeds maxBytes");
@@ -1131,20 +1145,40 @@ function invalidCaptureDiagnostic(capture, benchmarkRevision, maxBytes, error) {
 }
 
 function validateOutputUsage() {
-  return "usage: node scripts/review-units.mjs validate-output --input OUTPUT_JSON --max-bytes MAX_BYTES\n";
+  return "usage: node scripts/review-units.mjs validate-output --input OUTPUT_JSON --max-bytes MAX_BYTES [--profile PROFILE_JSON --config CONFIG_JSON]\n";
 }
 
 function validateOutputMain(argv) {
-  if (argv.length !== 5 || argv[0] !== "validate-output" || argv[1] !== "--input" || argv[3] !== "--max-bytes") {
+  if (argv[0] !== "validate-output") {
+    process.stderr.write(validateOutputUsage());
+    return 2;
+  }
+  const options = {};
+  for (let index = 1; index < argv.length; index += 2) {
+    const key = argv[index];
+    const entry = argv[index + 1];
+    if (!["--input", "--max-bytes", "--profile", "--config"].includes(key) || !entry || Object.hasOwn(options, key)) {
+      process.stderr.write(validateOutputUsage());
+      return 2;
+    }
+    options[key] = entry;
+  }
+  if (!options["--input"] || !options["--max-bytes"]) {
     process.stderr.write(validateOutputUsage());
     return 2;
   }
   try {
-    const maxBytes = Number(argv[4]);
-    if (!/^[1-9]\d*$/.test(argv[4]) || !Number.isSafeInteger(maxBytes)) throw new TypeError("maxBytes must be a positive safe integer");
-    const bytes = readFileSync(argv[2]);
+    const maxBytes = Number(options["--max-bytes"]);
+    if (!/^[1-9]\d*$/.test(options["--max-bytes"]) || !Number.isSafeInteger(maxBytes)) throw new TypeError("maxBytes must be a positive safe integer");
+    const bytes = readFileSync(options["--input"]);
     const value = JSON.parse(bytes.toString("utf8"));
-    validateShadowOutput(value, maxBytes);
+    const localOutput = value?.status === "complete" && Object.hasOwn(value, "capture");
+    if (localOutput && (!options["--profile"] || !options["--config"])) throw new TypeError("local shadow output requires trusted profile and config");
+    const trustedInputs = localOutput ? {
+      config: JSON.parse(readFileSync(options["--config"], "utf8")),
+      profile: JSON.parse(readFileSync(options["--profile"], "utf8")),
+    } : undefined;
+    validateShadowOutput(value, maxBytes, trustedInputs);
     if (!bytes.equals(Buffer.from(`${canonicalJson(value)}\n`))) throw new TypeError("shadow output is not canonically encoded");
     return 0;
   } catch (error) {

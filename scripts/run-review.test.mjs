@@ -6395,3 +6395,57 @@ exec "\${REAL_NODE}" "$@"
   assert.equal(Object.hasOwn(diagnostic, "forged"), false);
   assert.equal(validatePublication(run.publicationFile).status, 0);
 });
+
+test("partition shadow rejects self-consistent outputs built from forged trusted inputs", (t) => {
+  for (const forgedInput of ["config", "profile"]) {
+    const fixture = createFixture(t);
+    const nodeWrapper = join(fixture.bin, "node");
+    writeFileSync(nodeWrapper, `#!/usr/bin/env bash
+if [ "\${1##*/}" = review-units.mjs ] && [ "\${2:-}" = shadow ]; then
+  for ((index = 1; index <= $#; index += 1)); do
+    case "\${!index}" in
+      --capture) next=$((index + 1)); capture="\${!next}" ;;
+      --profile) next=$((index + 1)); profile="\${!next}" ;;
+      --config) next=$((index + 1)); config="\${!next}" ;;
+      --local-out) next=$((index + 1)); output="\${!next}" ;;
+    esac
+  done
+  forged="\${output}.forged-\${FAKE_SHADOW_FORGED_INPUT}.json"
+  if [ "\${FAKE_SHADOW_FORGED_INPUT}" = config ]; then
+    "$REAL_NODE" -e '
+      const fs = require("node:fs");
+      const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      value.atom_target_bytes = 1;
+      fs.writeFileSync(process.argv[2], JSON.stringify(value));
+    ' "$config" "$forged"
+    exec "$REAL_NODE" "$1" shadow --capture "$capture" --profile "$profile" --config "$forged" --local-out "$output"
+  fi
+  "$REAL_NODE" -e '
+    const fs = require("node:fs");
+    const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    value.descriptors = ["forged"];
+    value.descriptor_content_hashes = ["f".repeat(64)];
+    value.max_output_attempts = 2;
+    fs.writeFileSync(process.argv[2], JSON.stringify(value));
+  ' "$profile" "$forged"
+  exec "$REAL_NODE" "$1" shadow --capture "$capture" --profile "$forged" --config "$config" --local-out "$output"
+fi
+exec "\${REAL_NODE}" "$@"
+`);
+    chmodSync(nodeWrapper, 0o755);
+    const shadowFile = join(fixture.directory, `partition-shadow-${forgedInput}.json`);
+    const run = runReview(t, {
+      general: [{ findings: [] }],
+      correctness: [{ findings: [] }],
+      boundaries: [{ findings: [] }],
+    }, {
+      existingFixture: fixture,
+      args: ["--partition-shadow", "--partition-shadow-out", shadowFile, "--json"],
+      env: { FAKE_SHADOW_FORGED_INPUT: forgedInput },
+    });
+    assert.equal(run.result.status, 0, run.result.stderr);
+    assert.match(run.result.stderr, /partition shadow: planner_failed/);
+    assert.equal(JSON.parse(readFileSync(shadowFile, "utf8")).status, "planner_failed");
+    assert.equal(validatePublication(run.publicationFile).status, 0);
+  }
+});

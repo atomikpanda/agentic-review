@@ -514,9 +514,14 @@ test("validates canonical local, hosted, and diagnostic output envelopes", async
   }
 
   const outputPath = join(root, "local.json");
+  const configPath = join(root, "config.json");
+  const profilePath = join(root, "profile.json");
+  writeFileSync(configPath, `${canonicalJson(CLI_SHADOW_CONFIG)}\n`);
+  writeFileSync(profilePath, `${canonicalJson(CLI_SHADOW_PROFILE)}\n`);
   writeFileSync(outputPath, `${canonicalJson(local)}\n`);
   const validCli = spawnSync(process.execPath, [
     "scripts/review-units.mjs", "validate-output", "--input", outputPath,
+    "--profile", profilePath, "--config", configPath,
     "--max-bytes", String(CLI_SHADOW_CONFIG.max_shadow_artifact_bytes),
   ], { cwd: process.cwd(), encoding: "utf8" });
   assert.equal(validCli.status, 0, validCli.stderr);
@@ -533,6 +538,20 @@ test("validates canonical local, hosted, and diagnostic output envelopes", async
     () => validateShadowOutput(selfHashedFabrication, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes),
     /local output manifest does not match capture/,
   );
+  for (const [config, profile] of [
+    [{ ...CLI_SHADOW_CONFIG, atom_target_bytes: 1 }, CLI_SHADOW_PROFILE],
+    [CLI_SHADOW_CONFIG, { ...CLI_SHADOW_PROFILE, descriptors: ["forged"], descriptor_content_hashes: ["f".repeat(64)], max_output_attempts: 2 }],
+  ]) {
+    const forgedAtomization = atomizeCapturedReviewInput(complete, config.atom_target_bytes);
+    const forgedManifest = buildPathFallbackManifest({ capture: complete, atomization: forgedAtomization, config, executionProfile: profile });
+    writeFileSync(outputPath, `${canonicalJson(buildLocalShadowOutput(complete, forgedManifest))}\n`);
+    const trustedCli = spawnSync(process.execPath, [
+      "scripts/review-units.mjs", "validate-output", "--input", outputPath,
+      "--profile", profilePath, "--config", configPath,
+      "--max-bytes", String(CLI_SHADOW_CONFIG.max_shadow_artifact_bytes),
+    ], { cwd: process.cwd(), encoding: "utf8" });
+    assert.equal(trustedCli.status, 1);
+  }
   writeFileSync(outputPath, `${JSON.stringify(local)}\n`);
   const noncanonicalCli = spawnSync(process.execPath, [
     "scripts/review-units.mjs", "validate-output", "--input", outputPath,
