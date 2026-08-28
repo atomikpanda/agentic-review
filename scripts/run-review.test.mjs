@@ -201,7 +201,7 @@ function finding(title, overrides = {}) {
 }
 
 const fakeOmp = `#!/usr/bin/env node
-import { appendFileSync, lstatSync, mkdirSync, readFileSync, readlinkSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, lstatSync, mkdirSync, readFileSync, readlinkSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawn as spawnChild } from "node:child_process";
 import { dirname, join } from "node:path";
 
@@ -264,6 +264,12 @@ appendFileSync(process.env.FAKE_OMP_LOG, JSON.stringify({
 const plan = JSON.parse(readFileSync(process.env.FAKE_OMP_PLAN, "utf8"));
 const choices = plan[passId] ?? plan[id] ?? plan.default ?? [{ findings: [] }];
 const choice = choices[Math.min(attempt - 1, choices.length - 1)];
+if (choice?.__replace_shadow_parent) {
+  const parent = process.env.FAKE_SHADOW_PARENT;
+  const attacker = process.env.FAKE_SHADOW_ATTACKER;
+  renameSync(parent, parent + ".moved");
+  symlinkSync(attacker, parent);
+}
 const delayMs = Number(choice?.__delay_ms ?? 0);
 if (delayMs > 0 && process.env.FAKE_OMP_ACTIVE_DIR) {
   mkdirSync(process.env.FAKE_OMP_ACTIVE_DIR, { recursive: true });
@@ -5834,4 +5840,90 @@ PATH="$real_path" git "$@"
   assert.equal(unsafe.logs.length, 0);
   assert.equal(readFileSync(unsafeTarget, "utf8"), "operator-owned\n");
   assert.match(unsafe.result.stderr, /partition-shadow-out.*symlink/i);
+});
+
+test("partition shadow holds its prevalidated destination parent through model work", (t) => {
+  const fixture = createFixture(t);
+  const parent = join(fixture.directory, "shadow-output");
+  const attacker = join(fixture.directory, "attacker-output");
+  mkdirSync(parent);
+  mkdirSync(attacker);
+  const shadowFile = join(parent, "partition-shadow.json");
+  const run = runReview(t, {
+    general: [{ __replace_shadow_parent: true, findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    existingFixture: fixture,
+    args: ["--partition-shadow", "--partition-shadow-out", shadowFile, "--json"],
+    env: {
+      FAKE_SHADOW_PARENT: parent,
+      FAKE_SHADOW_ATTACKER: attacker,
+    },
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.equal(existsSync(join(attacker, "partition-shadow.json")), false);
+  assert.equal(JSON.parse(readFileSync(`${parent}.moved/partition-shadow.json`, "utf8")).status, "complete");
+});
+
+test("partition shadow capture uses the actual fallback review root", (t) => {
+  const fixture = createFixture(t);
+  const helperArguments = join(fixture.directory, "capture-helper-argv");
+  const nodeWrapper = join(fixture.bin, "node");
+  writeFileSync(nodeWrapper, `#!/usr/bin/env bash
+if [ "\${1##*/}" = review-capture.mjs ]; then printf '%s\\n' "$*" > "\${FAKE_SHADOW_HELPER_ARGUMENTS}"; fi
+exec "\${REAL_NODE}" "$@"
+`);
+  chmodSync(nodeWrapper, 0o755);
+  const shadowFile = join(fixture.directory, "partition-shadow.json");
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    existingFixture: fixture,
+    failWorktree: true,
+    args: ["--partition-shadow", "--partition-shadow-out", shadowFile, "--json"],
+    env: { FAKE_SHADOW_HELPER_ARGUMENTS: helperArguments },
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.match(readFileSync(helperArguments, "utf8"), new RegExp(`--repo ${fixture.repository}`));
+  assert.equal(JSON.parse(readFileSync(shadowFile, "utf8")).status, "complete");
+});
+
+test("partition shadow helper exits publish bounded redacted local diagnostics", (t) => {
+  for (const helper of ["capture", "units"]) {
+    const fixture = createFixture(t);
+    const nodeWrapper = join(fixture.bin, "node");
+    writeFileSync(nodeWrapper, `#!/usr/bin/env bash
+case "\${1##*/}:\${FAKE_SHADOW_FAIL_HELPER}" in
+  review-capture.mjs:capture|review-units.mjs:units)
+    printf '%600s' x | tr ' ' x >&2
+    printf '%s\\n' ' secret-reviewed-bytes' >&2
+    exit 91
+    ;;
+esac
+exec "\${REAL_NODE}" "$@"
+`);
+    chmodSync(nodeWrapper, 0o755);
+    const shadowFile = join(fixture.directory, "partition-shadow.json");
+    const run = runReview(t, {
+      general: [{ findings: [] }],
+      correctness: [{ findings: [] }],
+      boundaries: [{ findings: [] }],
+    }, {
+      existingFixture: fixture,
+      args: ["--partition-shadow", "--partition-shadow-out", shadowFile, "--json"],
+      env: { FAKE_SHADOW_FAIL_HELPER: helper },
+    });
+
+    assert.equal(run.result.status, 0, `${helper}: ${run.result.stderr}`);
+    assert.match(run.result.stderr, new RegExp(`partition shadow: ${helper === "capture" ? "capture_failed" : "planner_failed"}`));
+    const diagnostic = JSON.parse(readFileSync(shadowFile, "utf8"));
+    assert.equal(diagnostic.status, helper === "capture" ? "capture_failed" : "planner_failed");
+    assert.ok(Buffer.byteLength(diagnostic.diagnostic) <= 512);
+    assert.doesNotMatch(diagnostic.diagnostic, /secret-reviewed-bytes/);
+  }
 });

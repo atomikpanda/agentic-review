@@ -110,6 +110,8 @@ PUBLICATION_OUT="${AGENTIC_REVIEW_PUBLICATION_OUT:-}"
 DIAGNOSTICS_OUT="${AGENTIC_REVIEW_DIAGNOSTICS_OUT:-}"
 PARTITION_SHADOW=0
 PARTITION_SHADOW_OUT=""
+PARTITION_SHADOW_OUT_DIR_FD=""
+PARTITION_SHADOW_OUT_FD_PATH=""
 PASS_MAX_ATTEMPTS=2
 PASS_DIAGNOSTIC_STDERR_BYTES=4096
 PASS_DIAGNOSTIC_STDERR_LINES=64
@@ -328,6 +330,12 @@ if [ "$PARTITION_SHADOW" = 1 ]; then
        && [ "$PARTITION_SHADOW_OUT_IDENTITY" = "$DIAGNOSTICS_IDENTITY" ]; }; then
     die "--partition-shadow-out must be distinct from review output destinations"
   fi
+  PARTITION_SHADOW_OUT_PARENT="$(dirname "$PARTITION_SHADOW_OUT_IDENTITY")"
+  PARTITION_SHADOW_OUT_NAME="$(basename "$PARTITION_SHADOW_OUT_IDENTITY")"
+  if ! exec {PARTITION_SHADOW_OUT_DIR_FD}<"$PARTITION_SHADOW_OUT_PARENT"; then
+    die "could not hold --partition-shadow-out parent directory"
+  fi
+  PARTITION_SHADOW_OUT_FD_PATH="/proc/self/fd/$PARTITION_SHADOW_OUT_DIR_FD/$PARTITION_SHADOW_OUT_NAME"
 fi
 
 if [ -n "$DIAGNOSTICS_OUT" ]; then
@@ -551,6 +559,10 @@ cleanup_worktree() {
   if [ -n "$WORKTREE" ]; then
     git worktree remove --force "$WORKTREE" 2>/dev/null || rm -rf -- "$WORKTREE"
     WORKTREE=""
+  fi
+  if [ -n "$PARTITION_SHADOW_OUT_DIR_FD" ]; then
+    eval "exec ${PARTITION_SHADOW_OUT_DIR_FD}<&-"
+    PARTITION_SHADOW_OUT_DIR_FD=""
   fi
   if [ -n "$RUN_TMP" ]; then rm -rf -- "$RUN_TMP"; RUN_TMP=""; fi
 }
@@ -1519,72 +1531,154 @@ publish_findings() {
   fi
 }
 
+run_shadow_command() {
+  local stderr_file="$1" fifo="${1}.fifo" reader command_status
+  shift
+  rm -f -- "$stderr_file" "$fifo"
+  mkfifo "$fifo" || return 125
+  node -e '
+    const fs = require("node:fs");
+    const output = fs.openSync(process.argv[1], "wx", 0o600);
+    let written = 0;
+    process.stdin.on("data", (chunk) => {
+      const remaining = 512 - written;
+      if (remaining <= 0) return;
+      const admitted = chunk.subarray(0, remaining);
+      fs.writeSync(output, admitted);
+      written += admitted.length;
+    });
+    process.stdin.on("end", () => fs.closeSync(output));
+  ' "$stderr_file" <"$fifo" &
+  reader=$!
+  if "$@" 2>"$fifo"; then command_status=0; else command_status=$?; fi
+  wait "$reader" || :
+  rm -f -- "$fifo"
+  return "$command_status"
+}
+
+stage_shadow_helper_diagnostic() {
+  local requested_status="$1" reason="$2" stderr_file="$3" staged_local="$4"
+  node --input-type=module -e '
+    import { readFileSync } from "node:fs";
+    import { pathToFileURL } from "node:url";
+    const [
+      helper, configFile, captureFile, destination, requestedStatus, reason,
+      baseSha, headSha, stderrFile,
+    ] = process.argv.slice(1);
+    const { buildShadowDiagnostic, writeShadowOutput } =
+      await import(pathToFileURL(helper).href);
+    const config = JSON.parse(readFileSync(configFile, "utf8"));
+    let capture;
+    try { capture = JSON.parse(readFileSync(captureFile, "utf8")); } catch {}
+    const stderrPresent = (() => {
+      try { return readFileSync(stderrFile).length > 0; } catch { return false; }
+    })();
+    const canReportPlannerFailure = requestedStatus === "planner_failed"
+      && capture?.status === "complete";
+    const details = {
+      status: canReportPlannerFailure ? "planner_failed" : "capture_failed",
+      base_sha: baseSha,
+      head_sha: headSha,
+      benchmark_revision: config.benchmark_revision,
+      reason_codes: [canReportPlannerFailure ? reason : "capture_result_unavailable"],
+      diagnostic: stderrPresent
+        ? "Shadow helper failed; stderr redacted."
+        : "Shadow helper failed without stderr.",
+      observed_lower_bounds: {
+        patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0,
+        elapsed_milliseconds: 0,
+      },
+      counts: {},
+    };
+    if (canReportPlannerFailure) details.capture = capture;
+    writeShadowOutput(destination,
+      buildShadowDiagnostic(details, config.max_shadow_artifact_bytes));
+  ' "$SELF_ROOT/scripts/review-units.mjs" "$SHADOW_CONFIG_FILE" \
+    "$RUN_TMP/shadow-capture.json" "$staged_local" "$requested_status" "$reason" \
+    "$BASE_SHA" "$HEAD_SHA" "$stderr_file" 2>/dev/null
+}
+
 run_partition_shadow() {
   [ "$PARTITION_SHADOW" = 1 ] || return 0
   local status="$SHADOW_SETUP_STATUS" capture_helper units_helper staged_local
-  if [ -z "$status" ]; then
-    capture_helper="$(support_exec scripts/review-capture.mjs || :)"
-    units_helper="$(support_exec scripts/review-units.mjs || :)"
-    staged_local="$RUN_TMP/shadow-local.staged.json"
-    if [ -z "$capture_helper" ] || [ -z "$units_helper" ]; then
-      status="planner_failed"
-    elif ! node "$capture_helper" capture \
-      --repo "$WORKTREE" --base "$BASE_SHA" --head "$HEAD_SHA" \
-      --limits "$SHADOW_LIMITS_FILE" \
-      --out "$RUN_TMP/shadow-capture.json" 2>/dev/null; then
-      status="capture_failed"
-    elif ! node "$units_helper" shadow \
-      --capture "$RUN_TMP/shadow-capture.json" \
-      --profile "$SHADOW_PROFILE_FILE" \
-      --config "$SHADOW_CONFIG_FILE" \
-      --local-out "$staged_local" 2>/dev/null; then
-      status="planner_failed"
-    elif [ ! -s "$staged_local" ]; then
-      status="planner_failed"
-    else
-      status="$(node -e '
-        const fs = require("node:fs");
-        const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-        if (typeof value.status !== "string" || !/^[a-z_]{1,64}$/.test(value.status)) process.exit(1);
-        process.stdout.write(value.status);
-      ' "$staged_local" 2>/dev/null || printf planner_failed)"
-      if ! node -e '
-        const fs = require("node:fs");
-        const { basename, dirname, join } = require("node:path");
-        const { randomBytes } = require("node:crypto");
-        const [source, destination] = process.argv.slice(1);
-        if (fs.existsSync(destination) && fs.lstatSync(destination).isSymbolicLink()) {
-          throw new Error("refusing to replace a symbolic-link output path");
-        }
-        let descriptor;
-        let temporary;
-        try {
-          for (let attempt = 0; attempt < 10; attempt += 1) {
-            temporary = join(dirname(destination),
-              `.${basename(destination)}.tmp-${randomBytes(8).toString("hex")}`);
-            try {
-              descriptor = fs.openSync(temporary, "wx", 0o600);
-              break;
-            } catch (error) {
-              if (error.code !== "EEXIST") throw error;
-            }
+  local capture_stderr="$RUN_TMP/shadow-capture.stderr"
+  local units_stderr="$RUN_TMP/shadow-units.stderr"
+  staged_local="$RUN_TMP/shadow-local.staged.json"
+  capture_helper="$(support_exec scripts/review-capture.mjs || :)"
+  units_helper="$(support_exec scripts/review-units.mjs || :)"
+  if [ -n "$status" ] || [ -z "$capture_helper" ]; then
+    stage_shadow_helper_diagnostic capture_failed capture_helper_unavailable \
+      "$capture_stderr" "$staged_local" || :
+  elif ! run_shadow_command "$capture_stderr" \
+    node "$capture_helper" capture \
+    --repo "$REVIEW_ROOT" --base "$BASE_SHA" --head "$HEAD_SHA" \
+    --limits "$SHADOW_LIMITS_FILE" \
+    --out "$RUN_TMP/shadow-capture.json"; then
+    stage_shadow_helper_diagnostic capture_failed capture_helper_failed \
+      "$capture_stderr" "$staged_local" || :
+  elif [ ! -s "$RUN_TMP/shadow-capture.json" ]; then
+    stage_shadow_helper_diagnostic capture_failed capture_output_missing \
+      "$capture_stderr" "$staged_local" || :
+  elif [ -z "$units_helper" ]; then
+    stage_shadow_helper_diagnostic planner_failed planner_helper_unavailable \
+      "$units_stderr" "$staged_local" || :
+  elif ! run_shadow_command "$units_stderr" \
+    node "$units_helper" shadow \
+    --capture "$RUN_TMP/shadow-capture.json" \
+    --profile "$SHADOW_PROFILE_FILE" \
+    --config "$SHADOW_CONFIG_FILE" \
+    --local-out "$staged_local"; then
+    stage_shadow_helper_diagnostic planner_failed planner_helper_failed \
+      "$units_stderr" "$staged_local" || :
+  elif [ ! -s "$staged_local" ]; then
+    stage_shadow_helper_diagnostic planner_failed planner_output_missing \
+      "$units_stderr" "$staged_local" || :
+  fi
+  if [ -s "$staged_local" ]; then
+    status="$(node -e '
+      const fs = require("node:fs");
+      const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      if (typeof value.status !== "string" || !/^[a-z_]{1,64}$/.test(value.status)) process.exit(1);
+      process.stdout.write(value.status);
+    ' "$staged_local" 2>/dev/null || printf planner_failed)"
+    if ! node -e '
+      const fs = require("node:fs");
+      const { basename, dirname, join } = require("node:path");
+      const { randomBytes } = require("node:crypto");
+      const [source, destination] = process.argv.slice(1);
+      if (fs.existsSync(destination) && fs.lstatSync(destination).isSymbolicLink()) {
+        throw new Error("refusing to replace a symbolic-link output path");
+      }
+      let descriptor;
+      let temporary;
+      try {
+        for (let attempt = 0; attempt < 10; attempt += 1) {
+          temporary = join(dirname(destination),
+            `.${basename(destination)}.tmp-${randomBytes(8).toString("hex")}`);
+          try {
+            descriptor = fs.openSync(temporary, "wx", 0o600);
+            break;
+          } catch (error) {
+            if (error.code !== "EEXIST") throw error;
           }
-          if (descriptor === undefined) throw new Error("could not allocate shadow staging file");
-          fs.writeFileSync(descriptor, fs.readFileSync(source));
-          fs.closeSync(descriptor);
-          descriptor = undefined;
-          fs.renameSync(temporary, destination);
-          temporary = undefined;
-        } finally {
-          if (descriptor !== undefined) fs.closeSync(descriptor);
-          if (temporary !== undefined) {
-            try { fs.unlinkSync(temporary); } catch {}
-          }
         }
-      ' "$staged_local" "$PARTITION_SHADOW_OUT" 2>/dev/null; then
-        status="planner_failed"
-      fi
+        if (descriptor === undefined) throw new Error("could not allocate shadow staging file");
+        fs.writeFileSync(descriptor, fs.readFileSync(source));
+        fs.closeSync(descriptor);
+        descriptor = undefined;
+        fs.renameSync(temporary, destination);
+        temporary = undefined;
+      } finally {
+        if (descriptor !== undefined) fs.closeSync(descriptor);
+        if (temporary !== undefined) {
+          try { fs.unlinkSync(temporary); } catch {}
+        }
+      }
+    ' "$staged_local" "$PARTITION_SHADOW_OUT_FD_PATH" 2>/dev/null; then
+      status="planner_failed"
     fi
+  elif [ -z "$status" ]; then
+    status="capture_failed"
   fi
   say "partition shadow: $status"
 }
