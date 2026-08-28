@@ -48,12 +48,12 @@ function git(repoRoot, args) {
   return execFileSync("git", args, { cwd: repoRoot, encoding: "utf8" }).trim();
 }
 
-async function completeCaptureFixture(t) {
+async function completeCaptureFixture(t, objectFormat = undefined) {
   const root = mkdtempSync(join(tmpdir(), "review-units-shadow-"));
   const repoRoot = join(root, "repo");
   t.after(() => rmSync(root, { recursive: true, force: true }));
   execFileSync("mkdir", ["-p", repoRoot]);
-  git(repoRoot, ["init", "-q"]);
+  git(repoRoot, objectFormat === undefined ? ["init", "-q"] : ["init", "-q", `--object-format=${objectFormat}`]);
   git(repoRoot, ["config", "user.email", "units@example.test"]);
   git(repoRoot, ["config", "user.name", "Units Test"]);
   writeFileSync(join(repoRoot, "file.txt"), "old\n");
@@ -1259,6 +1259,44 @@ test("shadow CLI normalizes unavailable capture CLI coordinates", async (t) => {
     assert.equal(output.status, "capture_failed");
     assert.equal(output.base_sha, flag === "--base" ? "0".repeat(40) : complete.base_sha);
     assert.equal(output.head_sha, flag === "--head" ? "0".repeat(40) : complete.head_sha);
+    validateShadowOutput(output, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes);
+  }
+});
+
+test("shadow CLI preserves available SHA-256 coordinate width", async (t) => {
+  const { root, repoRoot, complete } = await completeCaptureFixture(t, "sha256");
+  const limitsPath = join(root, "limits.json");
+  const configPath = join(root, "config.json");
+  writeFileSync(limitsPath, JSON.stringify({
+    schema_version: 1,
+    max_patch_bytes: 1_000_000,
+    max_raw_z_bytes: 1_000_000,
+    max_single_blob_bytes: 1_000_000,
+    max_total_blob_bytes: 1_000_000,
+    max_capture_seconds: 5,
+  }));
+  writeFileSync(configPath, JSON.stringify(CLI_SHADOW_CONFIG));
+  for (const [base, head, expectedBase, expectedHead, label] of [
+    ["not-a-base-object-id", complete.head_sha, "0".repeat(64), complete.head_sha, "base"],
+    [complete.base_sha, "not-a-head-object-id", complete.base_sha, "0".repeat(64), "head"],
+    ["not-a-base-object-id", "not-a-head-object-id", "0".repeat(40), "0".repeat(40), "both"],
+  ]) {
+    const capturePath = join(root, `sha256-${label}-capture.json`);
+    const localOutput = join(root, `sha256-${label}-local.json`);
+    const captureChild = spawnSync(process.execPath, [
+      "scripts/review-capture.mjs", "capture", "--repo", repoRoot,
+      "--base", base, "--head", head, "--limits", limitsPath, "--out", capturePath,
+    ], { cwd: process.cwd(), encoding: "utf8" });
+    assert.equal(captureChild.status, 0, captureChild.stderr);
+    const shadowChild = spawnSync(process.execPath, [
+      "scripts/review-units.mjs", "shadow", "--capture", capturePath,
+      "--profile", join(root, "missing-profile.json"), "--config", configPath,
+      "--local-out", localOutput,
+    ], { cwd: process.cwd(), encoding: "utf8" });
+    assert.equal(shadowChild.status, 0, shadowChild.stderr);
+    const output = JSON.parse(readFileSync(localOutput, "utf8"));
+    assert.equal(output.base_sha, expectedBase);
+    assert.equal(output.head_sha, expectedHead);
     validateShadowOutput(output, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes);
   }
 });

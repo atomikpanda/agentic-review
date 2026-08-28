@@ -1204,10 +1204,12 @@ function parseShadowArgs(argv) {
 }
 
 function shadowDiagnosticFromCapture(capture, benchmarkRevision, maxBytes) {
+  const availableCoordinate = [capture.base_sha, capture.head_sha].find((value) => typeof value === "string" && GIT_ID.test(value));
+  const unavailableCoordinate = "0".repeat(availableCoordinate?.length ?? 40);
   return buildShadowDiagnostic({
     status: capture.status,
-    base_sha: capture.base_sha ?? "0".repeat(40),
-    head_sha: capture.head_sha ?? "0".repeat(40),
+    base_sha: capture.base_sha ?? unavailableCoordinate,
+    head_sha: capture.head_sha ?? unavailableCoordinate,
     benchmark_revision: benchmarkRevision,
     reason_codes: [capture.capacity_reason ?? "process_error"],
     diagnostic: "Shadow capture did not complete.",
