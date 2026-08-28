@@ -2087,6 +2087,9 @@ test("workflow independently retains the required result and optional diagnostic
   const resultStep = source.match(
     /^      - name: upload review result\n[\s\S]*?(?=^      - name:)/m,
   )?.[0];
+  const profileStep = source.match(
+    /^      - name: upload partition shadow execution profile\n[\s\S]*?(?=^      - name:)/m,
+  )?.[0];
   const diagnosticsStep = source.match(
     /^      - name: upload optional review diagnostics\n[\s\S]*$/m,
   )?.[0];
@@ -2104,6 +2107,10 @@ test("workflow independently retains the required result and optional diagnostic
     resultStep,
     /\/tmp\/review(?:\.md|-publication\.json|-runner\.(?:out|err))/,
   );
+  assert.ok(profileStep);
+  assert.doesNotMatch(resultStep, /review-partition-shadow-profile\.json/);
+  assert.match(profileStep, /^\s+path: \/tmp\/review-partition-shadow-profile\.json$/m);
+  assert.doesNotMatch(profileStep, /^\s+path: \/tmp\/review-result\.json$/m);
 
   assert.ok(diagnosticsStep);
   assert.match(
