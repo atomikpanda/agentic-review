@@ -987,7 +987,7 @@ jobs:
           HEAD: ${{ steps.target.outputs.head }}
           AGENTIC_REVIEW_PHASE: ${{ steps.cycle.outputs.phase }}
           AGENTIC_REVIEW_KNOWN_FINDINGS: /tmp/review-known-findings.json
-          PARTITION_SHADOW: ${{ inputs.partition_shadow }}
+          AGENTIC_REVIEW_PARTITION_SHADOW: ${{ inputs.partition_shadow }}
         run: &run-review-phase |
           set -euo pipefail
           actual_head="$(git rev-parse --verify 'HEAD^{commit}')"
@@ -1026,7 +1026,7 @@ jobs:
           )
           if [ -n "$MAX_TIME" ]; then RUNNER_ARGS+=(--max-time "$MAX_TIME"); fi
           if [ "${CODEGRAPH:-true}" != "true" ]; then RUNNER_ARGS+=(--no-codegraph); fi
-          if [ "${PARTITION_SHADOW:-false}" = "true" ]; then
+          if [ "${AGENTIC_REVIEW_PARTITION_SHADOW:-false}" = "true" ]; then
             rm -f "$REVIEW_PARTITION_SHADOW_PROFILE"
             RUNNER_ARGS+=(--execution-profile-out "$REVIEW_PARTITION_SHADOW_PROFILE")
           fi
@@ -1648,6 +1648,7 @@ jobs:
 
       - name: upload partition shadow execution profile
         if: ${{ !cancelled() && inputs.partition_shadow && steps.target.outputs.eligible == 'true' && steps.cycle.outputs.should_run == 'true' }}
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: agentic-review-partition-shadow-profile
@@ -2005,14 +2006,18 @@ jobs:
             fallback planner_failed planner_helper_failed
           fi
           test -s "$PARTITION_SHADOW_OUTPUT" || fallback capture_failed output_unavailable
-          OUTPUT_STATUS="$(node --input-type=module - "$PARTITION_SHADOW_OUTPUT" <<'NODE'
+          shadow_output_status() {
+            node --input-type=module - "$PARTITION_SHADOW_OUTPUT" 2>/dev/null <<'NODE'
           import { readFileSync } from "node:fs";
-          process.stdout.write(JSON.parse(readFileSync(process.argv[2], "utf8")).status);
+          const value = JSON.parse(readFileSync(process.argv[2], "utf8"));
+          if (typeof value?.status !== "string" || value.status.length === 0) throw new TypeError("shadow output status is unreadable");
+          process.stdout.write(value.status);
           NODE
-          )"
-          if [[ "$OUTPUT_STATUS" == "complete" ]]; then
-            node "$UNITS_HELPER" validate-output --input "$PARTITION_SHADOW_OUTPUT" --capture "$CAPTURE_FILE" --max-bytes 4194304 \
-              || fallback planner_failed output_validation_failed
+          }
+          if ! OUTPUT_STATUS="$(shadow_output_status)"; then
+            fallback planner_failed output_status_unreadable
+          elif ! node "$UNITS_HELPER" validate-output --input "$PARTITION_SHADOW_OUTPUT" --capture "$CAPTURE_FILE" --profile "$PROFILE_FILE" --max-bytes 4194304; then
+            fallback planner_failed output_validation_failed
           fi
 
       - name: upload optional partition shadow diagnostics
