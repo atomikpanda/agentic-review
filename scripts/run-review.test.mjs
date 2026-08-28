@@ -986,20 +986,24 @@ test("partition shadow waits for a completed authoritative review", () => {
   assert.equal(runsShadow("success", false), false);
 });
 
-test("partition shadow independently resolves immutable same-repository and App targets", (t) => {
+test("partition shadow captures immutable reviewed coordinates despite later PR API mutations", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "partition-shadow-target-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const bin = join(directory, "bin");
   const outputFile = join(directory, "github-output");
   mkdirSync(bin);
+  const reviewedBase = "b".repeat(40);
+  const reviewedHead = "h".repeat(40);
+  const mutatedBase = "c".repeat(40);
+  const mutatedHead = "d".repeat(40);
   const gh = join(bin, "gh");
   writeFileSync(gh, `#!/usr/bin/env bash
 case "$*" in
   *'--jq .state') printf 'open\\n' ;;
   *'--jq .draft') printf 'false\\n' ;;
   *'--jq .head.repo.full_name == .base.repo.full_name') printf 'true\\n' ;;
-  *'--jq .base.sha') printf '%s\\n' "${"b".repeat(40)}" ;;
-  *'--jq .head.sha') printf '%s\\n' "${"h".repeat(40)}" ;;
+  *'--jq .base.sha') printf '%s\\n' "${mutatedBase}" ;;
+  *'--jq .head.sha') printf '%s\\n' "${mutatedHead}" ;;
   *) exit 2 ;;
 esac
 `);
@@ -1040,32 +1044,41 @@ printf '%s\n' "$*" >> "$GIT_LOG"
     return envFileValues(outputFile);
   };
 
-  const sameRepository = resolve({ IN_REPO: "owner/repo", IN_PR: "7", GH_TOKEN: "read-token" });
+  const sameRepository = resolve({
+    IN_REPO: "owner/repo",
+    IN_PR: "7",
+    IN_BASE: reviewedBase,
+    IN_HEAD: reviewedHead,
+    GH_TOKEN: "read-token",
+  });
   assert.deepEqual(sameRepository, {
     repo: "owner/repo",
     pr: "7",
-    base: "b".repeat(40),
-    head: "h".repeat(40),
+    base: reviewedBase,
+    head: reviewedHead,
     eligible: "true",
   });
 
   const app = resolve({
     IN_REPO: "other/repo",
     IN_PR: "9",
+    IN_BASE: reviewedBase,
+    IN_HEAD: reviewedHead,
     APP_ID: "1",
     APP_PRIVATE_KEY: "test-key",
   });
   assert.deepEqual(app, {
     repo: "other/repo",
     pr: "9",
-    base: "b".repeat(40),
-    head: "h".repeat(40),
+    base: reviewedBase,
+    head: reviewedHead,
     eligible: "true",
     checked_out: "true",
   });
   assert.doesNotMatch(readFileSync(outputFile, "utf8"), /partition-shadow-read-token/);
   const appCheckout = readFileSync(gitLog, "utf8");
-  assert.match(appCheckout, new RegExp(`fetch.*${"b".repeat(40)}.*${"h".repeat(40)}`));
+  assert.match(appCheckout, new RegExp(`fetch.*${reviewedBase}.*${reviewedHead}`));
+  assert.doesNotMatch(appCheckout, new RegExp(`${mutatedBase}|${mutatedHead}`));
   assert.match(appCheckout, /checkout --detach --force/);
 });
 
@@ -1326,6 +1339,71 @@ test("partition shadow strips target configuration and records bounded helper di
   assert.equal(failedCapture.status, 0, failedCapture.stderr);
   assert.equal(JSON.parse(readFileSync(outputFile, "utf8")).status, "capture_failed");
   assert.equal(readFileSync(resultFile, "utf8"), "authoritative result\n");
+});
+
+test("partition shadow emits capacity diagnostics without a usable execution profile", async (t) => {
+  const fixture = createFixture(t);
+  const support = join(fixture.repository, ".partition-shadow-support", "scripts");
+  mkdirSync(support, { recursive: true });
+  for (const name of [
+    "lib-canonical-json.mjs",
+    "review-units.mjs",
+    "strip-agent-config.sh",
+  ]) {
+    copyFileSync(join(trustedRoot, "scripts", name), join(support, name));
+  }
+  writeFileSync(
+    join(support, "review-capture.mjs"),
+    `export { validateCapturedReviewInput } from ${JSON.stringify(join(trustedRoot, "scripts", "review-capture.mjs"))};
+import { spawnSync } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  const args = process.argv.slice(2);
+  const limitsPath = args[args.indexOf("--limits") + 1];
+  const limits = JSON.parse(readFileSync(limitsPath, "utf8"));
+  limits.max_patch_bytes = 1;
+  writeFileSync(limitsPath, \`\${JSON.stringify(limits)}\\n\`);
+  const result = spawnSync(process.execPath, [${JSON.stringify(join(trustedRoot, "scripts", "review-capture.mjs"))}, ...args], { stdio: "inherit" });
+  process.exitCode = result.status ?? 1;
+}
+`,
+  );
+  const profileDirectory = join(fixture.directory, "partition-shadow-profile");
+  const profileFile = join(profileDirectory, "review-partition-shadow-profile.json");
+  mkdirSync(profileDirectory);
+  const outputFile = join(fixture.directory, "review-partition-shadow.json");
+  const env = {
+    ...process.env,
+    GITHUB_WORKSPACE: fixture.repository,
+    RUNNER_TEMP: fixture.directory,
+    SUPPORT_ROOT: dirname(support),
+    BASE_SHA: fixture.baseSha,
+    HEAD_SHA: fixture.headSha,
+    PARTITION_SHADOW_OUTPUT: outputFile,
+  };
+  const capture = (profile) => {
+    rmSync(profileFile, { force: true });
+    if (profile !== undefined) writeFileSync(profileFile, profile);
+    const result = spawnSync("bash", ["-c", workflowRunStep("capture partition shadow diagnostics")], {
+      encoding: "utf8",
+      env,
+    });
+    assert.equal(result.status, 0, `${profile === undefined ? "missing" : "malformed"} profile: ${result.stderr}`);
+    const diagnostic = JSON.parse(readFileSync(outputFile, "utf8"));
+    assert.equal(diagnostic.status, "capture_capacity_exceeded");
+    assert.equal(diagnostic.capture_hash, null);
+    assert.equal(diagnostic.manifest_hash, null);
+    assert.ok(Buffer.byteLength(JSON.stringify(diagnostic)) <= 4194304);
+    return diagnostic;
+  };
+
+  await t.test("with a missing execution profile", () => {
+    capture();
+  });
+  await t.test("with a malformed execution profile", () => {
+    capture("{not JSON}\n");
+  });
 });
 
 test("runner rejects passthrough prompt and envelope changes before OMP", (t) => {
