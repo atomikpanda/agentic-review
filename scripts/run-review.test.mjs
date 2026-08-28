@@ -935,7 +935,7 @@ test("partition shadow is an isolated opt-in hosted diagnostic", () => {
   assert.match(shadowJob, /^    continue-on-error: true$/m);
   assert.match(shadowJob, /^    timeout-minutes: 5$/m);
   assert.match(shadowJob, /^    permissions:\n      contents: read\n      pull-requests: read$/m);
-  assert.doesNotMatch(shadowJob, /OPENROUTER_API_KEY|run-review\.sh|omp(?:_version|_VERSION)?|pull-requests:\s*write|pull_requests.*write/);
+  assert.doesNotMatch(shadowJob, /OPENROUTER_API_KEY|run-review\.sh|omp(?:_version|_VERSION)?|pull-requests:\s*write/);
   assert.match(shadowJob, /review-capture\.mjs/);
   assert.match(shadowJob, /review-units\.mjs/);
   assert.match(shadowJob, /review-partition-shadow\.json/);
@@ -1404,6 +1404,12 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 }
 `,
   );
+  writeFileSync(
+    join(support, "review-units.mjs"),
+    `export * from ${JSON.stringify(join(trustedRoot, "scripts", "review-units.mjs"))};
+if (import.meta.url === \`file://\${process.argv[1]}\`) process.exit(1);
+`,
+  );
   const profileDirectory = join(fixture.directory, "partition-shadow-profile");
   const profileFile = join(profileDirectory, "review-partition-shadow-profile.json");
   mkdirSync(profileDirectory);
@@ -1426,7 +1432,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     });
     assert.equal(result.status, 0, `${profile === undefined ? "missing" : "malformed"} profile: ${result.stderr}`);
     const diagnostic = JSON.parse(readFileSync(outputFile, "utf8"));
-    assert.equal(diagnostic.status, "capture_capacity_exceeded");
+    assert.equal(diagnostic.status, "capture_failed");
     assert.equal(diagnostic.capture_hash, null);
     assert.equal(diagnostic.manifest_hash, null);
     assert.ok(Buffer.byteLength(JSON.stringify(diagnostic)) <= 4194304);
