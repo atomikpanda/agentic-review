@@ -935,7 +935,12 @@ test("partition shadow is an isolated opt-in hosted diagnostic", () => {
   assert.match(shadowJob, /^    continue-on-error: true$/m);
   assert.match(shadowJob, /^    timeout-minutes: 5$/m);
   assert.match(shadowJob, /^    permissions:\n      contents: read\n      pull-requests: read$/m);
-  assert.doesNotMatch(shadowJob, /OPENROUTER_API_KEY|run-review\.sh|omp(?:_version|_VERSION)?|pull-requests:\s*write/);
+  const modelWiring = /OPENROUTER_API_KEY|run-review\.sh|(?:^|[;\n]\s*)omp(?:\s|$)|\bOMP_VERSION\b/;
+  assert.doesNotMatch(shadowJob, modelWiring);
+  assert.doesNotMatch("complete artifact_compacted", modelWiring);
+  assert.match("omp --model openrouter/example", modelWiring);
+  assert.match("OMP_VERSION=17.4.0", modelWiring);
+  assert.doesNotMatch(shadowJob, /pull-requests:\s*write/);
   assert.match(shadowJob, /review-capture\.mjs/);
   assert.match(shadowJob, /review-units\.mjs/);
   assert.match(shadowJob, /review-partition-shadow\.json/);
