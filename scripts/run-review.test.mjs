@@ -39,6 +39,13 @@ const installer = fileURLToPath(new URL("./install-review.sh", import.meta.url))
 const trustedRoot = dirname(dirname(runner));
 const stagedTargetRefPrefix = "refs/agentic-review/staged-targets/";
 
+function copyReviewResultDependencies(directory) {
+  const scriptsDirectory = join(directory, "scripts");
+  copyFileSync(resultCli, join(scriptsDirectory, "review-result.mjs"));
+  copyFileSync(join(dirname(resultCli), "lib-findings.mjs"), join(scriptsDirectory, "lib-findings.mjs"));
+  copyFileSync(join(dirname(resultCli), "lib-canonical-json.mjs"), join(scriptsDirectory, "lib-canonical-json.mjs"));
+}
+
 function workflowRunStep(name) {
   const lines = readFileSync(workflow, "utf8").split("\n");
   const stepStart = lines.findIndex((line) => line === `      - name: ${name}`);
@@ -2012,9 +2019,7 @@ test("behind-base poster no-result fallback pairs with the trusted merge-base pu
   const publicationFile = join(directory, "review-publication.json");
   mkdirSync(dirname(trustedPoster), { recursive: true });
   writeFileSync(trustedPoster, 'import "./missing-trusted-dependency.mjs";\n');
-  copyFileSync(resultCli, join(directory, "scripts", "review-result.mjs"));
-  copyFileSync(join(dirname(resultCli), "lib-findings.mjs"), join(directory, "scripts", "lib-findings.mjs"));
-  copyFileSync(join(dirname(resultCli), "lib-canonical-json.mjs"), join(directory, "scripts", "lib-canonical-json.mjs"));
+  copyReviewResultDependencies(directory);
 
   const baseSha = "1111111111111111111111111111111111111111";
   const targetBaseSha = "3333333333333333333333333333333333333333";
@@ -2249,8 +2254,7 @@ import { writeFileSync } from "node:fs";
 writeFileSync(process.env.REVIEW_RESULT_FILE, process.env.EMITTED_RESULT);
 process.exit(41);
 `);
-  copyFileSync(resultCli, join(directory, "scripts", "review-result.mjs"));
-  copyFileSync(join(dirname(resultCli), "lib-findings.mjs"), join(directory, "scripts", "lib-findings.mjs"));
+  copyReviewResultDependencies(directory);
 
   const baseSha = "1111111111111111111111111111111111111111";
   const headSha = "2222222222222222222222222222222222222222";
@@ -2401,8 +2405,7 @@ import { writeFileSync } from "node:fs";
 writeFileSync(process.env.REVIEW_RESULT_FILE, process.env.EMITTED_RESULT);
 process.exit(37);
 `);
-  copyFileSync(resultCli, join(directory, "scripts", "review-result.mjs"));
-  copyFileSync(join(dirname(resultCli), "lib-findings.mjs"), join(directory, "scripts", "lib-findings.mjs"));
+  copyReviewResultDependencies(directory);
 
   const baseSha = "1111111111111111111111111111111111111111";
   const headSha = "2222222222222222222222222222222222222222";
@@ -2489,8 +2492,7 @@ import { writeFileSync } from "node:fs";
 writeFileSync(process.env.REVIEW_RESULT_FILE, process.env.EMITTED_RESULT);
 process.exit(31);
 `);
-  copyFileSync(resultCli, join(directory, "scripts", "review-result.mjs"));
-  copyFileSync(join(dirname(resultCli), "lib-findings.mjs"), join(directory, "scripts", "lib-findings.mjs"));
+  copyReviewResultDependencies(directory);
 
   const baseSha = "1111111111111111111111111111111111111111";
   const headSha = "2222222222222222222222222222222222222222";
