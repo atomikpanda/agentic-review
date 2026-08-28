@@ -127,6 +127,13 @@ function removeDiffPrefix(path, prefix) {
 }
 
 function gitTokens(bytes) {
+  const unquotedBoundary = bytes[0] === 0x22 ? -1 : bytes.indexOf(Buffer.from(" b/"));
+  if (unquotedBoundary !== -1) {
+    return [
+      decodeGitPath(bytes.subarray(0, unquotedBoundary)),
+      decodeGitPath(bytes.subarray(unquotedBoundary + 1)),
+    ];
+  }
   const tokens = [];
   for (let index = 0; index < bytes.length && tokens.length < 2;) {
     while (bytes[index] === 0x20) index += 1;
@@ -140,6 +147,7 @@ function gitTokens(bytes) {
     } else while (index < bytes.length && bytes[index] !== 0x20) index += 1;
     tokens.push(decodeGitPath(bytes.subarray(start, index)));
   }
+  if (tokens.length !== 2) throw new TypeError("invalid diff header paths");
   return tokens;
 }
 
@@ -156,7 +164,12 @@ function parsePatch(bytes) {
   let lastChanged;
   let previousSides;
   let offset = 0;
-  const finishHunk = () => { hunk = undefined; lastChanged = undefined; previousSides = undefined; };
+  const finishHunk = () => {
+    if (hunk && (hunk.oldRecords !== hunk.oldCount || hunk.newRecords !== hunk.newCount)) throw new TypeError("patch hunk record counts do not match header");
+    hunk = undefined;
+    lastChanged = undefined;
+    previousSides = undefined;
+  };
   const startSection = (line) => {
     finishHunk();
     const [oldHeader, newHeader] = gitTokens(line.subarray(Buffer.byteLength("diff --git ")));
@@ -173,8 +186,9 @@ function parsePatch(bytes) {
     if (!hunk && line.subarray(0, 4).equals(Buffer.from("--- "))) { section.oldPath = removeDiffPrefix(decodeGitPath(line.subarray(4)), "a"); continue; }
     if (!hunk && line.subarray(0, 4).equals(Buffer.from("+++ "))) { section.newPath = removeDiffPrefix(decodeGitPath(line.subarray(4)), "b"); continue; }
     if (line.subarray(0, 3).equals(Buffer.from("@@ "))) {
+      finishHunk();
       const range = parseHunkHeader(line);
-      hunk = { ...range, events: [], blocks: [], currentBlock: undefined, oldCursor: range.oldStart, newCursor: range.newStart, oldLineIndex: 0, newLineIndex: 0, index: section.hunks.length };
+      hunk = { ...range, events: [], blocks: [], currentBlock: undefined, oldCursor: range.oldStart, newCursor: range.newStart, oldLineIndex: 0, newLineIndex: 0, oldRecords: 0, newRecords: 0, index: section.hunks.length };
       section.hunks.push(hunk);
       lastChanged = undefined;
       previousSides = undefined;
@@ -189,6 +203,8 @@ function parsePatch(bytes) {
     if (!hunk) continue;
     const marker = line[0];
     if (marker === 0x20) {
+      hunk.oldRecords += 1;
+      hunk.newRecords += 1;
       hunk.oldCursor += 1;
       hunk.newCursor += 1;
       hunk.currentBlock = undefined;
@@ -196,6 +212,7 @@ function parsePatch(bytes) {
       lastChanged = undefined;
     } else if (marker === 0x2d || marker === 0x2b) {
       const side = marker === 0x2d ? "old" : "new";
+      hunk[side === "old" ? "oldRecords" : "newRecords"] += 1;
       const lineValue = { bytes_base64: line.subarray(1).toString("base64"), terminator: "lf" };
       const event = { side, line: lineValue, oldBefore: hunk.oldCursor, newBefore: hunk.newCursor, lineIndex: side === "old" ? hunk.oldLineIndex++ : hunk.newLineIndex++ };
       hunk.events.push(event);
@@ -209,7 +226,9 @@ function parsePatch(bytes) {
       lastChanged = event;
       previousSides = [side];
     }
+    if (hunk.oldRecords > hunk.oldCount || hunk.newRecords > hunk.newCount) throw new TypeError("patch hunk record counts do not match header");
   }
+  finishHunk();
   return sections;
 }
 
@@ -523,6 +542,8 @@ const COMPACT_OUTPUT_KEYS = Object.freeze([
   "schema_version", "status", "mode", "capture_hash", "manifest_hash", "benchmark_revision",
   "counts", "sizes", "omitted",
 ]);
+
+const FALLBACK_SHADOW_DIAGNOSTIC_MAX_BYTES = 4 * 1024 * 1024;
 const DIAGNOSTIC_KEYS = Object.freeze([
   "schema_version", "status", "mode", "base_sha", "head_sha", "benchmark_revision",
   "capture_hash", "manifest_hash", "reason_codes", "diagnostic", "observed_lower_bounds",
@@ -1145,6 +1166,23 @@ function invalidCaptureDiagnostic(capture, benchmarkRevision, maxBytes, error) {
   }, maxBytes);
 }
 
+function plannerFailureDiagnostic(capture, benchmarkRevision, maxBytes, error) {
+  return buildShadowDiagnostic({
+    status: "planner_failed",
+    capture,
+    benchmark_revision: benchmarkRevision,
+    reason_codes: [error.message === "frontier_capacity_limit" ? "frontier_capacity_limit" : "planner_error"],
+    diagnostic: error.message,
+    observed_lower_bounds: { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 },
+    counts: {},
+  }, maxBytes);
+}
+
+function writeDiagnosticOutputs(options, diagnostic) {
+  if (options["--local-out"]) writeShadowOutput(options["--local-out"], diagnostic);
+  if (options["--diagnostics-out"]) writeShadowOutput(options["--diagnostics-out"], diagnostic);
+}
+
 function validateOutputUsage() {
   return "usage: node scripts/review-units.mjs validate-output --input OUTPUT_JSON --max-bytes MAX_BYTES [--profile PROFILE_JSON --config CONFIG_JSON]\n";
 }
@@ -1198,26 +1236,45 @@ function main(argv) {
     return 2;
   }
   try {
-    const capture = JSON.parse(readFileSync(options["--capture"], "utf8"));
-    const config = JSON.parse(readFileSync(options["--config"], "utf8"));
-    const configValue = configuration(config);
+    let capture;
+    try {
+      capture = JSON.parse(readFileSync(options["--capture"], "utf8"));
+    } catch (error) {
+      writeDiagnosticOutputs(options, invalidCaptureDiagnostic(undefined, "", FALLBACK_SHADOW_DIAGNOSTIC_MAX_BYTES, error));
+      return 0;
+    }
+    let config;
+    let configValue;
+    try {
+      config = JSON.parse(readFileSync(options["--config"], "utf8"));
+      configValue = configuration(config);
+    } catch (error) {
+      try {
+        validateCapturedReviewInput(capture);
+      } catch (captureError) {
+        writeDiagnosticOutputs(options, invalidCaptureDiagnostic(capture, "", FALLBACK_SHADOW_DIAGNOSTIC_MAX_BYTES, captureError));
+        return 0;
+      }
+      if (capture.status !== "complete") {
+        writeDiagnosticOutputs(options, shadowDiagnosticFromCapture(capture, "", FALLBACK_SHADOW_DIAGNOSTIC_MAX_BYTES));
+        return 0;
+      }
+      writeDiagnosticOutputs(options, plannerFailureDiagnostic(capture, "", FALLBACK_SHADOW_DIAGNOSTIC_MAX_BYTES, error));
+      return 0;
+    }
     try {
       validateCapturedReviewInput(capture);
     } catch (error) {
-      const diagnostic = invalidCaptureDiagnostic(capture, configValue.benchmark_revision, configValue.max_shadow_artifact_bytes, error);
-      if (options["--local-out"]) writeShadowOutput(options["--local-out"], diagnostic);
-      if (options["--diagnostics-out"]) writeShadowOutput(options["--diagnostics-out"], diagnostic);
+      writeDiagnosticOutputs(options, invalidCaptureDiagnostic(capture, configValue.benchmark_revision, configValue.max_shadow_artifact_bytes, error));
       return 0;
     }
     if (capture.status !== "complete") {
-      const diagnostic = shadowDiagnosticFromCapture(capture, configValue.benchmark_revision, configValue.max_shadow_artifact_bytes);
-      if (options["--local-out"]) writeShadowOutput(options["--local-out"], diagnostic);
-      if (options["--diagnostics-out"]) writeShadowOutput(options["--diagnostics-out"], diagnostic);
+      writeDiagnosticOutputs(options, shadowDiagnosticFromCapture(capture, configValue.benchmark_revision, configValue.max_shadow_artifact_bytes));
       return 0;
     }
-    const profile = JSON.parse(readFileSync(options["--profile"], "utf8"));
     const diagnostic = (() => {
       try {
+        const profile = JSON.parse(readFileSync(options["--profile"], "utf8"));
         const atomization = atomizeCapturedReviewInput(capture, configValue.atom_target_bytes);
         if (atomization.status !== "complete") return buildShadowDiagnostic({
           status: "atom_coverage_mismatch", capture, benchmark_revision: configValue.benchmark_revision,
@@ -1230,18 +1287,10 @@ function main(argv) {
         if (options["--diagnostics-out"]) writeShadowOutput(options["--diagnostics-out"], buildHostedShadowOutput(capture, manifest, configValue.max_shadow_artifact_bytes));
         return null;
       } catch (error) {
-        return buildShadowDiagnostic({
-          status: "planner_failed", capture, benchmark_revision: configValue.benchmark_revision,
-          reason_codes: [error.message === "frontier_capacity_limit" ? "frontier_capacity_limit" : "planner_error"], diagnostic: error.message,
-          observed_lower_bounds: { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 },
-          counts: {},
-        }, configValue.max_shadow_artifact_bytes);
+        return plannerFailureDiagnostic(capture, configValue.benchmark_revision, configValue.max_shadow_artifact_bytes, error);
       }
     })();
-    if (diagnostic !== null) {
-      if (options["--local-out"]) writeShadowOutput(options["--local-out"], diagnostic);
-      if (options["--diagnostics-out"]) writeShadowOutput(options["--diagnostics-out"], diagnostic);
-    }
+    if (diagnostic !== null) writeDiagnosticOutputs(options, diagnostic);
     return 0;
   } catch (error) {
     process.stderr.write(`${error.message}\n`);

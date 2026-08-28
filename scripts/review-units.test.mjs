@@ -247,6 +247,42 @@ test("keeps header-shaped changed lines inside active hunks", () => {
   assert.deepEqual(text.new_lines, [{ bytes_base64: Buffer.from("++ added").toString("base64"), terminator: "lf" }]);
 });
 
+test("correlates unquoted space-containing binary and mode-only diff headers", () => {
+  for (const { oldMode, newMode, patch, rows, expectedKind } of [
+    {
+      oldMode: "100644", newMode: "100644",
+      patch: "diff --git a/path with space b/path with space\nBinary files a/path with space and b/path with space differ\n",
+      rows: [row(OLD_ID, Buffer.from("old\n")), row(NEW_ID, Buffer.from("new\n"))],
+      expectedKind: "binary",
+    },
+    {
+      oldMode: "100644", newMode: "100755",
+      patch: "diff --git a/path with space b/path with space\nold mode 100644\nnew mode 100755\n",
+      rows: [row(OLD_ID, Buffer.from("old\n"), ["100644"]), row(NEW_ID, Buffer.from("new\n"), ["100755"])],
+      expectedKind: "mode",
+    },
+  ]) {
+    const result = atomizeCapturedReviewInput(capture({
+      raw: rawRecord({ oldMode, newMode, paths: ["path with space"] }),
+      patch,
+      rows,
+    }));
+    assert.equal(result.status, "complete", expectedKind);
+    assert.ok(result.atoms.find((atom) => atom.kind === "path_event").content_kinds.includes(expectedKind), expectedKind);
+  }
+});
+
+test("rejects hunks whose old or new records do not match their headers", () => {
+  for (const patch of [
+    "diff --git a/old.txt b/old.txt\n@@ -1,2 +1 @@\n-old\n+new\n",
+    "diff --git a/old.txt b/old.txt\n@@ -1 +1,2 @@\n-old\n+new\n",
+    "diff --git a/old.txt b/old.txt\n@@ -1 +1 @@\n",
+    "diff --git a/old.txt b/old.txt\n@@ -1 +1 @@\n-old\n-old-extra\n+new\n",
+  ]) {
+    assert.equal(atomizeCapturedReviewInput(capture({ raw: rawRecord({}), patch })).status, "atom_coverage_mismatch");
+  }
+});
+
 test("rejects coverage ownership IDs that are absent or have the wrong atom kind", () => {
   const source = capture({ raw: rawRecord({}), patch: "diff --git a/old.txt b/old.txt\n@@ -1 +1 @@\n-old\n+new\n" });
   const complete = atomizeCapturedReviewInput(source);
@@ -827,6 +863,39 @@ test("shadow CLI emits a non-complete capture diagnostic before reading the prof
   ], { cwd: process.cwd(), encoding: "utf8" });
   assert.equal(child.status, 0, child.stderr);
   assert.equal(JSON.parse(readFileSync(localOutput, "utf8")).status, limited.status);
+});
+
+test("shadow CLI writes bounded planner diagnostics for profile and config setup failures", async (t) => {
+  const { root, complete } = await completeCaptureFixture(t);
+  const capturePath = join(root, "capture.json");
+  const profilePath = join(root, "profile.json");
+  writeFileSync(capturePath, JSON.stringify(complete));
+  writeFileSync(profilePath, JSON.stringify(CLI_SHADOW_PROFILE));
+  for (const [index, config, profile] of [
+    [0, JSON.stringify(CLI_SHADOW_CONFIG), join(root, "missing-profile.json")],
+    [1, JSON.stringify(CLI_SHADOW_CONFIG), (() => {
+      const malformed = join(root, "malformed-profile.json");
+      writeFileSync(malformed, "{");
+      return malformed;
+    })()],
+    [2, "{", profilePath],
+  ]) {
+    const configPath = join(root, `config-${index}.json`);
+    const localOutput = join(root, `local-${index}.json`);
+    const diagnosticsOutput = join(root, `diagnostics-${index}.json`);
+    writeFileSync(configPath, config);
+    const child = spawnSync(process.execPath, [
+      "scripts/review-units.mjs", "shadow", "--capture", capturePath,
+      "--profile", profile, "--config", configPath,
+      "--local-out", localOutput, "--diagnostics-out", diagnosticsOutput,
+    ], { cwd: process.cwd(), encoding: "utf8" });
+    assert.equal(child.status, 0, child.stderr);
+    const output = JSON.parse(readFileSync(localOutput, "utf8"));
+    assert.deepEqual(JSON.parse(readFileSync(diagnosticsOutput, "utf8")), output);
+    assert.equal(output.status, "planner_failed");
+    assert.ok(output.reason_codes.includes("planner_error"));
+    validateShadowOutput(output, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes);
+  }
 });
 
 test("runs shadow CLI from both relative and absolute script paths", async (t) => {
