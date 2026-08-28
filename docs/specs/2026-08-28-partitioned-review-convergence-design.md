@@ -198,6 +198,18 @@ capture runs against fixed base/head commits and produces:
     "max_total_blob_bytes": 67108864,
     "max_capture_seconds": 30
   },
+  "git_environment": {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_EXTERNAL_DIFF": "",
+    "GIT_DIFF_OPTS": ""
+  },
+  "git_config_overrides": [
+    "diff.external=",
+    "diff.algorithm=myers",
+    "diff.renames=copies",
+    "core.quotePath=false"
+  ],
   "patch_argv": ["git", "diff", "..."],
   "raw_argv": ["git", "diff", "..."],
   "patch_base64": "<exact bytes>",
@@ -225,6 +237,8 @@ Capacity/failure is a separate diagnostic envelope, never a partial capture:
   "base_sha": "<full-object-id>",
   "head_sha": "<full-object-id>",
   "capture_configuration": {},
+  "git_environment": {},
+  "git_config_overrides": [],
   "patch_argv": [],
   "raw_argv": [],
   "capacity_reason": "patch_bytes | raw_z_bytes | blob_bytes | deadline | process_error",
@@ -243,13 +257,15 @@ and `capture_hash`. It cannot be passed to atomization or interpreted as an
 immutable reviewed scope.
 ```
 
-Both diff invocations explicitly use `--no-abbrev`, `--full-index`,
-`--diff-algorithm=myers`, `--unified=3`, `--find-renames=50%`,
-`--find-copies=50%`, `--find-copies-harder`, `--no-ext-diff`,
-`--no-textconv`, and `--no-color`, with configuration/environment sources that
-can change diff behavior neutralized. Literal argv arrays and neutralized config
-are persisted and fingerprinted. Tests set non-default abbreviation/config
-values and still require full object IDs and identical capture.
+The exact patch command is
+`git <config-overrides> diff --patch --no-raw --no-abbrev --full-index
+--diff-algorithm=myers --unified=3 --find-renames=50% --find-copies=50%
+--find-copies-harder --no-ext-diff --no-textconv --no-color BASE HEAD --`.
+The exact raw command is identical except it replaces
+`--patch --no-raw --unified=3` with `--raw -z --no-patch`. Literal argv,
+`git_environment`, and ordered `git_config_overrides` are persisted and
+fingerprinted. Tests set non-default abbreviation/config and still require full
+IDs and identical capture.
 
 Shadow capture streams both diff subprocesses into bounded private files while
 counting bytes. Exceeding either stream limit or the wall-clock deadline kills
@@ -321,8 +337,16 @@ that also have text hunks:
 
 Raw status mapping is literal: `A/D/M/R/C/T/U` map to the named status; any
 other status is `unknown` and makes atomization diagnostic-failed until schema
-support is added. `content_kinds` is a canonical ordered subset of `text`,
-`binary`, `mode`, `symlink`, `submodule`, `empty`, and `other`.
+support is added. `content_kinds` uses fixed order
+`text, binary, mode, symlink, submodule, empty, other` and includes:
+
+- `text` when the correlated patch record has at least one text hunk;
+- `binary` for a blob change reported binary with no text hunk;
+- `mode` when old/new modes differ;
+- `symlink` when either mode is `120000`;
+- `submodule` when either mode is `160000`;
+- `empty` when an admitted old/new blob has size zero;
+- `other` only when no preceding kind describes a supported raw record.
 
 One-path normalization:
 
@@ -337,9 +361,14 @@ capacity is represented explicitly and prevents complete atomization.
 
 ### Text atoms
 
-Parse every patch hunk byte-preservingly. Each contiguous changed-line run is
-split at changed-line boundaries toward 16,000 canonical payload bytes. A single
-line over target becomes `oversized=true` and is never truncated.
+Parse every patch hunk byte-preservingly. A change block is the maximal sequence
+of `-`/`+` records between context records. Walk each block in patch order. Add
+one changed line at a time to a candidate segment and canonical-encode the
+candidate text payload; if adding the line would exceed 16,000 bytes and the
+segment is nonempty, finalize it and start the next at the current old/new
+cursors. A single line over target becomes one `oversized=true` segment and is
+never truncated. Segment old/new starts are the side cursors before its first
+line and counts are the lines owned on each side.
 
 Each old/new line is:
 
@@ -382,8 +411,11 @@ Each atom has:
 }
 ```
 
-Path-event lineage binds raw status, status/content kind tuples, and old/new path
-bytes. Text lineage binds old/new path bytes and old/new ranges.
+`lineage_candidate` is a bounded string. Path-event candidate is
+`p:<sha256(canonicalJson({kind:"path_event",raw_status,status_kind,content_kinds,old_path_base64,new_path_base64}))>`.
+Text candidate is
+`t:<sha256(canonicalJson({kind:"text",old_path_base64,new_path_base64,old_start,old_count,new_start,new_count}))>`.
+The hashes bind canonical JSON bytes; candidate prefixes distinguish domains.
 
 Within one repeated lineage candidate, compute `segment_ordinal` by sorting the
 pre-ID tuple `(old_start,old_count,new_start,new_count,content_hash,canonical_payload_bytes)`.
@@ -771,22 +803,27 @@ wave, not the full cycle. The absolute call/event budgets bound total work.
 
 ## Shadow activation, output, and metrics
 
-Stage 1 is explicitly opt-in through CLI `--partition-shadow` and hosted input
-`partition_shadow: false` by default. Environment equivalent is
-`AGENTIC_REVIEW_PARTITION_SHADOW=false`.
+Stage 1 is explicitly opt-in through local CLI `--partition-shadow` and hosted
+input `partition_shadow: false` by default.
 
-Local `--partition-shadow-out FILE` writes the complete versioned shadow capture
-and manifest atomically when within configured capture limits. Hosted shadow
-output writes `/tmp/review-partition-shadow.json` into optional diagnostics. It
-contains no blob/line content, only schemas, capture/manifest hashes, status,
-counts, sizes, and metrics. `max_shadow_artifact_bytes=4194304` is fingerprinted;
-overflow emits a compact `artifact_compacted` metrics envelope rather than
-truncation or full-review failure.
+Local shadow capture/planning runs only after all model workers have stopped and
+the existing findings/publication/result work has completed. It may add
+explicitly requested local latency but cannot change model-visible context.
+`--partition-shadow-out FILE` writes the complete bounded capture and manifest.
 
-Every capture/planner exception is caught and represented as
-`status=capture_failed|planner_failed` with bounded diagnostic text. Shadow work
-never changes the full-run exit code, prompt, model environment, model call,
-publication, result file, workflow output, summary, comment, or gate.
+Hosted shadow runs in a separate `partition-shadow` job after the authoritative
+review job. The job has its own five-minute timeout, `continue-on-error: true`,
+contents-read permission only, no model key, no PR write token, and no reusable
+workflow outputs. It checks out the resolved immutable target and trusted
+support, invokes capture/planning directly, and uploads a separate optional
+`agentic-review-partition-shadow` artifact. Its success, failure, timeout, or
+cancellation cannot change the review job, publication, outputs, comment,
+summary, or gate.
+
+Hosted output contains no blob/line content, only schemas, hashes, status,
+counts, sizes, and metrics. `max_shadow_artifact_bytes=4194304` is fingerprinted.
+Every capture/planner exception is represented as a bounded diagnostic; it
+cannot affect authoritative review behavior.
 
 Metrics:
 
