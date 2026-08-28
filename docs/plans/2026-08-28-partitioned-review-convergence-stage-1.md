@@ -1049,8 +1049,9 @@ Execute the new job's shell bodies with controlled same-repository and central
 App-dispatch fixtures. Assert:
 
 - canonical base/head/repository are re-resolved independently;
-- checkout uses contents-read token, detached immutable head, and
-  `persist-credentials:false`;
+- the same credentialed resolver performs detached immutable Git checkout with
+  a command-scoped contents-read token, persists no credential, emits no token
+  output, and deletes token material before later steps;
 - central trusted support supplies helpers;
 - target agent configuration is stripped before any tool reads;
 - capture/planner timeout/failure cannot alter mocked review-job result;
@@ -1066,7 +1067,7 @@ Expected: FAIL because input/job/installer option are absent.
 
 - [ ] **Step 4: Add opt-in input and independent job**
 
-Add:
+Add the same boolean input to both `workflow_call` and `workflow_dispatch`:
 
 ```yaml
 partition_shadow:
@@ -1076,10 +1077,10 @@ partition_shadow:
 ```
 
 The job runs after `review`, has `continue-on-error:true`, its own five-minute
-timeout, and contents-read only. It repeats trusted target resolution/read-only
-checkout without sharing credentials between jobs, runs capture/unit CLIs
-directly, and uploads only the redacted diagnostics file. It does not influence
-the review job or reusable outputs.
+timeout, and contents-read only. Its target resolver mints/uses the App token
+inside one shell step for Git fetch/checkout and emits only repo/base/head
+coordinates; no token enters `$GITHUB_OUTPUT`. It then runs trusted capture/unit
+CLIs and uploads only redacted diagnostics. It does not influence review outputs.
 
 In `install-review.sh`, add validated `--partition-shadow`, set
 `I_PARTITION_SHADOW=true`, and emit `partition_shadow: true` only when requested.

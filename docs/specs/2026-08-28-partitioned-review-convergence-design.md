@@ -814,11 +814,12 @@ explicitly requested local latency but cannot change model-visible context.
 Hosted shadow runs in a separate `partition-shadow` job after the authoritative
 review job. The job has its own five-minute timeout, `continue-on-error: true`,
 contents-read permission only, no model key, no PR write token, and no reusable
-workflow outputs. It checks out the resolved immutable target and trusted
-support, invokes capture/planning directly, and uploads a separate optional
-`agentic-review-partition-shadow` artifact. Its success, failure, timeout, or
-cancellation cannot change the review job, publication, outputs, comment,
-summary, or gate.
+workflow outputs. The credentialed target-resolution step performs the detached
+immutable Git checkout itself and destroys the minted App token before later
+steps; masked tokens never transit step/job outputs. Trusted support is checked
+out separately. The job invokes capture/planning directly and uploads optional
+`agentic-review-partition-shadow`. Its success, failure, timeout, or cancellation
+cannot change the review job, publication, outputs, comment, summary, or gate.
 
 Hosted output contains no blob/line content, only schemas, hashes, status,
 counts, sizes, and metrics. `max_shadow_artifact_bytes=4194304` is fingerprinted.
