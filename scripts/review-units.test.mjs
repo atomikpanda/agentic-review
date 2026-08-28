@@ -622,6 +622,8 @@ test("shadow CLI validates complete captures before atomization or manifest proj
     (value) => { delete value.base_sha; },
     (value) => { delete value.head_sha; },
     (value) => { delete value.object_table; },
+    (value) => { delete value.capture_hash; },
+    (value) => { value.capture_hash = "not-a-hash"; },
     (value) => { value.capture_hash = "0".repeat(64); },
     (value) => { value.object_table[0].content_base64 = Buffer.from("tampered").toString("base64"); },
   ];
@@ -632,7 +634,7 @@ test("shadow CLI validates complete captures before atomization or manifest proj
     const child = spawnSync(process.execPath, ["scripts/review-units.mjs", "shadow", "--capture", capturePath, "--profile", profilePath, "--config", configPath, "--local-out", localOutput], { cwd: process.cwd(), encoding: "utf8" });
     assert.equal(child.status, 0, child.stderr);
     const output = JSON.parse(readFileSync(localOutput, "utf8"));
-    assert.equal(output.status, "planner_failed");
+    assert.equal(output.status, "capture_failed");
     assert.equal(Object.hasOwn(output, "manifest"), false);
     assert.ok(output.reason_codes.includes("capture_validation_failed"));
   }

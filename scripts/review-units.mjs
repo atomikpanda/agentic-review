@@ -937,11 +937,11 @@ function shadowDiagnosticFromCapture(capture, benchmarkRevision, maxBytes) {
 function invalidCaptureDiagnostic(capture, benchmarkRevision, maxBytes, error) {
   const safeId = (value) => typeof value === "string" && GIT_ID.test(value) ? value : "0".repeat(40);
   return buildShadowDiagnostic({
-    status: "planner_failed",
+    status: "capture_failed",
     base_sha: safeId(capture?.base_sha),
     head_sha: safeId(capture?.head_sha),
     benchmark_revision: typeof benchmarkRevision === "string" && benchmarkRevision.length <= 256 ? benchmarkRevision : "",
-    capture_hash: SHA256.test(capture?.capture_hash) ? capture.capture_hash : null,
+    capture_hash: null,
     manifest_hash: null,
     reason_codes: ["capture_validation_failed"],
     diagnostic: error instanceof Error ? error.message : "Capture validation failed.",
