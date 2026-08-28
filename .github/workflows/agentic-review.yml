@@ -1893,6 +1893,12 @@ jobs:
           printf '%s\n' '{"schema_version":1,"benchmark_revision":"","atom_target_bytes":16000,"unit_target_bytes":64000,"max_frontier_units":128,"max_shadow_artifact_bytes":4194304}' > "$CONFIG_FILE"
           fallback() {
             local status="$1" reason="$2"
+            if ! canonical_fallback "$status" "$reason"; then
+              emergency_fallback "$status" "$reason"
+            fi
+          }
+          canonical_fallback() {
+            local status="$1" reason="$2"
             STATUS="$status" REASON="$reason" BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" \
               node --input-type=module - "$CAPTURE_HELPER" "$UNITS_HELPER" "$CONFIG_FILE" "$CAPTURE_FILE" "$PARTITION_SHADOW_OUTPUT" <<'NODE'
           import { readFileSync } from "node:fs";
@@ -1929,6 +1935,61 @@ jobs:
             observed_lower_bounds,
             counts: {},
           }, config.max_shadow_artifact_bytes));
+          NODE
+          }
+          emergency_fallback() {
+            local status="$1" reason="$2"
+            STATUS="$status" REASON="$reason" BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" \
+              node --input-type=module - "$CONFIG_FILE" "$PARTITION_SHADOW_OUTPUT" <<'NODE'
+          import { randomUUID } from "node:crypto";
+          import { lstatSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+          import { dirname, join } from "node:path";
+          const [configFile, output] = process.argv.slice(2);
+          let maxBytes = 4_194_304;
+          try {
+            const configured = JSON.parse(readFileSync(configFile, "utf8")).max_shadow_artifact_bytes;
+            if (Number.isSafeInteger(configured) && configured > 0) maxBytes = configured;
+          } catch {}
+          const gitId = (value) => /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(value ?? "")
+            ? value
+            : "0".repeat(40);
+          const reason = typeof process.env.REASON === "string" && process.env.REASON.length > 0 && process.env.REASON.length <= 256
+            ? process.env.REASON
+            : "result_unavailable";
+          const diagnostic = {
+            schema_version: 1,
+            status: ["capture_capacity_exceeded", "capture_failed"].includes(process.env.STATUS) ? process.env.STATUS : "capture_failed",
+            mode: "partition_shadow",
+            base_sha: gitId(process.env.BASE_SHA),
+            head_sha: gitId(process.env.HEAD_SHA),
+            benchmark_revision: "",
+            capture_hash: null,
+            manifest_hash: null,
+            reason_codes: [reason],
+            diagnostic: "Partition shadow diagnostic unavailable.",
+            observed_lower_bounds: { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 },
+            counts: {},
+            sizes: { encoded_output_bytes: 0 },
+          };
+          for (;;) {
+            const encodedBytes = Buffer.byteLength(`${JSON.stringify(diagnostic)}\n`);
+            if (diagnostic.sizes.encoded_output_bytes === encodedBytes) break;
+            diagnostic.sizes.encoded_output_bytes = encodedBytes;
+          }
+          const content = `${JSON.stringify(diagnostic)}\n`;
+          if (Buffer.byteLength(content) > maxBytes) throw new Error("emergency diagnostic exceeds configured artifact limit");
+          try {
+            if (lstatSync(output).isSymbolicLink()) throw new Error("output path must not be a symlink");
+          } catch (error) {
+            if (error?.code !== "ENOENT") throw error;
+          }
+          const temporary = join(dirname(output), `.partition-shadow-${randomUUID()}.tmp`);
+          try {
+            writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
+            renameSync(temporary, output);
+          } finally {
+            try { unlinkSync(temporary); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+          }
           NODE
           }
           if ! node "$CAPTURE_HELPER" capture --repo "$GITHUB_WORKSPACE" --base "$BASE_SHA" --head "$HEAD_SHA" --limits "$LIMITS_FILE" --out "$CAPTURE_FILE"; then
