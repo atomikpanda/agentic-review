@@ -1783,12 +1783,6 @@ run_partition_shadow() {
       >>"$units_stderr" 2>&1; then
       stage_shadow_helper_diagnostic planner_failed planner_output_invalid \
         "$units_stderr" "$staged_local" || :
-      if ! node "$SELF_ROOT/scripts/review-units.mjs" validate-output \
-        --input "$staged_local" --profile "$SHADOW_PROFILE_FILE" \
-        --config "$SHADOW_CONFIG_FILE" --max-bytes "$LOCAL_SHADOW_VALIDATION_MAX_BYTES" \
-        >>"$units_stderr" 2>&1; then
-        rm -f -- "$staged_local"
-      fi
     fi
   fi
   if [ -s "$staged_local" ]; then

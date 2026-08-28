@@ -6520,7 +6520,7 @@ PATH="$real_path" git "$@"
   assert.match(unsafe.result.stderr, /partition-shadow-out.*symlink/i);
 });
 
-test("partition shadow preserves a canonical capacity diagnostic after its units helper disappears", (t) => {
+test("partition shadow preserves a canonical capacity diagnostic after its units helper becomes unloadable", (t) => {
   const fixture = createFixture(t);
   const isolatedRoot = join(fixture.directory, "isolated-runner");
   const isolatedScripts = join(isolatedRoot, "scripts");
@@ -6554,7 +6554,7 @@ if [ "\${1##*/}" = review-capture.mjs ] && [ "\${2:-}" = capture ]; then
   "$REAL_NODE" "$@"
   status=$?
   cp "$output" "$FAKE_SHADOW_CAPTURE"
-  rm -f "$FAKE_SHADOW_UNITS_HELPER"
+  printf '%s\n' 'not valid JavaScript {' > "$FAKE_SHADOW_UNITS_HELPER"
   exit "$status"
 fi
 exec "$REAL_NODE" "$@"
