@@ -969,22 +969,63 @@ test("partition shadow is an isolated opt-in hosted diagnostic", () => {
     /partition.shadow/i,
   );
 });
-test("partition shadow waits for a completed authoritative review", () => {
+test("partition shadow requires an eligible completed authoritative review", () => {
   const source = readFileSync(workflow, "utf8");
   const shadowJob = source.slice(source.indexOf("  partition-shadow:\n"));
   assert.match(
     shadowJob,
-    /^    if: \$\{\{ always\(\) && inputs\.partition_shadow && \(needs\.review\.result == 'success' \|\| needs\.review\.result == 'failure'\) \}\}$/m,
+    /^    if: \$\{\{ always\(\) && inputs\.partition_shadow && needs\.review\.outputs\.shadow_eligible == 'true' && \(needs\.review\.result == 'success' \|\| needs\.review\.result == 'failure'\) \}\}$/m,
   );
 
-  const runsShadow = (reviewResult, enabled = true) =>
-    enabled && ["success", "failure"].includes(reviewResult);
-  assert.equal(runsShadow("success"), true);
-  assert.equal(runsShadow("failure"), true);
-  assert.equal(runsShadow("skipped"), false);
-  assert.equal(runsShadow("cancelled"), false);
-  assert.equal(runsShadow("success", false), false);
+  const runsShadow = (reviewResult, eligible, enabled = true) =>
+    enabled && eligible === "true" && ["success", "failure"].includes(reviewResult);
+  assert.equal(runsShadow("success", "true"), true);
+  assert.equal(runsShadow("failure", "true"), true);
+  assert.equal(runsShadow("success", "false"), false);
+  assert.equal(runsShadow("success", ""), false);
+  assert.equal(runsShadow("skipped", "true"), false);
+  assert.equal(runsShadow("cancelled", "true"), false);
+  assert.equal(runsShadow("success", "true", false), false);
 });
+test("authoritative target makes draft and fork same-repository dispatches ineligible", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "review-target-eligibility-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const bin = join(directory, "bin");
+  const outputFile = join(directory, "github-output");
+  mkdirSync(bin);
+  const gh = join(bin, "gh");
+  writeFileSync(gh, `#!/usr/bin/env bash
+case "$*" in
+  *'--jq .state') printf 'open\\n' ;;
+  *'--jq .draft') printf '%s\\n' "$TARGET_DRAFT" ;;
+  *'--jq .head.repo.full_name == .base.repo.full_name') printf '%s\\n' "$TARGET_SAME_REPOSITORY" ;;
+  *) exit 2 ;;
+esac
+`);
+  chmodSync(gh, 0o755);
+  const resolve = (targetDraft, sameRepository) => {
+    rmSync(outputFile, { force: true });
+    const result = spawnSync("bash", ["-c", workflowRunStep("resolve the review target")], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        GITHUB_OUTPUT: outputFile,
+        GITHUB_REPOSITORY: "owner/repo",
+        IN_REPO: "owner/repo",
+        IN_PR: "7",
+        TARGET_DRAFT: targetDraft,
+        TARGET_SAME_REPOSITORY: sameRepository,
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    return envFileValues(outputFile);
+  };
+
+  assert.deepEqual(resolve("true", "true"), { eligible: "false" });
+  assert.deepEqual(resolve("false", "false"), { eligible: "false" });
+});
+
 
 test("partition shadow captures immutable reviewed coordinates despite later PR API mutations", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "partition-shadow-target-"));
