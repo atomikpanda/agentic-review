@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { canonicalJson } from "../../scripts/lib-canonical-json.mjs";
 
 const workflow = fileURLToPath(new URL("./agentic-review.yml", import.meta.url));
 const sha = "a".repeat(40);
@@ -76,6 +77,7 @@ test("helper-independent shadow fallback writes a bounded redacted diagnostic", 
     assert.equal(diagnostic.capture_hash, null);
     assert.equal(diagnostic.manifest_hash, null);
     assert.equal(diagnostic.sizes.encoded_output_bytes, Buffer.byteLength(text));
+    assert.equal(text, `${canonicalJson(diagnostic)}\n`);
     assert.doesNotMatch(diagnostic.diagnostic, /helper|support|module|load/i);
   } finally {
     rmSync(directory, { recursive: true, force: true });

@@ -1956,6 +1956,13 @@ jobs:
           const reason = typeof process.env.REASON === "string" && process.env.REASON.length > 0 && process.env.REASON.length <= 256
             ? process.env.REASON
             : "result_unavailable";
+          const canonicalJson = (value) => {
+            if (value === null || typeof value === "string" || typeof value === "boolean"
+              || (typeof value === "number" && Number.isFinite(value))) return JSON.stringify(value);
+            if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+            if (Object.getPrototypeOf(value) !== Object.prototype) throw new TypeError("diagnostic must be plain JSON");
+            return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+          };
           const diagnostic = {
             schema_version: 1,
             status: ["capture_capacity_exceeded", "capture_failed"].includes(process.env.STATUS) ? process.env.STATUS : "capture_failed",
@@ -1972,11 +1979,11 @@ jobs:
             sizes: { encoded_output_bytes: 0 },
           };
           for (;;) {
-            const encodedBytes = Buffer.byteLength(`${JSON.stringify(diagnostic)}\n`);
+            const encodedBytes = Buffer.byteLength(`${canonicalJson(diagnostic)}\n`);
             if (diagnostic.sizes.encoded_output_bytes === encodedBytes) break;
             diagnostic.sizes.encoded_output_bytes = encodedBytes;
           }
-          const content = `${JSON.stringify(diagnostic)}\n`;
+          const content = `${canonicalJson(diagnostic)}\n`;
           if (Buffer.byteLength(content) > maxBytes) throw new Error("emergency diagnostic exceeds configured artifact limit");
           try {
             if (lstatSync(output).isSymbolicLink()) throw new Error("output path must not be a symlink");
