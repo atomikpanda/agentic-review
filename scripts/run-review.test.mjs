@@ -28,6 +28,8 @@ import {
   scopeHash,
 } from "./review-result.mjs";
 import { encodeSummaryMarker } from "./post-review.mjs";
+import { validateShadowOutput } from "./review-units.mjs";
+
 
 const runner = fileURLToPath(new URL("./run-review.sh", import.meta.url));
 const resultCli = fileURLToPath(new URL("./review-result.mjs", import.meta.url));
@@ -1830,7 +1832,7 @@ test("workflow continues clean verification through final discovery without anot
   );
   assert.match(
     workflowRunStep("run automatic final discovery"),
-    /\$\{PARTITION_SHADOW:-false\}/,
+    /\$\{AGENTIC_REVIEW_PARTITION_SHADOW:-false\}/,
   );
   assert.ok(continuationPoster);
   assert.match(continuationPoster, /steps\.continuation_cycle\.outputs\.should_run == 'true'/);
@@ -6514,6 +6516,81 @@ PATH="$real_path" git "$@"
   assert.equal(unsafe.logs.length, 0);
   assert.equal(readFileSync(unsafeTarget, "utf8"), "operator-owned\n");
   assert.match(unsafe.result.stderr, /partition-shadow-out.*symlink/i);
+});
+
+test("partition shadow preserves a capacity diagnostic when its execution profile is unavailable", (t) => {
+  const fixture = createFixture(t);
+  const nodeWrapper = join(fixture.bin, "node");
+  writeFileSync(nodeWrapper, `#!/usr/bin/env bash
+if [ "\${1##*/}" = review-capture.mjs ] && [ "\${2:-}" = capture ]; then
+  for ((index = 1; index <= $#; index += 1)); do
+    if [ "\${!index}" = --limits ]; then
+      next=$((index + 1))
+      "$REAL_NODE" -e 'const fs = require("node:fs"); const limits = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); limits.max_raw_z_bytes = 1; fs.writeFileSync(process.argv[1], JSON.stringify(limits));' "\${!next}"
+      break
+    fi
+  done
+fi
+exec "$REAL_NODE" "$@"
+`);
+  chmodSync(nodeWrapper, 0o755);
+  const shadowFile = join(fixture.directory, "partition-shadow.json");
+  const profileTarget = join(fixture.directory, "profile-target.json");
+  const profileLink = join(fixture.directory, "profile-link.json");
+  writeFileSync(profileTarget, "operator-owned profile\n");
+  symlinkSync(profileTarget, profileLink);
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    existingFixture: fixture,
+    args: [
+      "--partition-shadow", "--partition-shadow-out", shadowFile,
+      "--execution-profile-out", profileLink, "--json",
+    ],
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.equal(readFileSync(profileTarget, "utf8"), "operator-owned profile\n");
+  assert.ok(existsSync(shadowFile), run.result.stderr);
+  const diagnostic = JSON.parse(readFileSync(shadowFile, "utf8"));
+  assert.equal(diagnostic.status, "capture_capacity_exceeded");
+  assert.deepEqual(diagnostic.reason_codes, ["raw_z_bytes"]);
+  assert.equal(diagnostic.capture_hash, null);
+  assert.equal(diagnostic.manifest_hash, null);
+  assert.ok(diagnostic.observed_lower_bounds.raw_z_bytes > 1);
+  assert.doesNotThrow(() => validateShadowOutput(diagnostic, 4 * 1024 * 1024));
+  assert.match(run.result.stderr, /partition shadow: capture_capacity_exceeded/);
+});
+
+test("partition shadow clears stale output only after destination validation", (t) => {
+  const fixture = createFixture(t);
+  const shadowFile = join(fixture.directory, "partition-shadow.json");
+  writeFileSync(shadowFile, "stale shadow\n");
+  const lateFailure = runReview(t, { general: [{ findings: [] }] }, {
+    existingFixture: fixture,
+    args: [
+      "--partition-shadow", "--partition-shadow-out", shadowFile,
+      "--prompt", "missing-prompt.md", "--json",
+    ],
+  });
+  assert.notEqual(lateFailure.result.status, 0);
+  assert.equal(existsSync(shadowFile), false);
+  const staleCollision = '{"findings":[]}\n';
+  const collidingShadow = join(fixture.directory, "colliding-shadow.json");
+  writeFileSync(collidingShadow, staleCollision);
+  const collision = runReview(t, { general: [{ findings: [] }] }, {
+    existingFixture: fixture,
+    args: ["--partition-shadow", "--partition-shadow-out", collidingShadow, "--json"],
+    outputPaths: ({ publicationFile }) => ({
+      findingsFile: collidingShadow,
+      publicationFile,
+    }),
+  });
+  assert.notEqual(collision.result.status, 0);
+  assert.equal(readFileSync(collidingShadow, "utf8"), staleCollision);
+  assert.match(collision.result.stderr, /partition-shadow-out.*distinct/i);
 });
 
 test("partition shadow holds its prevalidated destination parent through model work", (t) => {

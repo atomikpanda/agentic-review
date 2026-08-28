@@ -361,6 +361,10 @@ if [ -n "$EXECUTION_PROFILE_OUT" ] && [ ! -L "$EXECUTION_PROFILE_OUT" ]; then
     die "--execution-profile-out must be distinct from review output destinations"
   fi
 fi
+if [ "$PARTITION_SHADOW" = 1 ]; then
+  rm -f -- "$PARTITION_SHADOW_OUT_FD_PATH" \
+    || die "could not clear stale partition shadow at $PARTITION_SHADOW_OUT"
+fi
 if [ -n "$EXECUTION_PROFILE_OUT" ]; then
   if [ -L "$EXECUTION_PROFILE_OUT" ] \
      || ! rm -f -- "$EXECUTION_PROFILE_OUT"; then
@@ -1620,12 +1624,12 @@ run_shadow_command() {
 
 stage_shadow_helper_diagnostic() {
   local requested_status="$1" reason="$2" stderr_file="$3" staged_local="$4"
-  node --input-type=module -e '
+  if node --input-type=module -e '
     import { readFileSync } from "node:fs";
     import { pathToFileURL } from "node:url";
     const [
-      helper, configFile, captureFile, destination, requestedStatus, reason,
-      baseSha, headSha, stderrFile,
+      configFile, captureFile, destination, requestedStatus, reason,
+      baseSha, headSha, stderrFile, helper,
     ] = process.argv.slice(1);
     const { buildShadowDiagnostic, writeShadowOutput } =
       await import(pathToFileURL(helper).href);
@@ -1637,27 +1641,92 @@ stage_shadow_helper_diagnostic() {
     })();
     const canReportPlannerFailure = requestedStatus === "planner_failed"
       && capture?.status === "complete";
+    const canReportCapacity = capture?.status === "capture_capacity_exceeded";
     const details = {
-      status: canReportPlannerFailure ? "planner_failed" : "capture_failed",
+      status: canReportCapacity
+        ? "capture_capacity_exceeded"
+        : canReportPlannerFailure ? "planner_failed" : "capture_failed",
       base_sha: baseSha,
       head_sha: headSha,
       benchmark_revision: config.benchmark_revision,
-      reason_codes: [canReportPlannerFailure ? reason : "capture_result_unavailable"],
+      reason_codes: [canReportCapacity
+        ? capture.capacity_reason
+        : canReportPlannerFailure ? reason : "capture_result_unavailable"],
       diagnostic: stderrPresent
         ? "Shadow helper failed; stderr redacted."
         : "Shadow helper failed without stderr.",
-      observed_lower_bounds: {
-        patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0,
-        elapsed_milliseconds: 0,
-      },
+      observed_lower_bounds: canReportCapacity
+        ? capture.observed_lower_bounds
+        : {
+            patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0,
+            elapsed_milliseconds: 0,
+          },
       counts: {},
     };
     if (canReportPlannerFailure) details.capture = capture;
     writeShadowOutput(destination,
       buildShadowDiagnostic(details, config.max_shadow_artifact_bytes));
-  ' "$SELF_ROOT/scripts/review-units.mjs" "$SHADOW_CONFIG_FILE" \
-    "$RUN_TMP/shadow-capture.json" "$staged_local" "$requested_status" "$reason" \
-    "$BASE_SHA" "$HEAD_SHA" "$stderr_file" 2>/dev/null
+  ' "$SHADOW_CONFIG_FILE" "$RUN_TMP/shadow-capture.json" "$staged_local" \
+    "$requested_status" "$reason" "$BASE_SHA" "$HEAD_SHA" "$stderr_file" \
+    "$SELF_ROOT/scripts/review-units.mjs" 2>/dev/null; then
+    return 0
+  fi
+  node --input-type=module -e '
+    import { randomUUID } from "node:crypto";
+    import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+    import { dirname, join } from "node:path";
+    const [configFile, captureFile, destination, requestedStatus, reason, baseSha, headSha] =
+      process.argv.slice(1);
+    const emptyBounds = {
+      patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0,
+      elapsed_milliseconds: 0,
+    };
+    const validBounds = (value) => value !== null && typeof value === "object"
+      && Object.keys(value).sort().join(",") === "blob_bytes,blob_count,elapsed_milliseconds,patch_bytes,raw_z_bytes"
+      && Object.values(value).every((entry) => Number.isSafeInteger(entry) && entry >= 0);
+    let maxBytes = 4 * 1024 * 1024;
+    try {
+      const configured = JSON.parse(readFileSync(configFile, "utf8")).max_shadow_artifact_bytes;
+      if (Number.isSafeInteger(configured) && configured > 0) maxBytes = configured;
+    } catch {}
+    let capture;
+    try { capture = JSON.parse(readFileSync(captureFile, "utf8")); } catch {}
+    const capacity = capture?.status === "capture_capacity_exceeded"
+      && ["patch_bytes", "raw_z_bytes", "blob_bytes", "deadline"].includes(capture.capacity_reason)
+      && validBounds(capture.observed_lower_bounds);
+    const complete = capture?.status === "complete"
+      && /^[0-9a-f]{64}$/.test(capture.capture_hash);
+    const planner = !capacity && complete && requestedStatus === "planner_failed";
+    const diagnostic = {
+      schema_version: 1,
+      status: capacity ? "capture_capacity_exceeded" : planner ? "planner_failed" : "capture_failed",
+      mode: "partition_shadow",
+      base_sha: baseSha,
+      head_sha: headSha,
+      benchmark_revision: "",
+      capture_hash: planner ? capture.capture_hash : null,
+      manifest_hash: null,
+      reason_codes: [capacity ? capture.capacity_reason : planner ? reason : "capture_result_unavailable"],
+      diagnostic: "Shadow helper unavailable; details redacted.",
+      observed_lower_bounds: capacity ? capture.observed_lower_bounds : emptyBounds,
+      counts: {},
+      sizes: { encoded_output_bytes: 0 },
+    };
+    for (;;) {
+      const encodedBytes = Buffer.byteLength(`${JSON.stringify(diagnostic)}\n`);
+      if (diagnostic.sizes.encoded_output_bytes === encodedBytes) break;
+      diagnostic.sizes.encoded_output_bytes = encodedBytes;
+    }
+    if (diagnostic.sizes.encoded_output_bytes > maxBytes) throw new Error("shadow diagnostic exceeds size limit");
+    const temporary = join(dirname(destination), `.shadow-diagnostic-${randomUUID()}.tmp`);
+    try {
+      writeFileSync(temporary, `${JSON.stringify(diagnostic)}\n`, { flag: "wx", mode: 0o600 });
+      renameSync(temporary, destination);
+    } finally {
+      try { unlinkSync(temporary); } catch {}
+    }
+  ' "$SHADOW_CONFIG_FILE" "$RUN_TMP/shadow-capture.json" "$staged_local" \
+    "$requested_status" "$reason" "$BASE_SHA" "$HEAD_SHA"
 }
 
 run_partition_shadow() {
@@ -1699,7 +1768,7 @@ run_partition_shadow() {
     stage_shadow_helper_diagnostic planner_failed planner_output_missing \
       "$units_stderr" "$staged_local" || :
   fi
-  if [ -s "$staged_local" ]; then
+  if [ -s "$staged_local" ] && [ -n "$units_helper" ]; then
     if ! node "$SELF_ROOT/scripts/review-units.mjs" validate-output \
       --input "$staged_local" --profile "$SHADOW_PROFILE_FILE" \
       --config "$SHADOW_CONFIG_FILE" --max-bytes "$LOCAL_SHADOW_VALIDATION_MAX_BYTES" \
