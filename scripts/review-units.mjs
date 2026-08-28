@@ -169,11 +169,11 @@ function parsePatch(bytes) {
     offset = hasLf ? newline + 1 : bytes.length;
     if (line.subarray(0, 11).equals(Buffer.from("diff --git "))) { startSection(line); continue; }
     if (!section) continue;
-    if (line.subarray(0, 4).equals(Buffer.from("--- "))) { section.oldPath = removeDiffPrefix(decodeGitPath(line.subarray(4)), "a"); continue; }
-    if (line.subarray(0, 4).equals(Buffer.from("+++ "))) { section.newPath = removeDiffPrefix(decodeGitPath(line.subarray(4)), "b"); continue; }
+    if (!hunk && line.subarray(0, 4).equals(Buffer.from("--- "))) { section.oldPath = removeDiffPrefix(decodeGitPath(line.subarray(4)), "a"); continue; }
+    if (!hunk && line.subarray(0, 4).equals(Buffer.from("+++ "))) { section.newPath = removeDiffPrefix(decodeGitPath(line.subarray(4)), "b"); continue; }
     if (line.subarray(0, 3).equals(Buffer.from("@@ "))) {
       const range = parseHunkHeader(line);
-      hunk = { ...range, events: [], blocks: [], currentBlock: undefined, oldCursor: range.oldStart, newCursor: range.newStart, index: section.hunks.length };
+      hunk = { ...range, events: [], blocks: [], currentBlock: undefined, oldCursor: range.oldStart, newCursor: range.newStart, oldLineIndex: 0, newLineIndex: 0, index: section.hunks.length };
       section.hunks.push(hunk);
       lastChanged = undefined;
       continue;
@@ -193,7 +193,7 @@ function parsePatch(bytes) {
     } else if (marker === 0x2d || marker === 0x2b) {
       const side = marker === 0x2d ? "old" : "new";
       const lineValue = { bytes_base64: line.subarray(1).toString("base64"), terminator: "lf" };
-      const event = { side, line: lineValue, oldBefore: hunk.oldCursor, newBefore: hunk.newCursor, lineIndex: hunk.events.filter((item) => item.side === side).length };
+      const event = { side, line: lineValue, oldBefore: hunk.oldCursor, newBefore: hunk.newCursor, lineIndex: side === "old" ? hunk.oldLineIndex++ : hunk.newLineIndex++ };
       hunk.events.push(event);
       if (!hunk.currentBlock) {
         hunk.currentBlock = [];
@@ -411,14 +411,21 @@ export function validateAtomization(result, capture, suppliedState = undefined) 
   const expectedLines = expectedChangedLineKeys(sections);
   const rawOwners = Array.isArray(result.coverage?.raw_record_owners) ? result.coverage.raw_record_owners : [];
   const lineOwners = Array.isArray(result.coverage?.changed_line_owners) ? result.coverage.changed_line_owners : [];
+  const atomsById = new Map(Array.isArray(result.atoms) ? result.atoms.map((atom) => [atom.atom_id, atom]) : []);
   const reasons = [];
   const rawCounts = new Map(rawOwners.map((owner) => [owner.raw_record_index, 0]));
-  for (const owner of rawOwners) rawCounts.set(owner.raw_record_index, (rawCounts.get(owner.raw_record_index) ?? 0) + 1);
-  if (records.some((_, index) => (rawCounts.get(index) ?? 0) === 0)) reasons.push("missing_path_owner");
+  for (const owner of rawOwners) {
+    const atom = atomsById.get(owner.atom_id);
+    if (atom?.kind === "path_event") rawCounts.set(owner.raw_record_index, (rawCounts.get(owner.raw_record_index) ?? 0) + 1);
+  }
+  if (records.some((_, index) => (rawCounts.get(index) ?? 0) === 0) || rawOwners.some((owner) => atomsById.get(owner.atom_id)?.kind !== "path_event")) reasons.push("missing_path_owner");
   if ([...rawCounts.values()].some((value) => value > 1) || [...rawCounts.keys()].some((index) => !Number.isInteger(index) || index < 0 || index >= records.length)) reasons.push("duplicate_path_owner");
   const lineCounts = new Map(lineOwners.map((owner) => [owner.line_key, 0]));
-  for (const owner of lineOwners) lineCounts.set(owner.line_key, (lineCounts.get(owner.line_key) ?? 0) + 1);
-  if (expectedLines.some((key) => (lineCounts.get(key) ?? 0) === 0)) reasons.push("missing_changed_line_owner");
+  for (const owner of lineOwners) {
+    const atom = atomsById.get(owner.atom_id);
+    if (atom?.kind === "text") lineCounts.set(owner.line_key, (lineCounts.get(owner.line_key) ?? 0) + 1);
+  }
+  if (expectedLines.some((key) => (lineCounts.get(key) ?? 0) === 0) || lineOwners.some((owner) => atomsById.get(owner.atom_id)?.kind !== "text")) reasons.push("missing_changed_line_owner");
   if ([...lineCounts.values()].some((value) => value > 1) || [...lineCounts.keys()].some((key) => !expectedLines.includes(key))) reasons.push("duplicate_changed_line_owner");
   if (records.some((_, index) => sectionForRecord ? sectionForRecord[index] === -1 : false) || recordForSection.some((index) => index === -1)) reasons.push("raw_patch_path_disagreement");
   try {

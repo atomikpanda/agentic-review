@@ -196,3 +196,54 @@ test("reports ordered coverage failures for ownership and incomplete captures", 
   blobMismatchCapture.object_table[0].object_type = "tree";
   assert.deepEqual(validateAtomization(complete, blobMismatchCapture).reasons, ["mode_object_blob_disagreement"]);
 });
+test("keeps header-shaped changed lines inside active hunks", () => {
+  const result = atomizeCapturedReviewInput(capture({
+    raw: rawRecord({}),
+    patch: "diff --git a/old.txt b/old.txt\n@@ -1 +1 @@\n--- removed\n+++ added\n",
+  }));
+  assert.equal(result.status, "complete");
+  const text = result.atoms.find((atom) => atom.kind === "text");
+  assert.deepEqual(text.old_lines, [{ bytes_base64: Buffer.from("-- removed").toString("base64"), terminator: "lf" }]);
+  assert.deepEqual(text.new_lines, [{ bytes_base64: Buffer.from("++ added").toString("base64"), terminator: "lf" }]);
+});
+
+test("rejects coverage ownership IDs that are absent or have the wrong atom kind", () => {
+  const source = capture({ raw: rawRecord({}), patch: "diff --git a/old.txt b/old.txt\n@@ -1 +1 @@\n-old\n+new\n" });
+  const complete = atomizeCapturedReviewInput(source);
+  const path = complete.atoms.find((atom) => atom.kind === "path_event");
+  const text = complete.atoms.find((atom) => atom.kind === "text");
+
+  const absentPath = structuredClone(complete);
+  absentPath.coverage.raw_record_owners[0].atom_id = `a:${"0".repeat(64)}`;
+  assert.deepEqual(validateAtomization(absentPath, source).reasons, ["missing_path_owner"]);
+
+  const textAsPath = structuredClone(complete);
+  textAsPath.coverage.raw_record_owners[0].atom_id = text.atom_id;
+  assert.deepEqual(validateAtomization(textAsPath, source).reasons, ["missing_path_owner"]);
+
+  const absentLine = structuredClone(complete);
+  absentLine.coverage.changed_line_owners[0].atom_id = `a:${"f".repeat(64)}`;
+  assert.deepEqual(validateAtomization(absentLine, source).reasons, ["missing_changed_line_owner"]);
+
+  const pathAsLine = structuredClone(complete);
+  pathAsLine.coverage.changed_line_owners[0].atom_id = path.atom_id;
+  assert.deepEqual(validateAtomization(pathAsLine, source).reasons, ["missing_changed_line_owner"]);
+});
+
+test("indexes many changed lines without rescanning prior hunk events", () => {
+  const lineCount = 256;
+  const patch = `diff --git a/old.txt b/old.txt\n@@ -1,${lineCount} +1,${lineCount} @@\n${Array.from({ length: lineCount }, (_, index) => `-old-${index}\n+new-${index}\n`).join("")}`;
+  const originalFilter = Array.prototype.filter;
+  let filterCalls = 0;
+  Array.prototype.filter = function (...args) {
+    filterCalls += 1;
+    return originalFilter.apply(this, args);
+  };
+  try {
+    const result = atomizeCapturedReviewInput(capture({ raw: rawRecord({}), patch }));
+    assert.equal(result.status, "complete", JSON.stringify(result));
+    assert.ok(filterCalls < 10, `atomization made ${filterCalls} Array#filter calls`);
+  } finally {
+    Array.prototype.filter = originalFilter;
+  }
+});
