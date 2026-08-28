@@ -144,18 +144,20 @@ test("hosted shadow replaces malformed output with a bounded fallback", () => {
   }
 });
 
-test("hosted shadow validates compacted output with its capture and profile", () => {
+test("hosted shadow validates compacted output with its capture, profile, and config", () => {
   const source = readFileSync(workflow, "utf8");
   const directory = mkdtempSync(join(tmpdir(), "agentic-review-shadow-compacted-"));
   try {
     const output = join(directory, "shadow.json");
     const capture = join(directory, "capture.json");
     const profile = join(directory, "profile.json");
+    const config = join(directory, "config.json");
     const helper = join(directory, "units.mjs");
     const receipt = join(directory, "receipt.json");
     writeFileSync(output, JSON.stringify({ status: "artifact_compacted" }));
     writeFileSync(capture, "{}");
     writeFileSync(profile, "{}");
+    writeFileSync(config, "{}");
     writeFileSync(helper, [
       'import { writeFileSync } from "node:fs";',
       "const args = process.argv.slice(2);",
@@ -169,12 +171,13 @@ test("hosted shadow validates compacted output with its capture and profile", ()
         PARTITION_SHADOW_OUTPUT: output,
         CAPTURE_FILE: capture,
         PROFILE_FILE: profile,
+        CONFIG_FILE: config,
         RECEIPT: receipt,
       },
       stdio: "pipe",
     });
     assert.deepEqual(JSON.parse(readFileSync(receipt, "utf8")), [
-      "validate-output", "--input", output, "--capture", capture, "--profile", profile, "--max-bytes", "4194304",
+      "validate-output", "--input", output, "--capture", capture, "--profile", profile, "--config", config, "--max-bytes", "4194304",
     ]);
   } finally {
     rmSync(directory, { recursive: true, force: true });
