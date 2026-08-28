@@ -258,11 +258,11 @@ immutable reviewed scope.
 ```
 
 The exact patch command is
-`git <config-overrides> diff --patch --no-raw --no-abbrev --full-index
+`git <config-overrides> diff --patch --no-abbrev --full-index
 --diff-algorithm=myers --unified=3 --find-renames=50% --find-copies=50%
 --find-copies-harder --no-ext-diff --no-textconv --no-color BASE HEAD --`.
 The exact raw command is identical except it replaces
-`--patch --no-raw --unified=3` with `--raw -z --no-patch`. Literal argv,
+`--patch --unified=3` with `--raw -z`. Literal argv,
 `git_environment`, and ordered `git_config_overrides` are persisted and
 fingerprinted. Tests set non-default abbreviation/config and still require full
 IDs and identical capture.

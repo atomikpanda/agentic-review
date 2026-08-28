@@ -357,12 +357,12 @@ const commonDiffFlags = [
   "--no-ext-diff", "--no-textconv", "--no-color",
 ];
 const patchArgv = [
-  ...gitPrefix, "--patch", "--no-raw", "--no-abbrev", "--full-index",
+  ...gitPrefix, "--patch", "--no-abbrev", "--full-index",
   "--diff-algorithm=myers", "--unified=3",
   ...commonDiffFlags, baseSha, headSha, "--",
 ];
 const rawArgv = [
-  ...gitPrefix, "--raw", "-z", "--no-patch", "--no-abbrev", "--full-index",
+  ...gitPrefix, "--raw", "-z", "--no-abbrev", "--full-index",
   "--diff-algorithm=myers",
   ...commonDiffFlags, baseSha, headSha, "--",
 ];
