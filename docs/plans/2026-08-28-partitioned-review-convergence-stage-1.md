@@ -22,7 +22,7 @@
 
 ## Global Constraints
 
-- Stage 1 is opt-in: CLI `--partition-shadow`, hosted input `partition_shadow: false`, environment `AGENTIC_REVIEW_PARTITION_SHADOW=false`.
+- Stage 1 is opt-in: CLI `--partition-shadow`, hosted input `partition_shadow: false`, and validated local defaults `AGENTIC_REVIEW_PARTITION_SHADOW=false` with `AGENTIC_REVIEW_PARTITION_SHADOW_OUT`.
 - Full-mode diff bytes, scope hash, prompts, model calls, publications, outputs, comments, summaries, and gates must not change.
 - Capture limits: patch 8,388,608 bytes; raw-z 8,388,608 bytes; one blob 16,777,216 bytes; cumulative blobs 67,108,864 bytes; wall time 30 seconds.
 - Atom target: 16,000 canonical payload bytes; unit target: 64,000 bytes; maximum frontier units: 128.
@@ -1033,6 +1033,7 @@ partition-shadow:
   timeout-minutes: 5
   permissions:
     contents: read
+    pull-requests: read
 ```
 
 Assert the job contains no `OPENROUTER_API_KEY`, no pull-request/issues write
@@ -1077,10 +1078,11 @@ partition_shadow:
 ```
 
 The job runs after `review`, has `continue-on-error:true`, its own five-minute
-timeout, and contents-read only. Its target resolver mints/uses the App token
-inside one shell step for Git fetch/checkout and emits only repo/base/head
-coordinates; no token enters `$GITHUB_OUTPUT`. It then runs trusted capture/unit
-CLIs and uploads only redacted diagnostics. It does not influence review outputs.
+timeout, `contents: read` plus `pull-requests: read` only. Its target resolver
+mints/uses the App token inside one shell step for Git fetch/checkout and emits
+only repo/base/head coordinates; no token enters `$GITHUB_OUTPUT`. It then runs
+trusted capture/unit CLIs and uploads only redacted diagnostics. It does not
+influence review outputs.
 
 In `install-review.sh`, add validated `--partition-shadow`, set
 `I_PARTITION_SHADOW=true`, and emit `partition_shadow: true` only when requested.

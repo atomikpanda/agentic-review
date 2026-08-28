@@ -924,7 +924,7 @@ test("partition shadow is an isolated opt-in hosted diagnostic", () => {
   const inputs = source.match(/^    inputs:\n[\s\S]*?(?=^    secrets:)/m)?.[0];
   const shadowJob = source.slice(source.indexOf("  partition-shadow:\n"));
   const dispatch = source.match(/^  workflow_dispatch:\n[\s\S]*?(?=^  pull_request_target:)/m)?.[0];
-
+  assert.match(shadowJob, /^    permissions:\n      contents: read\n      pull-requests: read$/m);
   assert.ok(inputs);
   assert.match(inputs, /^      partition_shadow:\n        description: Compute diagnostic-only partition manifests after review\.\n        type: boolean\n        default: false$/m);
   assert.ok(dispatch);
@@ -945,6 +945,7 @@ test("partition shadow is an isolated opt-in hosted diagnostic", () => {
   assert.match(shadowJob, /persist-credentials: false/);
   assert.match(shadowJob, /permissions: \{ contents: "read", pull_requests: "read" \}/);
   assert.match(shadowJob, /atomikpanda\/agentic-review/);
+  assert.doesNotMatch(shadowJob, /pull-requests:\s*write|pull_requests.*write/);
   assert.ok(
     shadowJob.indexOf("strip target agent configuration")
       < shadowJob.indexOf("capture partition shadow diagnostics"),
@@ -1133,6 +1134,36 @@ test("partition shadow profile output preserves authoritative nondefault descrip
       projected_model_calls: projection.projected_model_calls,
     },
   );
+});
+
+test("partition shadow environment defaults activate privately and CLI values override them", (t) => {
+  const fixture = createFixture(t);
+  const environmentShadow = join(fixture.directory, "environment-shadow.json");
+  const cliShadow = join(fixture.directory, "cli-shadow.json");
+  const plan = { general: [{ findings: [] }], correctness: [{ findings: [] }], boundaries: [{ findings: [] }] };
+  const fromEnvironment = runReview(t, plan, {
+    existingFixture: fixture,
+    args: ["--json"],
+    env: {
+      AGENTIC_REVIEW_PARTITION_SHADOW: "true",
+      AGENTIC_REVIEW_PARTITION_SHADOW_OUT: environmentShadow,
+    },
+  });
+  assert.equal(fromEnvironment.result.status, 0, fromEnvironment.result.stderr);
+  assert.ok(existsSync(environmentShadow));
+  assert.ok(fromEnvironment.logs.every(({ environment_keys }) =>
+    !environment_keys.some((key) => /PARTITION_SHADOW/.test(key))));
+
+  const cli = runReview(t, plan, {
+    existingFixture: fixture,
+    args: ["--partition-shadow", "--partition-shadow-out", cliShadow, "--json"],
+    env: {
+      AGENTIC_REVIEW_PARTITION_SHADOW: "false",
+      AGENTIC_REVIEW_PARTITION_SHADOW_OUT: environmentShadow,
+    },
+  });
+  assert.equal(cli.result.status, 0, cli.result.stderr);
+  assert.ok(existsSync(cliShadow));
 });
 test("partition shadow strips target configuration and records bounded helper diagnostics separately", (t) => {
   const fixture = createFixture(t, {

@@ -325,7 +325,7 @@ directly.
 after every review worker has stopped and the ordinary findings, publication,
 and result have completed. The hosted form is a separate best-effort
 `partition-shadow` job after the authoritative review, with its own five-minute
-timeout and `contents: read` permission. Neither form makes a model call or
+timeout plus `contents: read` and `pull-requests: read` permissions. Neither
 adds a gate; capture or planner failure, timeout, and cancellation cannot
 change the review job, result, publication, outputs, comment, summary, or
 merge state.
@@ -342,7 +342,9 @@ This is diagnostic-only shadow planning, not convergence, durable state, delta
 reuse, or partitioned execution. Enable it from a reusable caller with
 `partition_shadow: true`, or have the installer emit that setting with
 `--partition-shadow`. Locally, `--partition-shadow` requires its companion
-`--partition-shadow-out FILE` destination.
+`--partition-shadow-out FILE` destination. The local environment defaults are
+`AGENTIC_REVIEW_PARTITION_SHADOW=true|false` and
+`AGENTIC_REVIEW_PARTITION_SHADOW_OUT=FILE`; command-line options override them.
 
 ### Standing summaries and finding history
 
@@ -475,7 +477,7 @@ cell means that surface does not expose the setting.
 | Broad discovery rounds per cycle | `2` | `max_discovery_rounds` | `--max-discovery-rounds` |  |
 | One additional human-authorized discovery | none | `review_cycle_override_reason` |  |  |
 | Post a PR comment | `true` | `post_comment` | `--no-comment` |  |
-| Partition shadow diagnostics | off | `partition_shadow` | `--partition-shadow` | `--partition-shadow --partition-shadow-out FILE` |
+| Partition shadow diagnostics | off | `partition_shadow` | `--partition-shadow` | `--partition-shadow --partition-shadow-out FILE`; `AGENTIC_REVIEW_PARTITION_SHADOW`, `AGENTIC_REVIEW_PARTITION_SHADOW_OUT` |
 | Resolve stale threads | `true` | `resolve_stale` |  |  |
 | Suppress every PR write | `false` | `suppress_writes` |  |  |
 | Block the hosted job on a blocked gate | `false` | `fail_on_findings` | `--fail-on-findings` | `--no-fail` separately suppresses the local any-finding exit |

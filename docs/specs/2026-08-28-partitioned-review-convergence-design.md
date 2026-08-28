@@ -813,8 +813,8 @@ explicitly requested local latency but cannot change model-visible context.
 
 Hosted shadow runs in a separate `partition-shadow` job after the authoritative
 review job. The job has its own five-minute timeout, `continue-on-error: true`,
-contents-read permission only, no model key, no PR write token, and no reusable
-workflow outputs. The credentialed target-resolution step performs the detached
+`contents: read` plus `pull-requests: read` permission only, no model key, no PR
+write token, and no reusable workflow outputs. The credentialed target-resolution step performs the detached
 immutable Git checkout itself and destroys the minted App token before later
 steps; masked tokens never transit step/job outputs. Trusted support is checked
 out separately. The job invokes capture/planning directly and uploads optional

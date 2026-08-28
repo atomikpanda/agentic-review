@@ -999,8 +999,7 @@ jobs:
           # verification publication as if it came from final discovery.
           REVIEW_PARTITION_SHADOW_PROFILE=/tmp/review-partition-shadow-profile.json
           rm -f "$REVIEW_FINDINGS_FILE" "$REVIEW_PUBLICATION_FILE" \
-            "$REVIEW_DIAGNOSTICS_FILE" "$REVIEW_RUNNER_STDOUT" "$REVIEW_RUNNER_STDERR" \
-            "$REVIEW_PARTITION_SHADOW_PROFILE"
+            "$REVIEW_DIAGNOSTICS_FILE" "$REVIEW_RUNNER_STDOUT" "$REVIEW_RUNNER_STDERR"
           RUNNER_ARGS=(
             --base "$BASE"
             --model "$MODEL"
@@ -1022,6 +1021,7 @@ jobs:
           if [ -n "$MAX_TIME" ]; then RUNNER_ARGS+=(--max-time "$MAX_TIME"); fi
           if [ "${CODEGRAPH:-true}" != "true" ]; then RUNNER_ARGS+=(--no-codegraph); fi
           if [ "${PARTITION_SHADOW:-false}" = "true" ]; then
+            rm -f "$REVIEW_PARTITION_SHADOW_PROFILE"
             RUNNER_ARGS+=(--execution-profile-out "$REVIEW_PARTITION_SHADOW_PROFILE")
           fi
 
@@ -1673,6 +1673,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+      pull-requests: read
     steps:
       - name: resolve partition shadow target
         id: target
