@@ -8,10 +8,10 @@
       "path_events": 3,
       "text_atoms": 3
     },
-    "unit_count": 3,
+    "unit_count": 4,
     "oversized_atoms": 1,
     "coalesced_units": 0,
-    "projected_batches": 3,
-    "projected_model_calls": 18
+    "projected_batches": 4,
+    "projected_model_calls": 24
   }
 }

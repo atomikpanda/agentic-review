@@ -236,6 +236,14 @@ test("reports ordered coverage failures for ownership and incomplete captures", 
   blobMismatchCapture.object_table[0].object_type = "tree";
   assert.deepEqual(validateAtomization(complete, blobMismatchCapture).reasons, ["mode_object_blob_disagreement"]);
 });
+
+test("rejects raw, header, and file-marker path disagreement", () => {
+  const result = atomizeCapturedReviewInput(capture({
+    raw: rawRecord({ paths: ["good.txt"] }),
+    patch: "diff --git a/good.txt b/good.txt\n--- a/bad.txt\n+++ b/bad.txt\n@@ -1 +1 @@\n-old\n+new\n",
+  }));
+  assert.deepEqual(result.reasons, ["raw_patch_path_disagreement"]);
+});
 test("keeps header-shaped changed lines inside active hunks", () => {
   const result = atomizeCapturedReviewInput(capture({
     raw: rawRecord({}),
@@ -492,10 +500,11 @@ test("builds a deterministic path-packed manifest with independent unit IDs", ()
     `root:path:${createHash("sha256").update(Buffer.from("a")).digest("hex")}:0`,
     `root:path:${createHash("sha256").update(Buffer.from("b")).digest("hex")}:0`,
     `root:path:${createHash("sha256").update(Buffer.from([0xff])).digest("hex")}:0`,
+    `root:path:${createHash("sha256").update(Buffer.from([0xff])).digest("hex")}:1`,
   ]);
-  assert.equal(manifest.units[2].oversized, true);
+  assert.equal(manifest.units[3].oversized, true);
   assert.equal(manifest.execution_projection.projected_batches, manifest.units.length);
-  assert.equal(manifest.execution_projection.projected_model_calls, 18);
+  assert.equal(manifest.execution_projection.projected_model_calls, 24);
   assert.equal(manifest.manifest_hash, sha256(Object.fromEntries(Object.entries(manifest).filter(([key]) => key !== "manifest_hash"))));
   const firstUnit = manifest.units[0];
   assert.equal(firstUnit.unit_id, sha256({
@@ -531,6 +540,22 @@ test("never coalesces oversized atom units beyond the frontier cap", () => {
   assert.deepEqual([...left.oversized_atom_ids, ...right.oversized_atom_ids], []);
 });
 
+test("isolates every oversized atom before path packing", () => {
+  const pathEvent = shadowAtom({ kind: "path_event", path: "a" });
+  const oversized = shadowAtom({ kind: "text", path: "a", payload: "x".repeat(32), oversized: true });
+  const trailing = shadowAtom({ kind: "text", path: "a", ordinal: 1, payload: "tail" });
+  const manifest = buildPathFallbackManifest({
+    capture: shadowCapture(),
+    atomization: shadowAtomization([pathEvent, oversized, trailing]),
+    config: SHADOW_CONFIG,
+    executionProfile: EXECUTION_PROFILE,
+  });
+  const oversizedUnit = manifest.units.find((unit) => unit.oversized_atom_ids.includes(oversized.atom_id));
+  assert.deepEqual(oversizedUnit.ordered_atom_ids, [oversized.atom_id]);
+  assert.equal(oversizedUnit.atomic, true);
+  assert.equal(oversizedUnit.oversized, true);
+});
+
 
 test("coalesces the minimum adjacent pair and splits non-atomic units deterministically", () => {
   const atoms = ["a", "b", "c", "d"].map((path) => shadowAtom({ kind: "path_event", path }));
@@ -559,7 +584,7 @@ test("validates evaluator metrics and produces redacted fixed-point hosted outpu
     shadowAtom({ kind: "path_event", path: "b" }),
     shadowAtom({ kind: "text", path: "b", payload: "more source bytes" }),
     shadowAtom({ kind: "path_event", path: Buffer.from([0xff]) }),
-    shadowAtom({ kind: "text", path: Buffer.from([0xff]), payload: "oversized".repeat(80) }),
+    shadowAtom({ kind: "text", path: Buffer.from([0xff]), payload: "oversized".repeat(80), oversized: true }),
   ];
   const manifest = buildPathFallbackManifest({
     capture: shadowCapture(),
@@ -646,7 +671,7 @@ test("validates canonical local, hosted, and diagnostic output envelopes", async
   ));
   assert.throws(
     () => validateShadowOutput(selfHashedFabrication, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes),
-    /local output manifest does not match capture/,
+    /manifest atom payload hash/,
   );
   for (const [config, profile] of [
     [{ ...CLI_SHADOW_CONFIG, atom_target_bytes: 1 }, CLI_SHADOW_PROFILE],
@@ -688,6 +713,63 @@ test("rejects self-hashed manifests with missing or extraneous metric keys", () 
     forged.manifest_hash = sha256(Object.fromEntries(Object.entries(forged)
       .filter(([key]) => key !== "manifest_hash")));
     assert.throws(() => buildLocalShadowOutput(shadowCapture(), forged), /manifest (counts|sizes) keys/);
+  }
+});
+
+test("rejects self-hashed atom rows and hosted unit ownership gaps", () => {
+  const atoms = [
+    shadowAtom({ kind: "path_event", path: "a" }),
+    shadowAtom({ kind: "text", path: "a", payload: "payload" }),
+  ];
+  const manifest = buildPathFallbackManifest({
+    capture: shadowCapture(),
+    atomization: shadowAtomization(atoms),
+    config: SHADOW_CONFIG,
+    executionProfile: EXECUTION_PROFILE,
+  });
+  const malformedAtom = structuredClone(manifest);
+  malformedAtom.atoms[0].content_hash = "0".repeat(64);
+  malformedAtom.atoms[0].atom_id = `a:${sha256({
+    atom_schema_version: 1,
+    lineage_candidate: malformedAtom.atoms[0].lineage_candidate,
+    segment_ordinal: malformedAtom.atoms[0].segment_ordinal,
+    content_hash: malformedAtom.atoms[0].content_hash,
+  })}`;
+  malformedAtom.manifest_hash = sha256(Object.fromEntries(Object.entries(malformedAtom)
+    .filter(([key]) => key !== "manifest_hash")));
+  assert.throws(() => buildLocalShadowOutput(shadowCapture(), malformedAtom), /atom payload hash/);
+
+  const hosted = buildHostedShadowOutput(shadowCapture(), manifest, 100_000);
+  const refreshSize = (value) => {
+    value.sizes.encoded_output_bytes = 0;
+    for (;;) {
+      const encoded = Buffer.byteLength(`${canonicalJson(value)}\n`);
+      if (value.sizes.encoded_output_bytes === encoded) return;
+      value.sizes.encoded_output_bytes = encoded;
+    }
+  };
+  for (const mutate of [
+    (value) => {
+      value.units = [];
+      value.execution_projection.projected_batches = 0;
+      value.execution_projection.projected_model_calls = 0;
+      value.sizes.unit_payload_bytes = 0;
+    },
+    (value) => {
+      const duplicate = structuredClone(value.units[0]);
+      value.units.push(duplicate);
+      value.execution_projection.projected_batches = 2;
+      value.execution_projection.projected_model_calls = 12;
+      value.sizes.unit_payload_bytes += duplicate.unit_payload_bytes;
+    },
+    (value) => {
+      value.units[0].ordered_atom_ids[0] = `a:${"f".repeat(64)}`;
+    },
+  ]) {
+    const forged = structuredClone(hosted);
+    mutate(forged);
+    refreshSize(forged);
+    assert.throws(() => validateShadowOutput(forged, 100_000), /atom ownership/);
   }
 });
 

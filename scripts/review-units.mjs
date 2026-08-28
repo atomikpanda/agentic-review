@@ -162,7 +162,7 @@ function parsePatch(bytes) {
   const startSection = (line) => {
     finishHunk();
     const headerPaths = line.subarray(Buffer.byteLength("diff --git "));
-    section = { oldPath: null, newPath: null, headerOldPath: null, headerNewPath: null, headerPaths, hunks: [], binary: false, oldFinalNewline: true, newFinalNewline: true };
+    section = { oldPath: null, newPath: null, hasOldPathMarker: false, hasNewPathMarker: false, headerPaths, hunks: [], binary: false, oldFinalNewline: true, newFinalNewline: true };
     sections.push(section);
   };
   while (offset < bytes.length) {
@@ -172,8 +172,8 @@ function parsePatch(bytes) {
     offset = hasLf ? newline + 1 : bytes.length;
     if (line.subarray(0, 11).equals(Buffer.from("diff --git "))) { startSection(line); continue; }
     if (!section) continue;
-    if (!hunk && line.subarray(0, 4).equals(Buffer.from("--- "))) { section.oldPath = removeDiffPrefix(decodeGitPath(line.subarray(4)), "a"); continue; }
-    if (!hunk && line.subarray(0, 4).equals(Buffer.from("+++ "))) { section.newPath = removeDiffPrefix(decodeGitPath(line.subarray(4)), "b"); continue; }
+    if (!hunk && line.subarray(0, 4).equals(Buffer.from("--- "))) { section.oldPath = removeDiffPrefix(decodeGitPath(line.subarray(4)), "a"); section.hasOldPathMarker = true; continue; }
+    if (!hunk && line.subarray(0, 4).equals(Buffer.from("+++ "))) { section.newPath = removeDiffPrefix(decodeGitPath(line.subarray(4)), "b"); section.hasNewPathMarker = true; continue; }
     if (line.subarray(0, 3).equals(Buffer.from("@@ "))) {
       finishHunk();
       const range = parseHunkHeader(line);
@@ -247,13 +247,22 @@ function recordHeaderKeys(record) {
   return keys;
 }
 
+function pathsEqual(left, right) {
+  return left === right || (left !== null && right !== null && left.equals(right));
+}
+
+function sectionMatchesRecord(record, section) {
+  return recordHeaderKeys(record).has(headerSectionKey(section.headerPaths))
+    && (!section.hasOldPathMarker || pathsEqual(record.oldPath, section.oldPath))
+    && (!section.hasNewPathMarker || pathsEqual(record.newPath, section.newPath));
+}
+
 function sectionKeys(section) {
   const keys = new Set();
-  for (const [oldPath, newPath] of [[section.oldPath, section.newPath], [section.headerOldPath, section.headerNewPath]]) {
-    if (oldPath === null && newPath === null) continue;
-    keys.add(`pair:${pathKey(oldPath)}:${pathKey(newPath)}`);
-    if (oldPath !== null) keys.add(`old:${pathKey(oldPath)}`);
-    if (newPath !== null) keys.add(`new:${pathKey(newPath)}`);
+  if (section.oldPath !== null || section.newPath !== null) {
+    keys.add(`pair:${pathKey(section.oldPath)}:${pathKey(section.newPath)}`);
+    if (section.oldPath !== null) keys.add(`old:${pathKey(section.oldPath)}`);
+    if (section.newPath !== null) keys.add(`new:${pathKey(section.newPath)}`);
   }
   return keys;
 }
@@ -483,7 +492,7 @@ export function atomizeCapturedReviewInput(capture, atomTargetBytes = ATOM_TARGE
   for (let index = 0; index < records.length; index += 1) {
     const section = sections[sectionForRecord[index]];
     const payload = pathPayload(records[index], section, rows);
-    bases.push({ payload, lineage_candidate: `p:${canonicalSha256({ kind: "path_event", raw_status: payload.raw_status, status_kind: payload.status_kind, content_kinds: payload.content_kinds, old_path_base64: payload.old_path_base64, new_path_base64: payload.new_path_base64 })}`, sort: [0, 0, 0, 0], rawRecordIndex: index, owners: [] });
+    bases.push({ payload, oversized: Buffer.byteLength(canonicalJson(payload)) > atomTargetBytes ? true : undefined, lineage_candidate: `p:${canonicalSha256({ kind: "path_event", raw_status: payload.raw_status, status_kind: payload.status_kind, content_kinds: payload.content_kinds, old_path_base64: payload.old_path_base64, new_path_base64: payload.new_path_base64 })}`, sort: [0, 0, 0, 0], rawRecordIndex: index, owners: [] });
     if (section) bases.push(...projectTextAtoms(records[index], section, sectionForRecord[index], atomTargetBytes));
   }
   const atoms = assignIdentities(bases);
@@ -521,7 +530,7 @@ export function validateAtomization(result, capture, suppliedState = undefined) 
   }
   if (expectedLines.some((key) => (lineCounts.get(key) ?? 0) === 0) || lineOwners.some((owner) => atomsById.get(owner.atom_id)?.kind !== "text")) reasons.push("missing_changed_line_owner");
   if ([...lineCounts.values()].some((value) => value > 1) || [...lineCounts.keys()].some((key) => !expectedLineSet.has(key))) reasons.push("duplicate_changed_line_owner");
-  if (records.some((_, index) => sectionForRecord ? sectionForRecord[index] === -1 : false) || recordForSection.some((index) => index === -1)) reasons.push("raw_patch_path_disagreement");
+  if (records.some((record, index) => sectionForRecord[index] === -1 || !sectionMatchesRecord(record, sections[sectionForRecord[index]])) || recordForSection.some((index) => index === -1)) reasons.push("raw_patch_path_disagreement");
   try {
     if (modeObjectBlobDisagreement(records, rows)) reasons.push("mode_object_blob_disagreement");
   } catch { reasons.push("mode_object_blob_disagreement"); }
@@ -694,6 +703,18 @@ function packUnits(atoms, config) {
     let candidateBytes = 0;
     while (index < atoms.length && Buffer.compare(path, ownerPath(atoms[index])) === 0) {
       const atom = atoms[index];
+      if (atom.oversized) {
+        if (candidate.length > 0) {
+          packed.push(makeUnit({ lineage: `root:path:${pathHash}:${ordinal}`, atoms: candidate }));
+          ordinal += 1;
+          candidate = [];
+          candidateBytes = 0;
+        }
+        packed.push(makeUnit({ lineage: `root:path:${pathHash}:${ordinal}`, atoms: [atom], oversized: true }));
+        ordinal += 1;
+        index += 1;
+        continue;
+      }
       if (candidate.length > 0 && candidateBytes + atom.payload_bytes > config.unit_target_bytes) {
         packed.push(makeUnit({ lineage: `root:path:${pathHash}:${ordinal}`, atoms: candidate }));
         ordinal += 1;
@@ -703,8 +724,8 @@ function packUnits(atoms, config) {
       candidate.push(atom);
       candidateBytes += atom.payload_bytes;
       index += 1;
-      if (candidate.length === 1 && (atom.oversized || candidateBytes > config.unit_target_bytes)) {
-        packed.push(makeUnit({ lineage: `root:path:${pathHash}:${ordinal}`, atoms: candidate, oversized: atom.oversized || candidateBytes > config.unit_target_bytes }));
+      if (candidate.length === 1 && candidateBytes > config.unit_target_bytes) {
+        packed.push(makeUnit({ lineage: `root:path:${pathHash}:${ordinal}`, atoms: candidate, oversized: true }));
         ordinal += 1;
         candidate = [];
         candidateBytes = 0;
@@ -759,6 +780,35 @@ function validateUnit(unit) {
   if (!SHA256.test(unit.unit_id) || typeof unit.unit_lineage !== "string" || !Array.isArray(unit.ordered_atom_ids) || unit.ordered_atom_ids.length === 0 || !Array.isArray(unit.coalesced_from) || !Array.isArray(unit.atom_payload_bytes) || unit.atom_payload_bytes.length !== unit.ordered_atom_ids.length || unit.atom_payload_bytes.some((value) => !Number.isSafeInteger(value) || value < 0) || !Array.isArray(unit.oversized_atom_ids) || unit.oversized_atom_ids.some((id, index) => !unit.ordered_atom_ids.includes(id) || unit.oversized_atom_ids.indexOf(id) !== index) || !Number.isSafeInteger(unit.unit_payload_bytes) || unit.unit_payload_bytes < 0 || unit.atom_payload_bytes.reduce((total, value) => total + value, 0) !== unit.unit_payload_bytes || typeof unit.atomic !== "boolean" || typeof unit.oversized !== "boolean") throw new TypeError("manifest unit is invalid");
 }
 
+function validateAtomIdentity(atom, payload = undefined) {
+  if (!/^a:[0-9a-f]{64}$/.test(atom.atom_id) || typeof atom.lineage_candidate !== "string" || !Number.isSafeInteger(atom.segment_ordinal) || atom.segment_ordinal < 0 || !SHA256.test(atom.content_hash) || !Number.isSafeInteger(atom.payload_bytes) || atom.payload_bytes < 0) throw new TypeError("manifest atom identity is invalid");
+  if (atom.atom_id !== `a:${canonicalSha256({ atom_schema_version: 1, lineage_candidate: atom.lineage_candidate, segment_ordinal: atom.segment_ordinal, content_hash: atom.content_hash })}`) throw new TypeError("manifest atom identity is invalid");
+  if (payload !== undefined && canonicalSha256(payload) !== atom.content_hash) throw new TypeError("manifest atom payload hash is invalid");
+}
+
+function validateAtomUnitOwnership(atoms, units) {
+  const atomsById = new Map(atoms.map((atom) => [atom.atom_id, atom]));
+  if (atomsById.size !== atoms.length) throw new TypeError("manifest atom identity is invalid");
+  const ownership = new Map(atoms.map((atom) => [atom.atom_id, 0]));
+  for (const unit of units) {
+    validateUnit(unit);
+    const oversizedIds = [];
+    for (let index = 0; index < unit.ordered_atom_ids.length; index += 1) {
+      const atomId = unit.ordered_atom_ids[index];
+      const atom = atomsById.get(atomId);
+      if (!atom) throw new TypeError("manifest atom ownership is invalid");
+      if (unit.atom_payload_bytes[index] !== atom.payload_bytes) throw new TypeError("manifest atom payload bytes are invalid");
+      if (atom.oversized) {
+        oversizedIds.push(atomId);
+        if (!unit.atomic || unit.ordered_atom_ids.length !== 1) throw new TypeError("manifest oversized atom ownership is invalid");
+      }
+      ownership.set(atomId, ownership.get(atomId) + 1);
+    }
+    if (canonicalJson(unit.oversized_atom_ids) !== canonicalJson(oversizedIds)) throw new TypeError("manifest oversized atom ownership is invalid");
+  }
+  if ([...ownership.values()].some((count) => count !== 1)) throw new TypeError("manifest atom ownership is invalid");
+}
+
 function validateManifest(manifest) {
   exactKeys(manifest, MANIFEST_KEYS, "manifest");
   if (manifest.schema_version !== 1 || manifest.status !== "complete" || manifest.mode !== "partition_shadow" || !SHA256.test(manifest.capture_hash) || !SHA256.test(manifest.manifest_hash)) throw new TypeError("manifest header is invalid");
@@ -780,7 +830,8 @@ function validateManifest(manifest) {
     || manifest.counts.coalesced_units !== manifest.units.filter((unit) => unit.coalesced_from.length > 0).length
     || manifest.sizes.atom_payload_bytes !== manifest.atoms.reduce((total, atom) => total + atom.payload_bytes, 0)
     || manifest.sizes.unit_payload_bytes !== manifest.units.reduce((total, unit) => total + unit.unit_payload_bytes, 0)) throw new TypeError("manifest metrics are invalid");
-  for (const unit of manifest.units) validateUnit(unit);
+  for (const atom of manifest.atoms) validateAtomIdentity(atom, atomPayload(atom));
+  validateAtomUnitOwnership(manifest.atoms, manifest.units);
   const core = { ...manifest };
   delete core.manifest_hash;
   if (manifest.manifest_hash !== canonicalSha256(core)) throw new TypeError("manifest hash is invalid");
@@ -998,8 +1049,9 @@ function validateHostedCompleteOutput(value, maxBytes) {
   for (const atom of value.atoms) {
     exactKeys(atom, ["atom_id", "kind", "lineage_candidate", "segment_ordinal", "content_hash", "owner_path_base64", "payload_bytes", "oversized", "status_kind", "content_kinds"], "hosted atom");
     if (!/^a:[0-9a-f]{64}$/.test(atom.atom_id) || !["path_event", "text"].includes(atom.kind) || typeof atom.lineage_candidate !== "string" || !Number.isSafeInteger(atom.segment_ordinal) || atom.segment_ordinal < 0 || !SHA256.test(atom.content_hash) || !Number.isSafeInteger(atom.payload_bytes) || atom.payload_bytes < 0 || typeof atom.oversized !== "boolean" || !Array.isArray(atom.content_kinds)) throw new TypeError("hosted atom is invalid");
+    validateAtomIdentity(atom);
   }
-  for (const unit of value.units) validateUnit(unit);
+  validateAtomUnitOwnership(value.atoms, value.units);
   exactKeys(value.counts, MANIFEST_COUNT_KEYS, "manifest counts");
   exactKeys(value.sizes, [...MANIFEST_SIZE_KEYS, "encoded_output_bytes"], "output sizes");
   if (value.counts.atoms !== value.atoms.length || value.sizes.atom_payload_bytes !== value.atoms.reduce((total, atom) => total + atom.payload_bytes, 0) || value.sizes.unit_payload_bytes !== value.units.reduce((total, unit) => total + unit.unit_payload_bytes, 0)) throw new TypeError("hosted complete output metrics are invalid");
@@ -1263,7 +1315,7 @@ function main(argv) {
       configValue = configuration(config);
     } catch (error) {
       try {
-        validateCapturedReviewInput(capture);
+        capture = validateCapturedReviewInput(capture);
       } catch (captureError) {
         writeDiagnosticOutputs(options, invalidCaptureDiagnostic(capture, "", FALLBACK_SHADOW_DIAGNOSTIC_MAX_BYTES, captureError));
         return 0;
@@ -1276,7 +1328,7 @@ function main(argv) {
       return 0;
     }
     try {
-      validateCapturedReviewInput(capture);
+      capture = validateCapturedReviewInput(capture);
     } catch (error) {
       writeDiagnosticOutputs(options, invalidCaptureDiagnostic(capture, configValue.benchmark_revision, configValue.max_shadow_artifact_bytes, error));
       return 0;
