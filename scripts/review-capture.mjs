@@ -275,13 +275,36 @@ function base64Bytes(value, label) {
   return bytes;
 }
 
+function isFullObjectId(value) {
+  return typeof value === "string" && HEX.test(value) && [40, 64].includes(value.length);
+}
+
+function diagnosticCoordinates(baseSha, headSha, objectFormat) {
+  const accepts = (value) => isFullObjectId(value) && (objectFormat === undefined || value.length === (objectFormat === "sha256" ? 64 : 40));
+  let base = accepts(baseSha) ? baseSha : null;
+  let head = accepts(headSha) ? headSha : null;
+  if (base !== null && head !== null && base.length !== head.length) {
+    base = null;
+    head = null;
+  }
+  return { base, head };
+}
+
 function validateCommon(value, keys, diagnostic) {
   exactKeys(value, keys, "captured review input");
   if (value.schema_version !== 1) throw new TypeError("captured review input schema_version must be 1");
   if (diagnostic ? !["capture_capacity_exceeded", "capture_failed"].includes(value.status) : value.status !== "complete") {
     throw new TypeError("captured review input has an invalid status");
   }
-  if (typeof value.base_sha !== "string" || typeof value.head_sha !== "string" || !HEX.test(value.base_sha) || !HEX.test(value.head_sha) || value.base_sha.length !== value.head_sha.length || ![40, 64].includes(value.base_sha.length)) {
+  const validCoordinates = isFullObjectId(value.base_sha) && isFullObjectId(value.head_sha) && value.base_sha.length === value.head_sha.length;
+  if ((!diagnostic || value.status === "capture_capacity_exceeded") && !validCoordinates) {
+    throw new TypeError("captured review input must contain full matching object IDs");
+  }
+  if (diagnostic && value.status === "capture_failed" && (
+    value.base_sha !== null && !isFullObjectId(value.base_sha)
+    || value.head_sha !== null && !isFullObjectId(value.head_sha)
+    || validCoordinates === false && value.base_sha !== null && value.head_sha !== null
+  )) {
     throw new TypeError("captured review input must contain full matching object IDs");
   }
   const configurationKeys = ["diff_algorithm", "context_lines", "rename_threshold", "copy_threshold", "find_copies_harder", "full_object_ids", "external_diff", "textconv", "max_patch_bytes", "max_raw_z_bytes", "max_single_blob_bytes", "max_total_blob_bytes", "max_capture_seconds"];
@@ -295,8 +318,8 @@ function validateCommon(value, keys, diagnostic) {
   exactKeys(value.git_environment, Object.keys(gitEnvironment), "git environment");
   if (canonicalSha256(value.git_environment) !== canonicalSha256(gitEnvironment)) throw new TypeError("git environment must be the exact capture environment");
   if (!Array.isArray(value.git_config_overrides) || value.git_config_overrides.length !== gitConfigOverrides.length || value.git_config_overrides.some((entry, index) => entry !== gitConfigOverrides[index])) throw new TypeError("git config overrides must be exact");
-  const expectedPatch = buildPatchArgv(value.base_sha, value.head_sha);
-  const expectedRaw = buildRawArgv(value.base_sha, value.head_sha);
+  const expectedPatch = validCoordinates ? buildPatchArgv(value.base_sha, value.head_sha) : [];
+  const expectedRaw = validCoordinates ? buildRawArgv(value.base_sha, value.head_sha) : [];
   for (const [actual, expected, label] of [[value.patch_argv, expectedPatch, "patch argv"], [value.raw_argv, expectedRaw, "raw argv"]]) {
     if (!Array.isArray(actual) || actual.length !== expected.length || actual.some((entry, index) => entry !== expected[index])) throw new TypeError(`${label} must be exact`);
   }
@@ -362,7 +385,7 @@ export function validateCapturedReviewInput(value) {
           ? "blob_bytes"
           : undefined;
     if (reason !== undefined) {
-      return diagnosticEnvelope("capture_capacity_exceeded", reason, value.base_sha, value.head_sha, configuration, value.patch_argv, value.raw_argv, observed);
+      return diagnosticEnvelope("capture_capacity_exceeded", reason, value.base_sha, value.head_sha, configuration, observed);
     }
     return value;
   }
@@ -375,15 +398,17 @@ export function validateCapturedReviewInput(value) {
   return value;
 }
 
-function diagnosticEnvelope(status, reason, baseSha, headSha, configuration, patchArgv, rawArgv, observed) {
+function diagnosticEnvelope(status, reason, baseSha, headSha, configuration, observed, objectFormat = undefined) {
+  const coordinates = diagnosticCoordinates(baseSha, headSha, objectFormat);
+  const hasCoordinates = coordinates.base !== null && coordinates.head !== null;
   return {
     schema_version: 1,
     status,
-    base_sha: baseSha,
-    head_sha: headSha,
+    base_sha: coordinates.base,
+    head_sha: coordinates.head,
     capture_configuration: configuration,
-    patch_argv: patchArgv,
-    raw_argv: rawArgv,
+    patch_argv: hasCoordinates ? buildPatchArgv(coordinates.base, coordinates.head) : [],
+    raw_argv: hasCoordinates ? buildRawArgv(coordinates.base, coordinates.head) : [],
     git_environment: { ...gitEnvironment },
     git_config_overrides: [...gitConfigOverrides],
     capacity_reason: reason,
@@ -393,8 +418,9 @@ function diagnosticEnvelope(status, reason, baseSha, headSha, configuration, pat
 
 function ensureCaptureOptions(options) {
   if (!isPlainJsonObject(options)) throw new TypeError("capture options must be a plain object");
-  for (const field of ["repoRoot", "baseSha", "headSha"]) {
-    if (typeof options[field] !== "string" || options[field].length === 0) throw new TypeError(`capture options.${field} must be a non-empty string`);
+  if (typeof options.repoRoot !== "string" || options.repoRoot.length === 0) throw new TypeError("capture options.repoRoot must be a non-empty string");
+  for (const field of ["baseSha", "headSha"]) {
+    if (typeof options[field] !== "string") throw new TypeError(`capture options.${field} must be a string`);
   }
   if (options.outputPath !== undefined && typeof options.outputPath !== "string") throw new TypeError("capture options.outputPath must be a string");
   return validateLimits(options.limits);
@@ -403,6 +429,7 @@ function ensureCaptureOptions(options) {
 /** @param {CaptureOptions} options */
 export async function captureReviewInput(options) {
   const limits = ensureCaptureOptions(options);
+  let objectFormat;
   const { repoRoot, baseSha, headSha, outputPath } = options;
   const patchArgv = buildPatchArgv(baseSha, headSha);
   const rawArgv = buildRawArgv(baseSha, headSha);
@@ -421,7 +448,7 @@ export async function captureReviewInput(options) {
       batch: join(workDir, "batch"),
     };
     const unlimited = () => {};
-    const objectFormat = (await runGitBuffer({ repoRoot, args: ["rev-parse", "--show-object-format"], filePath: paths.format, startedAt, limits, onChunk: unlimited })).toString("ascii").trim();
+    objectFormat = (await runGitBuffer({ repoRoot, args: ["rev-parse", "--show-object-format"], filePath: paths.format, startedAt, limits, onChunk: unlimited })).toString("ascii").trim();
     assertWithinDeadline(startedAt, limits);
     if (objectFormat !== "sha1" && objectFormat !== "sha256") throw { kind: "process" };
     assertObjectId(baseSha, objectFormat, "baseSha");
@@ -510,7 +537,7 @@ export async function captureReviewInput(options) {
     observed.elapsed_milliseconds = Date.now() - startedAt;
     const reason = error?.kind === "capacity" ? error.reason : "process_error";
     const status = error?.kind === "capacity" ? "capture_capacity_exceeded" : "capture_failed";
-    const diagnostic = diagnosticEnvelope(status, reason, baseSha, headSha, configuration, patchArgv, rawArgv, observed);
+    const diagnostic = diagnosticEnvelope(status, reason, baseSha, headSha, configuration, observed, objectFormat);
     validateCapturedReviewInput(diagnostic);
     if (outputPath !== undefined) writeJsonAtomic(outputPath, diagnostic);
     return diagnostic;

@@ -136,6 +136,12 @@ test("capture persists complete immutable inputs despite repository diff setting
   assert.ok(initial.object_table.every((row) => row.object_type === "blob"));
   assert.match(initial.capture_hash, /^[0-9a-f]{64}$/);
   assert.deepEqual(validateCapturedReviewInput(initial), initial);
+  const missingBase = structuredClone(initial);
+  missingBase.base_sha = null;
+  assert.throws(() => validateCapturedReviewInput(missingBase), /full matching object IDs/);
+  const mismatchedCoordinates = structuredClone(initial);
+  mismatchedCoordinates.head_sha = "0".repeat(64);
+  assert.throws(() => validateCapturedReviewInput(mismatchedCoordinates), /full matching object IDs/);
 
   runGit(repoRoot, ["config", "diff.algorithm", "histogram"]);
   runGit(repoRoot, ["config", "diff.renames", "false"]);
@@ -433,6 +439,44 @@ test("CLI parses exact snake-case limits and writes one capture envelope", (t) =
   });
   assert.equal(run.status, 0, run.stderr);
   assert.equal(JSON.parse(readFileSync(outputPath, "utf8")).status, "complete");
+});
+
+test("CLI writes bounded capture-failed diagnostics for invalid coordinates", (t) => {
+  const { repoRoot, baseSha, headSha } = createFixture(t);
+  const limitsPath = join(repoRoot, "limits.json");
+  writeFileSync(limitsPath, JSON.stringify({
+    schema_version: 1,
+    max_patch_bytes: TEST_LIMITS.maxPatchBytes,
+    max_raw_z_bytes: TEST_LIMITS.maxRawZBytes,
+    max_single_blob_bytes: TEST_LIMITS.maxSingleBlobBytes,
+    max_total_blob_bytes: TEST_LIMITS.maxTotalBlobBytes,
+    max_capture_seconds: 5,
+  }));
+  for (const [flag, validCoordinate, invalidCoordinate, label] of [
+    ["--base", headSha, "not-a-base-object-id", "text"],
+    ["--head", baseSha, "not-a-head-object-id", "text"],
+    ["--base", headSha, "", "empty"],
+    ["--head", baseSha, "", "empty"],
+  ]) {
+    const outputPath = join(repoRoot, `${flag.slice(2)}-${label}-invalid-capture.json`);
+    const base = flag === "--base" ? invalidCoordinate : validCoordinate;
+    const head = flag === "--head" ? invalidCoordinate : validCoordinate;
+    const run = spawnSync(process.execPath, ["scripts/review-capture.mjs", "capture", "--repo", repoRoot, "--base", base, "--head", head, "--limits", limitsPath, "--out", outputPath], {
+      cwd: process.cwd(), encoding: "utf8",
+    });
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(run.stderr, "");
+    const diagnostic = JSON.parse(readFileSync(outputPath, "utf8"));
+    assert.equal(diagnostic.status, "capture_failed");
+    assert.equal(diagnostic.capacity_reason, "process_error");
+    assert.equal(diagnostic.base_sha, flag === "--base" ? null : baseSha);
+    assert.equal(diagnostic.head_sha, flag === "--head" ? null : headSha);
+    assert.deepEqual(diagnostic.patch_argv, []);
+    assert.deepEqual(diagnostic.raw_argv, []);
+    if (invalidCoordinate.length > 0) assert.equal(JSON.stringify(diagnostic).includes(invalidCoordinate), false);
+    assert.ok(Buffer.byteLength(JSON.stringify(diagnostic)) < 4096);
+    assert.deepEqual(validateCapturedReviewInput(diagnostic), diagnostic);
+  }
 });
 
 
