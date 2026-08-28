@@ -341,7 +341,8 @@ to 4,194,304 bytes; it contains no blob or line content.
 This is diagnostic-only shadow planning, not convergence, durable state, delta
 reuse, or partitioned execution. Enable it from a reusable caller with
 `partition_shadow: true`, or have the installer emit that setting with
-`--partition-shadow`.
+`--partition-shadow`. Locally, `--partition-shadow` requires its companion
+`--partition-shadow-out FILE` destination.
 
 ### Standing summaries and finding history
 
@@ -474,7 +475,7 @@ cell means that surface does not expose the setting.
 | Broad discovery rounds per cycle | `2` | `max_discovery_rounds` | `--max-discovery-rounds` |  |
 | One additional human-authorized discovery | none | `review_cycle_override_reason` |  |  |
 | Post a PR comment | `true` | `post_comment` | `--no-comment` |  |
-| Partition shadow diagnostics | off | `partition_shadow` | `--partition-shadow` | `--partition-shadow` |
+| Partition shadow diagnostics | off | `partition_shadow` | `--partition-shadow` | `--partition-shadow --partition-shadow-out FILE` |
 | Resolve stale threads | `true` | `resolve_stale` |  |  |
 | Suppress every PR write | `false` | `suppress_writes` |  |  |
 | Block the hosted job on a blocked gate | `false` | `fail_on_findings` | `--fail-on-findings` | `--no-fail` separately suppresses the local any-finding exit |

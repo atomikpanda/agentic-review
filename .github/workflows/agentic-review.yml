@@ -981,6 +981,7 @@ jobs:
           HEAD: ${{ steps.target.outputs.head }}
           AGENTIC_REVIEW_PHASE: ${{ steps.cycle.outputs.phase }}
           AGENTIC_REVIEW_KNOWN_FINDINGS: /tmp/review-known-findings.json
+          PARTITION_SHADOW: ${{ inputs.partition_shadow }}
         run: &run-review-phase |
           set -euo pipefail
           actual_head="$(git rev-parse --verify 'HEAD^{commit}')"
@@ -996,8 +997,10 @@ jobs:
           REVIEW_RUNNER_STDERR=/tmp/review-runner.err
           # A failed continuation must not let its poster consume the preceding
           # verification publication as if it came from final discovery.
+          REVIEW_PARTITION_SHADOW_PROFILE=/tmp/review-partition-shadow-profile.json
           rm -f "$REVIEW_FINDINGS_FILE" "$REVIEW_PUBLICATION_FILE" \
-            "$REVIEW_DIAGNOSTICS_FILE" "$REVIEW_RUNNER_STDOUT" "$REVIEW_RUNNER_STDERR"
+            "$REVIEW_DIAGNOSTICS_FILE" "$REVIEW_RUNNER_STDOUT" "$REVIEW_RUNNER_STDERR" \
+            "$REVIEW_PARTITION_SHADOW_PROFILE"
           RUNNER_ARGS=(
             --base "$BASE"
             --model "$MODEL"
@@ -1018,6 +1021,9 @@ jobs:
           )
           if [ -n "$MAX_TIME" ]; then RUNNER_ARGS+=(--max-time "$MAX_TIME"); fi
           if [ "${CODEGRAPH:-true}" != "true" ]; then RUNNER_ARGS+=(--no-codegraph); fi
+          if [ "$PARTITION_SHADOW" = "true" ]; then
+            RUNNER_ARGS+=(--execution-profile-out "$REVIEW_PARTITION_SHADOW_PROFILE")
+          fi
 
           if [ -n "$EXTRA_ARGS" ]; then
             set -f
@@ -1634,6 +1640,15 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+      - name: upload partition shadow execution profile
+        if: ${{ !cancelled() && inputs.partition_shadow && steps.target.outputs.eligible == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentic-review-partition-shadow-profile
+          path: /tmp/review-partition-shadow-profile.json
+          retention-days: 1
+          if-no-files-found: error
+
       - name: upload optional review diagnostics
         if: ${{ !cancelled() && steps.target.outputs.eligible == 'true' }}
         uses: actions/upload-artifact@v4
@@ -1821,6 +1836,14 @@ jobs:
         run: |
           bash "$GITHUB_WORKSPACE/.partition-shadow-support/scripts/strip-agent-config.sh" --strip "$GITHUB_WORKSPACE"
 
+      - name: download partition shadow execution profile
+        if: steps.target.outputs.eligible == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: agentic-review-partition-shadow-profile
+          path: ${{ runner.temp }}/partition-shadow-profile
+
       - name: capture partition shadow diagnostics
         if: steps.target.outputs.eligible == 'true'
         env:
@@ -1832,20 +1855,13 @@ jobs:
           set -euo pipefail
           LIMITS_FILE="${RUNNER_TEMP}/partition-shadow-limits.json"
           CONFIG_FILE="${RUNNER_TEMP}/partition-shadow-config.json"
-          PROFILE_FILE="${RUNNER_TEMP}/partition-shadow-profile.json"
+          PROFILE_FILE="${RUNNER_TEMP}/partition-shadow-profile/review-partition-shadow-profile.json"
           CAPTURE_FILE="${RUNNER_TEMP}/partition-shadow-capture.json"
           CAPTURE_HELPER="${SUPPORT_ROOT}/scripts/review-capture.mjs"
           UNITS_HELPER="${SUPPORT_ROOT}/scripts/review-units.mjs"
           rm -f -- "$CAPTURE_FILE" "$PARTITION_SHADOW_OUTPUT"
           printf '%s\n' '{"schema_version":1,"max_patch_bytes":8388608,"max_raw_z_bytes":8388608,"max_single_blob_bytes":16777216,"max_total_blob_bytes":67108864,"max_capture_seconds":30}' > "$LIMITS_FILE"
           printf '%s\n' '{"schema_version":1,"benchmark_revision":"","atom_target_bytes":16000,"unit_target_bytes":64000,"max_frontier_units":128,"max_shadow_artifact_bytes":4194304}' > "$CONFIG_FILE"
-          node - "$PROFILE_FILE" <<'NODE'
-          const { createHash } = require("node:crypto");
-          const { writeFileSync } = require("node:fs");
-          const descriptors = ["general", "correctness", "boundaries"];
-          const descriptor_content_hashes = descriptors.map((descriptor) => createHash("sha256").update(`partition-shadow-v1:${descriptor}`).digest("hex"));
-          writeFileSync(process.argv[2], `${JSON.stringify({ schema_version: 1, descriptors, descriptor_content_hashes, max_output_attempts: 2 })}\n`);
-          NODE
           fallback() {
             local status="$1" reason="$2"
             STATUS="$status" REASON="$reason" BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" \

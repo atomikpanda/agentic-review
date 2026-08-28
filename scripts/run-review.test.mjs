@@ -944,6 +944,10 @@ test("partition shadow is an isolated opt-in hosted diagnostic", () => {
   );
   assert.doesNotMatch(shadowJob, /^\s+outputs:/m);
   assert.doesNotMatch(shadowJob, /steps\.target\.outputs\.token/);
+  assert.doesNotMatch(shadowJob, /partition-shadow-v1:/);
+  assert.match(shadowJob, /actions\/download-artifact@v4/);
+  assert.match(shadowJob, /agentic-review-partition-shadow-profile/);
+  assert.match(source, /--execution-profile-out "\$REVIEW_PARTITION_SHADOW_PROFILE"/);
   assert.doesNotMatch(source.match(/^  review:\n[\s\S]*?(?=^  [a-zA-Z][\w-]+:|\z)/m)?.[0] ?? "", /review-partition-shadow\.json/);
   assert.doesNotMatch(
     source.match(/^  workflow_call:\n    outputs:\n[\s\S]*?(?=^    inputs:)/m)?.[0] ?? "",
@@ -1073,6 +1077,50 @@ exit 1
   assert.doesNotMatch(install([]), /^      partition_shadow:/m);
   assert.match(install(["--partition-shadow"]), /^      partition_shadow: true$/m);
 });
+
+test("partition shadow profile output preserves authoritative nondefault descriptor content", (t) => {
+  const fixture = createFixture(t);
+  const profileFile = join(fixture.directory, "authoritative-profile.json");
+  const shadowFile = join(fixture.directory, "partition-shadow.json");
+  const plan = {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+  };
+  const authoritative = runReview(t, plan, {
+    existingFixture: fixture,
+    args: [
+      "--lenses", "correctness",
+      "--skill", "skills/security-review/SKILL.md",
+      "--execution-profile-out", profileFile,
+      "--json",
+    ],
+  });
+  assert.equal(authoritative.result.status, 0, authoritative.result.stderr);
+  const profile = JSON.parse(readFileSync(profileFile, "utf8"));
+
+  const shadow = runReview(t, plan, {
+    existingFixture: fixture,
+    args: [
+      "--lenses", "correctness",
+      "--skill", "skills/security-review/SKILL.md",
+      "--partition-shadow",
+      "--partition-shadow-out", shadowFile,
+      "--json",
+    ],
+  });
+  assert.equal(shadow.result.status, 0, shadow.result.stderr);
+  const projection = JSON.parse(readFileSync(shadowFile, "utf8")).manifest.execution_projection;
+  assert.deepEqual(
+    projection,
+    {
+      descriptors: profile.descriptors,
+      descriptor_content_hashes: profile.descriptor_content_hashes,
+      max_output_attempts: profile.max_output_attempts,
+      projected_batches: projection.projected_batches,
+      projected_model_calls: projection.projected_model_calls,
+    },
+  );
+});
 test("partition shadow strips target configuration and records bounded helper diagnostics separately", (t) => {
   const fixture = createFixture(t, {
     targetFiles: { ".omp/mcp.json": '{"mcpServers":{"untrusted":{"command":"false"}}}\n' },
@@ -1087,6 +1135,17 @@ test("partition shadow strips target configuration and records bounded helper di
   ]) {
     copyFileSync(join(trustedRoot, "scripts", name), join(support, name));
   }
+  const profileDirectory = join(fixture.directory, "partition-shadow-profile");
+  mkdirSync(profileDirectory);
+  writeFileSync(
+    join(profileDirectory, "review-partition-shadow-profile.json"),
+    `${JSON.stringify({
+      schema_version: 1,
+      descriptors: ["general"],
+      descriptor_content_hashes: ["a".repeat(64)],
+      max_output_attempts: 2,
+    })}\n`,
+  );
   const resultFile = join(fixture.directory, "authoritative-review-result.json");
   const outputFile = join(fixture.directory, "review-partition-shadow.json");
   writeFileSync(resultFile, "authoritative result\n");

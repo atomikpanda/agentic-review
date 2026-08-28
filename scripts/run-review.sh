@@ -40,6 +40,7 @@
 #                           (required with --partition-shadow)
 #                                                     no hosted environment
 #                                                     interface
+#   --execution-profile-out FILE write the trusted ordered descriptor profile
 #   --no-state          do not update local review history
 #   --open              list findings still open from previous runs
 #   --all               list every tracked finding, including dismissed
@@ -112,6 +113,7 @@ PARTITION_SHADOW=0
 PARTITION_SHADOW_OUT=""
 PARTITION_SHADOW_OUT_DIR_FD=""
 PARTITION_SHADOW_OUT_FD_PATH=""
+EXECUTION_PROFILE_OUT=""
 PASS_MAX_ATTEMPTS=2
 PASS_DIAGNOSTIC_STDERR_BYTES=4096
 PASS_DIAGNOSTIC_STDERR_LINES=64
@@ -140,6 +142,7 @@ while [ $# -gt 0 ]; do
     --diagnostics-out) DIAGNOSTICS_OUT="${2:-}"; shift 2 ;;
     --partition-shadow) PARTITION_SHADOW=1; shift ;;
     --partition-shadow-out) PARTITION_SHADOW_OUT="${2:-}"; shift 2 ;;
+    --execution-profile-out) EXECUTION_PROFILE_OUT="${2:-}"; shift 2 ;;
     --staged)       STAGED=1; shift ;;
     --no-fail)      FAIL_ON_FINDINGS=0; shift ;;
     --no-codegraph) USE_CODEGRAPH=0; shift ;;
@@ -1009,7 +1012,7 @@ node "$RESULT_HELPER" scope "$SCOPE_FILE" >/dev/null \
   || die "could not validate review scope"
 
 SHADOW_SETUP_STATUS=""
-if [ "$PARTITION_SHADOW" = 1 ]; then
+if [ "$PARTITION_SHADOW" = 1 ] || [ -n "$EXECUTION_PROFILE_OUT" ]; then
   SHADOW_LIMITS_FILE="$RUN_TMP/shadow-limits.json"
   SHADOW_PROFILE_FILE="$RUN_TMP/shadow-profile.json"
   SHADOW_CONFIG_FILE="$RUN_TMP/shadow-config.json"
@@ -1037,6 +1040,11 @@ EOF
   ' "$CONFIG_FILE" "$SHADOW_PROFILE_FILE" "$SELF_ROOT/scripts/lib-canonical-json.mjs" \
     "$PASS_MAX_ATTEMPTS" 2>/dev/null; then
     SHADOW_SETUP_STATUS="planner_failed"
+  fi
+  if [ -n "$EXECUTION_PROFILE_OUT" ]; then
+    [ ! -L "$EXECUTION_PROFILE_OUT" ] || die "--execution-profile-out cannot be a symlink destination"
+    cp "$SHADOW_PROFILE_FILE" "$EXECUTION_PROFILE_OUT" \
+      || die "could not write --execution-profile-out"
   fi
 fi
 
