@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import test from "node:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { atomizeCapturedReviewInput, buildHostedShadowOutput, buildLocalShadowOutput, buildPathFallbackManifest, buildShadowDiagnostic, splitUnit, validateAtomization, validatePartitionShadowEvaluatorFixture, writeShadowOutput } from "./review-units.mjs";
+import { captureReviewInput } from "./review-capture.mjs";
 
 const OLD_ID = "1".repeat(40);
 const NEW_ID = "2".repeat(40);
@@ -40,6 +44,40 @@ function capture({ raw, patch, rows = [row(OLD_ID, Buffer.from("old\r\n")), row(
     object_table: rows,
   };
 }
+function git(repoRoot, args) {
+  return execFileSync("git", args, { cwd: repoRoot, encoding: "utf8" }).trim();
+}
+
+async function completeCaptureFixture(t) {
+  const root = mkdtempSync(join(tmpdir(), "review-units-shadow-"));
+  const repoRoot = join(root, "repo");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  execFileSync("mkdir", ["-p", repoRoot]);
+  git(repoRoot, ["init", "-q"]);
+  git(repoRoot, ["config", "user.email", "units@example.test"]);
+  git(repoRoot, ["config", "user.name", "Units Test"]);
+  writeFileSync(join(repoRoot, "file.txt"), "old\n");
+  git(repoRoot, ["add", "file.txt"]);
+  git(repoRoot, ["commit", "-qm", "base"]);
+  const baseSha = git(repoRoot, ["rev-parse", "HEAD"]);
+  writeFileSync(join(repoRoot, "file.txt"), "new\n");
+  git(repoRoot, ["add", "file.txt"]);
+  git(repoRoot, ["commit", "-qm", "head"]);
+  const headSha = git(repoRoot, ["rev-parse", "HEAD"]);
+  const complete = await captureReviewInput({
+    repoRoot, baseSha, headSha,
+    limits: { maxPatchBytes: 1_000_000, maxRawZBytes: 1_000_000, maxSingleBlobBytes: 1_000_000, maxTotalBlobBytes: 1_000_000, maxCaptureMilliseconds: 5_000 },
+  });
+  return { root, complete };
+}
+
+const CLI_SHADOW_CONFIG = Object.freeze({
+  schema_version: 1, benchmark_revision: "unit-test", atom_target_bytes: 16_000,
+  unit_target_bytes: 64_000, max_frontier_units: 128, max_shadow_artifact_bytes: 1_000_000,
+});
+const CLI_SHADOW_PROFILE = Object.freeze({
+  schema_version: 1, descriptors: ["general"], descriptor_content_hashes: ["a".repeat(64)], max_output_attempts: 1,
+});
 
 const RENAME_MODE_TEXT_PATCH = [
   "diff --git a/old.txt b/new.txt",
@@ -552,5 +590,50 @@ test("atomic shadow writes reject attacker-created temporary names", () => {
     assert.equal(readFileSync(protectedPath, "utf8"), "protected");
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("propagates final unterminated context newline state into changed text atoms", () => {
+  const result = atomizeCapturedReviewInput(capture({
+    raw: rawRecord({}),
+    patch: "diff --git a/old.txt b/old.txt\n@@ -1,2 +1,2 @@\n-old\n+new\n final context\n\\ No newline at end of file\n",
+  }));
+  assert.equal(result.status, "complete");
+  const atom = result.atoms.find((candidate) => candidate.kind === "text");
+  assert.equal(atom.old_final_newline, false);
+  assert.equal(atom.new_final_newline, false);
+  assert.equal(atom.content_hash, sha256({
+    kind: "text", owner_path_base64: "b2xkLnR4dA==", old_path_base64: "b2xkLnR4dA==", new_path_base64: "b2xkLnR4dA==",
+    old_start: 1, old_count: 1, new_start: 1, new_count: 1,
+    old_lines: [{ bytes_base64: "b2xk", terminator: "lf" }], new_lines: [{ bytes_base64: "bmV3", terminator: "lf" }],
+    old_final_newline: false, new_final_newline: false, oversized: false,
+  }));
+});
+
+test("shadow CLI validates complete captures before atomization or manifest projection", async (t) => {
+  const { root, complete } = await completeCaptureFixture(t);
+  const configPath = join(root, "config.json");
+  const profilePath = join(root, "profile.json");
+  const capturePath = join(root, "capture.json");
+  const localOutput = join(root, "local.json");
+  writeFileSync(configPath, JSON.stringify(CLI_SHADOW_CONFIG));
+  writeFileSync(profilePath, JSON.stringify(CLI_SHADOW_PROFILE));
+  const mutations = [
+    (value) => { delete value.base_sha; },
+    (value) => { delete value.head_sha; },
+    (value) => { delete value.object_table; },
+    (value) => { value.capture_hash = "0".repeat(64); },
+    (value) => { value.object_table[0].content_base64 = Buffer.from("tampered").toString("base64"); },
+  ];
+  for (const mutate of mutations) {
+    const malformed = structuredClone(complete);
+    mutate(malformed);
+    writeFileSync(capturePath, JSON.stringify(malformed));
+    const child = spawnSync(process.execPath, ["scripts/review-units.mjs", "shadow", "--capture", capturePath, "--profile", profilePath, "--config", configPath, "--local-out", localOutput], { cwd: process.cwd(), encoding: "utf8" });
+    assert.equal(child.status, 0, child.stderr);
+    const output = JSON.parse(readFileSync(localOutput, "utf8"));
+    assert.equal(output.status, "planner_failed");
+    assert.equal(Object.hasOwn(output, "manifest"), false);
+    assert.ok(output.reason_codes.includes("capture_validation_failed"));
   }
 });

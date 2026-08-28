@@ -3,6 +3,7 @@ import { lstatSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "
 import { dirname, join } from "node:path";
 
 import { canonicalJson, canonicalSha256 } from "./lib-canonical-json.mjs";
+import { validateCapturedReviewInput } from "./review-capture.mjs";
 
 export const RAW_STATUS_PATH_COUNT = Object.freeze({
   A: 1,
@@ -156,12 +157,13 @@ function parsePatch(bytes) {
   let section;
   let hunk;
   let lastChanged;
+  let previousSides;
   let offset = 0;
-  const finishHunk = () => { hunk = undefined; lastChanged = undefined; };
+  const finishHunk = () => { hunk = undefined; lastChanged = undefined; previousSides = undefined; };
   const startSection = (line) => {
     finishHunk();
     const [oldHeader, newHeader] = gitTokens(line.subarray(Buffer.byteLength("diff --git ")));
-    section = { oldPath: removeDiffPrefix(oldHeader, "a"), newPath: removeDiffPrefix(newHeader, "b"), headerOldPath: removeDiffPrefix(oldHeader, "a"), headerNewPath: removeDiffPrefix(newHeader, "b"), hunks: [], binary: false };
+    section = { oldPath: removeDiffPrefix(oldHeader, "a"), newPath: removeDiffPrefix(newHeader, "b"), headerOldPath: removeDiffPrefix(oldHeader, "a"), headerNewPath: removeDiffPrefix(newHeader, "b"), hunks: [], binary: false, oldFinalNewline: true, newFinalNewline: true };
     sections.push(section);
   };
   while (offset < bytes.length) {
@@ -178,9 +180,11 @@ function parsePatch(bytes) {
       hunk = { ...range, events: [], blocks: [], currentBlock: undefined, oldCursor: range.oldStart, newCursor: range.newStart, oldLineIndex: 0, newLineIndex: 0, index: section.hunks.length };
       section.hunks.push(hunk);
       lastChanged = undefined;
+      previousSides = undefined;
       continue;
     }
     if (line.equals(Buffer.from("\\ No newline at end of file"))) {
+      for (const side of previousSides ?? []) section[side === "old" ? "oldFinalNewline" : "newFinalNewline"] = false;
       if (lastChanged) lastChanged.line.terminator = "none";
       continue;
     }
@@ -191,6 +195,7 @@ function parsePatch(bytes) {
       hunk.oldCursor += 1;
       hunk.newCursor += 1;
       hunk.currentBlock = undefined;
+      previousSides = ["old", "new"];
       lastChanged = undefined;
     } else if (marker === 0x2d || marker === 0x2b) {
       const side = marker === 0x2d ? "old" : "new";
@@ -205,6 +210,7 @@ function parsePatch(bytes) {
       if (side === "old") hunk.oldCursor += 1;
       else hunk.newCursor += 1;
       lastChanged = event;
+      previousSides = [side];
     }
   }
   return sections;
@@ -267,12 +273,12 @@ function pathPayload(record, section, rows) {
   };
 }
 
-function textPayload(record, oldStart, newStart, oldLines, newLines, oversized) {
+function textPayload(record, oldStart, newStart, oldLines, newLines, oversized, oldFinalNewline, newFinalNewline) {
   return {
     kind: "text", owner_path_base64: (record.newPath ?? record.oldPath).toString("base64"), old_path_base64: record.oldPath?.toString("base64") ?? null, new_path_base64: record.newPath?.toString("base64") ?? null,
     old_start: oldStart, old_count: oldLines.length, new_start: newStart, new_count: newLines.length,
     old_lines: oldLines, new_lines: newLines,
-    old_final_newline: oldLines.every((line) => line.terminator === "lf"), new_final_newline: newLines.every((line) => line.terminator === "lf"), oversized,
+    old_final_newline: oldFinalNewline, new_final_newline: newFinalNewline, oversized,
   };
 }
 
@@ -290,7 +296,7 @@ function projectTextAtoms(record, section, sectionIndex) {
       const start = () => ({ oldStart: oldCursor, newStart: newCursor, oldLines: [], newLines: [], owners: [] });
       const finish = () => {
         if (!candidate || candidate.owners.length === 0) return;
-        const payload = textPayload(record, candidate.oldStart, candidate.newStart, candidate.oldLines, candidate.newLines, candidate.oversized ?? false);
+        const payload = textPayload(record, candidate.oldStart, candidate.newStart, candidate.oldLines, candidate.newLines, candidate.oversized ?? false, section.oldFinalNewline, section.newFinalNewline);
         atoms.push({ payload, lineage_candidate: textLineage(payload), sort: [payload.old_start, payload.old_count, payload.new_start, payload.new_count], owners: candidate.owners });
         candidate = undefined;
       };
@@ -299,7 +305,7 @@ function projectTextAtoms(record, section, sectionIndex) {
         const prospective = { ...candidate, oldLines: [...candidate.oldLines], newLines: [...candidate.newLines] };
         prospective[event.side === "old" ? "oldLines" : "newLines"].push(event.line);
         prospective.owners = [...candidate.owners, `${sectionIndex}:${hunk.index}:${event.side}:${event.lineIndex}`];
-        const prospectivePayload = textPayload(record, prospective.oldStart, prospective.newStart, prospective.oldLines, prospective.newLines, false);
+        const prospectivePayload = textPayload(record, prospective.oldStart, prospective.newStart, prospective.oldLines, prospective.newLines, false, section.oldFinalNewline, section.newFinalNewline);
         if (candidate.owners.length > 0 && Buffer.byteLength(canonicalJson(prospectivePayload)) > ATOM_TARGET_BYTES) {
           finish();
           candidate = start();
@@ -307,7 +313,7 @@ function projectTextAtoms(record, section, sectionIndex) {
         candidate[event.side === "old" ? "oldLines" : "newLines"].push(event.line);
         candidate.owners.push(`${sectionIndex}:${hunk.index}:${event.side}:${event.lineIndex}`);
         if (candidate.owners.length === 1) {
-          const oneLine = textPayload(record, candidate.oldStart, candidate.newStart, candidate.oldLines, candidate.newLines, false);
+          const oneLine = textPayload(record, candidate.oldStart, candidate.newStart, candidate.oldLines, candidate.newLines, false, section.oldFinalNewline, section.newFinalNewline);
           candidate.oversized = Buffer.byteLength(canonicalJson(oneLine)) > ATOM_TARGET_BYTES;
         }
         if (event.side === "old") oldCursor += 1;
@@ -928,6 +934,22 @@ function shadowDiagnosticFromCapture(capture, benchmarkRevision, maxBytes) {
   }, maxBytes);
 }
 
+function invalidCaptureDiagnostic(capture, benchmarkRevision, maxBytes, error) {
+  const safeId = (value) => typeof value === "string" && GIT_ID.test(value) ? value : "0".repeat(40);
+  return buildShadowDiagnostic({
+    status: "planner_failed",
+    base_sha: safeId(capture?.base_sha),
+    head_sha: safeId(capture?.head_sha),
+    benchmark_revision: typeof benchmarkRevision === "string" && benchmarkRevision.length <= 256 ? benchmarkRevision : "",
+    capture_hash: SHA256.test(capture?.capture_hash) ? capture.capture_hash : null,
+    manifest_hash: null,
+    reason_codes: ["capture_validation_failed"],
+    diagnostic: error instanceof Error ? error.message : "Capture validation failed.",
+    observed_lower_bounds: { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 },
+    counts: {},
+  }, maxBytes);
+}
+
 function main(argv) {
   let options;
   try {
@@ -940,6 +962,14 @@ function main(argv) {
     const capture = JSON.parse(readFileSync(options["--capture"], "utf8"));
     const profile = JSON.parse(readFileSync(options["--profile"], "utf8"));
     const config = JSON.parse(readFileSync(options["--config"], "utf8"));
+    try {
+      validateCapturedReviewInput(capture);
+    } catch (error) {
+      const diagnostic = invalidCaptureDiagnostic(capture, config.benchmark_revision, config.max_shadow_artifact_bytes, error);
+      if (options["--local-out"]) writeShadowOutput(options["--local-out"], diagnostic);
+      if (options["--diagnostics-out"]) writeShadowOutput(options["--diagnostics-out"], diagnostic);
+      return 0;
+    }
     const diagnostic = capture.status === "complete"
       ? (() => {
         try {
