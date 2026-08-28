@@ -84,6 +84,9 @@ on:
       review_phase:
         description: "Phase completed by this run: discovery or verification."
         value: ${{ jobs.review.outputs.review_phase }}
+      review_next_phase:
+        description: "Next persisted phase: discovery, verification, or none."
+        value: ${{ jobs.review.outputs.review_next_phase }}
       discovery_round:
         description: Discovery round ordinal in the cross-run cycle.
         value: ${{ jobs.review.outputs.discovery_round }}
@@ -351,26 +354,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.timeout_minutes || 20 }}
     outputs:
-      analysis_state: ${{ steps.poster.outputs.analysis_state || steps.cycle.outputs.analysis_state }}
-      merge_state: ${{ steps.poster.outputs.merge_state || steps.cycle.outputs.merge_state }}
-      sample_state: ${{ steps.poster.outputs.sample_state || steps.cycle.outputs.sample_state }}
-      bounded_converged: ${{ steps.poster.outputs.bounded_converged || steps.cycle.outputs.bounded_converged }}
-      reviewed_head: ${{ steps.poster.outputs.reviewed_head || steps.cycle.outputs.reviewed_head }}
-      scope_hash: ${{ steps.poster.outputs.scope_hash || steps.cycle.outputs.scope_hash }}
-      coverage: ${{ steps.poster.outputs.coverage || steps.cycle.outputs.coverage }}
-      remaining_analysis: ${{ steps.poster.outputs.remaining_analysis || steps.cycle.outputs.remaining_analysis }}
-      converged: ${{ steps.poster.outputs.converged || steps.cycle.outputs.converged }}
-      base_sha: ${{ steps.poster.outputs.base_sha || steps.cycle.outputs.base_sha }}
-      head_sha: ${{ steps.poster.outputs.head_sha || steps.cycle.outputs.head_sha }}
-      configuration_fingerprint: ${{ steps.poster.outputs.configuration_fingerprint || steps.cycle.outputs.configuration_fingerprint }}
-      passes_requested: ${{ steps.poster.outputs.passes_requested || steps.cycle.outputs.passes_requested }}
-      passes_completed: ${{ steps.poster.outputs.passes_completed || steps.cycle.outputs.passes_completed }}
-      current_counts: ${{ steps.poster.outputs.current_counts || steps.cycle.outputs.current_counts }}
-      unresolved_counts: ${{ steps.poster.outputs.unresolved_counts || steps.cycle.outputs.unresolved_counts }}
-      review_cycle_state: ${{ steps.poster.outputs.review_cycle_state || steps.cycle.outputs.cycle_state }}
-      review_phase: ${{ steps.poster.outputs.review_phase || steps.cycle.outputs.phase }}
-      discovery_round: ${{ steps.poster.outputs.discovery_round || steps.cycle.outputs.discovery_round }}
-      max_discovery_rounds: ${{ steps.poster.outputs.max_discovery_rounds || inputs.max_discovery_rounds || 2 }}
+      analysis_state: ${{ steps.continuation_poster.outputs.analysis_state || steps.poster.outputs.analysis_state || steps.cycle.outputs.analysis_state }}
+      merge_state: ${{ steps.continuation_poster.outputs.merge_state || steps.poster.outputs.merge_state || steps.cycle.outputs.merge_state }}
+      sample_state: ${{ steps.continuation_poster.outputs.sample_state || steps.poster.outputs.sample_state || steps.cycle.outputs.sample_state }}
+      bounded_converged: ${{ steps.continuation_poster.outputs.bounded_converged || steps.poster.outputs.bounded_converged || steps.cycle.outputs.bounded_converged }}
+      reviewed_head: ${{ steps.continuation_poster.outputs.reviewed_head || steps.poster.outputs.reviewed_head || steps.cycle.outputs.reviewed_head }}
+      scope_hash: ${{ steps.continuation_poster.outputs.scope_hash || steps.poster.outputs.scope_hash || steps.cycle.outputs.scope_hash }}
+      coverage: ${{ steps.continuation_poster.outputs.coverage || steps.poster.outputs.coverage || steps.cycle.outputs.coverage }}
+      remaining_analysis: ${{ steps.continuation_poster.outputs.remaining_analysis || steps.poster.outputs.remaining_analysis || steps.cycle.outputs.remaining_analysis }}
+      converged: ${{ steps.continuation_poster.outputs.converged || steps.poster.outputs.converged || steps.cycle.outputs.converged }}
+      base_sha: ${{ steps.continuation_poster.outputs.base_sha || steps.poster.outputs.base_sha || steps.cycle.outputs.base_sha }}
+      head_sha: ${{ steps.continuation_poster.outputs.head_sha || steps.poster.outputs.head_sha || steps.cycle.outputs.head_sha }}
+      configuration_fingerprint: ${{ steps.continuation_poster.outputs.configuration_fingerprint || steps.poster.outputs.configuration_fingerprint || steps.cycle.outputs.configuration_fingerprint }}
+      passes_requested: ${{ steps.continuation_poster.outputs.passes_requested || steps.poster.outputs.passes_requested || steps.cycle.outputs.passes_requested }}
+      passes_completed: ${{ steps.continuation_poster.outputs.passes_completed || steps.poster.outputs.passes_completed || steps.cycle.outputs.passes_completed }}
+      current_counts: ${{ steps.continuation_poster.outputs.current_counts || steps.poster.outputs.current_counts || steps.cycle.outputs.current_counts }}
+      unresolved_counts: ${{ steps.continuation_poster.outputs.unresolved_counts || steps.poster.outputs.unresolved_counts || steps.cycle.outputs.unresolved_counts }}
+      review_cycle_state: ${{ steps.continuation_poster.outputs.review_cycle_state || steps.poster.outputs.review_cycle_state || steps.cycle.outputs.cycle_state }}
+      review_phase: ${{ steps.continuation_poster.outputs.review_phase || steps.poster.outputs.review_phase || steps.cycle.outputs.phase }}
+      review_next_phase: ${{ steps.continuation_poster.outputs.review_next_phase || steps.poster.outputs.review_next_phase || steps.cycle.outputs.next_phase }}
+      discovery_round: ${{ steps.continuation_poster.outputs.discovery_round || steps.poster.outputs.discovery_round || steps.cycle.outputs.discovery_round }}
+      max_discovery_rounds: ${{ steps.continuation_poster.outputs.max_discovery_rounds || steps.poster.outputs.max_discovery_rounds || inputs.max_discovery_rounds || 2 }}
     steps:
       # ONE place that answers "what am I reviewing, and with what credential".
       # Everything downstream reads these outputs instead of
@@ -969,7 +973,7 @@ jobs:
           HEAD: ${{ steps.target.outputs.head }}
           AGENTIC_REVIEW_PHASE: ${{ steps.cycle.outputs.phase }}
           AGENTIC_REVIEW_KNOWN_FINDINGS: /tmp/review-known-findings.json
-        run: |
+        run: &run-review-phase |
           set -euo pipefail
           actual_head="$(git rev-parse --verify 'HEAD^{commit}')"
           [ "$actual_head" = "$HEAD" ] || {
@@ -977,6 +981,15 @@ jobs:
             exit 1
           }
 
+          REVIEW_FINDINGS_FILE=/tmp/review.md
+          REVIEW_PUBLICATION_FILE=/tmp/review-publication.json
+          REVIEW_DIAGNOSTICS_FILE=/tmp/review-pass-diagnostics.json
+          REVIEW_RUNNER_STDOUT=/tmp/review-runner.out
+          REVIEW_RUNNER_STDERR=/tmp/review-runner.err
+          # A failed continuation must not let its poster consume the preceding
+          # verification publication as if it came from final discovery.
+          rm -f "$REVIEW_FINDINGS_FILE" "$REVIEW_PUBLICATION_FILE" \
+            "$REVIEW_DIAGNOSTICS_FILE" "$REVIEW_RUNNER_STDOUT" "$REVIEW_RUNNER_STDERR"
           RUNNER_ARGS=(
             --base "$BASE"
             --model "$MODEL"
@@ -988,9 +1001,9 @@ jobs:
             --max-parallel "$MAX_PARALLEL"
             --review-mode "$REVIEW_MODE"
             --omp-version "$OMP_VERSION"
-            --out /tmp/review.md
-            --publication-out /tmp/review-publication.json
-            --diagnostics-out /tmp/review-pass-diagnostics.json
+            --out "$REVIEW_FINDINGS_FILE"
+            --publication-out "$REVIEW_PUBLICATION_FILE"
+            --diagnostics-out "$REVIEW_DIAGNOSTICS_FILE"
             --no-state
             --no-fail
             --json
@@ -1007,23 +1020,24 @@ jobs:
           fi
 
           # --json prevents the local renderer from invoking the poster. Hosted
-          # presentation and gating happen exactly once in the next step.
+          # presentation and gating happen in the phase-specific poster step.
           if ! AGENTIC_REVIEW_MAX_DIFF_BYTES="$MAX_DIFF_BYTES" \
                AGENTIC_REVIEW_TRUSTED_DATA_ROOT="$TRUSTED_DATA_ROOT" \
                bash "$REVIEW_RUNNER" "${RUNNER_ARGS[@]}" \
-                 > /tmp/review-runner.out 2> /tmp/review-runner.err; then
-            cat /tmp/review-runner.err >&2
+                 > "$REVIEW_RUNNER_STDOUT" 2> "$REVIEW_RUNNER_STDERR"; then
+            cat "$REVIEW_RUNNER_STDERR" >&2
             exit 1
           fi
-          cat /tmp/review-runner.err >&2
-          echo "  review result: $(wc -c < /tmp/review.md) bytes"
-          echo "  publication: $(wc -c < /tmp/review-publication.json) bytes"
+          cat "$REVIEW_RUNNER_STDERR" >&2
+          echo "  review result: $(wc -c < "$REVIEW_FINDINGS_FILE") bytes"
+          echo "  publication: $(wc -c < "$REVIEW_PUBLICATION_FILE") bytes"
 
       - name: post review
         id: poster
         # Run after runner failure so the poster or this boundary can emit a
         # conservative result without posting missing or invalid artifacts.
         if: ${{ !cancelled() }}
+        continue-on-error: ${{ steps.cycle.outputs.phase == 'verification' }}
         env:
           # The write-capable credential is confined to this presentation step.
           GH_TOKEN: ${{ steps.target.outputs.eligible == 'true' && (steps.target.outputs.token || github.token) || '' }}
@@ -1038,8 +1052,10 @@ jobs:
           CYCLE_SHOULD_RUN: ${{ steps.cycle.outputs.should_run }}
           CYCLE_STATE: ${{ steps.cycle.outputs.cycle_state }}
           CYCLE_PHASE: ${{ steps.cycle.outputs.phase }}
+          CYCLE_NEXT_PHASE: ${{ steps.cycle.outputs.next_phase }}
+          CYCLE_JSON: ${{ steps.cycle.outputs.cycle_json }}
           CYCLE_DISCOVERY_ROUND: ${{ steps.cycle.outputs.discovery_round }}
-        run: |
+        run: &post-review-phase |
           if [ "${TARGET_ELIGIBLE:-}" = "false" ]; then
             exit 0
           fi
@@ -1047,6 +1063,7 @@ jobs:
             {
               echo "review_cycle_state=${CYCLE_STATE}"
               echo "review_phase=${CYCLE_PHASE}"
+              echo "review_next_phase=${CYCLE_NEXT_PHASE}"
               echo "discovery_round=${CYCLE_DISCOVERY_ROUND}"
               echo "max_discovery_rounds=${MAX_DISCOVERY_ROUNDS}"
             } >> "$GITHUB_OUTPUT"
@@ -1070,6 +1087,18 @@ jobs:
           const baseSha = process.env.BASE_SHA ?? "";
           const headSha = process.env.HEAD_SHA ?? "";
           const resultFile = process.env.REVIEW_RESULT_FILE || "/tmp/review-result.json";
+          const isPlainObject = (value) => (
+            value !== null
+            && typeof value === "object"
+            && !Array.isArray(value)
+          );
+          let persistedCycle = null;
+          try {
+            const candidate = JSON.parse(process.env.CYCLE_JSON ?? "null");
+            if (isPlainObject(candidate)) persistedCycle = candidate;
+          } catch {
+            // Missing cycle evidence keeps the fallback cycle-free.
+          }
           let trustedMetadata = null;
           let trustedFailureResult = null;
           try {
@@ -1091,30 +1120,28 @@ jobs:
           const trustedRemainingAnalysis = Array.isArray(trustedMetadata?.remaining_analysis)
             ? trustedMetadata.remaining_analysis
             : null;
-          const conservativeResult = trustedFailureResult ?? {
-            analysis_state: "inconclusive",
-            merge_state: "ready",
-            sample_state: "unknown",
-            bounded_converged: false,
-            base_sha: baseSha,
-            head_sha: headSha,
-            configuration_fingerprint: "",
-            passes_requested: 0,
-            passes_completed: 0,
-            current_counts: { Critical: 0, High: 0, Medium: 0 },
-            unresolved_counts: { Critical: 0, High: 0, Medium: 0 },
-            reviewed_head: headSha,
-            scope_hash: "",
-            coverage: "unknown",
-            remaining_analysis: ["execution_failed"],
-            converged: false,
+          const conservativeResult = {
+            ...(trustedFailureResult ?? {
+              analysis_state: "inconclusive",
+              merge_state: "ready",
+              sample_state: "unknown",
+              bounded_converged: false,
+              base_sha: baseSha,
+              head_sha: headSha,
+              configuration_fingerprint: "",
+              passes_requested: 0,
+              passes_completed: 0,
+              current_counts: { Critical: 0, High: 0, Medium: 0 },
+              unresolved_counts: { Critical: 0, High: 0, Medium: 0 },
+              reviewed_head: headSha,
+              scope_hash: "",
+              coverage: "unknown",
+              remaining_analysis: ["execution_failed"],
+              converged: false,
+            }),
+            ...(persistedCycle === null ? {} : { review_cycle: persistedCycle }),
           };
           const requiredFields = Object.keys(conservativeResult);
-          const isPlainObject = (value) => (
-            value !== null
-            && typeof value === "object"
-            && !Array.isArray(value)
-          );
           const stateValues = {
             analysis_state: new Set(["complete", "inconclusive"]),
             merge_state: new Set(["blocked", "ready"]),
@@ -1400,6 +1427,15 @@ jobs:
             `remaining_analysis=${JSON.stringify(result.remaining_analysis)}`,
             `converged=${result.converged}`,
           ];
+          if (result.review_cycle) {
+            outputLines.push(
+              `review_cycle_state=${result.review_cycle.state}`,
+              `review_phase=${result.review_cycle.last_phase}`,
+              `review_next_phase=${result.review_cycle.next_phase ?? "none"}`,
+              `discovery_round=${result.review_cycle.discovery_round}`,
+              `max_discovery_rounds=${result.review_cycle.max_discovery_rounds}`,
+            );
+          }
           if (process.env.GITHUB_OUTPUT) {
             const existingOutput = existsSync(process.env.GITHUB_OUTPUT)
               ? readFileSync(process.env.GITHUB_OUTPUT, "utf8")
@@ -1425,6 +1461,9 @@ jobs:
             `| Scope hash | \`${result.scope_hash}\` |`,
             `| Coverage | \`${result.coverage}\` |`,
             `| Remaining analysis | \`${JSON.stringify(result.remaining_analysis)}\` |`,
+            ...(result.review_cycle
+              ? [`| Review cycle | \`${result.review_cycle.state}\` · last \`${result.review_cycle.last_phase}\` · next \`${result.review_cycle.next_phase ?? "none"}\` · discovery ${result.review_cycle.discovery_round}/${result.review_cycle.max_discovery_rounds} |`]
+              : []),
             `| Converged | \`${result.converged}\` |`,
             `| Base SHA | \`${result.base_sha}\` |`,
             `| Head SHA | \`${result.head_sha}\` |`,
@@ -1516,6 +1555,67 @@ jobs:
             finalize_missing_surfaces
             exit "$poster_status"
           fi
+
+      - name: plan automatic final discovery
+        id: continuation_cycle
+        if: >-
+          steps.poster.outputs.review_cycle_state == 'active'
+          && steps.poster.outputs.review_next_phase == 'discovery'
+        env:
+          GH_TOKEN: ${{ steps.target.outputs.token || github.token }}
+          GITHUB_REPO: ${{ steps.target.outputs.repo }}
+          PR_NUMBER: ${{ steps.target.outputs.pr }}
+          HEAD_SHA: ${{ steps.target.outputs.head }}
+          BASE_SHA: ${{ steps.target.outputs.base }}
+          REVIEW_CYCLE_PLAN_FILE: /tmp/review-cycle-plan.json
+          KNOWN_FINDINGS_FILE: /tmp/review-known-findings.json
+          REVIEW_RESULT_FILE: /tmp/review-result.json
+        run: |
+          set -euo pipefail
+          node "$REVIEW_POSTER" cycle-plan
+
+      - name: run automatic final discovery
+        if: >-
+          steps.continuation_cycle.outputs.phase == 'discovery'
+          && steps.continuation_cycle.outputs.should_run == 'true'
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          BASE: ${{ steps.target.outputs.base }}
+          HEAD: ${{ steps.target.outputs.head }}
+          AGENTIC_REVIEW_PHASE: ${{ steps.continuation_cycle.outputs.phase }}
+          AGENTIC_REVIEW_KNOWN_FINDINGS: /tmp/review-known-findings.json
+        run: *run-review-phase
+
+      - name: post automatic final discovery
+        id: continuation_poster
+        if: ${{ !cancelled() && steps.continuation_cycle.outputs.phase == 'discovery' && steps.continuation_cycle.outputs.should_run == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.target.outputs.token || github.token }}
+          TARGET_ELIGIBLE: ${{ steps.target.outputs.eligible }}
+          REVIEW_PUBLICATION_FILE: /tmp/review-publication.json
+          REVIEW_RESULT_FILE: /tmp/review-result.json
+          GITHUB_REPO: ${{ steps.target.outputs.repo }}
+          PR_NUMBER: ${{ steps.target.outputs.pr }}
+          HEAD_SHA: ${{ steps.target.outputs.head }}
+          BASE_SHA: ${{ steps.target.outputs.base }}
+          REVIEW_CYCLE_PLAN_FILE: /tmp/review-cycle-plan.json
+          CYCLE_SHOULD_RUN: ${{ steps.continuation_cycle.outputs.should_run }}
+          CYCLE_STATE: ${{ steps.continuation_cycle.outputs.cycle_state }}
+          CYCLE_PHASE: ${{ steps.continuation_cycle.outputs.phase }}
+          CYCLE_NEXT_PHASE: ${{ steps.continuation_cycle.outputs.next_phase }}
+          CYCLE_JSON: ${{ steps.continuation_cycle.outputs.cycle_json }}
+          CYCLE_DISCOVERY_ROUND: ${{ steps.continuation_cycle.outputs.discovery_round }}
+        run: *post-review-phase
+
+      - name: enforce incomplete verification gate
+        if: >-
+          !cancelled()
+          && steps.cycle.outputs.phase == 'verification'
+          && steps.poster.outcome == 'failure'
+          && steps.continuation_poster.outcome == 'skipped'
+        run: |
+          echo "::error::verification did not reach the required final discovery"
+          exit 1
 
       - name: upload review result
         if: ${{ !cancelled() && steps.target.outputs.eligible != 'false' }}

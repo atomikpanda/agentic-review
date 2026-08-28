@@ -193,10 +193,11 @@ Hosted reviews add a bounded **cross-run cycle** around that per-run ensemble:
    identities and invariants directly affected by their fixes. A directly
    linked regression names its causal `verification_id`; the runner withholds
    new identities without that provenance from its published result.
-3. A clean verification schedules one more discovery round.
+3. A clean verification persists that transition, then the same hosted
+   invocation runs one final discovery against the same immutable head.
 4. The default `max_discovery_rounds: 2` permits that final discovery, but never
    an automatic third broad round. Verification retries do not consume the
-   discovery budget.
+   discovery budget. No synthetic push or manual workflow rerun is required.
 
 The bot persists the cycle beside held findings in its authenticated
 pull-request review marker. Marker v2 carries the cycle and workflow run
@@ -302,7 +303,7 @@ The reusable workflow exposes these exact outputs:
 | `base_sha`, `head_sha`, `configuration_fingerprint` | The immutable review identity |
 | `passes_requested`, `passes_completed` | Counts of configured and valid passes |
 | `current_counts`, `unresolved_counts` | JSON severity maps for current and held findings |
-| `review_cycle_state`, `review_phase`, `discovery_round`, `max_discovery_rounds` | Persisted cross-run phase, terminal state, ordinal, and discovery budget |
+| `review_cycle_state`, `review_phase`, `review_next_phase`, `discovery_round`, `max_discovery_rounds` | Persisted cross-run state, completed and pending phases, ordinal, and discovery budget |
 
 The same values appear in the review body and GitHub job summary. The hosted
 `agentic-review` artifact always retains the required final result
@@ -348,9 +349,10 @@ affects `merge_state`/`sample_state`. It is retired only when a complete run
 confirms that span changed, except during verification: a complete
 current-lineage verification may retire only an identity persisted in that
 verification plan when no verification evidence was withheld and both summary
-and thread history are known. A clean verification advances to one final
-discovery; only that clean final discovery makes the cycle ready. Suppressed-write
-runs read and reconcile the standing state for outputs and gating but do not
+and thread history are known. A clean verification is persisted before the same
+workflow invocation runs one final discovery; only that clean final discovery
+makes the cycle ready.
+Suppressed-write runs read and reconcile the standing state for outputs and gating but do not
 append a review. If identity lookup, pull-request review history, thread
 history, or reconciliation fails, summary-derived dismissals are not applied,
 the state is not changed, and the result cannot be clean or converged.

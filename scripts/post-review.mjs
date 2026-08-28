@@ -722,7 +722,7 @@ function renderFinalResultTable(result) {
     `| Coverage | \`${result.coverage}\` |`,
     `| Remaining analysis | \`${JSON.stringify(result.remaining_analysis)}\` |`,
     ...(result.review_cycle
-      ? [`| Review cycle | \`${result.review_cycle.state}\` · phase \`${result.review_cycle.last_phase}\` · discovery ${result.review_cycle.discovery_round}/${result.review_cycle.max_discovery_rounds} |`]
+      ? [`| Review cycle | \`${result.review_cycle.state}\` · last \`${result.review_cycle.last_phase}\` · next \`${result.review_cycle.next_phase ?? "none"}\` · discovery ${result.review_cycle.discovery_round}/${result.review_cycle.max_discovery_rounds} |`]
       : []),
     `| Converged | \`${result.converged}\` |`,
     `| Base SHA | \`${result.base_sha}\` |`,
@@ -772,6 +772,7 @@ export function renderReviewBody({
   current,
   unresolved,
   reconciliationKnown = true,
+  cycle = null,
 }) {
   if (!["summary", "inline", "suggest"].includes(mode)) {
     throw new TypeError("review mode must be summary, inline, or suggest");
@@ -779,7 +780,7 @@ export function renderReviewBody({
   const out = [
     "### Agentic review",
     "",
-    renderStateTable(metadata, state, { reconciliationKnown }),
+    renderStateTable(metadata, state, { reconciliationKnown, cycle }),
   ];
   appendFindings(out, "Current findings", current, mode);
   appendFindings(out, "Held findings", unresolved, mode);
@@ -843,6 +844,7 @@ export function buildReviewTopBody({
   current,
   unresolved,
   reconciliationKnown = true,
+  cycle = null,
 }) {
   const full = renderReviewBody({
     mode,
@@ -851,13 +853,14 @@ export function buildReviewTopBody({
     current,
     unresolved,
     reconciliationKnown,
+    cycle,
   });
   if (Buffer.byteLength(full) <= GITHUB_COMMENT_MAX_BYTES) return full;
 
   const out = [
     "### Agentic review",
     "",
-    renderStateTable(metadata, state, { reconciliationKnown }),
+    renderStateTable(metadata, state, { reconciliationKnown, cycle }),
     "",
   ];
   let omitted = 0;
@@ -925,6 +928,7 @@ export function buildStandingSummaryBody({
     current,
     unresolved,
     reconciliationKnown,
+    cycle,
   })}\n\n${marker}`;
   if (Buffer.byteLength(full) <= GITHUB_COMMENT_MAX_BYTES) return full;
 
@@ -935,6 +939,7 @@ export function buildStandingSummaryBody({
     current: [],
     unresolved: [],
     reconciliationKnown,
+    cycle,
   })}\n\n_Display details truncated to retain the complete standing review state._\n\n${marker}`;
   if (Buffer.byteLength(safetyOnly) > GITHUB_COMMENT_MAX_BYTES) {
     throw new RangeError("standing summary safety marker exceeds GitHub comment limit");
@@ -979,6 +984,7 @@ export function emitWorkflowResult({
         ? [
             `review_cycle_state=${result.review_cycle.state}`,
             `review_phase=${result.review_cycle.last_phase}`,
+            `review_next_phase=${result.review_cycle.next_phase ?? "none"}`,
             `discovery_round=${result.review_cycle.discovery_round}`,
             `max_discovery_rounds=${result.review_cycle.max_discovery_rounds}`,
           ]
@@ -1841,6 +1847,7 @@ export function buildInlineReviewPayload({
     state,
     current: fresh,
     unresolved,
+    cycle,
   });
   const body = cycle === null
     ? topBody
@@ -2019,6 +2026,7 @@ async function runCyclePlanMode() {
   const configuredMaximum = cycle?.max_discovery_rounds
     ?? plan.max_discovery_rounds
     ?? maxDiscoveryRounds;
+  const nextPhase = cycle?.next_phase ?? "none";
   let terminalResult = null;
   if (!plan.should_run) {
     const state = deriveReviewState({
@@ -2060,6 +2068,8 @@ async function runCyclePlanMode() {
       `discovery_round=${plan.discovery_round}`,
       `max_discovery_rounds=${configuredMaximum}`,
       `cycle_state=${cycleState}`,
+      `next_phase=${nextPhase}`,
+      `cycle_json=${JSON.stringify(cycle)}`,
       ...(terminalResult
         ? [
             `analysis_state=${terminalResult.analysis_state}`,
@@ -2220,6 +2230,7 @@ async function main() {
         current: findings,
         unresolved,
         reconciliationKnown,
+        cycle,
       });
     process.stdout.write(`${body}\n`);
     enforceGate(state, cycle);

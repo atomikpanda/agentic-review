@@ -672,6 +672,7 @@ test("a pending cycle phase cannot publish a clean green result", () => {
   assert.equal(result.finalResult.bounded_converged, false);
   assert.equal(result.finalResult.review_cycle.state, "active");
   assert.equal(result.finalResult.review_cycle.next_phase, "discovery");
+  assert.match(result.workflowOutput, /review_next_phase=discovery/);
 });
 test("cycle exhaustion fails the gate without rewriting successful execution evidence", () => {
   const priorCycle = {
@@ -2031,6 +2032,42 @@ test("state table renders the exact explicit contract", () => {
     "| Current findings | `Critical: 0 · High: 1 · Medium: 0` |",
     "| Held/unresolved findings | `Critical: 0 · High: 0 · Medium: 1` |",
   ].join("\n"));
+});
+
+test("summary and inline review bodies expose the complete persisted cycle transition", () => {
+  const cycle = {
+    schema_version: 1,
+    lineage_base_sha: BASE_SHA,
+    discovery_round: 1,
+    max_discovery_rounds: 2,
+    state: "active",
+    last_phase: "verification",
+    next_phase: "discovery",
+    last_reviewed_head: HEAD_SHA,
+    last_scope_hash: SCOPE_HASH,
+    last_analysis_state: "complete",
+    override: null,
+  };
+  const expected = "| Review cycle | `active` · last `verification` · next `discovery` · discovery 1/2 |";
+  const summaryBody = buildStandingSummaryBody({
+    metadata: metadata(),
+    state: state(),
+    cycle,
+    current: [],
+    unresolved: [],
+  });
+  const inlineBody = poster.buildInlineReviewPayload({
+    metadata: metadata(),
+    state: state(),
+    current: [],
+    fresh: [],
+    unresolved: [],
+    comments: [],
+    cycle,
+  }).body;
+
+  assert.match(summaryBody, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(inlineBody, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
 test("review body and job summary render the same reconciliation-adjusted final values", () => {
