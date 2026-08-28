@@ -645,7 +645,9 @@ test("validates canonical local, hosted, and diagnostic output envelopes", async
     counts: {},
   }, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes);
   for (const output of [local, hosted, diagnostic]) {
-    const trustedInputs = output === hosted ? { capture: complete } : undefined;
+    const trustedInputs = output === hosted ? {
+      capture: complete, config: CLI_SHADOW_CONFIG, profile: CLI_SHADOW_PROFILE,
+    } : undefined;
     assert.equal(validateShadowOutput(output, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, trustedInputs), output);
   }
 
@@ -768,8 +770,10 @@ test("rejects self-hashed atom rows and hosted unit ownership gaps", async (t) =
     mutate(forged);
     refreshSize(forged);
     assert.throws(
-      () => validateShadowOutput(forged, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, { capture: complete }),
-      /atom ownership/,
+      () => validateShadowOutput(forged, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, {
+        capture: complete, config: CLI_SHADOW_CONFIG, profile: CLI_SHADOW_PROFILE,
+      }),
+      /hosted output does not match deterministic capture manifest/,
     );
   }
 });
@@ -794,10 +798,12 @@ test("binds hosted complete output to its capture atomization", async (t) => {
   };
   assert.throws(
     () => validateShadowOutput(hosted, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes),
-    /hosted complete output requires original capture/,
+    /hosted output requires original capture, profile, and configuration/,
   );
   assert.equal(
-    validateShadowOutput(hosted, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, { capture: complete }),
+    validateShadowOutput(hosted, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, {
+      capture: complete, config: CLI_SHADOW_CONFIG, profile: CLI_SHADOW_PROFILE,
+    }),
     hosted,
   );
 
@@ -814,8 +820,10 @@ test("binds hosted complete output to its capture atomization", async (t) => {
   vacuous.execution_projection.projected_model_calls = 0;
   refreshSize(vacuous);
   assert.throws(
-    () => validateShadowOutput(vacuous, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, { capture: complete }),
-    /hosted complete output atoms do not match capture/,
+    () => validateShadowOutput(vacuous, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, {
+      capture: complete, config: CLI_SHADOW_CONFIG, profile: CLI_SHADOW_PROFILE,
+    }),
+    /hosted output does not match deterministic capture manifest/,
   );
 
   const mismatched = structuredClone(hosted);
@@ -833,8 +841,10 @@ test("binds hosted complete output to its capture atomization", async (t) => {
   }
   refreshSize(mismatched);
   assert.throws(
-    () => validateShadowOutput(mismatched, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, { capture: complete }),
-    /hosted complete output atoms do not match capture/,
+    () => validateShadowOutput(mismatched, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, {
+      capture: complete, config: CLI_SHADOW_CONFIG, profile: CLI_SHADOW_PROFILE,
+    }),
+    /hosted output does not match deterministic capture manifest/,
   );
 
   const emptyCapture = await captureReviewInput({
@@ -851,13 +861,19 @@ test("binds hosted complete output to its capture atomization", async (t) => {
   });
   const emptyHosted = buildHostedShadowOutput(emptyCapture, emptyManifest, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes);
   assert.equal(
-    validateShadowOutput(emptyHosted, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, { capture: emptyCapture }),
+    validateShadowOutput(emptyHosted, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, {
+      capture: emptyCapture, config: CLI_SHADOW_CONFIG, profile: CLI_SHADOW_PROFILE,
+    }),
     emptyHosted,
   );
 
   const capturePath = join(root, "capture.json");
+  const profilePath = join(root, "profile.json");
+  const configPath = join(root, "config.json");
   const hostedPath = join(root, "hosted.json");
   writeFileSync(capturePath, `${canonicalJson(complete)}\n`);
+  writeFileSync(profilePath, `${canonicalJson(CLI_SHADOW_PROFILE)}\n`);
+  writeFileSync(configPath, `${canonicalJson(CLI_SHADOW_CONFIG)}\n`);
   writeFileSync(hostedPath, `${canonicalJson(hosted)}\n`);
   const missingCaptureCli = spawnSync(process.execPath, [
     "scripts/review-units.mjs", "validate-output", "--input", hostedPath,
@@ -866,9 +882,105 @@ test("binds hosted complete output to its capture atomization", async (t) => {
   assert.equal(missingCaptureCli.status, 1);
   const hostedCli = spawnSync(process.execPath, [
     "scripts/review-units.mjs", "validate-output", "--input", hostedPath,
-    "--capture", capturePath, "--max-bytes", String(CLI_SHADOW_CONFIG.max_shadow_artifact_bytes),
+    "--capture", capturePath, "--profile", profilePath, "--config", configPath,
+    "--max-bytes", String(CLI_SHADOW_CONFIG.max_shadow_artifact_bytes),
   ], { cwd: process.cwd(), encoding: "utf8" });
   assert.equal(hostedCli.status, 0, hostedCli.stderr);
+});
+
+test("requires capture, profile, and configuration to validate canonical hosted artifacts", async (t) => {
+  const { root, complete } = await completeCaptureFixture(t);
+  const atomization = atomizeCapturedReviewInput(complete, CLI_SHADOW_CONFIG.atom_target_bytes);
+  const manifest = buildPathFallbackManifest({
+    capture: complete,
+    atomization,
+    config: CLI_SHADOW_CONFIG,
+    executionProfile: CLI_SHADOW_PROFILE,
+  });
+  const hosted = buildHostedShadowOutput(complete, manifest, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes);
+  const compacted = buildHostedShadowOutput(complete, manifest, hosted.sizes.encoded_output_bytes - 1);
+  const trustedInputs = { capture: complete, config: CLI_SHADOW_CONFIG, profile: CLI_SHADOW_PROFILE };
+  assert.equal(validateShadowOutput(hosted, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, trustedInputs), hosted);
+  assert.equal(validateShadowOutput(compacted, hosted.sizes.encoded_output_bytes - 1, trustedInputs), compacted);
+  assert.throws(
+    () => validateShadowOutput(compacted, hosted.sizes.encoded_output_bytes - 1),
+    /hosted output requires original capture, profile, and configuration/,
+  );
+
+  const capturePath = join(root, "capture.json");
+  const profilePath = join(root, "profile.json");
+  const configPath = join(root, "config.json");
+  const outputPath = join(root, "compacted.json");
+  writeFileSync(capturePath, `${canonicalJson(complete)}\n`);
+  writeFileSync(profilePath, `${canonicalJson(CLI_SHADOW_PROFILE)}\n`);
+  writeFileSync(configPath, `${canonicalJson(CLI_SHADOW_CONFIG)}\n`);
+  writeFileSync(outputPath, `${canonicalJson(compacted)}\n`);
+  const missingProfile = spawnSync(process.execPath, [
+    "scripts/review-units.mjs", "validate-output", "--input", outputPath,
+    "--capture", capturePath, "--config", configPath,
+    "--max-bytes", String(hosted.sizes.encoded_output_bytes - 1),
+  ], { cwd: process.cwd(), encoding: "utf8" });
+  assert.equal(missingProfile.status, 1);
+  const canonicalCli = spawnSync(process.execPath, [
+    "scripts/review-units.mjs", "validate-output", "--input", outputPath,
+    "--capture", capturePath, "--profile", profilePath, "--config", configPath,
+    "--max-bytes", String(hosted.sizes.encoded_output_bytes - 1),
+  ], { cwd: process.cwd(), encoding: "utf8" });
+  assert.equal(canonicalCli.status, 0, canonicalCli.stderr);
+});
+
+test("rejects unowned atomization rows and forged hosted partitions", async (t) => {
+  const { complete } = await completeCaptureFixture(t);
+  const atomization = atomizeCapturedReviewInput(complete, CLI_SHADOW_CONFIG.atom_target_bytes);
+  const extraAtom = structuredClone(atomization);
+  extraAtom.atoms.push(structuredClone(extraAtom.atoms[0]));
+  assert.equal(validateAtomization(extraAtom, complete).status, "atom_coverage_mismatch");
+
+  const manifest = buildPathFallbackManifest({
+    capture: complete,
+    atomization,
+    config: CLI_SHADOW_CONFIG,
+    executionProfile: CLI_SHADOW_PROFILE,
+  });
+  const hosted = buildHostedShadowOutput(complete, manifest, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes);
+  const forged = structuredClone(hosted);
+  forged.objects = [];
+  forged.units[0].unit_lineage = "forged";
+  forged.units[0].unit_id = "0".repeat(64);
+  forged.sizes.encoded_output_bytes = 0;
+  for (;;) {
+    const encoded = Buffer.byteLength(`${canonicalJson(forged)}\n`);
+    if (forged.sizes.encoded_output_bytes === encoded) break;
+    forged.sizes.encoded_output_bytes = encoded;
+  }
+  assert.throws(
+    () => validateShadowOutput(forged, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, {
+      capture: complete, config: CLI_SHADOW_CONFIG, profile: CLI_SHADOW_PROFILE,
+    }),
+    /hosted output does not match deterministic capture manifest/,
+  );
+});
+
+test("rejects local output when capture validation downgrades its declared capacity", async (t) => {
+  const { complete } = await completeCaptureFixture(t);
+  const downgraded = structuredClone(complete);
+  downgraded.capture_configuration.max_patch_bytes = 1;
+  const unsignedCapture = { ...downgraded };
+  delete unsignedCapture.capture_hash;
+  downgraded.capture_hash = sha256(unsignedCapture);
+  const manifest = buildPathFallbackManifest({
+    capture: downgraded,
+    atomization: atomizeCapturedReviewInput(downgraded, CLI_SHADOW_CONFIG.atom_target_bytes),
+    config: CLI_SHADOW_CONFIG,
+    executionProfile: CLI_SHADOW_PROFILE,
+  });
+  const local = buildLocalShadowOutput(downgraded, manifest);
+  assert.throws(
+    () => validateShadowOutput(local, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, {
+      config: CLI_SHADOW_CONFIG, profile: CLI_SHADOW_PROFILE,
+    }),
+    /local output capture does not match manifest/,
+  );
 });
 
 test("keeps generated atom unions deterministic across canonical input shuffles", () => {

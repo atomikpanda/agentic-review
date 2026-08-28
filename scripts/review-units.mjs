@@ -514,28 +514,45 @@ export function validateAtomization(result, capture, suppliedState = undefined) 
   const expectedLineSet = new Set(expectedLines);
   const rawOwners = Array.isArray(result.coverage?.raw_record_owners) ? result.coverage.raw_record_owners : [];
   const lineOwners = Array.isArray(result.coverage?.changed_line_owners) ? result.coverage.changed_line_owners : [];
-  const atomsById = new Map(Array.isArray(result.atoms) ? result.atoms.map((atom) => [atom.atom_id, atom]) : []);
+  const atoms = Array.isArray(result.atoms) ? result.atoms : [];
+  const atomsById = new Map(atoms.map((atom) => [atom.atom_id, atom]));
   const reasons = [];
   const rawCounts = new Map(rawOwners.map((owner) => [owner.raw_record_index, 0]));
+  const rawAtomCounts = new Map();
   for (const owner of rawOwners) {
     const atom = atomsById.get(owner.atom_id);
-    if (atom?.kind === "path_event") rawCounts.set(owner.raw_record_index, (rawCounts.get(owner.raw_record_index) ?? 0) + 1);
+    if (atom?.kind === "path_event") {
+      rawCounts.set(owner.raw_record_index, (rawCounts.get(owner.raw_record_index) ?? 0) + 1);
+      rawAtomCounts.set(owner.atom_id, (rawAtomCounts.get(owner.atom_id) ?? 0) + 1);
+    }
   }
   if (records.some((_, index) => (rawCounts.get(index) ?? 0) === 0) || rawOwners.some((owner) => atomsById.get(owner.atom_id)?.kind !== "path_event")) reasons.push("missing_path_owner");
   if ([...rawCounts.values()].some((value) => value > 1) || [...rawCounts.keys()].some((index) => !Number.isInteger(index) || index < 0 || index >= records.length)) reasons.push("duplicate_path_owner");
   const lineCounts = new Map(lineOwners.map((owner) => [owner.line_key, 0]));
+  const lineAtomCounts = new Map();
   for (const owner of lineOwners) {
     const atom = atomsById.get(owner.atom_id);
-    if (atom?.kind === "text") lineCounts.set(owner.line_key, (lineCounts.get(owner.line_key) ?? 0) + 1);
+    if (atom?.kind === "text") {
+      lineCounts.set(owner.line_key, (lineCounts.get(owner.line_key) ?? 0) + 1);
+      lineAtomCounts.set(owner.atom_id, (lineAtomCounts.get(owner.atom_id) ?? 0) + 1);
+    }
   }
   if (expectedLines.some((key) => (lineCounts.get(key) ?? 0) === 0) || lineOwners.some((owner) => atomsById.get(owner.atom_id)?.kind !== "text")) reasons.push("missing_changed_line_owner");
   if ([...lineCounts.values()].some((value) => value > 1) || [...lineCounts.keys()].some((key) => !expectedLineSet.has(key))) reasons.push("duplicate_changed_line_owner");
+  if (reasons.length === 0 && (
+    atomsById.size !== atoms.length
+    || atoms.some((atom) => atom?.kind === "path_event"
+      ? rawAtomCounts.get(atom.atom_id) !== 1
+      : atom?.kind === "text"
+        ? (lineAtomCounts.get(atom.atom_id) ?? 0) === 0
+        : true)
+  )) reasons.push("atom_ownership_mismatch");
   if (records.some((record, index) => sectionForRecord[index] === -1 || !sectionMatchesRecord(record, sections[sectionForRecord[index]])) || recordForSection.some((index) => index === -1)) reasons.push("raw_patch_path_disagreement");
   try {
     if (modeObjectBlobDisagreement(records, rows)) reasons.push("mode_object_blob_disagreement");
   } catch { reasons.push("mode_object_blob_disagreement"); }
   if (records.some((record) => !Object.hasOwn(STATUS_KINDS, record.status))) reasons.push("unsupported_raw_status");
-  const countValue = counts(records, result.atoms, expectedLines.length, lineOwners);
+  const countValue = counts(records, atoms, expectedLines.length, lineOwners);
   return reasons.length === 0 ? result : mismatch(reasons, countValue);
 }
 
@@ -917,20 +934,6 @@ function redactedAtoms(atoms) {
   }));
 }
 
-function hostedAtomsFromCapture(capture, atomTargetBytes) {
-  const atomization = atomizeCapturedReviewInput(capture, atomTargetBytes);
-  if (atomization.status !== "complete") throw new TypeError("hosted complete output capture atomization is invalid");
-  return redactedAtoms(atomization.atoms.map((atom) => {
-    const payload = atomPayload(atom);
-    return { ...atom, oversized: atom.oversized === true, payload_bytes: Buffer.byteLength(canonicalJson(payload)) };
-  }).sort(atomComparator));
-}
-
-function sameAtomRows(actual, expected) {
-  if (actual.length !== expected.length) return false;
-  const actualById = new Map(actual.map((atom) => [atom.atom_id, atom]));
-  return actualById.size === actual.length && expected.every((atom) => actualById.has(atom.atom_id) && canonicalJson(actualById.get(atom.atom_id)) === canonicalJson(atom));
-}
 
 /** Returns the local-only complete capture and manifest envelope. */
 export function buildLocalShadowOutput(capture, manifest) {
@@ -1019,13 +1022,6 @@ export function buildShadowDiagnostic(details, maxBytes) {
   return requireOutputWithinCap(diagnostic, maxBytes);
 }
 
-function validateManifestConfiguration(value) {
-  exactKeys(value, ["atom_target_bytes", "unit_target_bytes", "max_frontier_units", "max_shadow_artifact_bytes"], "manifest configuration");
-  const atomTarget = positiveInteger(value.atom_target_bytes, "manifest atom_target_bytes");
-  if (positiveInteger(value.unit_target_bytes, "manifest unit_target_bytes") < atomTarget) throw new TypeError("manifest unit target is invalid");
-  positiveInteger(value.max_frontier_units, "manifest max_frontier_units");
-  positiveInteger(value.max_shadow_artifact_bytes, "manifest max_shadow_artifact_bytes");
-}
 
 function validateOutputEncodedSize(value, maxBytes, sizeKeys = ["encoded_output_bytes"]) {
   positiveInteger(maxBytes, "maxBytes");
@@ -1051,30 +1047,23 @@ function validateDiagnosticOutput(value, maxBytes) {
   validateOutputEncodedSize(value, maxBytes);
 }
 
-function validateHostedCompleteOutput(value, maxBytes, capture) {
-  exactKeys(value, COMPLETE_OUTPUT_KEYS, "hosted complete output");
-  if (value.schema_version !== 1 || value.status !== "complete" || value.mode !== "partition_shadow" || !SHA256.test(value.capture_hash) || !SHA256.test(value.manifest_hash) || typeof value.benchmark_revision !== "string" || value.benchmark_revision.length > 256) throw new TypeError("hosted complete output header is invalid");
-  if (capture === undefined) throw new TypeError("hosted complete output requires original capture");
-  const validatedCapture = validateCapturedReviewInput(capture);
-  if (validatedCapture.status !== "complete" || validatedCapture.capture_hash !== value.capture_hash) throw new TypeError("hosted complete output capture does not match output");
-  validateManifestConfiguration(value.configuration);
-  if (!Array.isArray(value.objects) || !Array.isArray(value.atoms) || !Array.isArray(value.units)) throw new TypeError("hosted complete output arrays are invalid");
-  validateExecutionProjection(value.execution_projection, value.units.length);
-  for (const object of value.objects) {
-    exactKeys(object, ["object_id", "object_type", "modes", "size", "content_sha256"], "hosted object");
-    if (!GIT_ID.test(object.object_id) || typeof object.object_type !== "string" || !Array.isArray(object.modes) || object.modes.some((mode) => typeof mode !== "string") || !Number.isSafeInteger(object.size) || object.size < 0 || !SHA256.test(object.content_sha256)) throw new TypeError("hosted object is invalid");
+function validateHostedOutput(value, maxBytes, trustedInputs) {
+  if (trustedInputs?.capture === undefined || trustedInputs?.config === undefined || trustedInputs?.profile === undefined) {
+    throw new TypeError("hosted output requires original capture, profile, and configuration");
   }
-  for (const atom of value.atoms) {
-    exactKeys(atom, ["atom_id", "kind", "lineage_candidate", "segment_ordinal", "content_hash", "owner_path_base64", "payload_bytes", "oversized", "status_kind", "content_kinds"], "hosted atom");
-    if (!/^a:[0-9a-f]{64}$/.test(atom.atom_id) || !["path_event", "text"].includes(atom.kind) || typeof atom.lineage_candidate !== "string" || !Number.isSafeInteger(atom.segment_ordinal) || atom.segment_ordinal < 0 || !SHA256.test(atom.content_hash) || !Number.isSafeInteger(atom.payload_bytes) || atom.payload_bytes < 0 || typeof atom.oversized !== "boolean" || !Array.isArray(atom.content_kinds)) throw new TypeError("hosted atom is invalid");
-    validateAtomIdentity(atom);
-  }
-  validateAtomUnitOwnership(value.atoms, value.units);
-  if (!sameAtomRows(value.atoms, hostedAtomsFromCapture(validatedCapture, value.configuration.atom_target_bytes))) throw new TypeError("hosted complete output atoms do not match capture");
-  exactKeys(value.counts, MANIFEST_COUNT_KEYS, "manifest counts");
-  exactKeys(value.sizes, [...MANIFEST_SIZE_KEYS, "encoded_output_bytes"], "output sizes");
-  if (value.counts.atoms !== value.atoms.length || value.sizes.atom_payload_bytes !== value.atoms.reduce((total, atom) => total + atom.payload_bytes, 0) || value.sizes.unit_payload_bytes !== value.units.reduce((total, unit) => total + unit.unit_payload_bytes, 0)) throw new TypeError("hosted complete output metrics are invalid");
-  validateOutputEncodedSize(value, maxBytes, [...MANIFEST_SIZE_KEYS, "encoded_output_bytes"]);
+  const validatedCapture = validateCapturedReviewInput(trustedInputs.capture);
+  if (validatedCapture.status !== "complete") throw new TypeError("hosted output capture must be complete");
+  const trustedConfiguration = configuration(trustedInputs.config);
+  const atomization = atomizeCapturedReviewInput(validatedCapture, trustedConfiguration.atom_target_bytes);
+  if (atomization.status !== "complete") throw new TypeError("hosted output capture atomization is invalid");
+  const manifest = buildPathFallbackManifest({
+    capture: validatedCapture,
+    atomization,
+    config: trustedInputs.config,
+    executionProfile: trustedInputs.profile,
+  });
+  const expected = buildHostedShadowOutput(validatedCapture, manifest, maxBytes);
+  if (canonicalJson(value) !== canonicalJson(expected)) throw new TypeError("hosted output does not match deterministic capture manifest");
 }
 
 /** Validates canonical local, hosted, compacted, and diagnostic shadow output. */
@@ -1084,9 +1073,9 @@ export function validateShadowOutput(value, maxBytes, trustedInputs = undefined)
   if (value.status === "complete" && Object.hasOwn(value, "capture")) {
     exactKeys(value, LOCAL_OUTPUT_KEYS, "local shadow output");
     if (value.schema_version !== 1 || value.mode !== "partition_shadow") throw new TypeError("local shadow output header is invalid");
-    validateCapturedReviewInput(value.capture);
+    const validatedCapture = validateCapturedReviewInput(value.capture);
     validateManifest(value.manifest);
-    if (value.capture.status !== "complete" || value.capture.capture_hash !== value.manifest.capture_hash) throw new TypeError("local output capture does not match manifest");
+    if (validatedCapture.status !== "complete" || validatedCapture.capture_hash !== value.manifest.capture_hash) throw new TypeError("local output capture does not match manifest");
     const trustedConfig = trustedInputs?.config ?? {
       schema_version: 1,
       benchmark_revision: value.manifest.benchmark_revision,
@@ -1110,10 +1099,10 @@ export function validateShadowOutput(value, maxBytes, trustedInputs = undefined)
       })
       || canonicalJson(value.manifest.execution_projection) !== canonicalJson(trustedProjection)
     )) throw new TypeError("local output manifest does not match trusted inputs");
-    const atomization = atomizeCapturedReviewInput(value.capture, trustedConfiguration.atom_target_bytes);
+    const atomization = atomizeCapturedReviewInput(validatedCapture, trustedConfiguration.atom_target_bytes);
     if (atomization.status !== "complete") throw new TypeError("local output manifest does not match capture");
     const reconstructed = buildPathFallbackManifest({
-      capture: value.capture,
+      capture: validatedCapture,
       atomization,
       config: trustedConfig,
       executionProfile: trustedProfile,
@@ -1122,15 +1111,8 @@ export function validateShadowOutput(value, maxBytes, trustedInputs = undefined)
     if (Buffer.byteLength(`${canonicalJson(value)}\n`) > maxBytes) throw new RangeError("shadow output exceeds maxBytes");
     return value;
   }
-  if (value.status === "complete") {
-    validateHostedCompleteOutput(value, maxBytes, trustedInputs?.capture);
-    return value;
-  }
-  if (value.status === "artifact_compacted") {
-    exactKeys(value, COMPACT_OUTPUT_KEYS, "hosted compact output");
-    if (value.schema_version !== 1 || value.mode !== "partition_shadow" || !SHA256.test(value.capture_hash) || !SHA256.test(value.manifest_hash) || typeof value.benchmark_revision !== "string" || value.benchmark_revision.length > 256 || !Array.isArray(value.omitted) || canonicalJson(value.omitted) !== canonicalJson(["atoms", "units"])) throw new TypeError("hosted compact output is invalid");
-    exactKeys(value.counts, MANIFEST_COUNT_KEYS, "manifest counts");
-    validateOutputEncodedSize(value, maxBytes);
+  if (value.status === "complete" || value.status === "artifact_compacted") {
+    validateHostedOutput(value, maxBytes, trustedInputs);
     return value;
   }
   if (DIAGNOSTIC_STATUSES.has(value.status)) {
@@ -1285,7 +1267,7 @@ function writeDiagnosticOutputs(options, diagnostic) {
 }
 
 function validateOutputUsage() {
-  return "usage: node scripts/review-units.mjs validate-output --input OUTPUT_JSON --max-bytes MAX_BYTES [--capture CAPTURE_JSON] [--profile PROFILE_JSON --config CONFIG_JSON]\n";
+  return "usage: node scripts/review-units.mjs validate-output --input OUTPUT_JSON --max-bytes MAX_BYTES [--capture CAPTURE_JSON --profile PROFILE_JSON --config CONFIG_JSON]\n";
 }
 
 function validateOutputMain(argv) {
@@ -1313,14 +1295,16 @@ function validateOutputMain(argv) {
     const bytes = readFileSync(options["--input"]);
     const value = JSON.parse(bytes.toString("utf8"));
     const localOutput = value?.status === "complete" && Object.hasOwn(value, "capture");
-    const hostedCompleteOutput = value?.status === "complete" && !localOutput;
+    const hostedOutput = (value?.status === "complete" && !localOutput) || value?.status === "artifact_compacted";
     if (localOutput && (!options["--profile"] || !options["--config"])) throw new TypeError("local shadow output requires trusted profile and config");
-    if (hostedCompleteOutput && !options["--capture"]) throw new TypeError("hosted complete output requires original capture");
+    if (hostedOutput && (!options["--capture"] || !options["--profile"] || !options["--config"])) throw new TypeError("hosted output requires original capture, profile, and configuration");
     const trustedInputs = localOutput ? {
       config: JSON.parse(readFileSync(options["--config"], "utf8")),
       profile: JSON.parse(readFileSync(options["--profile"], "utf8")),
-    } : hostedCompleteOutput ? {
+    } : hostedOutput ? {
       capture: JSON.parse(readFileSync(options["--capture"], "utf8")),
+      config: JSON.parse(readFileSync(options["--config"], "utf8")),
+      profile: JSON.parse(readFileSync(options["--profile"], "utf8")),
     } : undefined;
     validateShadowOutput(value, maxBytes, trustedInputs);
     if (!bytes.equals(Buffer.from(`${canonicalJson(value)}\n`))) throw new TypeError("shadow output is not canonically encoded");
