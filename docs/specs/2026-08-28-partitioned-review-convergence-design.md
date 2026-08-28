@@ -208,6 +208,10 @@ capture runs against fixed base/head commits and produces:
     "diff.external=",
     "diff.algorithm=myers",
     "diff.renames=copies",
+    "diff.mnemonicPrefix=false",
+    "diff.noprefix=false",
+    "diff.srcPrefix=a/",
+    "diff.dstPrefix=b/",
     "core.quotePath=false"
   ],
   "patch_argv": ["git", "diff", "..."],
@@ -262,10 +266,12 @@ The exact patch command is
 --diff-algorithm=myers --unified=3 --find-renames=50% --find-copies=50%
 --find-copies-harder --no-ext-diff --no-textconv --no-color BASE HEAD --`.
 The exact raw command is identical except it replaces
-`--patch --unified=3` with `--raw -z`. Literal argv,
-`git_environment`, and ordered `git_config_overrides` are persisted and
-fingerprinted. Tests set non-default abbreviation/config and still require full
-IDs and identical capture.
+`--patch --unified=3` with `--raw -z`. Ordered config overrides also force
+`diff.mnemonicPrefix=false`, `diff.noprefix=false`, `diff.srcPrefix=a/`, and
+`diff.dstPrefix=b/`, so patch correlation always observes canonical `a/` and
+`b/` paths. Literal argv, `git_environment`, and ordered `git_config_overrides`
+are persisted and fingerprinted. Tests set non-default abbreviation/config and
+still require full IDs and identical capture.
 
 Shadow capture streams both diff subprocesses into bounded private files while
 counting bytes. Exceeding either stream limit or the wall-clock deadline kills

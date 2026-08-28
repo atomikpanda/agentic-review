@@ -2,7 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { closeSync, lstatSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { canonicalSha256, isPlainJsonObject } from "./lib-canonical-json.mjs";
 import { parseRawDiffZ } from "./review-units.mjs";
@@ -17,6 +18,10 @@ const gitConfigOverrides = Object.freeze([
   "diff.external=",
   "diff.algorithm=myers",
   "diff.renames=copies",
+  "diff.mnemonicPrefix=false",
+  "diff.noprefix=false",
+  "diff.srcPrefix=a/",
+  "diff.dstPrefix=b/",
   "core.quotePath=false",
 ]);
 const gitPrefix = Object.freeze([
@@ -533,6 +538,6 @@ async function main(argv) {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   main(process.argv.slice(2)).then((code) => { process.exitCode = code; });
 }

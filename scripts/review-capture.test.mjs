@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 
 import { captureReviewInput, parseCaptureLimits, validateCapturedReviewInput } from "./review-capture.mjs";
-import { parseRawDiffZ } from "./review-units.mjs";
+import { atomizeCapturedReviewInput, parseRawDiffZ } from "./review-units.mjs";
 
 const TEST_LIMITS = Object.freeze({
   maxPatchBytes: 1024 * 1024,
@@ -143,6 +143,33 @@ test("capture persists complete immutable inputs despite repository diff setting
   runGit(repoRoot, ["config", "core.quotePath", "true"]);
   const configured = await captureReviewInput({ repoRoot, baseSha, headSha, limits: TEST_LIMITS });
   assert.deepEqual(configured, initial);
+  runGit(repoRoot, ["config", "diff.mnemonicPrefix", "true"]);
+  runGit(repoRoot, ["config", "diff.noprefix", "true"]);
+  runGit(repoRoot, ["config", "diff.srcPrefix", "source/"]);
+  runGit(repoRoot, ["config", "diff.dstPrefix", "destination/"]);
+  const canonicalized = await captureReviewInput({ repoRoot, baseSha, headSha, limits: TEST_LIMITS });
+  assert.deepEqual(canonicalized, initial);
+
+});
+
+test("canonical prefix overrides preserve capture and atomization correlation", async (t) => {
+  const repoRoot = mkdtempSync(join(tmpdir(), "canonical-prefix-"));
+  t.after(() => rmSync(repoRoot, { recursive: true, force: true }));
+  runGit(repoRoot, ["init", "-q"]);
+  runGit(repoRoot, ["config", "user.email", "capture@example.test"]);
+  runGit(repoRoot, ["config", "user.name", "Capture Test"]);
+  writeRepoFile(repoRoot, "subject.txt", "base\n");
+  const baseSha = commitAll(repoRoot, "base");
+  writeRepoFile(repoRoot, "subject.txt", "head\n");
+  const headSha = commitAll(repoRoot, "head");
+  runGit(repoRoot, ["config", "diff.mnemonicPrefix", "true"]);
+  runGit(repoRoot, ["config", "diff.noprefix", "true"]);
+  runGit(repoRoot, ["config", "diff.srcPrefix", "source/"]);
+  runGit(repoRoot, ["config", "diff.dstPrefix", "destination/"]);
+  const capture = await captureReviewInput({ repoRoot, baseSha, headSha, limits: TEST_LIMITS });
+  assert.equal(capture.status, "complete");
+  assert.match(Buffer.from(capture.patch_base64, "base64").toString("utf8"), /^diff --git a\/subject\.txt b\/subject\.txt/m);
+  assert.equal(atomizeCapturedReviewInput(capture).status, "complete");
 });
 
 test("capture ignores inherited Git execution controls", async (t) => {
@@ -343,6 +370,12 @@ test("CLI parses exact snake-case limits and writes one capture envelope", (t) =
     max_total_blob_bytes: TEST_LIMITS.maxTotalBlobBytes,
     max_capture_seconds: 5,
   }));
+  const absoluteOutputPath = join(repoRoot, "capture-absolute.json");
+  const absoluteRun = spawnSync(process.execPath, [resolve(process.cwd(), "scripts/review-capture.mjs"), "capture", "--repo", repoRoot, "--base", baseSha, "--head", headSha, "--limits", limitsPath, "--out", absoluteOutputPath], {
+    cwd: process.cwd(), encoding: "utf8",
+  });
+  assert.equal(absoluteRun.status, 0, absoluteRun.stderr);
+  assert.equal(JSON.parse(readFileSync(absoluteOutputPath, "utf8")).status, "complete");
   assert.deepEqual(parseCaptureLimits(JSON.parse(readFileSync(limitsPath, "utf8"))), TEST_LIMITS);
   const run = spawnSync(process.execPath, ["scripts/review-capture.mjs", "capture", "--repo", repoRoot, "--base", baseSha, "--head", headSha, "--limits", limitsPath, "--out", outputPath], {
     cwd: process.cwd(), encoding: "utf8",

@@ -299,7 +299,8 @@ Include a literal `parseRawDiffZ` test for a one-path `M`, one-path `A`, one-pat
 Extend the temporary-Git matrix with binary add/modify/delete, rename and copy
 with/without edits, regular-to-symlink and symlink-target changes, newline/tab
 and invalid-byte paths, unsupported extensions, and non-default `diff.algorithm`,
-`diff.renames`, external-diff, textconv, quoting, and abbreviation config.
+`diff.renames`, mnemonic/no-prefix/src-prefix/dst-prefix, external-diff, textconv,
+quoting, and abbreviation config. Require capture and atomization to retain canonical `a/` and `b/` patch paths.
 
 - [ ] **Step 2: Run the capture test to verify RED**
 
@@ -345,6 +346,10 @@ const gitConfigOverrides = [
   "diff.external=",
   "diff.algorithm=myers",
   "diff.renames=copies",
+  "diff.mnemonicPrefix=false",
+  "diff.noprefix=false",
+  "diff.srcPrefix=a/",
+  "diff.dstPrefix=b/",
   "core.quotePath=false",
 ];
 const gitPrefix = [
