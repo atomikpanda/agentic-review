@@ -1712,15 +1712,23 @@ stage_shadow_helper_diagnostic() {
       counts: {},
       sizes: { encoded_output_bytes: 0 },
     };
+    const canonicalJson = (value) => {
+      if (value === null || typeof value === "string" || typeof value === "boolean"
+        || (typeof value === "number" && Number.isFinite(value))) return JSON.stringify(value);
+      if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+      if (Object.getPrototypeOf(value) !== Object.prototype) throw new TypeError("diagnostic must be plain JSON");
+      return `{${Object.keys(value).sort().map((key) =>
+        `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+    };
     for (;;) {
-      const encodedBytes = Buffer.byteLength(`${JSON.stringify(diagnostic)}\n`);
+      const encodedBytes = Buffer.byteLength(`${canonicalJson(diagnostic)}\n`);
       if (diagnostic.sizes.encoded_output_bytes === encodedBytes) break;
       diagnostic.sizes.encoded_output_bytes = encodedBytes;
     }
     if (diagnostic.sizes.encoded_output_bytes > maxBytes) throw new Error("shadow diagnostic exceeds size limit");
     const temporary = join(dirname(destination), `.shadow-diagnostic-${randomUUID()}.tmp`);
     try {
-      writeFileSync(temporary, `${JSON.stringify(diagnostic)}\n`, { flag: "wx", mode: 0o600 });
+      writeFileSync(temporary, `${canonicalJson(diagnostic)}\n`, { flag: "wx", mode: 0o600 });
       renameSync(temporary, destination);
     } finally {
       try { unlinkSync(temporary); } catch {}

@@ -29,6 +29,7 @@ import {
 } from "./review-result.mjs";
 import { encodeSummaryMarker } from "./post-review.mjs";
 import { validateShadowOutput } from "./review-units.mjs";
+import { canonicalJson } from "./lib-canonical-json.mjs";
 
 
 const runner = fileURLToPath(new URL("./run-review.sh", import.meta.url));
@@ -6555,6 +6556,7 @@ exec "$REAL_NODE" "$@"
   assert.equal(readFileSync(profileTarget, "utf8"), "operator-owned profile\n");
   assert.ok(existsSync(shadowFile), run.result.stderr);
   const diagnostic = JSON.parse(readFileSync(shadowFile, "utf8"));
+  assert.equal(readFileSync(shadowFile, "utf8"), `${canonicalJson(diagnostic)}\n`);
   assert.equal(diagnostic.status, "capture_capacity_exceeded");
   assert.deepEqual(diagnostic.reason_codes, ["raw_z_bytes"]);
   assert.equal(diagnostic.capture_hash, null);
