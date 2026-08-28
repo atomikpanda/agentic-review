@@ -27,6 +27,7 @@ import {
   enrichRunMetadata,
   scopeHash,
 } from "./review-result.mjs";
+import { encodeSummaryMarker } from "./post-review.mjs";
 
 const runner = fileURLToPath(new URL("./run-review.sh", import.meta.url));
 const resultCli = fileURLToPath(new URL("./review-result.mjs", import.meta.url));
@@ -42,8 +43,19 @@ function workflowRunStep(name) {
   const lines = readFileSync(workflow, "utf8").split("\n");
   const stepStart = lines.findIndex((line) => line === `      - name: ${name}`);
   if (stepStart === -1) throw new Error(`workflow step not found: ${name}`);
-  const runStart = lines.findIndex((line, index) => index > stepStart && line === "        run: |");
-  if (runStart === -1) throw new Error(`workflow run body not found: ${name}`);
+  const stepEnd = lines.findIndex(
+    (line, index) => index > stepStart && /^      - (?:name:|uses:)/.test(line),
+  );
+  const runIndex = lines.findIndex(
+    (line, index) => index > stepStart && (stepEnd === -1 || index < stepEnd)
+      && /^        run: (?:&[A-Za-z0-9_-]+ )?\||^        run: \*[A-Za-z0-9_-]+$/.test(line),
+  );
+  if (runIndex === -1) throw new Error(`workflow run body not found: ${name}`);
+  const alias = lines[runIndex].match(/^        run: \*([A-Za-z0-9_-]+)$/)?.[1];
+  const runStart = alias
+    ? lines.findIndex((line) => line === `        run: &${alias} |`)
+    : runIndex;
+  if (runStart === -1) throw new Error(`workflow run anchor not found: ${name}`);
   const body = [];
   for (let index = runStart + 1; index < lines.length; index += 1) {
     const line = lines[index];
@@ -1156,7 +1168,7 @@ test("workflow exposes and always retains the additive final result contract", (
     "converged",
   ]) {
     assert.match(source, new RegExp(`^      ${field}:`, "m"));
-    assert.match(source, new RegExp(`^      ${field}: \\$\\{\\{ steps\\.poster\\.outputs\\.${field} \\|\\| steps\\.cycle\\.outputs\\.${field} \\}\\}`, "m"));
+    assert.match(source, new RegExp(`^      ${field}: \\$\\{\\{ steps\\.continuation_poster\\.outputs\\.${field} \\|\\| steps\\.poster\\.outputs\\.${field} \\|\\| steps\\.cycle\\.outputs\\.${field} \\}\\}`, "m"));
   }
   assert.match(source, /\/tmp\/review-result\.json/);
 });
@@ -1188,6 +1200,298 @@ test("workflow plans and persists a bounded discovery-verification cycle", () =>
   assert.match(posterStep, /review cycle exhausted; an authenticated override is required/);
 });
 
+test("workflow continues clean verification through final discovery without another event", () => {
+  const source = readFileSync(workflow, "utf8");
+  const firstPoster = source.match(
+    /^      - name: post review\n[\s\S]*?(?=^      - (?:name:|uses:))/m,
+  )?.[0];
+  const continuationPlan = source.match(
+    /^      - name: plan automatic final discovery\n[\s\S]*?(?=^      - (?:name:|uses:))/m,
+  )?.[0];
+  const continuationRunner = source.match(
+    /^      - name: run automatic final discovery\n[\s\S]*?(?=^      - (?:name:|uses:))/m,
+  )?.[0];
+  const continuationPoster = source.match(
+    /^      - name: post automatic final discovery\n[\s\S]*?(?=^      - (?:name:|uses:))/m,
+  )?.[0];
+
+  assert.ok(firstPoster);
+  assert.match(firstPoster, /continue-on-error:.*steps\.cycle\.outputs\.phase == 'verification'/);
+  assert.ok(continuationPlan);
+  assert.match(continuationPlan, /steps\.poster\.outputs\.review_cycle_state == 'active'/);
+  assert.match(continuationPlan, /steps\.poster\.outputs\.review_next_phase == 'discovery'/);
+  assert.match(continuationPlan, /node "\$REVIEW_POSTER" cycle-plan/);
+  assert.ok(continuationRunner);
+  assert.match(continuationRunner, /steps\.continuation_cycle\.outputs\.phase == 'discovery'/);
+  assert.match(continuationRunner, /steps\.continuation_cycle\.outputs\.should_run == 'true'/);
+  assert.match(
+    workflowRunStep("run automatic final discovery"),
+    /REVIEW_PUBLICATION_FILE=\/tmp\/review-publication\.json[\s\S]*rm -f[\s\S]*"\$REVIEW_PUBLICATION_FILE"/,
+  );
+  assert.ok(continuationPoster);
+  assert.match(continuationPoster, /steps\.continuation_cycle\.outputs\.should_run == 'true'/);
+  assert.match(continuationPoster, /steps\.continuation_cycle\.outputs\.phase == 'discovery'/);
+  assert.match(
+    source,
+    /^      bounded_converged: \$\{\{ steps\.continuation_poster\.outputs\.bounded_converged \|\| steps\.poster\.outputs\.bounded_converged \|\| steps\.cycle\.outputs\.bounded_converged \}\}$/m,
+  );
+  assert.doesNotMatch(
+    `${continuationPlan}\n${continuationRunner}\n${continuationPoster}`,
+    /workflow dispatch|repository_dispatch|actions\/workflows|rerun|re-run/i,
+  );
+});
+
+test("one hosted run advances clean verification through final discovery on the same head", (t) => {
+  const fixture = createFixture(t);
+  const held = finding("Persisted verification blocker", {
+    file: "alpha.txt",
+    severity: "High",
+  });
+  const historyFile = join(fixture.directory, "cycle-history.json");
+  const preloadFile = join(fixture.directory, "cycle-github.mjs");
+  const planFile = join(fixture.directory, "cycle-omp-plan.json");
+  const logFile = join(fixture.directory, "cycle-omp.log");
+  const firstPlanOutput = join(fixture.directory, "verification-plan-output");
+  const verificationOutput = join(fixture.directory, "verification-poster-output");
+  const continuationPlanOutput = join(fixture.directory, "continuation-plan-output");
+  const finalOutput = join(fixture.directory, "final-poster-output");
+  const summaryFile = join(fixture.directory, "cycle-summary");
+  const fixedPaths = [
+    "/tmp/review-cycle-plan.json",
+    "/tmp/review-known-findings.json",
+    "/tmp/review-result.json",
+    "/tmp/review.md",
+    "/tmp/review-publication.json",
+    "/tmp/review-pass-diagnostics.json",
+    "/tmp/review-runner.out",
+    "/tmp/review-runner.err",
+  ];
+  for (const path of fixedPaths) rmSync(path, { force: true });
+  t.after(() => fixedPaths.forEach((path) => rmSync(path, { force: true })));
+
+  const priorCycle = {
+    schema_version: 1,
+    lineage_base_sha: fixture.baseSha,
+    discovery_round: 1,
+    max_discovery_rounds: 2,
+    state: "active",
+    last_phase: "discovery",
+    next_phase: "verification",
+    last_reviewed_head: fixture.baseSha,
+    last_scope_hash: "4".repeat(64),
+    last_analysis_state: "complete",
+    override: null,
+  };
+  writeFileSync(historyFile, JSON.stringify([{
+    id: 1,
+    body: encodeSummaryMarker({
+      headSha: fixture.baseSha,
+      findings: [held],
+      cycle: priorCycle,
+      runId: "100",
+    }),
+    submitted_at: "2026-08-28T00:00:00Z",
+    user: { login: "github-actions[bot]", type: "Bot" },
+  }]));
+  writeFileSync(planFile, JSON.stringify({
+    general: [{ findings: [] }, { findings: [] }],
+    correctness: [{ findings: [] }, { findings: [] }],
+    boundaries: [{ findings: [] }, { findings: [] }],
+  }));
+  writeFileSync(preloadFile, `
+import { readFileSync, writeFileSync } from "node:fs";
+const reply = (value, status = 200) => ({
+  ok: status >= 200 && status < 300,
+  status,
+  json: async () => value,
+  text: async () => JSON.stringify(value),
+});
+globalThis.fetch = async (url, options = {}) => {
+  const target = String(url);
+  const method = options.method ?? "GET";
+  if (target === "https://api.github.com/graphql") {
+    const request = JSON.parse(options.body);
+    if (request.query.includes("viewer")) {
+      return reply({ data: { viewer: { login: "github-actions[bot]" } } });
+    }
+    if (request.query.includes("reviewThreads")) {
+      return reply({ data: { repository: { pullRequest: { reviewThreads: {
+        nodes: [],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      } } } } });
+    }
+  }
+  if (target.includes("/pulls/17/reviews?") && method === "GET") {
+    return reply(JSON.parse(readFileSync(process.env.CYCLE_HISTORY_FILE, "utf8")));
+  }
+  if (target.includes("/issues/17/comments?") && method === "GET") return reply([]);
+  if (target.endsWith("/pulls/17/reviews") && method === "POST") {
+    const history = JSON.parse(readFileSync(process.env.CYCLE_HISTORY_FILE, "utf8"));
+    const payload = JSON.parse(options.body);
+    history.push({
+      id: history.length + 1,
+      body: payload.body,
+      commit_id: payload.commit_id,
+      submitted_at: \`2026-08-28T00:00:0\${history.length}Z\`,
+      user: { login: "github-actions[bot]", type: "Bot" },
+    });
+    writeFileSync(process.env.CYCLE_HISTORY_FILE, JSON.stringify(history));
+    return reply({});
+  }
+  throw new Error(\`unexpected GitHub request: \${method} \${target}\`);
+};
+`);
+
+  const nodeOptions = `--import=${preloadFile}`;
+  const planEnv = {
+    ...process.env,
+    NODE_OPTIONS: nodeOptions,
+    CYCLE_HISTORY_FILE: historyFile,
+    REVIEW_POSTER: poster,
+    GH_TOKEN: "installation-token",
+    GITHUB_REPO: "outside/target",
+    PR_NUMBER: "17",
+    HEAD_SHA: fixture.headSha,
+    BASE_SHA: fixture.baseSha,
+    MAX_DISCOVERY_ROUNDS: "2",
+    REVIEW_CYCLE_PLAN_FILE: "/tmp/review-cycle-plan.json",
+    KNOWN_FINDINGS_FILE: "/tmp/review-known-findings.json",
+    REVIEW_RESULT_FILE: "/tmp/review-result.json",
+    GITHUB_RUN_ID: "200",
+  };
+  const firstPlan = spawnSync("bash", ["-c", workflowRunStep("plan bounded review cycle")], {
+    cwd: fixture.repository,
+    encoding: "utf8",
+    env: { ...planEnv, GITHUB_OUTPUT: firstPlanOutput },
+  });
+  assert.equal(firstPlan.status, 0, firstPlan.stderr);
+  const verificationPlan = envFileValues(firstPlanOutput);
+  assert.equal(verificationPlan.phase, "verification");
+  assert.equal(verificationPlan.discovery_round, "1");
+  assert.equal(JSON.parse(verificationPlan.cycle_json).next_phase, "verification");
+
+  const runnerEnv = {
+    ...process.env,
+    NODE_OPTIONS: nodeOptions,
+    CYCLE_HISTORY_FILE: historyFile,
+    PATH: `${fixture.bin}:${process.env.PATH}`,
+    REVIEW_RUNNER: runner,
+    TRUSTED_DATA_ROOT: trustedRoot,
+    PROMPT_FILE: join(trustedRoot, "review/prompt.md"),
+    SKILL_FILE: join(trustedRoot, "skills/infra-review/SKILL.md"),
+    OPENROUTER_API_KEY: "sk-or-cycle-test",
+    FAKE_OMP_PLAN: planFile,
+    FAKE_OMP_LOG: logFile,
+    FAKE_OMP_STATE: fixture.state,
+    BASE: fixture.baseSha,
+    HEAD: fixture.headSha,
+    MODEL: "openrouter/test/cycle",
+    THINKING: "low",
+    TOOLS: "read,grep,glob",
+    MAX_TIME: "",
+    MAX_FINDINGS: "20",
+    MAX_PARALLEL: "3",
+    MAX_DIFF_BYTES: "400000",
+    REVIEW_MODE: "summary",
+    OMP_VERSION: "latest",
+    EXTRA_ARGS: "",
+    CODEGRAPH: "false",
+    AGENTIC_REVIEW_PHASE: "verification",
+    AGENTIC_REVIEW_KNOWN_FINDINGS: "/tmp/review-known-findings.json",
+  };
+  const verificationRun = spawnSync(
+    "bash",
+    ["-c", workflowRunStep("run agentic review (read-only)")],
+    { cwd: fixture.repository, encoding: "utf8", env: runnerEnv },
+  );
+  assert.equal(verificationRun.status, 0, verificationRun.stderr);
+
+  const posterEnv = {
+    ...planEnv,
+    TRUSTED_DATA_ROOT: trustedRoot,
+    REVIEW_RESULT_HELPER: resultCli,
+    TARGET_ELIGIBLE: "true",
+    REVIEW_PUBLICATION_FILE: "/tmp/review-publication.json",
+    REVIEW_MODE: "summary",
+    POST_COMMENT: "true",
+    SUPPRESS_WRITES: "false",
+    RESOLVE_STALE: "true",
+    MAX_FINDINGS: "20",
+    FAIL_ON_FINDINGS: "false",
+    BLOCK_SEVERITIES: "Critical,High",
+    CYCLE_SHOULD_RUN: verificationPlan.should_run,
+    CYCLE_STATE: verificationPlan.cycle_state,
+    CYCLE_PHASE: verificationPlan.phase,
+    CYCLE_NEXT_PHASE: verificationPlan.next_phase,
+    CYCLE_JSON: verificationPlan.cycle_json,
+    CYCLE_DISCOVERY_ROUND: verificationPlan.discovery_round,
+    GITHUB_STEP_SUMMARY: summaryFile,
+  };
+  const verificationPost = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: fixture.repository,
+    encoding: "utf8",
+    env: { ...posterEnv, GITHUB_OUTPUT: verificationOutput },
+  });
+  assert.equal(verificationPost.status, 1, verificationPost.stderr);
+  const verificationResult = JSON.parse(readFileSync("/tmp/review-result.json", "utf8"));
+  const verificationOutputs = envFileValues(verificationOutput);
+  assert.equal(verificationOutputs.review_cycle_state, "active");
+  assert.equal(verificationOutputs.review_next_phase, "discovery");
+  assert.equal(verificationResult.head_sha, fixture.headSha);
+
+  const continuationPlan = spawnSync(
+    "bash",
+    ["-c", workflowRunStep("plan automatic final discovery")],
+    {
+      cwd: fixture.repository,
+      encoding: "utf8",
+      env: { ...planEnv, GITHUB_OUTPUT: continuationPlanOutput },
+    },
+  );
+  assert.equal(continuationPlan.status, 0, continuationPlan.stderr);
+  const continuation = envFileValues(continuationPlanOutput);
+  assert.equal(continuation.should_run, "true");
+  assert.equal(continuation.phase, "discovery");
+  assert.equal(continuation.discovery_round, "2");
+
+  const finalRun = spawnSync("bash", ["-c", workflowRunStep("run automatic final discovery")], {
+    cwd: fixture.repository,
+    encoding: "utf8",
+    env: { ...runnerEnv, AGENTIC_REVIEW_PHASE: continuation.phase },
+  });
+  assert.equal(finalRun.status, 0, finalRun.stderr);
+  const finalPost = spawnSync("bash", ["-c", workflowRunStep("post automatic final discovery")], {
+    cwd: fixture.repository,
+    encoding: "utf8",
+    env: {
+      ...posterEnv,
+      CYCLE_SHOULD_RUN: continuation.should_run,
+      CYCLE_STATE: continuation.cycle_state,
+      CYCLE_PHASE: continuation.phase,
+      CYCLE_NEXT_PHASE: continuation.next_phase,
+      CYCLE_JSON: continuation.cycle_json,
+      CYCLE_DISCOVERY_ROUND: continuation.discovery_round,
+      GITHUB_OUTPUT: finalOutput,
+    },
+  });
+  assert.equal(finalPost.status, 0, finalPost.stderr);
+
+  const finalResult = JSON.parse(readFileSync("/tmp/review-result.json", "utf8"));
+  const finalOutputs = envFileValues(finalOutput);
+  assert.equal(finalResult.head_sha, fixture.headSha);
+  assert.equal(finalResult.review_cycle.state, "ready");
+  assert.equal(finalResult.review_cycle.last_phase, "discovery");
+  assert.equal(finalResult.review_cycle.next_phase, null);
+  assert.equal(finalResult.bounded_converged, true);
+  assert.equal(finalOutputs.review_next_phase, "none");
+  const history = JSON.parse(readFileSync(historyFile, "utf8"));
+  assert.equal(history.length, 3);
+  assert.match(
+    history.at(-1).body,
+    /\| Review cycle \| `ready` · last `discovery` · next `none` · discovery 2\/2 \|/,
+  );
+});
+
 test("workflow skips the write-capable poster after cancellation but not ordinary failure", () => {
   const source = readFileSync(workflow, "utf8");
   const posterStep = source.match(
@@ -1211,7 +1515,8 @@ test("workflow uploads pass diagnostics and exposes an explicit concurrency prob
   assert.ok(dispatch);
   assert.match(dispatch, /^\s+max_parallel:$/m);
   assert.ok(runnerStep);
-  assert.match(runnerStep, /--diagnostics-out \/tmp\/review-pass-diagnostics\.json/);
+  assert.match(runnerStep, /REVIEW_DIAGNOSTICS_FILE=\/tmp\/review-pass-diagnostics\.json/);
+  assert.match(runnerStep, /--diagnostics-out "\$REVIEW_DIAGNOSTICS_FILE"/);
   assert.match(
     source,
     /^\s+\/tmp\/review-pass-diagnostics\.json$/m,
@@ -1346,8 +1651,65 @@ writeFileSync(process.env.UNTRUSTED_POSTER_MARKER, "executed");
   const source = readFileSync(workflow, "utf8");
   for (const field of ["analysis_state", "sample_state", "bounded_converged", "coverage", "converged"]) {
     assert.match(source, new RegExp(`^        value: \\$\\{\\{ jobs\\.review\\.outputs\\.${field} \\}\\}`, "m"));
-    assert.match(source, new RegExp(`^      ${field}: \\$\\{\\{ steps\\.poster\\.outputs\\.${field} \\|\\| steps\\.cycle\\.outputs\\.${field} \\}\\}`, "m"));
+    assert.match(source, new RegExp(`^      ${field}: \\$\\{\\{ steps\\.continuation_poster\\.outputs\\.${field} \\|\\| steps\\.poster\\.outputs\\.${field} \\|\\| steps\\.cycle\\.outputs\\.${field} \\}\\}`, "m"));
   }
+});
+
+test("runnable-phase fallback preserves the persisted cycle in artifacts and outputs", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hosted-cycle-finalizer-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const outputFile = join(directory, "github-output");
+  const resultFile = join(directory, "review-result.json");
+  const summaryFile = join(directory, "step-summary");
+  const baseSha = "1".repeat(40);
+  const headSha = "2".repeat(40);
+  const cycle = {
+    schema_version: 1,
+    lineage_base_sha: baseSha,
+    discovery_round: 1,
+    max_discovery_rounds: 2,
+    state: "active",
+    last_phase: "verification",
+    next_phase: "discovery",
+    last_reviewed_head: headSha,
+    last_scope_hash: "4".repeat(64),
+    last_analysis_state: "complete",
+    override: null,
+  };
+  const env = {
+    ...process.env,
+    TARGET_ELIGIBLE: "true",
+    PR_NUMBER: "7",
+    GITHUB_REPO: "example/repository",
+    HEAD_SHA: headSha,
+    BASE_SHA: baseSha,
+    CYCLE_SHOULD_RUN: "true",
+    CYCLE_JSON: JSON.stringify(cycle),
+    GITHUB_OUTPUT: outputFile,
+    REVIEW_RESULT_FILE: resultFile,
+    GITHUB_STEP_SUMMARY: summaryFile,
+  };
+
+  const finalized = spawnSync("bash", ["-c", workflowRunStep("post review")], {
+    cwd: directory,
+    encoding: "utf8",
+    env,
+  });
+
+  assert.equal(finalized.status, 1, finalized.stderr);
+  const result = JSON.parse(readFileSync(resultFile, "utf8"));
+  const outputs = envFileValues(outputFile);
+  assert.deepEqual(result, {
+    ...expectedExecutionFailureResult(baseSha, headSha),
+    review_cycle: cycle,
+  });
+  assert.equal(outputs.review_cycle_state, "active");
+  assert.equal(outputs.review_phase, "verification");
+  assert.equal(outputs.review_next_phase, "discovery");
+  assert.match(
+    readFileSync(summaryFile, "utf8"),
+    /\| Review cycle \| `active` · last `verification` · next `discovery` · discovery 1\/2 \|/,
+  );
 });
 
 test("behind-base poster no-result fallback pairs with the trusted merge-base publication", (t) => {

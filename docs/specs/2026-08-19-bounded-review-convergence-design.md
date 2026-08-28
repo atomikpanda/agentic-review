@@ -179,8 +179,9 @@ finding omitted by the current sample stays held while its original code span is
 unchanged or indeterminate, and is retired only after that span changes, except
 in a complete current-lineage verification. That verification may retire only an
 identity persisted in its plan when no verification evidence was withheld and
-both summary and thread history are known. A clean verification schedules one
-final discovery; the cycle becomes ready only when that discovery is clean.
+both summary and thread history are known. A clean verification persists its
+transition, then the same hosted invocation executes one final discovery on the
+same immutable head; the cycle becomes ready only when that discovery is clean.
 Deleting the standing comment explicitly resets summary-mode history.
 Suppressed-write runs read this state for gating but do not edit it.
 
