@@ -716,7 +716,7 @@ test("rejects self-hashed manifests with missing or extraneous metric keys", () 
   }
 });
 
-test("rejects self-hashed atom rows and hosted unit ownership gaps", () => {
+test("rejects self-hashed atom rows, hosted ownership gaps, and vacuous complete outputs", () => {
   const atoms = [
     shadowAtom({ kind: "path_event", path: "a" }),
     shadowAtom({ kind: "text", path: "a", payload: "payload" }),
@@ -771,6 +771,22 @@ test("rejects self-hashed atom rows and hosted unit ownership gaps", () => {
     refreshSize(forged);
     assert.throws(() => validateShadowOutput(forged, 100_000), /atom ownership/);
   }
+  const vacuous = structuredClone(hosted);
+  vacuous.atoms = [];
+  vacuous.units = [];
+  vacuous.counts = {
+    atoms: 0, path_events: 0, text_atoms: 0, oversized_atoms: 0, coalesced_units: 0,
+    by_raw_status: {}, by_content_kind: {},
+  };
+  vacuous.sizes.atom_payload_bytes = 0;
+  vacuous.sizes.unit_payload_bytes = 0;
+  vacuous.execution_projection.projected_batches = 0;
+  vacuous.execution_projection.projected_model_calls = 0;
+  refreshSize(vacuous);
+  assert.throws(
+    () => validateShadowOutput(vacuous, 100_000),
+    /hosted complete output must contain atoms and units/,
+  );
 });
 
 test("keeps generated atom unions deterministic across canonical input shuffles", () => {

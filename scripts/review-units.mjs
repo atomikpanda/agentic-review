@@ -1041,6 +1041,7 @@ function validateHostedCompleteOutput(value, maxBytes) {
   if (value.schema_version !== 1 || value.status !== "complete" || value.mode !== "partition_shadow" || !SHA256.test(value.capture_hash) || !SHA256.test(value.manifest_hash) || typeof value.benchmark_revision !== "string" || value.benchmark_revision.length > 256) throw new TypeError("hosted complete output header is invalid");
   validateManifestConfiguration(value.configuration);
   if (!Array.isArray(value.objects) || !Array.isArray(value.atoms) || !Array.isArray(value.units)) throw new TypeError("hosted complete output arrays are invalid");
+  if (value.atoms.length === 0) throw new TypeError("hosted complete output must contain atoms and units");
   validateExecutionProjection(value.execution_projection, value.units.length);
   for (const object of value.objects) {
     exactKeys(object, ["object_id", "object_type", "modes", "size", "content_sha256"], "hosted object");
