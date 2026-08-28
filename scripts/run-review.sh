@@ -1028,7 +1028,8 @@ EOF
   cat > "$SHADOW_CONFIG_FILE" <<'EOF'
 {"schema_version":1,"benchmark_revision":"","atom_target_bytes":16000,"unit_target_bytes":64000,"max_frontier_units":128,"max_shadow_artifact_bytes":4194304}
 EOF
-  if ! node --input-type=module -e '
+  SHADOW_PROFILE_READY=0
+  if node --input-type=module -e '
     import { readFileSync, writeFileSync } from "node:fs";
     import { pathToFileURL } from "node:url";
     const [configurationFile, profileFile, canonicalJsonFile, attempts] = process.argv.slice(1);
@@ -1044,13 +1045,32 @@ EOF
     };
     writeFileSync(profileFile, `${JSON.stringify(profile)}\n`, { mode: 0o600 });
   ' "$CONFIG_FILE" "$SHADOW_PROFILE_FILE" "$SELF_ROOT/scripts/lib-canonical-json.mjs" \
-    "$PASS_MAX_ATTEMPTS" 2>/dev/null; then
+    "$PASS_MAX_ATTEMPTS" 2>/dev/null \
+    && node -e '
+      const fs = require("node:fs");
+      const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const keys = Object.keys(value).sort().join(",");
+      if (keys !== "descriptor_content_hashes,descriptors,max_output_attempts,schema_version"
+        || value.schema_version !== 1
+        || !Array.isArray(value.descriptors) || value.descriptors.length === 0
+        || value.descriptors.some((entry) => typeof entry !== "string" || !entry)
+        || !Array.isArray(value.descriptor_content_hashes)
+        || value.descriptor_content_hashes.length !== value.descriptors.length
+        || value.descriptor_content_hashes.some((entry) => !/^[0-9a-f]{64}$/.test(entry))
+        || !Number.isSafeInteger(value.max_output_attempts) || value.max_output_attempts <= 0) {
+        process.exit(1);
+      }
+    ' "$SHADOW_PROFILE_FILE" 2>/dev/null; then
+    SHADOW_PROFILE_READY=1
+  else
     SHADOW_SETUP_STATUS="planner_failed"
+    rm -f -- "$SHADOW_PROFILE_FILE"
   fi
-  if [ -n "$EXECUTION_PROFILE_OUT" ]; then
-    [ ! -L "$EXECUTION_PROFILE_OUT" ] || die "--execution-profile-out cannot be a symlink destination"
-    cp "$SHADOW_PROFILE_FILE" "$EXECUTION_PROFILE_OUT" \
-      || die "could not write --execution-profile-out"
+  if [ -n "$EXECUTION_PROFILE_OUT" ] && [ "$SHADOW_PROFILE_READY" = 1 ]; then
+    if [ -L "$EXECUTION_PROFILE_OUT" ] \
+       || ! cp "$SHADOW_PROFILE_FILE" "$EXECUTION_PROFILE_OUT"; then
+      SHADOW_SETUP_STATUS="planner_failed"
+    fi
   fi
 fi
 

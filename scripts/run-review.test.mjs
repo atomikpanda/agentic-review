@@ -1153,6 +1153,38 @@ test("partition shadow profile output preserves authoritative nondefault descrip
   );
 });
 
+test("partition profile generation is diagnostic-only when it fails or produces no file", (t) => {
+  for (const mode of ["failure", "missing"]) {
+    const fixture = createFixture(t);
+    const nodeWrapper = join(fixture.bin, "node");
+    writeFileSync(nodeWrapper, `#!/usr/bin/env bash
+if [ "\${1:-}" = --input-type=module ] && [ "\${2:-}" = -e ] \
+  && [[ "\${3:-}" = *descriptor_content_hashes* ]]; then
+  [ "\${FAKE_PROFILE_MODE}" = failure ] && exit 91
+  exit 0
+fi
+exec "\${REAL_NODE}" "$@"
+`);
+    chmodSync(nodeWrapper, 0o755);
+    const profileFile = join(fixture.directory, `${mode}-profile.json`);
+    const run = runReview(t, {
+      general: [{ findings: [] }],
+      correctness: [{ findings: [] }],
+      boundaries: [{ findings: [] }],
+    }, {
+      existingFixture: fixture,
+      args: ["--execution-profile-out", profileFile, "--json"],
+      env: { FAKE_PROFILE_MODE: mode },
+    });
+
+    assert.equal(run.result.status, 0, `${mode}: ${run.result.stderr}`);
+    assert.equal(run.logs.length, 3, `${mode}: model work must still run`);
+    assert.equal(existsSync(profileFile), false, `${mode}: optional profile must remain absent`);
+    assert.deepEqual(run.findings.findings, []);
+    assert.equal(validatePublication(run.publicationFile).status, 0);
+  }
+});
+
 test("partition shadow environment defaults activate privately and CLI values override them", (t) => {
   const fixture = createFixture(t);
   const environmentShadow = join(fixture.directory, "environment-shadow.json");
