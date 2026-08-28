@@ -524,6 +524,15 @@ test("validates canonical local, hosted, and diagnostic output envelopes", async
   const forged = structuredClone(local);
   forged.manifest.manifest_hash = "0".repeat(64);
   assert.throws(() => validateShadowOutput(forged, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes), /manifest hash/);
+  const selfHashedFabrication = structuredClone(local);
+  selfHashedFabrication.manifest.atoms[0].owner_path_base64 = Buffer.from("forged.txt").toString("base64");
+  selfHashedFabrication.manifest.manifest_hash = sha256(Object.fromEntries(
+    Object.entries(selfHashedFabrication.manifest).filter(([key]) => key !== "manifest_hash"),
+  ));
+  assert.throws(
+    () => validateShadowOutput(selfHashedFabrication, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes),
+    /local output manifest does not match capture/,
+  );
   writeFileSync(outputPath, `${JSON.stringify(local)}\n`);
   const noncanonicalCli = spawnSync(process.execPath, [
     "scripts/review-units.mjs", "validate-output", "--input", outputPath,

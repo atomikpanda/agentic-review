@@ -981,6 +981,24 @@ export function validateShadowOutput(value, maxBytes) {
     validateCapturedReviewInput(value.capture);
     validateManifest(value.manifest);
     if (value.capture.status !== "complete" || value.capture.capture_hash !== value.manifest.capture_hash) throw new TypeError("local output capture does not match manifest");
+    const atomization = atomizeCapturedReviewInput(value.capture, value.manifest.configuration.atom_target_bytes);
+    if (atomization.status !== "complete") throw new TypeError("local output manifest does not match capture");
+    const reconstructed = buildPathFallbackManifest({
+      capture: value.capture,
+      atomization,
+      config: {
+        schema_version: 1,
+        benchmark_revision: value.manifest.benchmark_revision,
+        ...value.manifest.configuration,
+      },
+      executionProfile: {
+        schema_version: 1,
+        descriptors: value.manifest.execution_projection.descriptors,
+        descriptor_content_hashes: value.manifest.execution_projection.descriptor_content_hashes,
+        max_output_attempts: value.manifest.execution_projection.max_output_attempts,
+      },
+    });
+    if (canonicalJson(reconstructed) !== canonicalJson(value.manifest)) throw new TypeError("local output manifest does not match capture");
     if (Buffer.byteLength(`${canonicalJson(value)}\n`) > maxBytes) throw new RangeError("shadow output exceeds maxBytes");
     return value;
   }

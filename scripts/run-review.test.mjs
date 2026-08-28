@@ -6348,14 +6348,33 @@ test("partition shadow rejects a zero-exit helper's forged staged output", (t) =
   const nodeWrapper = join(fixture.bin, "node");
   writeFileSync(nodeWrapper, `#!/usr/bin/env bash
 if [ "\${1##*/}" = review-units.mjs ] && [ "\${2:-}" = shadow ]; then
-  shift 2
-  while [ "$#" -gt 0 ]; do
-    if [ "$1" = --local-out ]; then
-      printf '%s\\n' '{"status":"complete","forged":true}' > "$2"
-      exit 0
+  helper="$1"
+  "$REAL_NODE" "$@"
+  result=$?
+  [ "$result" -eq 0 ] || exit "$result"
+  for ((index = 1; index <= $#; index += 1)); do
+    if [ "\${!index}" = --local-out ]; then
+      next=$((index + 1))
+      output="\${!next}"
+      break
     fi
-    shift
   done
+  "$REAL_NODE" --input-type=module -e '
+    import { createHash } from "node:crypto";
+    import { readFileSync, writeFileSync } from "node:fs";
+    const canonicalJson = (value) => {
+      if (value === null || typeof value === "string" || typeof value === "boolean" || typeof value === "number") return JSON.stringify(value);
+      if (Array.isArray(value)) return \`[\${value.map(canonicalJson).join(",")}]\`;
+      return \`{\${Object.keys(value).sort().map((key) => \`\${JSON.stringify(key)}:\${canonicalJson(value[key])}\`).join(",")}}\`;
+    };
+    const value = JSON.parse(readFileSync(process.argv[1], "utf8"));
+    value.manifest.atoms[0].owner_path_base64 = Buffer.from("forged.txt").toString("base64");
+    const core = { ...value.manifest };
+    delete core.manifest_hash;
+    value.manifest.manifest_hash = createHash("sha256").update(canonicalJson(core)).digest("hex");
+    writeFileSync(process.argv[1], \`\${canonicalJson(value)}\\n\`);
+  ' "$output"
+  exit 0
 fi
 exec "\${REAL_NODE}" "$@"
 `);
