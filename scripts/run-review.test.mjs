@@ -480,6 +480,7 @@ function createFixture(t, {
 }
 
 function runReview(t, plan, {
+  runnerPath = runner,
   args = ["--json"],
   env = {},
   targetFiles = {},
@@ -531,7 +532,7 @@ function runReview(t, plan, {
   }
   writeFileSync(planFile, JSON.stringify(plan));
   const runnerArgs = [
-    runner,
+    runnerPath,
     ...(staged ? ["--staged"] : ["--base", "main"]),
     ...(useFakeCodegraph ? [] : ["--no-codegraph"]),
     ...(noFail ? ["--no-fail"] : []),
@@ -6519,18 +6520,42 @@ PATH="$real_path" git "$@"
   assert.match(unsafe.result.stderr, /partition-shadow-out.*symlink/i);
 });
 
-test("partition shadow preserves a capacity diagnostic when its execution profile is unavailable", (t) => {
+test("partition shadow preserves a canonical capacity diagnostic after its units helper disappears", (t) => {
   const fixture = createFixture(t);
+  const isolatedRoot = join(fixture.directory, "isolated-runner");
+  const isolatedScripts = join(isolatedRoot, "scripts");
+  mkdirSync(isolatedScripts, { recursive: true });
+  for (const name of [
+    "run-review.sh",
+    "review-capture.mjs",
+    "review-units.mjs",
+    "lib-canonical-json.mjs",
+    "review-result.mjs",
+    "lib-findings.mjs",
+    "merge-findings.mjs",
+    "strip-agent-config.sh",
+  ]) {
+    copyFileSync(join(trustedRoot, "scripts", name), join(isolatedScripts, name));
+  }
+  const captureFile = join(fixture.directory, "helper-free-capture.json");
   const nodeWrapper = join(fixture.bin, "node");
   writeFileSync(nodeWrapper, `#!/usr/bin/env bash
 if [ "\${1##*/}" = review-capture.mjs ] && [ "\${2:-}" = capture ]; then
+  output=""
   for ((index = 1; index <= $#; index += 1)); do
     if [ "\${!index}" = --limits ]; then
       next=$((index + 1))
       "$REAL_NODE" -e 'const fs = require("node:fs"); const limits = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); limits.max_raw_z_bytes = 1; fs.writeFileSync(process.argv[1], JSON.stringify(limits));' "\${!next}"
-      break
+    elif [ "\${!index}" = --out ]; then
+      next=$((index + 1))
+      output="\${!next}"
     fi
   done
+  "$REAL_NODE" "$@"
+  status=$?
+  cp "$output" "$FAKE_SHADOW_CAPTURE"
+  rm -f "$FAKE_SHADOW_UNITS_HELPER"
+  exit "$status"
 fi
 exec "$REAL_NODE" "$@"
 `);
@@ -6546,15 +6571,21 @@ exec "$REAL_NODE" "$@"
     boundaries: [{ findings: [] }],
   }, {
     existingFixture: fixture,
+    runnerPath: join(isolatedScripts, "run-review.sh"),
     args: [
       "--partition-shadow", "--partition-shadow-out", shadowFile,
       "--execution-profile-out", profileLink, "--json",
     ],
+    env: {
+      AGENTIC_REVIEW_TRUSTED_DATA_ROOT: trustedRoot,
+      FAKE_SHADOW_CAPTURE: captureFile,
+      FAKE_SHADOW_UNITS_HELPER: join(isolatedScripts, "review-units.mjs"),
+    },
   });
 
   assert.equal(run.result.status, 0, run.result.stderr);
+  assert.equal(JSON.parse(readFileSync(captureFile, "utf8")).status, "capture_capacity_exceeded");
   assert.equal(readFileSync(profileTarget, "utf8"), "operator-owned profile\n");
-  assert.ok(existsSync(shadowFile), run.result.stderr);
   const diagnostic = JSON.parse(readFileSync(shadowFile, "utf8"));
   assert.equal(readFileSync(shadowFile, "utf8"), `${canonicalJson(diagnostic)}\n`);
   assert.equal(diagnostic.status, "capture_capacity_exceeded");
