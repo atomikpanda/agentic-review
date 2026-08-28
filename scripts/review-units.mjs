@@ -1206,8 +1206,8 @@ function parseShadowArgs(argv) {
 function shadowDiagnosticFromCapture(capture, benchmarkRevision, maxBytes) {
   return buildShadowDiagnostic({
     status: capture.status,
-    base_sha: capture.base_sha,
-    head_sha: capture.head_sha,
+    base_sha: capture.base_sha ?? "0".repeat(40),
+    head_sha: capture.head_sha ?? "0".repeat(40),
     benchmark_revision: benchmarkRevision,
     reason_codes: [capture.capacity_reason ?? "process_error"],
     diagnostic: "Shadow capture did not complete.",

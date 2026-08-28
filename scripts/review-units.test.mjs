@@ -1219,6 +1219,50 @@ test("shadow CLI emits a non-complete capture diagnostic before reading the prof
   assert.equal(JSON.parse(readFileSync(localOutput, "utf8")).status, limited.status);
 });
 
+test("shadow CLI normalizes unavailable capture CLI coordinates", async (t) => {
+  const { root, repoRoot, complete } = await completeCaptureFixture(t);
+  const limitsPath = join(root, "limits.json");
+  const configPath = join(root, "config.json");
+  writeFileSync(limitsPath, JSON.stringify({
+    schema_version: 1,
+    max_patch_bytes: 1_000_000,
+    max_raw_z_bytes: 1_000_000,
+    max_single_blob_bytes: 1_000_000,
+    max_total_blob_bytes: 1_000_000,
+    max_capture_seconds: 5,
+  }));
+  writeFileSync(configPath, JSON.stringify(CLI_SHADOW_CONFIG));
+  for (const [flag, validCoordinate, invalidCoordinate, label] of [
+    ["--base", complete.head_sha, "not-a-base-object-id", "text"],
+    ["--head", complete.base_sha, "not-a-head-object-id", "text"],
+    ["--base", complete.head_sha, "", "empty"],
+    ["--head", complete.base_sha, "", "empty"],
+  ]) {
+    const capturePath = join(root, `invalid-${flag.slice(2)}-${label}-capture.json`);
+    const localOutput = join(root, `invalid-${flag.slice(2)}-${label}-local.json`);
+    const base = flag === "--base" ? invalidCoordinate : validCoordinate;
+    const head = flag === "--head" ? invalidCoordinate : validCoordinate;
+    const captureChild = spawnSync(process.execPath, [
+      "scripts/review-capture.mjs", "capture", "--repo", repoRoot,
+      "--base", base, "--head", head, "--limits", limitsPath, "--out", capturePath,
+    ], { cwd: process.cwd(), encoding: "utf8" });
+    assert.equal(captureChild.status, 0, captureChild.stderr);
+    const capture = JSON.parse(readFileSync(capturePath, "utf8"));
+    assert.equal(capture.status, "capture_failed");
+    const shadowChild = spawnSync(process.execPath, [
+      "scripts/review-units.mjs", "shadow", "--capture", capturePath,
+      "--profile", join(root, "missing-profile.json"), "--config", configPath,
+      "--local-out", localOutput,
+    ], { cwd: process.cwd(), encoding: "utf8" });
+    assert.equal(shadowChild.status, 0, shadowChild.stderr);
+    const output = JSON.parse(readFileSync(localOutput, "utf8"));
+    assert.equal(output.status, "capture_failed");
+    assert.equal(output.base_sha, flag === "--base" ? "0".repeat(40) : complete.base_sha);
+    assert.equal(output.head_sha, flag === "--head" ? "0".repeat(40) : complete.head_sha);
+    validateShadowOutput(output, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes);
+  }
+});
+
 test("shadow CLI writes bounded planner diagnostics for profile and config setup failures", async (t) => {
   const { root, complete } = await completeCaptureFixture(t);
   const capturePath = join(root, "capture.json");
