@@ -6,7 +6,7 @@ import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { atomizeCapturedReviewInput, buildHostedShadowOutput, buildLocalShadowOutput, buildPathFallbackManifest, buildShadowDiagnostic, splitUnit, validateAtomization, validatePartitionShadowEvaluatorFixture, writeShadowOutput } from "./review-units.mjs";
+import { atomizeCapturedReviewInput, buildHostedShadowOutput, buildLocalShadowOutput, buildPathFallbackManifest, buildShadowDiagnostic, parseRawDiffZ, splitUnit, validateAtomization, validatePartitionShadowEvaluatorFixture, writeShadowOutput } from "./review-units.mjs";
 import { captureReviewInput } from "./review-capture.mjs";
 
 const OLD_ID = "1".repeat(40);
@@ -637,5 +637,76 @@ test("shadow CLI validates complete captures before atomization or manifest proj
     assert.equal(output.status, "capture_failed");
     assert.equal(Object.hasOwn(output, "manifest"), false);
     assert.ok(output.reason_codes.includes("capture_validation_failed"));
+  }
+});
+
+test("runs shadow CLI from both relative and absolute script paths", async (t) => {
+  const { root, complete } = await completeCaptureFixture(t);
+  const configPath = join(root, "config.json");
+  const profilePath = join(root, "profile.json");
+  const capturePath = join(root, "capture.json");
+  writeFileSync(configPath, JSON.stringify(CLI_SHADOW_CONFIG));
+  writeFileSync(profilePath, JSON.stringify(CLI_SHADOW_PROFILE));
+  writeFileSync(capturePath, JSON.stringify(complete));
+  for (const [index, script] of ["scripts/review-units.mjs", join(process.cwd(), "scripts/review-units.mjs")].entries()) {
+    const localOutput = join(root, `local-${index}.json`);
+    const child = spawnSync(process.execPath, [script, "shadow", "--capture", capturePath, "--profile", profilePath, "--config", configPath, "--local-out", localOutput], { cwd: process.cwd(), encoding: "utf8" });
+    assert.equal(child.status, 0, child.stderr);
+    assert.equal(JSON.parse(readFileSync(localOutput, "utf8")).status, "complete");
+  }
+});
+
+test("atomizes unknown uppercase raw statuses as bounded diagnostics", async (t) => {
+  const raw = Buffer.from(`:100644 100644 ${OLD_ID} ${NEW_ID} Q\0path.txt\0`);
+  assert.equal(parseRawDiffZ(raw, "sha1")[0].status, "Q");
+  const atomization = atomizeCapturedReviewInput(capture({ raw, patch: "diff --git a/path.txt b/path.txt\n", rows: [row(OLD_ID, Buffer.from("old\n")), row(NEW_ID, Buffer.from("new\n"))] }));
+  assert.deepEqual(atomization.reasons, ["unsupported_raw_status"]);
+
+  const { root, complete } = await completeCaptureFixture(t);
+  const rawBytes = Buffer.from(complete.raw_z_base64, "base64");
+  rawBytes[rawBytes.indexOf(Buffer.from(" M\0")) + 1] = 0x51;
+  const unknown = { ...complete, raw_z_base64: rawBytes.toString("base64") };
+  unknown.capture_hash = sha256(Object.fromEntries(Object.entries(unknown).filter(([key]) => key !== "capture_hash")));
+  const configPath = join(root, "config.json");
+  const profilePath = join(root, "profile.json");
+  const capturePath = join(root, "capture.json");
+  const localOutput = join(root, "local.json");
+  writeFileSync(configPath, JSON.stringify(CLI_SHADOW_CONFIG));
+  writeFileSync(profilePath, JSON.stringify(CLI_SHADOW_PROFILE));
+  writeFileSync(capturePath, JSON.stringify(unknown));
+  const child = spawnSync(process.execPath, ["scripts/review-units.mjs", "shadow", "--capture", capturePath, "--profile", profilePath, "--config", configPath, "--local-out", localOutput], { cwd: process.cwd(), encoding: "utf8" });
+  assert.equal(child.status, 0, child.stderr);
+  const output = JSON.parse(readFileSync(localOutput, "utf8"));
+  assert.equal(output.status, "atom_coverage_mismatch");
+  assert.ok(output.reason_codes.includes("unsupported_raw_status"));
+});
+
+test("correlates many raw records without rescanning patch sections", () => {
+  const count = 128;
+  const raw = Buffer.concat(Array.from({ length: count }, (_, index) => rawRecord({ paths: [`p-${index}`] })));
+  const patch = Array.from({ length: count }, (_, index) => `diff --git a/p-${index} b/p-${index}\n`).join("");
+  const originalFindIndex = Array.prototype.findIndex;
+  let findIndexCalls = 0;
+  Array.prototype.findIndex = function (...args) {
+    findIndexCalls += 1;
+    return originalFindIndex.apply(this, args);
+  };
+  try {
+    const result = atomizeCapturedReviewInput(capture({ raw, patch, rows: [row(OLD_ID, Buffer.from("old\n")), row(NEW_ID, Buffer.from("new\n"))] }));
+    assert.equal(result.status, "complete");
+    assert.equal(findIndexCalls, 0);
+  } finally {
+    Array.prototype.findIndex = originalFindIndex;
+  }
+});
+
+test("preserves aligned unit atom payload bytes through JSON and split", () => {
+  const manifest = buildPathFallbackManifest({ capture: shadowCapture(), atomization: shadowAtomization([shadowAtom({ kind: "path_event", path: "a" }), shadowAtom({ kind: "text", path: "a", payload: "payload" })]), config: SHADOW_CONFIG, executionProfile: EXECUTION_PROFILE });
+  const parent = structuredClone(manifest.units.find((unit) => unit.ordered_atom_ids.length > 1));
+  assert.equal(parent.atom_payload_bytes.reduce((total, value) => total + value, 0), parent.unit_payload_bytes);
+  const [left, right] = splitUnit(parent);
+  for (const child of [left, right]) {
+    assert.equal(child.atom_payload_bytes.length, child.ordered_atom_ids.length);
+    assert.equal(child.atom_payload_bytes.reduce((total, value) => total + value, 0), child.unit_payload_bytes);
   }
 });

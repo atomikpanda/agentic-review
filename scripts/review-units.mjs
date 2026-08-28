@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
+import { pathToFileURL } from "node:url";
 import { canonicalJson, canonicalSha256 } from "./lib-canonical-json.mjs";
 import { validateCapturedReviewInput } from "./review-capture.mjs";
 
@@ -59,17 +60,16 @@ export function parseRawDiffZ(bytes, objectFormat) {
       }
     }
     const match = /^([A-Z])(?:(\d{1,3}))?$/.exec(rawStatus);
-    if (!match || !Object.hasOwn(RAW_STATUS_PATH_COUNT, match[1])) {
-      throw new TypeError("raw diff metadata has an unknown status");
-    }
+    if (!match) throw new TypeError("raw diff metadata has an invalid status");
     const [, status, similarityText] = match;
-    if ((status === "R" || status === "C") !== (similarityText !== undefined)) {
+    const knownStatus = Object.hasOwn(RAW_STATUS_PATH_COUNT, status);
+    if (knownStatus && (status === "R" || status === "C") !== (similarityText !== undefined)) {
       throw new TypeError("raw diff rename/copy status must include similarity");
     }
     if (similarityText !== undefined && Number(similarityText) > 100) {
       throw new TypeError("raw diff similarity must not exceed 100");
     }
-    const pathCount = RAW_STATUS_PATH_COUNT[status];
+    const pathCount = RAW_STATUS_PATH_COUNT[status] ?? 1;
     if (fields.length - index - 1 < pathCount) throw new TypeError("raw diff record has missing path fields");
     const paths = fields.slice(index + 1, index + 1 + pathCount).map((path) => Buffer.from(path, "binary"));
     index += pathCount + 1;
@@ -96,9 +96,6 @@ function canonicalBase64(value, label) {
   return bytes;
 }
 
-function samePath(left, right) {
-  return left === null || right === null ? left === right : Buffer.compare(left, right) === 0;
-}
 
 function decodeGitPath(value) {
   if (value.equals(Buffer.from("/dev/null"))) return null;
@@ -216,26 +213,53 @@ function parsePatch(bytes) {
   return sections;
 }
 
-function patchMatchesRecord(section, record) {
-  if (record.oldPath === null) return samePath(section.newPath, record.newPath) || samePath(section.headerNewPath, record.newPath);
-  if (record.newPath === null) return samePath(section.oldPath, record.oldPath) || samePath(section.headerOldPath, record.oldPath);
-  return (samePath(section.oldPath, record.oldPath) && samePath(section.newPath, record.newPath))
-    || (samePath(section.headerOldPath, record.oldPath) && samePath(section.headerNewPath, record.newPath));
+function pathKey(path) {
+  return path === null ? "-" : path.toString("base64");
+}
+
+function recordSectionKey(record) {
+  if (record.oldPath === null) return `new:${pathKey(record.newPath)}`;
+  if (record.newPath === null) return `old:${pathKey(record.oldPath)}`;
+  return `pair:${pathKey(record.oldPath)}:${pathKey(record.newPath)}`;
+}
+
+function sectionKeys(section) {
+  const keys = new Set();
+  for (const [oldPath, newPath] of [[section.oldPath, section.newPath], [section.headerOldPath, section.headerNewPath]]) {
+    keys.add(`pair:${pathKey(oldPath)}:${pathKey(newPath)}`);
+    if (oldPath !== null) keys.add(`old:${pathKey(oldPath)}`);
+    if (newPath !== null) keys.add(`new:${pathKey(newPath)}`);
+  }
+  return keys;
 }
 
 function correlate(records, sections) {
   const sectionForRecord = new Array(records.length).fill(-1);
   const recordForSection = new Array(sections.length).fill(-1);
+  const indexedSections = new Map();
+  sections.forEach((section, sectionIndex) => {
+    for (const key of sectionKeys(section)) {
+      const queue = indexedSections.get(key) ?? [];
+      queue.push(sectionIndex);
+      indexedSections.set(key, queue);
+    }
+  });
+  const queueOffsets = new Map();
   for (let recordIndex = 0; recordIndex < records.length; recordIndex += 1) {
-    const sectionIndex = sections.findIndex((section, index) => recordForSection[index] === -1 && patchMatchesRecord(section, records[recordIndex]));
-    if (sectionIndex !== -1) {
+    const key = recordSectionKey(records[recordIndex]);
+    const queue = indexedSections.get(key) ?? [];
+    let offset = queueOffsets.get(key) ?? 0;
+    while (offset < queue.length && recordForSection[queue[offset]] !== -1) offset += 1;
+    queueOffsets.set(key, offset);
+    if (offset < queue.length) {
+      const sectionIndex = queue[offset];
       sectionForRecord[recordIndex] = sectionIndex;
       recordForSection[sectionIndex] = recordIndex;
+      queueOffsets.set(key, offset + 1);
     }
   }
   return { sectionForRecord, recordForSection };
 }
-
 function objectRows(capture) {
   const rows = new Map();
   if (!Array.isArray(capture.object_table)) return rows;
@@ -543,12 +567,6 @@ function unitId(unitLineage, orderedAtomIds, coalescedFrom) {
   });
 }
 
-function attachPayloadBytes(unit, payloadBytes) {
-  Object.defineProperty(unit, "_atomPayloadBytes", { value: payloadBytes, enumerable: false });
-  return unit;
-}
-
-
 function configuration(config) {
   exactKeys(config, SHADOW_CONFIG_KEYS, "shadow configuration");
   if (config.schema_version !== 1) throw new TypeError("shadow configuration schema_version must be 1");
@@ -582,16 +600,16 @@ function executionProjection(profile, unitCount) {
 
 function makeUnit({ lineage, atoms, coalescedFrom = [], oversized = atoms.some((atom) => atom.oversized) }) {
   const atomPayloadBytes = atoms.map((atom) => atom.payload_bytes);
-  const unitPayloadBytes = atomPayloadBytes.reduce((total, value) => total + value, 0);
-  return attachPayloadBytes({
+  return {
     unit_id: unitId(lineage, atoms.map((atom) => atom.atom_id), coalescedFrom),
     unit_lineage: lineage,
     ordered_atom_ids: atoms.map((atom) => atom.atom_id),
     coalesced_from: coalescedFrom,
-    unit_payload_bytes: unitPayloadBytes,
+    atom_payload_bytes: atomPayloadBytes,
+    unit_payload_bytes: atomPayloadBytes.reduce((total, value) => total + value, 0),
     atomic: atoms.length === 1,
     oversized,
-  }, atomPayloadBytes);
+  };
 }
 
 function packUnits(atoms, config) {
@@ -637,17 +655,18 @@ function coalesceUnits(units, maxFrontierUnits) {
     }
     const left = frontier[selected];
     const right = frontier[selected + 1];
-    const atomPayloadBytes = [...left._atomPayloadBytes, ...right._atomPayloadBytes];
+    const atomPayloadBytes = [...left.atom_payload_bytes, ...right.atom_payload_bytes];
     const lineage = `root:coalesced:${canonicalSha256([left.unit_lineage, right.unit_lineage])}`;
-    const merged = attachPayloadBytes({
+    const merged = {
       unit_id: unitId(lineage, [...left.ordered_atom_ids, ...right.ordered_atom_ids], [left.unit_lineage, right.unit_lineage]),
       unit_lineage: lineage,
       ordered_atom_ids: [...left.ordered_atom_ids, ...right.ordered_atom_ids],
       coalesced_from: [left.unit_lineage, right.unit_lineage],
+      atom_payload_bytes: atomPayloadBytes,
       unit_payload_bytes: left.unit_payload_bytes + right.unit_payload_bytes,
       atomic: false,
       oversized: left.oversized || right.oversized,
-    }, atomPayloadBytes);
+    };
     frontier.splice(selected, 2, merged);
   }
   return frontier;
@@ -663,6 +682,11 @@ function validateExecutionProjection(projection, unitCount) {
   if (!Number.isSafeInteger(modelCalls) || projection.projected_model_calls !== modelCalls) throw new TypeError("manifest execution projection model calls are invalid");
 }
 
+function validateUnit(unit) {
+  exactKeys(unit, ["unit_id", "unit_lineage", "ordered_atom_ids", "coalesced_from", "atom_payload_bytes", "unit_payload_bytes", "atomic", "oversized"], "manifest unit");
+  if (!SHA256.test(unit.unit_id) || typeof unit.unit_lineage !== "string" || !Array.isArray(unit.ordered_atom_ids) || unit.ordered_atom_ids.length === 0 || !Array.isArray(unit.coalesced_from) || !Array.isArray(unit.atom_payload_bytes) || unit.atom_payload_bytes.length !== unit.ordered_atom_ids.length || unit.atom_payload_bytes.some((value) => !Number.isSafeInteger(value) || value < 0) || !Number.isSafeInteger(unit.unit_payload_bytes) || unit.unit_payload_bytes < 0 || unit.atom_payload_bytes.reduce((total, value) => total + value, 0) !== unit.unit_payload_bytes || typeof unit.atomic !== "boolean" || typeof unit.oversized !== "boolean") throw new TypeError("manifest unit is invalid");
+}
+
 function validateManifest(manifest) {
   exactKeys(manifest, MANIFEST_KEYS, "manifest");
   if (manifest.schema_version !== 1 || manifest.status !== "complete" || manifest.mode !== "partition_shadow" || !SHA256.test(manifest.capture_hash) || !SHA256.test(manifest.manifest_hash)) throw new TypeError("manifest header is invalid");
@@ -672,6 +696,7 @@ function validateManifest(manifest) {
   exactKeys(manifest.counts, ["atoms", "path_events", "text_atoms", "oversized_atoms", "coalesced_units", "by_raw_status", "by_content_kind"], "manifest counts");
   exactKeys(manifest.sizes, ["atom_payload_bytes", "unit_payload_bytes"], "manifest sizes");
   if (manifest.counts.atoms !== manifest.atoms.length || manifest.sizes.atom_payload_bytes !== manifest.atoms.reduce((total, atom) => total + atom.payload_bytes, 0) || manifest.sizes.unit_payload_bytes !== manifest.units.reduce((total, unit) => total + unit.unit_payload_bytes, 0)) throw new TypeError("manifest metrics are invalid");
+  for (const unit of manifest.units) validateUnit(unit);
   const core = { ...manifest };
   delete core.manifest_hash;
   if (manifest.manifest_hash !== canonicalSha256(core)) throw new TypeError("manifest hash is invalid");
@@ -847,8 +872,8 @@ export function buildShadowDiagnostic(details, maxBytes) {
 /** Splits a non-atomic unit at its byte-balanced deterministic boundary. */
 export function splitUnit(unit) {
   if (unit?.atomic || !Array.isArray(unit?.ordered_atom_ids) || unit.ordered_atom_ids.length < 2) throw new TypeError("atomic unit cannot be split");
-  const payloadBytes = unit._atomPayloadBytes ?? unit.atom_payload_bytes;
-  if (!Array.isArray(payloadBytes) || payloadBytes.length !== unit.ordered_atom_ids.length || payloadBytes.some((value) => !Number.isSafeInteger(value) || value < 0)) throw new TypeError("unit atom payload bytes are required for splitting");
+  const payloadBytes = unit.atom_payload_bytes;
+  if (!Array.isArray(payloadBytes) || payloadBytes.length !== unit.ordered_atom_ids.length || payloadBytes.some((value) => !Number.isSafeInteger(value) || value < 0) || payloadBytes.reduce((total, value) => total + value, 0) !== unit.unit_payload_bytes) throw new TypeError("unit atom payload bytes are required for splitting");
   let best = 1;
   let prefix = payloadBytes[0];
   let difference = Math.abs(prefix - (unit.unit_payload_bytes - prefix));
@@ -860,15 +885,16 @@ export function splitUnit(unit) {
       difference = candidate;
     }
   }
-  const child = (suffix, ids, bytes) => attachPayloadBytes({
+  const child = (suffix, ids, bytes) => ({
     unit_id: unitId(`${unit.unit_lineage}/${suffix}`, ids, []),
     unit_lineage: `${unit.unit_lineage}/${suffix}`,
     ordered_atom_ids: ids,
     coalesced_from: [],
+    atom_payload_bytes: bytes,
     unit_payload_bytes: bytes.reduce((total, value) => total + value, 0),
     atomic: ids.length === 1,
     oversized: false,
-  }, bytes);
+  });
   return [
     child(0, unit.ordered_atom_ids.slice(0, best), payloadBytes.slice(0, best)),
     child(1, unit.ordered_atom_ids.slice(best), payloadBytes.slice(best)),
@@ -1005,4 +1031,4 @@ function main(argv) {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) process.exitCode = main(process.argv.slice(2));
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) process.exitCode = main(process.argv.slice(2));

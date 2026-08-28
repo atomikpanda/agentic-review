@@ -798,6 +798,7 @@ complete schema:
     unit_lineage: "root:path:hash:0",
     ordered_atom_ids: ["a:64-hex"],
     coalesced_from: [],
+    atom_payload_bytes: [100],
     unit_payload_bytes: 100,
     atomic: true,
     oversized: false,
