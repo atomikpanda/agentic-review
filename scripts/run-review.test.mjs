@@ -1377,11 +1377,13 @@ test("partition shadow strips target configuration and records bounded helper di
     env,
   });
   assert.equal(failedCapture.status, 0, failedCapture.stderr);
-  assert.equal(JSON.parse(readFileSync(outputFile, "utf8")).status, "capture_failed");
+  const failedCaptureDiagnostic = JSON.parse(readFileSync(outputFile, "utf8"));
+  assert.equal(failedCaptureDiagnostic.status, "capture_failed");
+  assert.deepEqual(failedCaptureDiagnostic.reason_codes, ["result_unavailable"]);
   assert.equal(readFileSync(resultFile, "utf8"), "authoritative result\n");
 });
 
-test("partition shadow emits capacity diagnostics without a usable execution profile", async (t) => {
+test("partition shadow preserves raw-z capacity diagnostics when profile/planner is unavailable", async (t) => {
   const fixture = createFixture(t);
   const support = join(fixture.repository, ".partition-shadow-support", "scripts");
   mkdirSync(support, { recursive: true });
@@ -1402,7 +1404,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
   const limitsPath = args[args.indexOf("--limits") + 1];
   const limits = JSON.parse(readFileSync(limitsPath, "utf8"));
-  limits.max_patch_bytes = 1;
+  limits.max_raw_z_bytes = 1;
   writeFileSync(limitsPath, \`\${JSON.stringify(limits)}\\n\`);
   const result = spawnSync(process.execPath, [${JSON.stringify(join(trustedRoot, "scripts", "review-capture.mjs"))}, ...args], { stdio: "inherit" });
   process.exitCode = result.status ?? 1;
@@ -1417,8 +1419,9 @@ if (import.meta.url === \`file://\${process.argv[1]}\`) process.exit(1);
   );
   const profileDirectory = join(fixture.directory, "partition-shadow-profile");
   const profileFile = join(profileDirectory, "review-partition-shadow-profile.json");
-  mkdirSync(profileDirectory);
+  const captureFile = join(fixture.directory, "partition-shadow-capture.json");
   const outputFile = join(fixture.directory, "review-partition-shadow.json");
+  mkdirSync(profileDirectory);
   const env = {
     ...process.env,
     GITHUB_WORKSPACE: fixture.repository,
@@ -1436,12 +1439,17 @@ if (import.meta.url === \`file://\${process.argv[1]}\`) process.exit(1);
       env,
     });
     assert.equal(result.status, 0, `${profile === undefined ? "missing" : "malformed"} profile: ${result.stderr}`);
+    const captured = JSON.parse(readFileSync(captureFile, "utf8"));
+    assert.equal(captured.status, "capture_capacity_exceeded");
+    assert.equal(captured.capacity_reason, "raw_z_bytes");
+    assert.ok(captured.observed_lower_bounds.raw_z_bytes > 1);
     const diagnostic = JSON.parse(readFileSync(outputFile, "utf8"));
     assert.equal(diagnostic.status, "capture_capacity_exceeded");
+    assert.deepEqual(diagnostic.reason_codes, ["raw_z_bytes"]);
+    assert.deepEqual(diagnostic.observed_lower_bounds, captured.observed_lower_bounds);
     assert.equal(diagnostic.capture_hash, null);
     assert.equal(diagnostic.manifest_hash, null);
     assert.ok(Buffer.byteLength(JSON.stringify(diagnostic)) <= 4194304);
-    return diagnostic;
   };
 
   await t.test("with a missing execution profile", () => {

@@ -1916,7 +1916,7 @@ jobs:
             : validated?.status ?? "capture_failed";
           const fallbackReason = completeCapture
             ? process.env.REASON
-            : validated?.capacity_reason ?? "capture_result_unavailable";
+            : validated?.capacity_reason ?? "result_unavailable";
           writeShadowOutput(output, buildShadowDiagnostic({
             status: fallbackStatus,
             base_sha: process.env.BASE_SHA,
