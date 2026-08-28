@@ -1894,25 +1894,30 @@ jobs:
           fallback() {
             local status="$1" reason="$2"
             STATUS="$status" REASON="$reason" BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" \
-              node --input-type=module - "$UNITS_HELPER" "$CONFIG_FILE" "$CAPTURE_FILE" "$PARTITION_SHADOW_OUTPUT" <<'NODE'
-          import { existsSync, readFileSync } from "node:fs";
+              node --input-type=module - "$CAPTURE_HELPER" "$UNITS_HELPER" "$CONFIG_FILE" "$CAPTURE_FILE" "$PARTITION_SHADOW_OUTPUT" <<'NODE'
+          import { readFileSync } from "node:fs";
           import { pathToFileURL } from "node:url";
-          const [helper, configFile, captureFile, output] = process.argv.slice(2);
-          const { buildShadowDiagnostic, writeShadowOutput } = await import(pathToFileURL(helper).href);
+          const [captureHelper, unitsHelper, configFile, captureFile, output] = process.argv.slice(2);
+          const { validateCapturedReviewInput } = await import(pathToFileURL(captureHelper).href);
+          const { buildShadowDiagnostic, writeShadowOutput } = await import(pathToFileURL(unitsHelper).href);
           const config = JSON.parse(readFileSync(configFile, "utf8"));
           let capture;
-          try { capture = JSON.parse(readFileSync(captureFile, "utf8")); } catch {}
-          const observed_lower_bounds = capture?.observed_lower_bounds
+          let validated;
+          try {
+            capture = JSON.parse(readFileSync(captureFile, "utf8"));
+            validated = validateCapturedReviewInput(capture);
+          } catch {}
+          const observed_lower_bounds = validated?.observed_lower_bounds
             ?? { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 };
-          const completeCapture = capture?.status === "complete"
-            && typeof capture.capture_hash === "string"
-            && /^[0-9a-f]{64}$/.test(capture.capture_hash);
+          const completeCapture = validated?.status === "complete"
+            && typeof validated.capture_hash === "string"
+            && /^[0-9a-f]{64}$/.test(validated.capture_hash);
           writeShadowOutput(output, buildShadowDiagnostic({
             status: completeCapture ? process.env.STATUS : "capture_failed",
             base_sha: process.env.BASE_SHA,
             head_sha: process.env.HEAD_SHA,
             benchmark_revision: config.benchmark_revision,
-            capture_hash: completeCapture ? capture.capture_hash : null,
+            capture_hash: completeCapture ? validated.capture_hash : null,
             reason_codes: [completeCapture ? process.env.REASON : "capture_result_unavailable"],
             diagnostic: "Partition shadow helper failed; details redacted.",
             observed_lower_bounds,
