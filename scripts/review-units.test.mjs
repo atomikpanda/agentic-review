@@ -68,7 +68,7 @@ async function completeCaptureFixture(t) {
     repoRoot, baseSha, headSha,
     limits: { maxPatchBytes: 1_000_000, maxRawZBytes: 1_000_000, maxSingleBlobBytes: 1_000_000, maxTotalBlobBytes: 1_000_000, maxCaptureMilliseconds: 5_000 },
   });
-  return { root, complete };
+  return { root, repoRoot, complete };
 }
 
 const CLI_SHADOW_CONFIG = Object.freeze({
@@ -645,7 +645,8 @@ test("validates canonical local, hosted, and diagnostic output envelopes", async
     counts: {},
   }, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes);
   for (const output of [local, hosted, diagnostic]) {
-    assert.equal(validateShadowOutput(output, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes), output);
+    const trustedInputs = output === hosted ? { capture: complete } : undefined;
+    assert.equal(validateShadowOutput(output, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, trustedInputs), output);
   }
 
   const outputPath = join(root, "local.json");
@@ -716,16 +717,13 @@ test("rejects self-hashed manifests with missing or extraneous metric keys", () 
   }
 });
 
-test("rejects self-hashed atom rows, hosted ownership gaps, and vacuous complete outputs", () => {
-  const atoms = [
-    shadowAtom({ kind: "path_event", path: "a" }),
-    shadowAtom({ kind: "text", path: "a", payload: "payload" }),
-  ];
+test("rejects self-hashed atom rows and hosted unit ownership gaps", async (t) => {
+  const { complete } = await completeCaptureFixture(t);
   const manifest = buildPathFallbackManifest({
-    capture: shadowCapture(),
-    atomization: shadowAtomization(atoms),
-    config: SHADOW_CONFIG,
-    executionProfile: EXECUTION_PROFILE,
+    capture: complete,
+    atomization: atomizeCapturedReviewInput(complete, CLI_SHADOW_CONFIG.atom_target_bytes),
+    config: CLI_SHADOW_CONFIG,
+    executionProfile: CLI_SHADOW_PROFILE,
   });
   const malformedAtom = structuredClone(manifest);
   malformedAtom.atoms[0].content_hash = "0".repeat(64);
@@ -737,9 +735,9 @@ test("rejects self-hashed atom rows, hosted ownership gaps, and vacuous complete
   })}`;
   malformedAtom.manifest_hash = sha256(Object.fromEntries(Object.entries(malformedAtom)
     .filter(([key]) => key !== "manifest_hash")));
-  assert.throws(() => buildLocalShadowOutput(shadowCapture(), malformedAtom), /atom payload hash/);
+  assert.throws(() => buildLocalShadowOutput(complete, malformedAtom), /atom payload hash/);
 
-  const hosted = buildHostedShadowOutput(shadowCapture(), manifest, 100_000);
+  const hosted = buildHostedShadowOutput(complete, manifest, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes);
   const refreshSize = (value) => {
     value.sizes.encoded_output_bytes = 0;
     for (;;) {
@@ -759,7 +757,7 @@ test("rejects self-hashed atom rows, hosted ownership gaps, and vacuous complete
       const duplicate = structuredClone(value.units[0]);
       value.units.push(duplicate);
       value.execution_projection.projected_batches = 2;
-      value.execution_projection.projected_model_calls = 12;
+      value.execution_projection.projected_model_calls = 2;
       value.sizes.unit_payload_bytes += duplicate.unit_payload_bytes;
     },
     (value) => {
@@ -769,8 +767,40 @@ test("rejects self-hashed atom rows, hosted ownership gaps, and vacuous complete
     const forged = structuredClone(hosted);
     mutate(forged);
     refreshSize(forged);
-    assert.throws(() => validateShadowOutput(forged, 100_000), /atom ownership/);
+    assert.throws(
+      () => validateShadowOutput(forged, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, { capture: complete }),
+      /atom ownership/,
+    );
   }
+});
+
+test("binds hosted complete output to its capture atomization", async (t) => {
+  const { root, repoRoot, complete } = await completeCaptureFixture(t);
+  const atomization = atomizeCapturedReviewInput(complete, CLI_SHADOW_CONFIG.atom_target_bytes);
+  const manifest = buildPathFallbackManifest({
+    capture: complete,
+    atomization,
+    config: CLI_SHADOW_CONFIG,
+    executionProfile: CLI_SHADOW_PROFILE,
+  });
+  const hosted = buildHostedShadowOutput(complete, manifest, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes);
+  const refreshSize = (value) => {
+    value.sizes.encoded_output_bytes = 0;
+    for (;;) {
+      const encoded = Buffer.byteLength(`${canonicalJson(value)}\n`);
+      if (value.sizes.encoded_output_bytes === encoded) return;
+      value.sizes.encoded_output_bytes = encoded;
+    }
+  };
+  assert.throws(
+    () => validateShadowOutput(hosted, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes),
+    /hosted complete output requires original capture/,
+  );
+  assert.equal(
+    validateShadowOutput(hosted, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, { capture: complete }),
+    hosted,
+  );
+
   const vacuous = structuredClone(hosted);
   vacuous.atoms = [];
   vacuous.units = [];
@@ -784,9 +814,61 @@ test("rejects self-hashed atom rows, hosted ownership gaps, and vacuous complete
   vacuous.execution_projection.projected_model_calls = 0;
   refreshSize(vacuous);
   assert.throws(
-    () => validateShadowOutput(vacuous, 100_000),
-    /hosted complete output must contain atoms and units/,
+    () => validateShadowOutput(vacuous, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, { capture: complete }),
+    /hosted complete output atoms do not match capture/,
   );
+
+  const mismatched = structuredClone(hosted);
+  const originalId = mismatched.atoms[0].atom_id;
+  mismatched.atoms[0].content_hash = "0".repeat(64);
+  mismatched.atoms[0].atom_id = `a:${sha256({
+    atom_schema_version: 1,
+    lineage_candidate: mismatched.atoms[0].lineage_candidate,
+    segment_ordinal: mismatched.atoms[0].segment_ordinal,
+    content_hash: mismatched.atoms[0].content_hash,
+  })}`;
+  for (const unit of mismatched.units) {
+    const index = unit.ordered_atom_ids.indexOf(originalId);
+    if (index !== -1) unit.ordered_atom_ids[index] = mismatched.atoms[0].atom_id;
+  }
+  refreshSize(mismatched);
+  assert.throws(
+    () => validateShadowOutput(mismatched, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, { capture: complete }),
+    /hosted complete output atoms do not match capture/,
+  );
+
+  const emptyCapture = await captureReviewInput({
+    repoRoot,
+    baseSha: complete.head_sha,
+    headSha: complete.head_sha,
+    limits: { maxPatchBytes: 1_000_000, maxRawZBytes: 1_000_000, maxSingleBlobBytes: 1_000_000, maxTotalBlobBytes: 1_000_000, maxCaptureMilliseconds: 5_000 },
+  });
+  const emptyManifest = buildPathFallbackManifest({
+    capture: emptyCapture,
+    atomization: atomizeCapturedReviewInput(emptyCapture, CLI_SHADOW_CONFIG.atom_target_bytes),
+    config: CLI_SHADOW_CONFIG,
+    executionProfile: CLI_SHADOW_PROFILE,
+  });
+  const emptyHosted = buildHostedShadowOutput(emptyCapture, emptyManifest, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes);
+  assert.equal(
+    validateShadowOutput(emptyHosted, CLI_SHADOW_CONFIG.max_shadow_artifact_bytes, { capture: emptyCapture }),
+    emptyHosted,
+  );
+
+  const capturePath = join(root, "capture.json");
+  const hostedPath = join(root, "hosted.json");
+  writeFileSync(capturePath, `${canonicalJson(complete)}\n`);
+  writeFileSync(hostedPath, `${canonicalJson(hosted)}\n`);
+  const missingCaptureCli = spawnSync(process.execPath, [
+    "scripts/review-units.mjs", "validate-output", "--input", hostedPath,
+    "--max-bytes", String(CLI_SHADOW_CONFIG.max_shadow_artifact_bytes),
+  ], { cwd: process.cwd(), encoding: "utf8" });
+  assert.equal(missingCaptureCli.status, 1);
+  const hostedCli = spawnSync(process.execPath, [
+    "scripts/review-units.mjs", "validate-output", "--input", hostedPath,
+    "--capture", capturePath, "--max-bytes", String(CLI_SHADOW_CONFIG.max_shadow_artifact_bytes),
+  ], { cwd: process.cwd(), encoding: "utf8" });
+  assert.equal(hostedCli.status, 0, hostedCli.stderr);
 });
 
 test("keeps generated atom unions deterministic across canonical input shuffles", () => {

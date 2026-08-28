@@ -917,6 +917,21 @@ function redactedAtoms(atoms) {
   }));
 }
 
+function hostedAtomsFromCapture(capture, atomTargetBytes) {
+  const atomization = atomizeCapturedReviewInput(capture, atomTargetBytes);
+  if (atomization.status !== "complete") throw new TypeError("hosted complete output capture atomization is invalid");
+  return redactedAtoms(atomization.atoms.map((atom) => {
+    const payload = atomPayload(atom);
+    return { ...atom, oversized: atom.oversized === true, payload_bytes: Buffer.byteLength(canonicalJson(payload)) };
+  }).sort(atomComparator));
+}
+
+function sameAtomRows(actual, expected) {
+  if (actual.length !== expected.length) return false;
+  const actualById = new Map(actual.map((atom) => [atom.atom_id, atom]));
+  return actualById.size === actual.length && expected.every((atom) => actualById.has(atom.atom_id) && canonicalJson(actualById.get(atom.atom_id)) === canonicalJson(atom));
+}
+
 /** Returns the local-only complete capture and manifest envelope. */
 export function buildLocalShadowOutput(capture, manifest) {
   validateManifest(manifest);
@@ -1036,12 +1051,14 @@ function validateDiagnosticOutput(value, maxBytes) {
   validateOutputEncodedSize(value, maxBytes);
 }
 
-function validateHostedCompleteOutput(value, maxBytes) {
+function validateHostedCompleteOutput(value, maxBytes, capture) {
   exactKeys(value, COMPLETE_OUTPUT_KEYS, "hosted complete output");
   if (value.schema_version !== 1 || value.status !== "complete" || value.mode !== "partition_shadow" || !SHA256.test(value.capture_hash) || !SHA256.test(value.manifest_hash) || typeof value.benchmark_revision !== "string" || value.benchmark_revision.length > 256) throw new TypeError("hosted complete output header is invalid");
+  if (capture === undefined) throw new TypeError("hosted complete output requires original capture");
+  const validatedCapture = validateCapturedReviewInput(capture);
+  if (validatedCapture.status !== "complete" || validatedCapture.capture_hash !== value.capture_hash) throw new TypeError("hosted complete output capture does not match output");
   validateManifestConfiguration(value.configuration);
   if (!Array.isArray(value.objects) || !Array.isArray(value.atoms) || !Array.isArray(value.units)) throw new TypeError("hosted complete output arrays are invalid");
-  if (value.atoms.length === 0) throw new TypeError("hosted complete output must contain atoms and units");
   validateExecutionProjection(value.execution_projection, value.units.length);
   for (const object of value.objects) {
     exactKeys(object, ["object_id", "object_type", "modes", "size", "content_sha256"], "hosted object");
@@ -1053,6 +1070,7 @@ function validateHostedCompleteOutput(value, maxBytes) {
     validateAtomIdentity(atom);
   }
   validateAtomUnitOwnership(value.atoms, value.units);
+  if (!sameAtomRows(value.atoms, hostedAtomsFromCapture(validatedCapture, value.configuration.atom_target_bytes))) throw new TypeError("hosted complete output atoms do not match capture");
   exactKeys(value.counts, MANIFEST_COUNT_KEYS, "manifest counts");
   exactKeys(value.sizes, [...MANIFEST_SIZE_KEYS, "encoded_output_bytes"], "output sizes");
   if (value.counts.atoms !== value.atoms.length || value.sizes.atom_payload_bytes !== value.atoms.reduce((total, atom) => total + atom.payload_bytes, 0) || value.sizes.unit_payload_bytes !== value.units.reduce((total, unit) => total + unit.unit_payload_bytes, 0)) throw new TypeError("hosted complete output metrics are invalid");
@@ -1105,7 +1123,7 @@ export function validateShadowOutput(value, maxBytes, trustedInputs = undefined)
     return value;
   }
   if (value.status === "complete") {
-    validateHostedCompleteOutput(value, maxBytes);
+    validateHostedCompleteOutput(value, maxBytes, trustedInputs?.capture);
     return value;
   }
   if (value.status === "artifact_compacted") {
@@ -1267,7 +1285,7 @@ function writeDiagnosticOutputs(options, diagnostic) {
 }
 
 function validateOutputUsage() {
-  return "usage: node scripts/review-units.mjs validate-output --input OUTPUT_JSON --max-bytes MAX_BYTES [--profile PROFILE_JSON --config CONFIG_JSON]\n";
+  return "usage: node scripts/review-units.mjs validate-output --input OUTPUT_JSON --max-bytes MAX_BYTES [--capture CAPTURE_JSON] [--profile PROFILE_JSON --config CONFIG_JSON]\n";
 }
 
 function validateOutputMain(argv) {
@@ -1279,7 +1297,7 @@ function validateOutputMain(argv) {
   for (let index = 1; index < argv.length; index += 2) {
     const key = argv[index];
     const entry = argv[index + 1];
-    if (!["--input", "--max-bytes", "--profile", "--config"].includes(key) || !entry || Object.hasOwn(options, key)) {
+    if (!["--input", "--max-bytes", "--capture", "--profile", "--config"].includes(key) || !entry || Object.hasOwn(options, key)) {
       process.stderr.write(validateOutputUsage());
       return 2;
     }
@@ -1295,10 +1313,14 @@ function validateOutputMain(argv) {
     const bytes = readFileSync(options["--input"]);
     const value = JSON.parse(bytes.toString("utf8"));
     const localOutput = value?.status === "complete" && Object.hasOwn(value, "capture");
+    const hostedCompleteOutput = value?.status === "complete" && !localOutput;
     if (localOutput && (!options["--profile"] || !options["--config"])) throw new TypeError("local shadow output requires trusted profile and config");
+    if (hostedCompleteOutput && !options["--capture"]) throw new TypeError("hosted complete output requires original capture");
     const trustedInputs = localOutput ? {
       config: JSON.parse(readFileSync(options["--config"], "utf8")),
       profile: JSON.parse(readFileSync(options["--profile"], "utf8")),
+    } : hostedCompleteOutput ? {
+      capture: JSON.parse(readFileSync(options["--capture"], "utf8")),
     } : undefined;
     validateShadowOutput(value, maxBytes, trustedInputs);
     if (!bytes.equals(Buffer.from(`${canonicalJson(value)}\n`))) throw new TypeError("shadow output is not canonically encoded");

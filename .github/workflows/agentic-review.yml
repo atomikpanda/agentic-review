@@ -2005,6 +2005,15 @@ jobs:
             fallback planner_failed planner_helper_failed
           fi
           test -s "$PARTITION_SHADOW_OUTPUT" || fallback capture_failed output_unavailable
+          OUTPUT_STATUS="$(node --input-type=module - "$PARTITION_SHADOW_OUTPUT" <<'NODE'
+          import { readFileSync } from "node:fs";
+          process.stdout.write(JSON.parse(readFileSync(process.argv[2], "utf8")).status);
+          NODE
+          )"
+          if [[ "$OUTPUT_STATUS" == "complete" ]]; then
+            node "$UNITS_HELPER" validate-output --input "$PARTITION_SHADOW_OUTPUT" --capture "$CAPTURE_FILE" --max-bytes 4194304 \
+              || fallback planner_failed output_validation_failed
+          fi
 
       - name: upload optional partition shadow diagnostics
         if: ${{ !cancelled() && steps.target.outputs.eligible == 'true' }}
