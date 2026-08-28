@@ -931,7 +931,7 @@ test("partition shadow is an isolated opt-in hosted diagnostic", () => {
   assert.match(dispatch, /^      partition_shadow:\n        description: Compute diagnostic-only partition manifests after review\.\n        type: boolean\n        default: false$/m);
   assert.ok(shadowJob);
   assert.match(shadowJob, /^    needs: review$/m);
-  assert.match(shadowJob, /^    if: \$\{\{ always\(\) && inputs\.partition_shadow && \(needs\.review\.result == 'success' \|\| needs\.review\.result == 'failure'\) \}\}$/m);
+  assert.match(shadowJob, /^    if: \$\{\{ always\(\) && inputs\.partition_shadow && needs\.review\.outputs\.shadow_eligible == 'true' && \(needs\.review\.result == 'success' \|\| needs\.review\.result == 'failure'\) \}\}$/m);
   assert.match(shadowJob, /^    continue-on-error: true$/m);
   assert.match(shadowJob, /^    timeout-minutes: 5$/m);
   assert.match(shadowJob, /^    permissions:\n      contents: read\n      pull-requests: read$/m);
@@ -969,13 +969,7 @@ test("partition shadow is an isolated opt-in hosted diagnostic", () => {
     /partition.shadow/i,
   );
 });
-test("partition shadow requires an eligible completed authoritative review", () => {
-  const source = readFileSync(workflow, "utf8");
-  const shadowJob = source.slice(source.indexOf("  partition-shadow:\n"));
-  assert.match(
-    shadowJob,
-    /^    if: \$\{\{ always\(\) && inputs\.partition_shadow && needs\.review\.outputs\.shadow_eligible == 'true' && \(needs\.review\.result == 'success' \|\| needs\.review\.result == 'failure'\) \}\}$/m,
-  );
+test("partition shadow runs only for eligible completed authoritative reviews", () => {
 
   const runsShadow = (reviewResult, eligible, enabled = true) =>
     enabled && eligible === "true" && ["success", "failure"].includes(reviewResult);
@@ -987,7 +981,7 @@ test("partition shadow requires an eligible completed authoritative review", () 
   assert.equal(runsShadow("cancelled", "true"), false);
   assert.equal(runsShadow("success", "true", false), false);
 });
-test("authoritative target makes draft and fork same-repository dispatches ineligible", (t) => {
+test("partition shadow authoritative target makes draft and fork same-repository dispatches ineligible", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "review-target-eligibility-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const bin = join(directory, "bin");
