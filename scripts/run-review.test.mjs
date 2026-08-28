@@ -1185,6 +1185,51 @@ exec "\${REAL_NODE}" "$@"
   }
 });
 
+test("profile-producing runs remove stale output on generation failure but final discovery preserves it", (t) => {
+  const fixture = createFixture(t);
+  const profileFile = join(fixture.directory, "execution-profile.json");
+  const plan = {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  };
+  const successful = runReview(t, plan, {
+    existingFixture: fixture,
+    args: ["--execution-profile-out", profileFile, "--json"],
+  });
+  assert.equal(successful.result.status, 0, successful.result.stderr);
+  assert.equal(JSON.parse(readFileSync(profileFile, "utf8")).schema_version, 1);
+
+  const nodeWrapper = join(fixture.bin, "node");
+  writeFileSync(nodeWrapper, `#!/usr/bin/env bash
+if [ "\${1:-}" = --input-type=module ] && [ "\${2:-}" = -e ] \
+  && [[ "\${3:-}" = *descriptor_content_hashes* ]]; then
+  exit 91
+fi
+exec "\${REAL_NODE}" "$@"
+`);
+  chmodSync(nodeWrapper, 0o755);
+  const failed = runReview(t, plan, {
+    existingFixture: fixture,
+    args: ["--execution-profile-out", profileFile, "--json"],
+  });
+  assert.equal(failed.result.status, 0, failed.result.stderr);
+  assert.equal(existsSync(profileFile), false);
+  assert.equal(failed.logs.length - successful.logs.length, 3,
+    "profile failure must not skip model work");
+  assert.equal(validatePublication(failed.publicationFile).status, 0);
+
+  rmSync(nodeWrapper, { force: true });
+  writeFileSync(profileFile, "prior profile for automatic final discovery\n");
+  const finalDiscovery = runReview(t, plan, {
+    existingFixture: fixture,
+    args: ["--json"],
+    env: { AGENTIC_REVIEW_PHASE: "discovery" },
+  });
+  assert.equal(finalDiscovery.result.status, 0, finalDiscovery.result.stderr);
+  assert.equal(readFileSync(profileFile, "utf8"), "prior profile for automatic final discovery\n");
+});
+
 test("partition shadow environment defaults activate privately and CLI values override them", (t) => {
   const fixture = createFixture(t);
   const environmentShadow = join(fixture.directory, "environment-shadow.json");
