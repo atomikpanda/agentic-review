@@ -1667,7 +1667,7 @@ jobs:
   # the authoritative review job that precedes it.
   partition-shadow:
     needs: review
-    if: ${{ always() && inputs.partition_shadow }}
+    if: ${{ always() && inputs.partition_shadow && (needs.review.result == 'success' || needs.review.result == 'failure') }}
     continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 5

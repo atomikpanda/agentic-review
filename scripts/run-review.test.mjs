@@ -931,10 +931,10 @@ test("partition shadow is an isolated opt-in hosted diagnostic", () => {
   assert.match(dispatch, /^      partition_shadow:\n        description: Compute diagnostic-only partition manifests after review\.\n        type: boolean\n        default: false$/m);
   assert.ok(shadowJob);
   assert.match(shadowJob, /^    needs: review$/m);
-  assert.match(shadowJob, /^    if: \$\{\{ always\(\) && inputs\.partition_shadow \}\}$/m);
+  assert.match(shadowJob, /^    if: \$\{\{ always\(\) && inputs\.partition_shadow && \(needs\.review\.result == 'success' \|\| needs\.review\.result == 'failure'\) \}\}$/m);
   assert.match(shadowJob, /^    continue-on-error: true$/m);
   assert.match(shadowJob, /^    timeout-minutes: 5$/m);
-  assert.match(shadowJob, /^    permissions:\n      contents: read$/m);
+  assert.match(shadowJob, /^    permissions:\n      contents: read\n      pull-requests: read$/m);
   assert.doesNotMatch(shadowJob, /OPENROUTER_API_KEY|run-review\.sh|omp(?:_version|_VERSION)?|pull-requests:\s*write|pull_requests.*write/);
   assert.match(shadowJob, /review-capture\.mjs/);
   assert.match(shadowJob, /review-units\.mjs/);
@@ -958,6 +958,7 @@ test("partition shadow is an isolated opt-in hosted diagnostic", () => {
   assert.match(source, /--execution-profile-out "\$REVIEW_PARTITION_SHADOW_PROFILE"/);
   const profileUpload = source.match(
     /^      - name: upload partition shadow execution profile\n[\s\S]*?(?=^      - (?:name:|uses:))/m,
+
   )?.[0];
   assert.ok(profileUpload);
   assert.match(profileUpload, /steps\.cycle\.outputs\.should_run == 'true'/);
@@ -967,6 +968,22 @@ test("partition shadow is an isolated opt-in hosted diagnostic", () => {
     source.match(/^  workflow_call:\n    outputs:\n[\s\S]*?(?=^    inputs:)/m)?.[0] ?? "",
     /partition.shadow/i,
   );
+});
+test("partition shadow waits for a completed authoritative review", () => {
+  const source = readFileSync(workflow, "utf8");
+  const shadowJob = source.slice(source.indexOf("  partition-shadow:\n"));
+  assert.match(
+    shadowJob,
+    /^    if: \$\{\{ always\(\) && inputs\.partition_shadow && \(needs\.review\.result == 'success' \|\| needs\.review\.result == 'failure'\) \}\}$/m,
+  );
+
+  const runsShadow = (reviewResult, enabled = true) =>
+    enabled && ["success", "failure"].includes(reviewResult);
+  assert.equal(runsShadow("success"), true);
+  assert.equal(runsShadow("failure"), true);
+  assert.equal(runsShadow("skipped"), false);
+  assert.equal(runsShadow("cancelled"), false);
+  assert.equal(runsShadow("success", false), false);
 });
 
 test("partition shadow independently resolves immutable same-repository and App targets", (t) => {
