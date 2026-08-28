@@ -248,22 +248,34 @@ test("keeps header-shaped changed lines inside active hunks", () => {
 });
 
 test("correlates unquoted space-containing binary and mode-only diff headers", () => {
-  for (const { oldMode, newMode, patch, rows, expectedKind } of [
+  for (const { path, oldMode, newMode, patch, rows, expectedKind } of [
     {
-      oldMode: "100644", newMode: "100644",
+      path: "path with space", oldMode: "100644", newMode: "100644",
       patch: "diff --git a/path with space b/path with space\nBinary files a/path with space and b/path with space differ\n",
       rows: [row(OLD_ID, Buffer.from("old\n")), row(NEW_ID, Buffer.from("new\n"))],
       expectedKind: "binary",
     },
     {
-      oldMode: "100644", newMode: "100755",
+      path: "path with space", oldMode: "100644", newMode: "100755",
       patch: "diff --git a/path with space b/path with space\nold mode 100644\nnew mode 100755\n",
+      rows: [row(OLD_ID, Buffer.from("old\n"), ["100644"]), row(NEW_ID, Buffer.from("new\n"), ["100755"])],
+      expectedKind: "mode",
+    },
+    {
+      path: "foo b/bar", oldMode: "100644", newMode: "100644",
+      patch: "diff --git a/foo b/bar b/foo b/bar\nBinary files a/foo b/bar and b/foo b/bar differ\n",
+      rows: [row(OLD_ID, Buffer.from("old\n")), row(NEW_ID, Buffer.from("new\n"))],
+      expectedKind: "binary",
+    },
+    {
+      path: "foo b/bar", oldMode: "100644", newMode: "100755",
+      patch: "diff --git a/foo b/bar b/foo b/bar\nold mode 100644\nnew mode 100755\n",
       rows: [row(OLD_ID, Buffer.from("old\n"), ["100644"]), row(NEW_ID, Buffer.from("new\n"), ["100755"])],
       expectedKind: "mode",
     },
   ]) {
     const result = atomizeCapturedReviewInput(capture({
-      raw: rawRecord({ oldMode, newMode, paths: ["path with space"] }),
+      raw: rawRecord({ oldMode, newMode, paths: [path] }),
       patch,
       rows,
     }));

@@ -127,13 +127,6 @@ function removeDiffPrefix(path, prefix) {
 }
 
 function gitTokens(bytes) {
-  const unquotedBoundary = bytes[0] === 0x22 ? -1 : bytes.indexOf(Buffer.from(" b/"));
-  if (unquotedBoundary !== -1) {
-    return [
-      decodeGitPath(bytes.subarray(0, unquotedBoundary)),
-      decodeGitPath(bytes.subarray(unquotedBoundary + 1)),
-    ];
-  }
   const tokens = [];
   for (let index = 0; index < bytes.length && tokens.length < 2;) {
     while (bytes[index] === 0x20) index += 1;
@@ -172,8 +165,9 @@ function parsePatch(bytes) {
   };
   const startSection = (line) => {
     finishHunk();
-    const [oldHeader, newHeader] = gitTokens(line.subarray(Buffer.byteLength("diff --git ")));
-    section = { oldPath: removeDiffPrefix(oldHeader, "a"), newPath: removeDiffPrefix(newHeader, "b"), headerOldPath: removeDiffPrefix(oldHeader, "a"), headerNewPath: removeDiffPrefix(newHeader, "b"), hunks: [], binary: false, oldFinalNewline: true, newFinalNewline: true };
+    const headerPaths = line.subarray(Buffer.byteLength("diff --git "));
+    const [oldHeader, newHeader] = headerPaths.includes(0x22) ? gitTokens(headerPaths) : [null, null];
+    section = { oldPath: removeDiffPrefix(oldHeader, "a"), newPath: removeDiffPrefix(newHeader, "b"), headerOldPath: removeDiffPrefix(oldHeader, "a"), headerNewPath: removeDiffPrefix(newHeader, "b"), headerPaths: oldHeader === null ? headerPaths : null, hunks: [], binary: false, oldFinalNewline: true, newFinalNewline: true };
     sections.push(section);
   };
   while (offset < bytes.length) {
@@ -242,9 +236,20 @@ function recordSectionKey(record) {
   return `pair:${pathKey(record.oldPath)}:${pathKey(record.newPath)}`;
 }
 
+function headerSectionKey(headerPaths) {
+  return `header:${headerPaths.toString("base64")}`;
+}
+
+function recordHeaderKey(record) {
+  const oldPath = record.oldPath ?? record.newPath;
+  const newPath = record.newPath ?? record.oldPath;
+  return headerSectionKey(Buffer.concat([Buffer.from("a/"), oldPath, Buffer.from(" b/"), newPath]));
+}
+
 function sectionKeys(section) {
   const keys = new Set();
   for (const [oldPath, newPath] of [[section.oldPath, section.newPath], [section.headerOldPath, section.headerNewPath]]) {
+    if (oldPath === null && newPath === null) continue;
     keys.add(`pair:${pathKey(oldPath)}:${pathKey(newPath)}`);
     if (oldPath !== null) keys.add(`old:${pathKey(oldPath)}`);
     if (newPath !== null) keys.add(`new:${pathKey(newPath)}`);
@@ -262,19 +267,26 @@ function correlate(records, sections) {
       queue.push(sectionIndex);
       indexedSections.set(key, queue);
     }
+    if (section.headerPaths) {
+      const key = headerSectionKey(section.headerPaths);
+      const queue = indexedSections.get(key) ?? [];
+      queue.push(sectionIndex);
+      indexedSections.set(key, queue);
+    }
   });
   const queueOffsets = new Map();
   for (let recordIndex = 0; recordIndex < records.length; recordIndex += 1) {
-    const key = recordSectionKey(records[recordIndex]);
-    const queue = indexedSections.get(key) ?? [];
-    let offset = queueOffsets.get(key) ?? 0;
-    while (offset < queue.length && recordForSection[queue[offset]] !== -1) offset += 1;
-    queueOffsets.set(key, offset);
-    if (offset < queue.length) {
+    for (const key of [recordSectionKey(records[recordIndex]), recordHeaderKey(records[recordIndex])]) {
+      const queue = indexedSections.get(key) ?? [];
+      let offset = queueOffsets.get(key) ?? 0;
+      while (offset < queue.length && recordForSection[queue[offset]] !== -1) offset += 1;
+      queueOffsets.set(key, offset);
+      if (offset >= queue.length) continue;
       const sectionIndex = queue[offset];
       sectionForRecord[recordIndex] = sectionIndex;
       recordForSection[sectionIndex] = recordIndex;
       queueOffsets.set(key, offset + 1);
+      break;
     }
   }
   return { sectionForRecord, recordForSection };
