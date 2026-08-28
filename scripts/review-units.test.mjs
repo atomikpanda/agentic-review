@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import test from "node:test";
 
-import { atomizeCapturedReviewInput, buildHostedShadowOutput, buildLocalShadowOutput, buildPathFallbackManifest, buildShadowDiagnostic, splitUnit, validateAtomization, validatePartitionShadowEvaluatorFixture } from "./review-units.mjs";
+import { atomizeCapturedReviewInput, buildHostedShadowOutput, buildLocalShadowOutput, buildPathFallbackManifest, buildShadowDiagnostic, splitUnit, validateAtomization, validatePartitionShadowEvaluatorFixture, writeShadowOutput } from "./review-units.mjs";
 
 const OLD_ID = "1".repeat(40);
 const NEW_ID = "2".repeat(40);
@@ -388,11 +388,13 @@ test("validates evaluator metrics and produces redacted fixed-point hosted outpu
   const hosted = buildHostedShadowOutput(shadowCapture(), manifest, 100_000);
   assert.equal(hosted.status, "complete");
   assert.equal(hosted.sizes.encoded_output_bytes, Buffer.byteLength(`${canonicalJson(hosted)}\n`));
+  assert.ok(hosted.sizes.encoded_output_bytes <= 100_000);
   assert.equal(JSON.stringify(hosted).includes("source bytes stay local"), false);
   assert.equal(Object.hasOwn(hosted.atoms.find((atom) => atom.kind === "text"), "old_lines"), false);
-  const compacted = buildHostedShadowOutput(shadowCapture(), manifest, 100);
+  const compacted = buildHostedShadowOutput(shadowCapture(), manifest, hosted.sizes.encoded_output_bytes - 1);
   assert.equal(compacted.status, "artifact_compacted");
   assert.equal(compacted.sizes.encoded_output_bytes, Buffer.byteLength(`${canonicalJson(compacted)}\n`));
+  assert.ok(compacted.sizes.encoded_output_bytes <= hosted.sizes.encoded_output_bytes - 1);
   const diagnostic = buildShadowDiagnostic({
     status: "atom_coverage_mismatch",
     capture: shadowCapture(),
@@ -407,6 +409,7 @@ test("validates evaluator metrics and produces redacted fixed-point hosted outpu
   assert.equal(diagnostic.manifest_hash, null);
   assert.ok(Buffer.byteLength(diagnostic.diagnostic) <= 512);
   assert.equal(diagnostic.sizes.encoded_output_bytes, Buffer.byteLength(`${canonicalJson(diagnostic)}\n`));
+  assert.ok(diagnostic.sizes.encoded_output_bytes <= 10_000);
 });
 
 test("keeps generated atom unions deterministic across canonical input shuffles", () => {
@@ -509,4 +512,45 @@ test("allows the specified empty benchmark revision", () => {
     executionProfile: EXECUTION_PROFILE,
   });
   assert.equal(manifest.benchmark_revision, "");
+});
+
+test("rejects too-small caps and forged self-hashed execution projections", () => {
+  const manifest = buildPathFallbackManifest({
+    capture: shadowCapture(),
+    atomization: shadowAtomization([shadowAtom({ kind: "path_event", path: "a" })]),
+    config: SHADOW_CONFIG,
+    executionProfile: EXECUTION_PROFILE,
+  });
+  assert.throws(() => buildHostedShadowOutput(shadowCapture(), manifest, 100), RangeError);
+  assert.throws(() => buildShadowDiagnostic({
+    status: "capture_failed",
+    base_sha: OLD_ID,
+    head_sha: NEW_ID,
+    benchmark_revision: "",
+    reason_codes: ["process_error"],
+    diagnostic: "",
+    observed_lower_bounds: { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 },
+    counts: {},
+  }, 100), RangeError);
+  const forged = structuredClone(manifest);
+  forged.execution_projection.descriptors = [];
+  forged.execution_projection.descriptor_content_hashes = [];
+  forged.execution_projection.projected_model_calls = 0;
+  forged.manifest_hash = sha256(Object.fromEntries(Object.entries(forged).filter(([key]) => key !== "manifest_hash")));
+  assert.throws(() => buildLocalShadowOutput(shadowCapture(), forged), /execution projection/);
+});
+
+test("atomic shadow writes reject attacker-created temporary names", () => {
+  const directory = mkdtempSync("/tmp/review-units-");
+  const destination = `${directory}/output.json`;
+  const protectedPath = `${directory}/protected.json`;
+  const temporary = `${directory}/.review-units-attacker.tmp`;
+  writeFileSync(protectedPath, "protected");
+  symlinkSync(protectedPath, temporary);
+  try {
+    assert.throws(() => writeShadowOutput(destination, { value: "safe" }, () => "attacker"), /EEXIST/);
+    assert.equal(readFileSync(protectedPath, "utf8"), "protected");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

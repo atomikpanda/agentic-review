@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { lstatSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { lstatSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { canonicalJson, canonicalSha256 } from "./lib-canonical-json.mjs";
@@ -647,12 +647,22 @@ function coalesceUnits(units, maxFrontierUnits) {
   return frontier;
 }
 
+function validateExecutionProjection(projection, unitCount) {
+  exactKeys(projection, ["descriptors", "descriptor_content_hashes", "max_output_attempts", "projected_batches", "projected_model_calls"], "manifest execution projection");
+  if (!Array.isArray(projection.descriptors) || projection.descriptors.length === 0 || projection.descriptors.some((value) => typeof value !== "string" || value.length === 0 || value.length > 256)) throw new TypeError("manifest execution projection descriptors are invalid");
+  if (!Array.isArray(projection.descriptor_content_hashes) || projection.descriptor_content_hashes.length !== projection.descriptors.length || projection.descriptor_content_hashes.some((value) => !SHA256.test(value))) throw new TypeError("manifest execution projection descriptor hashes are invalid");
+  const attempts = positiveInteger(projection.max_output_attempts, "manifest max_output_attempts");
+  if (!Number.isSafeInteger(unitCount) || unitCount < 0 || projection.projected_batches !== unitCount) throw new TypeError("manifest execution projection batches are invalid");
+  const modelCalls = unitCount * projection.descriptors.length * attempts;
+  if (!Number.isSafeInteger(modelCalls) || projection.projected_model_calls !== modelCalls) throw new TypeError("manifest execution projection model calls are invalid");
+}
+
 function validateManifest(manifest) {
   exactKeys(manifest, MANIFEST_KEYS, "manifest");
   if (manifest.schema_version !== 1 || manifest.status !== "complete" || manifest.mode !== "partition_shadow" || !SHA256.test(manifest.capture_hash) || !SHA256.test(manifest.manifest_hash)) throw new TypeError("manifest header is invalid");
   exactKeys(manifest.configuration, ["atom_target_bytes", "unit_target_bytes", "max_frontier_units", "max_shadow_artifact_bytes"], "manifest configuration");
-  exactKeys(manifest.execution_projection, ["descriptors", "descriptor_content_hashes", "max_output_attempts", "projected_batches", "projected_model_calls"], "manifest execution projection");
-  if (!Array.isArray(manifest.atoms) || !Array.isArray(manifest.units) || manifest.execution_projection.projected_batches !== manifest.units.length) throw new TypeError("manifest arrays are invalid");
+  validateExecutionProjection(manifest.execution_projection, Array.isArray(manifest.units) ? manifest.units.length : -1);
+  if (!Array.isArray(manifest.atoms) || !Array.isArray(manifest.units)) throw new TypeError("manifest arrays are invalid");
   exactKeys(manifest.counts, ["atoms", "path_events", "text_atoms", "oversized_atoms", "coalesced_units", "by_raw_status", "by_content_kind"], "manifest counts");
   exactKeys(manifest.sizes, ["atom_payload_bytes", "unit_payload_bytes"], "manifest sizes");
   if (manifest.counts.atoms !== manifest.atoms.length || manifest.sizes.atom_payload_bytes !== manifest.atoms.reduce((total, atom) => total + atom.payload_bytes, 0) || manifest.sizes.unit_payload_bytes !== manifest.units.reduce((total, unit) => total + unit.unit_payload_bytes, 0)) throw new TypeError("manifest metrics are invalid");
@@ -713,6 +723,11 @@ function withEncodedOutputSize(output) {
     if (sized.sizes.encoded_output_bytes === encodedLength) return sized;
     sized.sizes.encoded_output_bytes = encodedLength;
   }
+}
+
+function requireOutputWithinCap(output, maxBytes) {
+  if (output.sizes.encoded_output_bytes > maxBytes) throw new RangeError("shadow output exceeds maxBytes");
+  return output;
 }
 
 function redactedObjects(capture) {
@@ -777,7 +792,7 @@ export function buildHostedShadowOutput(capture, manifest, maxBytes) {
     omitted: ["atoms", "units"],
   });
   exactKeys(compacted, COMPACT_OUTPUT_KEYS, "hosted compact output");
-  return compacted;
+  return requireOutputWithinCap(compacted, maxBytes);
 }
 
 function truncateDiagnostic(value) {
@@ -820,7 +835,7 @@ export function buildShadowDiagnostic(details, maxBytes) {
   });
   exactKeys(diagnostic, DIAGNOSTIC_KEYS, "shadow diagnostic");
   if (!GIT_ID.test(diagnostic.base_sha) || !GIT_ID.test(diagnostic.head_sha) || typeof diagnostic.benchmark_revision !== "string" || diagnostic.benchmark_revision.length > 256 || diagnostic.reason_codes.some((reason) => typeof reason !== "string" || reason.length === 0)) throw new TypeError("shadow diagnostic fields are invalid");
-  return diagnostic;
+  return requireOutputWithinCap(diagnostic, maxBytes);
 }
 
 /** Splits a non-atomic unit at its byte-balanced deterministic boundary. */
@@ -868,15 +883,19 @@ export function validatePartitionShadowEvaluatorFixture(value) {
   return value;
 }
 
-function writeShadowOutput(path, value) {
+export function writeShadowOutput(path, value, random = randomUUID) {
   try {
     if (lstatSync(path).isSymbolicLink()) throw new TypeError("output path must not be a symlink");
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
-  const temporary = join(dirname(path), `.${Date.now()}-${process.pid}-review-units.tmp`);
-  writeFileSync(temporary, `${canonicalJson(value)}\n`, { mode: 0o600 });
-  renameSync(temporary, path);
+  const temporary = join(dirname(path), `.review-units-${random()}.tmp`);
+  try {
+    writeFileSync(temporary, `${canonicalJson(value)}\n`, { flag: "wx", mode: 0o600 });
+    renameSync(temporary, path);
+  } finally {
+    try { unlinkSync(temporary); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+  }
 }
 
 function shadowUsage() {
@@ -896,7 +915,7 @@ function parseShadowArgs(argv) {
   return options;
 }
 
-function shadowDiagnosticFromCapture(capture, benchmarkRevision) {
+function shadowDiagnosticFromCapture(capture, benchmarkRevision, maxBytes) {
   return buildShadowDiagnostic({
     status: capture.status,
     base_sha: capture.base_sha,
@@ -906,7 +925,7 @@ function shadowDiagnosticFromCapture(capture, benchmarkRevision) {
     diagnostic: "Shadow capture did not complete.",
     observed_lower_bounds: capture.observed_lower_bounds,
     counts: {},
-  }, Number.MAX_SAFE_INTEGER);
+  }, maxBytes);
 }
 
 function main(argv) {
@@ -944,7 +963,7 @@ function main(argv) {
           }, config.max_shadow_artifact_bytes);
         }
       })()
-      : shadowDiagnosticFromCapture(capture, config.benchmark_revision);
+      : shadowDiagnosticFromCapture(capture, config.benchmark_revision, config.max_shadow_artifact_bytes);
     if (diagnostic !== null) {
       if (options["--local-out"]) writeShadowOutput(options["--local-out"], diagnostic);
       if (options["--diagnostics-out"]) writeShadowOutput(options["--diagnostics-out"], diagnostic);
