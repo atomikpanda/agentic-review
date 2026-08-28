@@ -259,6 +259,7 @@ appendFileSync(process.env.FAKE_OMP_LOG, JSON.stringify({
   reviewedAlpha,
   reviewedCodegraph,
   argv: process.argv.slice(2),
+  environment_keys: Object.keys(process.env).sort(),
 }) + "\\n");
 const plan = JSON.parse(readFileSync(process.env.FAKE_OMP_PLAN, "utf8"));
 const choices = plan[passId] ?? plan[id] ?? plan.default ?? [{ findings: [] }];
@@ -1721,6 +1722,7 @@ test("behind-base poster no-result fallback pairs with the trusted merge-base pu
   writeFileSync(trustedPoster, 'import "./missing-trusted-dependency.mjs";\n');
   copyFileSync(resultCli, join(directory, "scripts", "review-result.mjs"));
   copyFileSync(join(dirname(resultCli), "lib-findings.mjs"), join(directory, "scripts", "lib-findings.mjs"));
+  copyFileSync(join(dirname(resultCli), "lib-canonical-json.mjs"), join(directory, "scripts", "lib-canonical-json.mjs"));
 
   const baseSha = "1111111111111111111111111111111111111111";
   const targetBaseSha = "3333333333333333333333333333333333333333";
@@ -5686,4 +5688,150 @@ test("merge failure preserves a structured valid-pass artifact but is never comp
   assert.equal(run.metadata.coverage, "unknown");
   assert.deepEqual(run.metadata.remaining_analysis, ["merge_failed"]);
   assert.equal(validatePublication(run.publicationFile).status, 0);
+});
+
+test("partition shadow is opt-in, preserves authoritative review bytes, and excludes shadow state from OMP", (t) => {
+  const plan = {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  };
+  const disabled = runReview(t, plan);
+  assert.equal(disabled.result.status, 0, disabled.result.stderr);
+  const comparableLogs = (logs) => logs.map(({
+    id, pass_id, attempt, prompt, prompt_base64, skill, reviewedAlpha,
+    reviewedCodegraph, argv, environment_keys,
+  }) => ({
+    id,
+    pass_id,
+    attempt,
+    prompt,
+    prompt_base64,
+    skill,
+    reviewedAlpha,
+    reviewedCodegraph,
+    argv: argv.map((argument) => argument.startsWith("--cwd=")
+      ? "--cwd=<review-root>"
+      : argument.startsWith("--append-system-prompt=")
+        ? "--append-system-prompt=<skill>"
+        : argument.startsWith("@") ? "@<prompt>" : argument),
+    environment_keys,
+  })).sort((left, right) => left.pass_id.localeCompare(right.pass_id));
+  const baseline = {
+    stdout: disabled.result.stdout,
+    stderr: disabled.result.stderr,
+    findings: readFileSync(disabled.findingsFile, "utf8"),
+    publication: readFileSync(disabled.publicationFile, "utf8"),
+    logs: comparableLogs(disabled.logs),
+  };
+  rmSync(disabled.state, { recursive: true, force: true });
+  mkdirSync(disabled.state);
+  rmSync(join(disabled.directory, "omp.log"), { force: true });
+  const shadowFile = join(disabled.directory, "partition-shadow.json");
+  const enabled = runReview(t, plan, {
+    existingFixture: disabled,
+    args: ["--partition-shadow", "--partition-shadow-out", shadowFile, "--json"],
+  });
+
+  assert.equal(enabled.result.status, 0, enabled.result.stderr);
+  assert.equal(enabled.result.stdout, baseline.stdout);
+  assert.equal(readFileSync(enabled.findingsFile, "utf8"), baseline.findings);
+  assert.equal(readFileSync(enabled.publicationFile, "utf8"), baseline.publication);
+  assert.deepEqual(comparableLogs(enabled.logs), baseline.logs);
+  assert.match(enabled.result.stderr, /partition shadow: complete/);
+  assert.ok(enabled.logs.every(({ environment_keys }) =>
+    !environment_keys.some((key) => /PARTITION_SHADOW/.test(key))));
+  const shadow = JSON.parse(readFileSync(shadowFile, "utf8"));
+  assert.deepEqual(Object.keys(shadow).sort(), [
+    "capture", "manifest", "mode", "schema_version", "status",
+  ]);
+  assert.equal(shadow.schema_version, 1);
+  assert.equal(shadow.status, "complete");
+  assert.equal(shadow.mode, "partition_shadow");
+  assert.deepEqual(shadow.manifest.execution_projection.descriptors,
+    ["general", "correctness", "boundaries"]);
+  assert.equal(shadow.manifest.execution_projection.max_output_attempts, 2);
+});
+
+test("partition shadow starts after workers stop and published authoritative artifacts exist", (t) => {
+  const fixture = createFixture(t);
+  const timingLog = join(fixture.directory, "shadow-timing.log");
+  const shadowFile = join(fixture.directory, "partition-shadow.json");
+  const findingsFile = join(fixture.directory, "findings.json");
+  const publicationFile = join(fixture.directory, "publication.json");
+  const gitWrapper = join(fixture.bin, "git");
+  writeFileSync(gitWrapper, `#!/usr/bin/env bash
+real_path="\${PATH#*:}"
+case " $* " in
+  *" --raw "*)
+    if [ -e "\${FAKE_SHADOW_PUBLICATION}" ] && [ "\$(wc -l < "\${FAKE_OMP_LOG}")" = 3 ]; then
+      printf '%s\\n' ready >> "\${FAKE_SHADOW_TIMING_LOG}"
+    else
+      printf '%s\\n' early >> "\${FAKE_SHADOW_TIMING_LOG}"
+    fi
+    ;;
+esac
+PATH="$real_path" git "$@"
+`);
+  chmodSync(gitWrapper, 0o755);
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    existingFixture: fixture,
+    args: ["--partition-shadow", "--partition-shadow-out", shadowFile, "--json"],
+    outputPaths: () => ({ findingsFile, publicationFile }),
+    env: {
+      FAKE_SHADOW_PUBLICATION: publicationFile,
+      FAKE_SHADOW_TIMING_LOG: timingLog,
+    },
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.equal(readFileSync(timingLog, "utf8"), "ready\n");
+  assert.equal(JSON.parse(readFileSync(shadowFile, "utf8")).status, "complete");
+});
+
+test("partition shadow capture failures and unsafe destinations cannot alter authoritative review", (t) => {
+  const fixture = createFixture(t);
+  const shadowFile = join(fixture.directory, "partition-shadow.json");
+  const findingsFile = join(fixture.directory, "findings.json");
+  const publicationFile = join(fixture.directory, "publication.json");
+  const gitWrapper = join(fixture.bin, "git");
+  writeFileSync(gitWrapper, `#!/usr/bin/env bash
+real_path="\${PATH#*:}"
+case " $* " in *" --raw "*) printf ':bad\\0'; exit 0 ;; esac
+PATH="$real_path" git "$@"
+`);
+  chmodSync(gitWrapper, 0o755);
+  const failedCapture = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    existingFixture: fixture,
+    args: ["--partition-shadow", "--partition-shadow-out", shadowFile, "--json"],
+    outputPaths: () => ({ findingsFile, publicationFile }),
+  });
+
+  assert.equal(failedCapture.result.status, 0, failedCapture.result.stderr);
+  assert.deepEqual(failedCapture.findings.findings, []);
+  assert.equal(validatePublication(failedCapture.publicationFile).status, 0);
+  assert.match(failedCapture.result.stderr, /partition shadow: capture_failed/);
+  assert.equal(JSON.parse(readFileSync(shadowFile, "utf8")).status, "capture_failed");
+
+  const unsafeFixture = createFixture(t);
+  const unsafeTarget = join(unsafeFixture.directory, "shadow-target.json");
+  const unsafeShadow = join(unsafeFixture.directory, "unsafe-shadow.json");
+  writeFileSync(unsafeTarget, "operator-owned\n");
+  symlinkSync(unsafeTarget, unsafeShadow);
+  const unsafe = runReview(t, { general: [{ findings: [] }] }, {
+    existingFixture: unsafeFixture,
+    args: ["--partition-shadow", "--partition-shadow-out", unsafeShadow, "--json"],
+  });
+  assert.notEqual(unsafe.result.status, 0);
+  assert.equal(unsafe.logs.length, 0);
+  assert.equal(readFileSync(unsafeTarget, "utf8"), "operator-owned\n");
+  assert.match(unsafe.result.stderr, /partition-shadow-out.*symlink/i);
 });
