@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { captureReviewInput, parseCaptureLimits, validateCapturedReviewInput } from "./review-capture.mjs";
 import { atomizeCapturedReviewInput, parseRawDiffZ } from "./review-units.mjs";
+import { canonicalSha256 } from "./lib-canonical-json.mjs";
 
 const TEST_LIMITS = Object.freeze({
   maxPatchBytes: 1024 * 1024,
@@ -150,6 +151,51 @@ test("capture persists complete immutable inputs despite repository diff setting
   const canonicalized = await captureReviewInput({ repoRoot, baseSha, headSha, limits: TEST_LIMITS });
   assert.deepEqual(canonicalized, initial);
 
+});
+test("complete capture validation downgrades configured byte-limit violations", async (t) => {
+  const { repoRoot, baseSha, headSha } = createFixture(t);
+  const complete = await captureReviewInput({ repoRoot, baseSha, headSha, limits: TEST_LIMITS });
+  assert.equal(complete.status, "complete");
+  const patchBytes = Buffer.from(complete.patch_base64, "base64").length;
+  const rawZBytes = Buffer.from(complete.raw_z_base64, "base64").length;
+  const blobBytes = complete.object_table.reduce((total, row) => total + row.size, 0);
+  const maxBlobBytes = Math.max(...complete.object_table.map((row) => row.size));
+  const withLimits = (limits) => {
+    const value = structuredClone(complete);
+    Object.assign(value.capture_configuration, limits);
+    delete value.capture_hash;
+    value.capture_hash = canonicalSha256(value);
+    return value;
+  };
+  const exact = withLimits({
+    max_patch_bytes: patchBytes,
+    max_raw_z_bytes: rawZBytes,
+    max_single_blob_bytes: maxBlobBytes,
+    max_total_blob_bytes: blobBytes,
+  });
+  assert.deepEqual(validateCapturedReviewInput(exact), exact);
+
+  const observed = {
+    patch_bytes: patchBytes,
+    raw_z_bytes: rawZBytes,
+    blob_bytes: blobBytes,
+    blob_count: complete.object_table.length,
+    elapsed_milliseconds: 0,
+  };
+  for (const [limits, reason] of [
+    [{ max_patch_bytes: patchBytes - 1 }, "patch_bytes"],
+    [{ max_raw_z_bytes: rawZBytes - 1 }, "raw_z_bytes"],
+    [{ max_single_blob_bytes: maxBlobBytes - 1 }, "blob_bytes"],
+    [{ max_total_blob_bytes: blobBytes - 1 }, "blob_bytes"],
+  ]) {
+    const downgraded = validateCapturedReviewInput(withLimits(limits));
+    assertDiagnostic(downgraded, reason);
+    assert.deepEqual(downgraded.observed_lower_bounds, observed);
+  }
+
+  const forged = withLimits({ max_patch_bytes: patchBytes - 1 });
+  forged.capture_hash = "0".repeat(64);
+  assert.throws(() => validateCapturedReviewInput(forged), /capture hash does not match capture content/);
 });
 
 test("canonical prefix overrides preserve capture and atomization correlation", async (t) => {
