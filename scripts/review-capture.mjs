@@ -131,6 +131,17 @@ function capacityError(reason) {
   return { kind: "capacity", reason };
 }
 
+function assertWithinDeadline(startedAt, limits) {
+  if (Date.now() - startedAt >= limits.maxCaptureMilliseconds) throw capacityError("deadline");
+}
+
+function gitExecutionEnvironment() {
+  return {
+    ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))),
+    ...gitEnvironment,
+  };
+}
+
 function terminateProcessTree(child) {
   if (!child.pid) return;
   try {
@@ -143,6 +154,12 @@ function terminateProcessTree(child) {
 
 function runGitToFile({ repoRoot, args, input, filePath, startedAt, limits, onChunk }) {
   return new Promise((resolve, reject) => {
+    try {
+      assertWithinDeadline(startedAt, limits);
+    } catch (error) {
+      reject(error);
+      return;
+    }
     const remaining = limits.maxCaptureMilliseconds - (Date.now() - startedAt);
     if (remaining <= 0) {
       reject(capacityError("deadline"));
@@ -152,6 +169,13 @@ function runGitToFile({ repoRoot, args, input, filePath, startedAt, limits, onCh
     let settled = false;
     let exceeded;
     let timer;
+    let descriptor;
+    const closeDescriptor = () => {
+      if (descriptor !== undefined) {
+        closeSync(descriptor);
+        descriptor = undefined;
+      }
+    };
     const finish = (callback, value) => {
       if (settled) return;
       settled = true;
@@ -159,22 +183,27 @@ function runGitToFile({ repoRoot, args, input, filePath, startedAt, limits, onCh
       callback(value);
     };
     try {
+      descriptor = openSync(filePath, "wx", 0o600);
       child = spawn("git", args, {
         cwd: repoRoot,
         detached: process.platform !== "win32",
-        env: { ...process.env, ...gitEnvironment },
+        env: gitExecutionEnvironment(),
         stdio: ["pipe", "pipe", "ignore"],
       });
     } catch {
+      closeDescriptor();
       reject({ kind: "process" });
       return;
     }
-    const descriptor = openSync(filePath, "wx", 0o600);
     timer = setTimeout(() => {
       exceeded = capacityError("deadline");
       terminateProcessTree(child);
     }, remaining);
-    child.on("error", () => finish(reject, { kind: "process" }));
+    child.on("error", () => {
+      terminateProcessTree(child);
+      closeDescriptor();
+      finish(reject, { kind: "process" });
+    });
     child.stdout.on("data", (chunk) => {
       if (settled || exceeded) return;
       try {
@@ -186,10 +215,17 @@ function runGitToFile({ repoRoot, args, input, filePath, startedAt, limits, onCh
       }
     });
     child.on("close", (code) => {
-      closeSync(descriptor);
+      closeDescriptor();
       if (exceeded) finish(reject, exceeded);
       else if (code !== 0) finish(reject, { kind: "process" });
-      else finish(resolve);
+      else {
+        try {
+          assertWithinDeadline(startedAt, limits);
+          finish(resolve);
+        } catch (error) {
+          finish(reject, error);
+        }
+      }
     });
     if (input !== undefined) child.stdin.end(input);
     else child.stdin.end();
@@ -198,7 +234,9 @@ function runGitToFile({ repoRoot, args, input, filePath, startedAt, limits, onCh
 
 async function runGitBuffer(options) {
   await runGitToFile(options);
-  return readFileSync(options.filePath);
+  const content = readFileSync(options.filePath);
+  assertWithinDeadline(options.startedAt, options.limits);
+  return content;
 }
 
 function assertObjectId(objectId, objectFormat, label) {
@@ -334,19 +372,24 @@ export async function captureReviewInput(options) {
   const configuration = captureConfiguration(limits);
   const startedAt = Date.now();
   const observed = emptyObserved(startedAt);
-  const workDir = mkdtempSync(join(tmpdir(), "review-capture-"));
-  const paths = {
-    format: join(workDir, "object-format"),
-    patch: join(workDir, "patch"),
-    raw: join(workDir, "raw"),
-    batch: join(workDir, "batch"),
-  };
+  let workDir;
   try {
+    assertWithinDeadline(startedAt, limits);
+    workDir = mkdtempSync(join(tmpdir(), "review-capture-"));
+    assertWithinDeadline(startedAt, limits);
+    const paths = {
+      format: join(workDir, "object-format"),
+      patch: join(workDir, "patch"),
+      raw: join(workDir, "raw"),
+      batch: join(workDir, "batch"),
+    };
     const unlimited = () => {};
     const objectFormat = (await runGitBuffer({ repoRoot, args: ["rev-parse", "--show-object-format"], filePath: paths.format, startedAt, limits, onChunk: unlimited })).toString("ascii").trim();
+    assertWithinDeadline(startedAt, limits);
     if (objectFormat !== "sha1" && objectFormat !== "sha256") throw { kind: "process" };
     assertObjectId(baseSha, objectFormat, "baseSha");
     assertObjectId(headSha, objectFormat, "headSha");
+    assertWithinDeadline(startedAt, limits);
     await runGitToFile({
       repoRoot, args: patchArgv.slice(1), filePath: paths.patch, startedAt, limits,
       onChunk: (chunk) => {
@@ -354,6 +397,7 @@ export async function captureReviewInput(options) {
         if (observed.patch_bytes > limits.maxPatchBytes) throw capacityError("patch_bytes");
       },
     });
+    assertWithinDeadline(startedAt, limits);
     await runGitToFile({
       repoRoot, args: rawArgv.slice(1), filePath: paths.raw, startedAt, limits,
       onChunk: (chunk) => {
@@ -361,10 +405,12 @@ export async function captureReviewInput(options) {
         if (observed.raw_z_bytes > limits.maxRawZBytes) throw capacityError("raw_z_bytes");
       },
     });
+    assertWithinDeadline(startedAt, limits);
     const rawBytes = readFileSync(paths.raw);
     const rawRecords = parseRawDiffZ(rawBytes, objectFormat);
     const objectModes = expectedObjectModes(rawRecords);
     const objectIds = [...objectModes.keys()].sort();
+    assertWithinDeadline(startedAt, limits);
     if (objectIds.length > 0) {
       const batchInput = Buffer.from(`${objectIds.join("\n")}\n`, "ascii");
       const batch = await runGitBuffer({ repoRoot, args: ["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"], input: batchInput, filePath: paths.batch, startedAt, limits, onChunk: unlimited });
@@ -374,6 +420,7 @@ export async function captureReviewInput(options) {
         const [objectId, objectType, size] = lines[index].split(" ");
         if (objectId !== objectIds[index] || objectType !== "blob" || !/^\d+$/.test(size)) throw { kind: "process" };
       }
+      assertWithinDeadline(startedAt, limits);
     }
     const objectTable = [];
     for (const objectId of objectIds) {
@@ -397,6 +444,7 @@ export async function captureReviewInput(options) {
         content_sha256: createHash("sha256").update(content).digest("hex"),
         content_base64: content.toString("base64"),
       });
+      assertWithinDeadline(startedAt, limits);
     }
     const complete = {
       schema_version: 1,
@@ -413,9 +461,13 @@ export async function captureReviewInput(options) {
       raw_z_base64: rawBytes.toString("base64"),
       object_table: objectTable,
     };
+    assertWithinDeadline(startedAt, limits);
     complete.capture_hash = canonicalSha256(complete);
+    assertWithinDeadline(startedAt, limits);
     validateCapturedReviewInput(complete);
-    if (outputPath !== undefined) writeJsonAtomic(outputPath, complete);
+    assertWithinDeadline(startedAt, limits);
+    if (outputPath !== undefined) writeJsonAtomic(outputPath, complete, () => assertWithinDeadline(startedAt, limits));
+    assertWithinDeadline(startedAt, limits);
     return complete;
   } catch (error) {
     observed.elapsed_milliseconds = Date.now() - startedAt;
@@ -426,19 +478,23 @@ export async function captureReviewInput(options) {
     if (outputPath !== undefined) writeJsonAtomic(outputPath, diagnostic);
     return diagnostic;
   } finally {
-    rmSync(workDir, { recursive: true, force: true });
+    if (workDir !== undefined) rmSync(workDir, { recursive: true, force: true });
   }
 }
 
-export function writeJsonAtomic(path, value) {
+export function writeJsonAtomic(path, value, onProgress = undefined) {
   try {
     if (lstatSync(path).isSymbolicLink()) throw new TypeError("refusing to replace a symbolic-link output path");
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
+  onProgress?.();
+  const content = `${JSON.stringify(value)}\n`;
+  onProgress?.();
   const pendingPath = join(dirname(path), `.${basename(path)}.pending-${randomUUID()}`);
   try {
-    writeFileSync(pendingPath, `${JSON.stringify(value)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    writeFileSync(pendingPath, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    onProgress?.();
     renameSync(pendingPath, path);
   } finally {
     rmSync(pendingPath, { force: true });

@@ -145,6 +145,28 @@ test("capture persists complete immutable inputs despite repository diff setting
   assert.deepEqual(configured, initial);
 });
 
+test("capture ignores inherited Git execution controls", async (t) => {
+  const { repoRoot, baseSha, headSha } = createFixture(t);
+  const hostileRoot = mkdtempSync(join(tmpdir(), "hostile-git-"));
+  t.after(() => rmSync(hostileRoot, { recursive: true, force: true }));
+  runGit(hostileRoot, ["init", "-q"]);
+  const originalGitDir = process.env.GIT_DIR;
+  const originalGitWorkTree = process.env.GIT_WORK_TREE;
+  process.env.GIT_DIR = join(hostileRoot, ".git");
+  process.env.GIT_WORK_TREE = hostileRoot;
+  try {
+    const result = await captureReviewInput({ repoRoot, baseSha, headSha, limits: TEST_LIMITS });
+    assert.equal(result.status, "complete");
+    assert.equal(result.base_sha, baseSha);
+    assert.equal(result.head_sha, headSha);
+  } finally {
+    if (originalGitDir === undefined) delete process.env.GIT_DIR;
+    else process.env.GIT_DIR = originalGitDir;
+    if (originalGitWorkTree === undefined) delete process.env.GIT_WORK_TREE;
+    else process.env.GIT_WORK_TREE = originalGitWorkTree;
+  }
+});
+
 test("capture failures are diagnostic-only capacity envelopes", async (t) => {
   const { repoRoot, baseSha, headSha } = createFixture(t);
   await assertDiagnostic(await captureReviewInput({
@@ -185,6 +207,80 @@ test("deadline kills the git process tree without writing partial output", async
     else process.env.FAKE_GIT_CHILD_PID = originalPidPath;
     rmSync(bin, { recursive: true, force: true });
   }
+});
+
+test("deadline during finalization publishes only a diagnostic envelope", async (t) => {
+  const { repoRoot, baseSha, headSha } = createFixture(t);
+  const baseline = await captureReviewInput({ repoRoot, baseSha, headSha, limits: TEST_LIMITS });
+  const bin = mkdtempSync(join(tmpdir(), "counting-git-"));
+  const callsPath = join(bin, "calls");
+  const fakeGit = join(bin, "git");
+  writeFileSync(fakeGit, "#!/bin/sh\nprintf . >> \"$CAPTURE_GIT_CALLS\"\nexec /usr/bin/git \"$@\"\n");
+  chmodSync(fakeGit, 0o755);
+  const outputPath = join(repoRoot, "capture.json");
+  const originalPath = process.env.PATH;
+  const originalCallsPath = process.env.CAPTURE_GIT_CALLS;
+  const originalNow = Date.now;
+  const startedAt = originalNow();
+  const finalGitCall = 4 + baseline.object_table.length;
+  process.env.PATH = `${bin}:${originalPath}`;
+  process.env.CAPTURE_GIT_CALLS = callsPath;
+  Date.now = () => (
+    existsSync(callsPath) && readFileSync(callsPath).length >= finalGitCall
+      ? startedAt + TEST_LIMITS.maxCaptureMilliseconds + 1
+      : startedAt
+  );
+  try {
+    const result = await captureReviewInput({ repoRoot, baseSha, headSha, outputPath, limits: TEST_LIMITS });
+    assertDiagnostic(result, "deadline");
+    assert.deepEqual(JSON.parse(readFileSync(outputPath, "utf8")), result);
+  } finally {
+    Date.now = originalNow;
+    process.env.PATH = originalPath;
+    if (originalCallsPath === undefined) delete process.env.CAPTURE_GIT_CALLS;
+    else process.env.CAPTURE_GIT_CALLS = originalCallsPath;
+    rmSync(bin, { recursive: true, force: true });
+  }
+});
+
+test("temporary output setup fails before any Git process starts", (t) => {
+  const { repoRoot, baseSha, headSha } = createFixture(t);
+  const bin = mkdtempSync(join(tmpdir(), "open-failure-git-"));
+  const markerPath = join(bin, "started");
+  const childPidPath = join(bin, "child.pid");
+  const fakeGit = join(bin, "git");
+  const preloadPath = join(bin, "inject-open-failure.cjs");
+  const limitsPath = join(repoRoot, "limits.json");
+  const outputPath = join(repoRoot, "capture.json");
+  writeFileSync(fakeGit, "#!/bin/sh\n(sleep 60) >/dev/null 2>&1 &\necho $! > \"$OPEN_FAILURE_CHILD_PID\"\ntouch \"$OPEN_FAILURE_STARTED\"\nexit 0\n");
+  writeFileSync(preloadPath, "const fs = require('node:fs'); const { syncBuiltinESMExports } = require('node:module'); const openSync = fs.openSync; fs.openSync = (path, ...args) => { if (String(path).includes('/review-capture-')) throw new Error('injected temporary-open failure'); return openSync(path, ...args); }; syncBuiltinESMExports();\n");
+  chmodSync(fakeGit, 0o755);
+  writeFileSync(limitsPath, JSON.stringify({
+    schema_version: 1,
+    max_patch_bytes: TEST_LIMITS.maxPatchBytes,
+    max_raw_z_bytes: TEST_LIMITS.maxRawZBytes,
+    max_single_blob_bytes: TEST_LIMITS.maxSingleBlobBytes,
+    max_total_blob_bytes: TEST_LIMITS.maxTotalBlobBytes,
+    max_capture_seconds: 5,
+  }));
+  t.after(() => {
+    if (existsSync(childPidPath)) spawnSync("kill", ["-KILL", readFileSync(childPidPath, "utf8").trim()]);
+    rmSync(bin, { recursive: true, force: true });
+  });
+  const result = spawnSync(process.execPath, ["scripts/review-capture.mjs", "capture", "--repo", repoRoot, "--base", baseSha, "--head", headSha, "--limits", limitsPath, "--out", outputPath], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      NODE_OPTIONS: `--require=${preloadPath}`,
+      OPEN_FAILURE_CHILD_PID: childPidPath,
+      OPEN_FAILURE_STARTED: markerPath,
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(existsSync(markerPath), false);
+  assert.equal(JSON.parse(readFileSync(outputPath, "utf8")).status, "capture_failed");
 });
 
 test("git process errors redact process output from capture envelopes", async (t) => {
