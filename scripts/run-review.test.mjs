@@ -916,9 +916,12 @@ test("partition shadow is an isolated opt-in hosted diagnostic", () => {
   const source = readFileSync(workflow, "utf8");
   const inputs = source.match(/^    inputs:\n[\s\S]*?(?=^    secrets:)/m)?.[0];
   const shadowJob = source.slice(source.indexOf("  partition-shadow:\n"));
+  const dispatch = source.match(/^  workflow_dispatch:\n[\s\S]*?(?=^  pull_request_target:)/m)?.[0];
 
   assert.ok(inputs);
   assert.match(inputs, /^      partition_shadow:\n        description: Compute diagnostic-only partition manifests after review\.\n        type: boolean\n        default: false$/m);
+  assert.ok(dispatch);
+  assert.match(dispatch, /^      partition_shadow:\n        description: Compute diagnostic-only partition manifests after review\.\n        type: boolean\n        default: false$/m);
   assert.ok(shadowJob);
   assert.match(shadowJob, /^    needs: review$/m);
   assert.match(shadowJob, /^    if: \$\{\{ always\(\) && inputs\.partition_shadow \}\}$/m);
@@ -940,6 +943,7 @@ test("partition shadow is an isolated opt-in hosted diagnostic", () => {
       < shadowJob.indexOf("capture partition shadow diagnostics"),
   );
   assert.doesNotMatch(shadowJob, /^\s+outputs:/m);
+  assert.doesNotMatch(shadowJob, /steps\.target\.outputs\.token/);
   assert.doesNotMatch(source.match(/^  review:\n[\s\S]*?(?=^  [a-zA-Z][\w-]+:|\z)/m)?.[0] ?? "", /review-partition-shadow\.json/);
   assert.doesNotMatch(
     source.match(/^  workflow_call:\n    outputs:\n[\s\S]*?(?=^    inputs:)/m)?.[0] ?? "",
@@ -972,6 +976,12 @@ if [ "\${1##*/}" = partition-shadow-app-token.mjs ]; then
 fi
 exec "$REAL_NODE" "$@"
 `);
+  const gitLog = join(directory, "git.log");
+  const gitBinary = join(bin, "git");
+  writeFileSync(gitBinary, `#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GIT_LOG"
+`);
+  chmodSync(gitBinary, 0o755);
   chmodSync(gh, 0o755);
   chmodSync(node, 0o755);
   const resolve = (env) => {
@@ -983,9 +993,11 @@ exec "$REAL_NODE" "$@"
         ...env,
         PATH: `${bin}:${process.env.PATH}`,
         REAL_NODE: process.execPath,
+        GIT_LOG: gitLog,
         GITHUB_OUTPUT: outputFile,
         GITHUB_REPOSITORY: "owner/repo",
         RUNNER_TEMP: directory,
+        GITHUB_WORKSPACE: join(directory, "workspace"),
       },
     });
     assert.equal(result.status, 0, result.stderr);
@@ -1013,9 +1025,13 @@ exec "$REAL_NODE" "$@"
     pr: "9",
     base: "b".repeat(40),
     head: "h".repeat(40),
-    token: "partition-shadow-read-token",
     eligible: "true",
+    checked_out: "true",
   });
+  assert.doesNotMatch(readFileSync(outputFile, "utf8"), /partition-shadow-read-token/);
+  const appCheckout = readFileSync(gitLog, "utf8");
+  assert.match(appCheckout, new RegExp(`fetch.*${"b".repeat(40)}.*${"h".repeat(40)}`));
+  assert.match(appCheckout, /checkout --detach --force/);
 });
 
 test("partition shadow installer forwarding is explicit and defaults off", (t) => {

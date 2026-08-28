@@ -294,6 +294,10 @@ on:
         description: Pull request number to review.
         type: string
         required: true
+      partition_shadow:
+        description: Compute diagnostic-only partition manifests after review.
+        type: boolean
+        default: false
       max_parallel:
         description: Maximum independent model passes to execute concurrently.
         type: number
@@ -1733,6 +1737,11 @@ jobs:
           NODE
           token="$(node "${RUNNER_TEMP}/partition-shadow-app-token.mjs" "$IN_REPO")"
           echo "::add-mask::$token"
+          cleanup_token() {
+            rm -f -- "${RUNNER_TEMP}/partition-shadow-app-token.mjs"
+            unset token auth
+          }
+          trap cleanup_token EXIT
           gh_t() { GH_TOKEN="$token" gh api "repos/${IN_REPO}/pulls/${IN_PR}" --jq "$1"; }
           [ "$(gh_t .state)" = "open" ] || { echo "::error::${IN_REPO}#${IN_PR} is not open"; exit 1; }
           if [ "$(gh_t .draft)" = "true" ] \
@@ -1740,22 +1749,34 @@ jobs:
             echo "eligible=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          base="$(gh_t .base.sha)"
+          head="$(gh_t .head.sha)"
+          auth="$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')"
+          git -C "$GITHUB_WORKSPACE" init --quiet
+          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/${IN_REPO}.git"
+          git -C "$GITHUB_WORKSPACE" \
+            -c credential.helper= \
+            -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+            fetch --no-tags --depth=1 origin "$base" "$head"
+          auth=""
+          git -C "$GITHUB_WORKSPACE" checkout --detach --force "$head"
+          cleanup_token
+          trap - EXIT
           {
             echo "repo=$IN_REPO"
             echo "pr=$IN_PR"
-            echo "base=$(gh_t .base.sha)"
-            echo "head=$(gh_t .head.sha)"
-            echo "token=$token"
+            echo "base=$base"
+            echo "head=$head"
+            echo "checked_out=true"
             echo "eligible=true"
           } >> "$GITHUB_OUTPUT"
 
       - name: checkout immutable partition shadow target
-        if: steps.target.outputs.eligible == 'true'
+        if: steps.target.outputs.eligible == 'true' && steps.target.outputs.checked_out != 'true'
         uses: actions/checkout@v4
         with:
           repository: ${{ steps.target.outputs.repo }}
           ref: ${{ steps.target.outputs.head }}
-          token: ${{ steps.target.outputs.token || github.token }}
           fetch-depth: 0
           persist-credentials: false
 
