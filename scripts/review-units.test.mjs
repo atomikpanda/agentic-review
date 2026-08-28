@@ -287,6 +287,23 @@ test("indexes many changed lines without rescanning prior hunk events", () => {
     Array.prototype.filter = originalFilter;
   }
 });
+test("validates many changed lines with indexed expected-line membership", () => {
+  const changedLines = 512;
+  const patch = `diff --git a/old.txt b/old.txt\n@@ -1,${changedLines} +1,${changedLines} @@\n${Array.from({ length: changedLines }, (_, index) => `-old-${index}\n+new-${index}\n`).join("")}`;
+  const originalIncludes = Array.prototype.includes;
+  let expectedLineMembershipScans = 0;
+  Array.prototype.includes = function (...args) {
+    if (this[0] === "0:0:old:0") expectedLineMembershipScans += 1;
+    return originalIncludes.apply(this, args);
+  };
+  try {
+    const result = atomizeCapturedReviewInput(capture({ raw: rawRecord({}), patch }));
+    assert.equal(result.status, "complete", JSON.stringify(result));
+  } finally {
+    Array.prototype.includes = originalIncludes;
+  }
+  assert.equal(expectedLineMembershipScans, 0, `validated ${expectedLineMembershipScans} expected changed-line keys with Array#includes`);
+});
 
 test("atomizes many short changed lines with linearly bounded array iteration", () => {
   const changedLines = 2_000;

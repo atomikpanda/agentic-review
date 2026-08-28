@@ -470,6 +470,7 @@ export function validateAtomization(result, capture, suppliedState = undefined) 
   const rows = state.rows ?? objectRows(capture);
   const { sectionForRecord, recordForSection } = state.sectionForRecord ? { sectionForRecord: state.sectionForRecord, recordForSection: state.recordForSection } : correlate(records, sections);
   const expectedLines = expectedChangedLineKeys(sections);
+  const expectedLineSet = new Set(expectedLines);
   const rawOwners = Array.isArray(result.coverage?.raw_record_owners) ? result.coverage.raw_record_owners : [];
   const lineOwners = Array.isArray(result.coverage?.changed_line_owners) ? result.coverage.changed_line_owners : [];
   const atomsById = new Map(Array.isArray(result.atoms) ? result.atoms.map((atom) => [atom.atom_id, atom]) : []);
@@ -487,7 +488,7 @@ export function validateAtomization(result, capture, suppliedState = undefined) 
     if (atom?.kind === "text") lineCounts.set(owner.line_key, (lineCounts.get(owner.line_key) ?? 0) + 1);
   }
   if (expectedLines.some((key) => (lineCounts.get(key) ?? 0) === 0) || lineOwners.some((owner) => atomsById.get(owner.atom_id)?.kind !== "text")) reasons.push("missing_changed_line_owner");
-  if ([...lineCounts.values()].some((value) => value > 1) || [...lineCounts.keys()].some((key) => !expectedLines.includes(key))) reasons.push("duplicate_changed_line_owner");
+  if ([...lineCounts.values()].some((value) => value > 1) || [...lineCounts.keys()].some((key) => !expectedLineSet.has(key))) reasons.push("duplicate_changed_line_owner");
   if (records.some((_, index) => sectionForRecord ? sectionForRecord[index] === -1 : false) || recordForSection.some((index) => index === -1)) reasons.push("raw_patch_path_disagreement");
   try {
     if (modeObjectBlobDisagreement(records, rows)) reasons.push("mode_object_blob_disagreement");
