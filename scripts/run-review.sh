@@ -35,7 +35,12 @@
 #   --publication-out FILE atomically write findings, metadata, and reviewed scope here
 #                                                     $AGENTIC_REVIEW_PUBLICATION_OUT
 #   --diagnostics-out FILE write bounded per-attempt failure diagnostics
-#                                                     $AGENTIC_REVIEW_DIAGNOSTICS_OUT
+#   --partition-shadow write an optional local partition-planning shadow
+#   --partition-shadow-out FILE destination for the local partition shadow
+#                           (required with --partition-shadow)
+#                                                     no hosted environment
+#                                                     interface
+#   --execution-profile-out FILE write the trusted ordered descriptor profile
 #   --no-state          do not update local review history
 #   --open              list findings still open from previous runs
 #   --all               list every tracked finding, including dismissed
@@ -104,8 +109,23 @@ MAX_PARALLEL="${AGENTIC_REVIEW_MAX_PARALLEL:-3}"
 MIN_VOTES="${AGENTIC_REVIEW_MIN_VOTES:-1}"
 PUBLICATION_OUT="${AGENTIC_REVIEW_PUBLICATION_OUT:-}"
 DIAGNOSTICS_OUT="${AGENTIC_REVIEW_DIAGNOSTICS_OUT:-}"
+PARTITION_SHADOW_INPUT="${AGENTIC_REVIEW_PARTITION_SHADOW:-false}"
+PARTITION_SHADOW_OUT="${AGENTIC_REVIEW_PARTITION_SHADOW_OUT:-}"
+case "$PARTITION_SHADOW_INPUT" in
+  true) PARTITION_SHADOW=1 ;;
+  false) PARTITION_SHADOW=0 ;;
+  *) printf '%s\n' "AGENTIC_REVIEW_PARTITION_SHADOW must be true or false" >&2; exit 2 ;;
+esac
+unset AGENTIC_REVIEW_PARTITION_SHADOW AGENTIC_REVIEW_PARTITION_SHADOW_OUT
+PARTITION_SHADOW_OUT_DIR_FD=""
+PARTITION_SHADOW_OUT_FD_PATH=""
+EXECUTION_PROFILE_OUT=""
+EXECUTION_PROFILE_OUT_REJECTED=0
+PASS_MAX_ATTEMPTS=2
 PASS_DIAGNOSTIC_STDERR_BYTES=4096
 PASS_DIAGNOSTIC_STDERR_LINES=64
+# Local complete shadows retain capture evidence beyond the hosted artifact cap.
+LOCAL_SHADOW_VALIDATION_MAX_BYTES=9007199254740991
 TRUSTED_DATA_ROOT="${AGENTIC_REVIEW_TRUSTED_DATA_ROOT:-}"
 STAGED=0; OUT=""; FAIL_ON_FINDINGS=1; AS_JSON=0; USE_CODEGRAPH=1; VIEW=""; TRUST_REPO="${TRUST_REPO:-0}"; RECORD_STATE=1
 PASSTHRU=()
@@ -129,6 +149,9 @@ while [ $# -gt 0 ]; do
     --out)          OUT="${2:-}"; shift 2 ;;
     --publication-out) PUBLICATION_OUT="${2:-}"; shift 2 ;;
     --diagnostics-out) DIAGNOSTICS_OUT="${2:-}"; shift 2 ;;
+    --partition-shadow) PARTITION_SHADOW=1; shift ;;
+    --partition-shadow-out) PARTITION_SHADOW_OUT="${2:-}"; shift 2 ;;
+    --execution-profile-out) EXECUTION_PROFILE_OUT="${2:-}"; shift 2 ;;
     --staged)       STAGED=1; shift ;;
     --no-fail)      FAIL_ON_FINDINGS=0; shift ;;
     --no-codegraph) USE_CODEGRAPH=0; shift ;;
@@ -303,6 +326,50 @@ if [ -n "$DIAGNOSTICS_OUT" ] && {
       && [ "$DIAGNOSTICS_IDENTITY" = "$PUBLICATION_IDENTITY" ]; }
 }; then
   die "--diagnostics-out must be distinct from review output destinations"
+fi
+if [ "$PARTITION_SHADOW" = 1 ] && [ -z "$PARTITION_SHADOW_OUT" ]; then
+  die "--partition-shadow requires --partition-shadow-out FILE"
+fi
+if [ "$PARTITION_SHADOW" = 1 ] && [ -L "$PARTITION_SHADOW_OUT" ]; then
+  die "--partition-shadow-out cannot be a symlink destination"
+fi
+if [ "$PARTITION_SHADOW" = 1 ]; then
+  PARTITION_SHADOW_OUT_IDENTITY="$(destination_identity "$PARTITION_SHADOW_OUT")"
+  if { [ -n "$OUT" ] && [ "$PARTITION_SHADOW_OUT_IDENTITY" = "$OUT_IDENTITY" ]; } \
+     || { [ -n "$PUBLICATION_OUT" ] \
+       && [ "$PARTITION_SHADOW_OUT_IDENTITY" = "$PUBLICATION_IDENTITY" ]; } \
+     || { [ -n "$DIAGNOSTICS_OUT" ] \
+       && [ "$PARTITION_SHADOW_OUT_IDENTITY" = "$DIAGNOSTICS_IDENTITY" ]; }; then
+    die "--partition-shadow-out must be distinct from review output destinations"
+  fi
+  PARTITION_SHADOW_OUT_PARENT="$(dirname "$PARTITION_SHADOW_OUT_IDENTITY")"
+  PARTITION_SHADOW_OUT_NAME="$(basename "$PARTITION_SHADOW_OUT_IDENTITY")"
+  if ! exec {PARTITION_SHADOW_OUT_DIR_FD}<"$PARTITION_SHADOW_OUT_PARENT"; then
+    die "could not hold --partition-shadow-out parent directory"
+  fi
+  PARTITION_SHADOW_OUT_FD_PATH="/proc/self/fd/$PARTITION_SHADOW_OUT_DIR_FD/$PARTITION_SHADOW_OUT_NAME"
+fi
+if [ -n "$EXECUTION_PROFILE_OUT" ] && [ ! -L "$EXECUTION_PROFILE_OUT" ]; then
+  EXECUTION_PROFILE_OUT_IDENTITY="$(destination_identity "$EXECUTION_PROFILE_OUT")"
+  if { [ -n "$OUT" ] && [ "$EXECUTION_PROFILE_OUT_IDENTITY" = "$OUT_IDENTITY" ]; } \
+     || { [ -n "$PUBLICATION_OUT" ] \
+       && [ "$EXECUTION_PROFILE_OUT_IDENTITY" = "$PUBLICATION_IDENTITY" ]; } \
+     || { [ -n "$DIAGNOSTICS_OUT" ] \
+       && [ "$EXECUTION_PROFILE_OUT_IDENTITY" = "$DIAGNOSTICS_IDENTITY" ]; } \
+     || { [ "$PARTITION_SHADOW" = 1 ] \
+       && [ "$EXECUTION_PROFILE_OUT_IDENTITY" = "$PARTITION_SHADOW_OUT_IDENTITY" ]; }; then
+    die "--execution-profile-out must be distinct from review output destinations"
+  fi
+fi
+if [ "$PARTITION_SHADOW" = 1 ]; then
+  rm -f -- "$PARTITION_SHADOW_OUT_FD_PATH" \
+    || die "could not clear stale partition shadow at $PARTITION_SHADOW_OUT"
+fi
+if [ -n "$EXECUTION_PROFILE_OUT" ]; then
+  if [ -L "$EXECUTION_PROFILE_OUT" ] \
+     || ! rm -f -- "$EXECUTION_PROFILE_OUT"; then
+    EXECUTION_PROFILE_OUT_REJECTED=1
+  fi
 fi
 
 if [ -n "$DIAGNOSTICS_OUT" ]; then
@@ -526,6 +593,10 @@ cleanup_worktree() {
   if [ -n "$WORKTREE" ]; then
     git worktree remove --force "$WORKTREE" 2>/dev/null || rm -rf -- "$WORKTREE"
     WORKTREE=""
+  fi
+  if [ -n "$PARTITION_SHADOW_OUT_DIR_FD" ]; then
+    eval "exec ${PARTITION_SHADOW_OUT_DIR_FD}<&-"
+    PARTITION_SHADOW_OUT_DIR_FD=""
   fi
   if [ -n "$RUN_TMP" ]; then rm -rf -- "$RUN_TMP"; RUN_TMP=""; fi
 }
@@ -971,6 +1042,70 @@ CONFIGURATION_FINGERPRINT="$CONFIGURATION_FINGERPRINT" node -e '
 node "$RESULT_HELPER" scope "$SCOPE_FILE" >/dev/null \
   || die "could not validate review scope"
 
+SHADOW_SETUP_STATUS=""
+SHADOW_SETUP_REASON=""
+if [ "$EXECUTION_PROFILE_OUT_REJECTED" = 1 ]; then
+  SHADOW_SETUP_STATUS="planner_failed"
+  SHADOW_SETUP_REASON="execution_profile_output_unavailable"
+fi
+if [ "$PARTITION_SHADOW" = 1 ] || [ -n "$EXECUTION_PROFILE_OUT" ]; then
+  SHADOW_LIMITS_FILE="$RUN_TMP/shadow-limits.json"
+  SHADOW_PROFILE_FILE="$RUN_TMP/shadow-profile.json"
+  SHADOW_CONFIG_FILE="$RUN_TMP/shadow-config.json"
+  cat > "$SHADOW_LIMITS_FILE" <<'EOF'
+{"schema_version":1,"max_patch_bytes":8388608,"max_raw_z_bytes":8388608,"max_single_blob_bytes":16777216,"max_total_blob_bytes":67108864,"max_capture_seconds":30}
+EOF
+  cat > "$SHADOW_CONFIG_FILE" <<'EOF'
+{"schema_version":1,"benchmark_revision":"","atom_target_bytes":16000,"unit_target_bytes":64000,"max_frontier_units":128,"max_shadow_artifact_bytes":4194304}
+EOF
+  SHADOW_PROFILE_READY=0
+  if node --input-type=module -e '
+    import { readFileSync, writeFileSync } from "node:fs";
+    import { pathToFileURL } from "node:url";
+    const [configurationFile, profileFile, canonicalJsonFile, attempts] = process.argv.slice(1);
+    const { canonicalSha256 } = await import(pathToFileURL(canonicalJsonFile).href);
+    const configuration = JSON.parse(readFileSync(configurationFile, "utf8"));
+    const descriptors = configuration.pass_descriptors;
+    const profile = {
+      schema_version: 1,
+      descriptors: descriptors.map(({ id }) => id),
+      descriptor_content_hashes: descriptors.map(({ lens, lens_content, skill_content }) =>
+        canonicalSha256({ lens, lens_content, skill_content })),
+      max_output_attempts: Number(attempts),
+    };
+    writeFileSync(profileFile, `${JSON.stringify(profile)}\n`, { mode: 0o600 });
+  ' "$CONFIG_FILE" "$SHADOW_PROFILE_FILE" "$SELF_ROOT/scripts/lib-canonical-json.mjs" \
+    "$PASS_MAX_ATTEMPTS" 2>/dev/null \
+    && node -e '
+      const fs = require("node:fs");
+      const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const keys = Object.keys(value).sort().join(",");
+      if (keys !== "descriptor_content_hashes,descriptors,max_output_attempts,schema_version"
+        || value.schema_version !== 1
+        || !Array.isArray(value.descriptors) || value.descriptors.length === 0
+        || value.descriptors.some((entry) => typeof entry !== "string" || !entry)
+        || !Array.isArray(value.descriptor_content_hashes)
+        || value.descriptor_content_hashes.length !== value.descriptors.length
+        || value.descriptor_content_hashes.some((entry) => !/^[0-9a-f]{64}$/.test(entry))
+        || !Number.isSafeInteger(value.max_output_attempts) || value.max_output_attempts <= 0) {
+        process.exit(1);
+      }
+    ' "$SHADOW_PROFILE_FILE" 2>/dev/null; then
+    SHADOW_PROFILE_READY=1
+  else
+    SHADOW_SETUP_STATUS="planner_failed"
+    SHADOW_SETUP_REASON="execution_profile_generation_failed"
+    rm -f -- "$SHADOW_PROFILE_FILE"
+  fi
+  if [ -n "$EXECUTION_PROFILE_OUT" ] && [ "$SHADOW_PROFILE_READY" = 1 ]; then
+    if [ -L "$EXECUTION_PROFILE_OUT" ] \
+       || ! cp "$SHADOW_PROFILE_FILE" "$EXECUTION_PROFILE_OUT"; then
+      SHADOW_SETUP_STATUS="planner_failed"
+      SHADOW_SETUP_REASON="execution_profile_output_unavailable"
+    fi
+  fi
+fi
+
 step "Reviewing with $MODEL"
 say "read-only tools: $TOOLS${THINKING:+ | thinking: $THINKING} | passes: ${#PASS_IDS[@]} | max parallel: $MAX_PARALLEL"
 
@@ -1121,7 +1256,7 @@ run_pass_worker() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
   : > "$diagnostics"
-  for attempt in 1 2; do
+  for ((attempt = 1; attempt <= PASS_MAX_ATTEMPTS; attempt++)); do
     attempts="$attempt"
     if run_pass "$RUN_TMP/prompt.$pass_index" "$out_file" \
        "$RUN_TMP/skill.$pass_index" "${PASS_IDS[pass_index]}"; then
@@ -1462,10 +1597,250 @@ publish_findings() {
   fi
 }
 
+run_shadow_command() {
+  local stderr_file="$1" fifo="${1}.fifo" reader command_status
+  shift
+  rm -f -- "$stderr_file" "$fifo"
+  mkfifo "$fifo" || return 125
+  node -e '
+    const fs = require("node:fs");
+    const output = fs.openSync(process.argv[1], "wx", 0o600);
+    let written = 0;
+    process.stdin.on("data", (chunk) => {
+      const remaining = 512 - written;
+      if (remaining <= 0) return;
+      const admitted = chunk.subarray(0, remaining);
+      fs.writeSync(output, admitted);
+      written += admitted.length;
+    });
+    process.stdin.on("end", () => fs.closeSync(output));
+  ' "$stderr_file" <"$fifo" &
+  reader=$!
+  if "$@" 2>"$fifo"; then command_status=0; else command_status=$?; fi
+  wait "$reader" || :
+  rm -f -- "$fifo"
+  return "$command_status"
+}
+
+stage_shadow_helper_diagnostic() {
+  local requested_status="$1" reason="$2" stderr_file="$3" staged_local="$4"
+  if node --input-type=module -e '
+    import { readFileSync } from "node:fs";
+    import { pathToFileURL } from "node:url";
+    const [
+      configFile, captureFile, destination, requestedStatus, reason,
+      baseSha, headSha, stderrFile, helper,
+    ] = process.argv.slice(1);
+    const { buildShadowDiagnostic, writeShadowOutput } =
+      await import(pathToFileURL(helper).href);
+    const config = JSON.parse(readFileSync(configFile, "utf8"));
+    let capture;
+    try { capture = JSON.parse(readFileSync(captureFile, "utf8")); } catch {}
+    const stderrPresent = (() => {
+      try { return readFileSync(stderrFile).length > 0; } catch { return false; }
+    })();
+    const canReportPlannerFailure = requestedStatus === "planner_failed"
+      && capture?.status === "complete";
+    const canReportCapacity = capture?.status === "capture_capacity_exceeded";
+    const details = {
+      status: canReportCapacity
+        ? "capture_capacity_exceeded"
+        : canReportPlannerFailure ? "planner_failed" : "capture_failed",
+      base_sha: baseSha,
+      head_sha: headSha,
+      benchmark_revision: config.benchmark_revision,
+      reason_codes: [canReportCapacity
+        ? capture.capacity_reason
+        : canReportPlannerFailure ? reason : "capture_result_unavailable"],
+      diagnostic: stderrPresent
+        ? "Shadow helper failed; stderr redacted."
+        : "Shadow helper failed without stderr.",
+      observed_lower_bounds: canReportCapacity
+        ? capture.observed_lower_bounds
+        : {
+            patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0,
+            elapsed_milliseconds: 0,
+          },
+      counts: {},
+    };
+    if (canReportPlannerFailure) details.capture = capture;
+    writeShadowOutput(destination,
+      buildShadowDiagnostic(details, config.max_shadow_artifact_bytes));
+  ' "$SHADOW_CONFIG_FILE" "$RUN_TMP/shadow-capture.json" "$staged_local" \
+    "$requested_status" "$reason" "$BASE_SHA" "$HEAD_SHA" "$stderr_file" \
+    "$SELF_ROOT/scripts/review-units.mjs" 2>/dev/null; then
+    return 0
+  fi
+  node --input-type=module -e '
+    import { randomUUID } from "node:crypto";
+    import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+    import { dirname, join } from "node:path";
+    const [configFile, captureFile, destination, requestedStatus, reason, baseSha, headSha] =
+      process.argv.slice(1);
+    const emptyBounds = {
+      patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0,
+      elapsed_milliseconds: 0,
+    };
+    const validBounds = (value) => value !== null && typeof value === "object"
+      && Object.keys(value).sort().join(",") === "blob_bytes,blob_count,elapsed_milliseconds,patch_bytes,raw_z_bytes"
+      && Object.values(value).every((entry) => Number.isSafeInteger(entry) && entry >= 0);
+    let maxBytes = 4 * 1024 * 1024;
+    try {
+      const configured = JSON.parse(readFileSync(configFile, "utf8")).max_shadow_artifact_bytes;
+      if (Number.isSafeInteger(configured) && configured > 0) maxBytes = configured;
+    } catch {}
+    let capture;
+    try { capture = JSON.parse(readFileSync(captureFile, "utf8")); } catch {}
+    const capacity = capture?.status === "capture_capacity_exceeded"
+      && ["patch_bytes", "raw_z_bytes", "blob_bytes", "deadline"].includes(capture.capacity_reason)
+      && validBounds(capture.observed_lower_bounds);
+    const complete = capture?.status === "complete"
+      && /^[0-9a-f]{64}$/.test(capture.capture_hash);
+    const planner = !capacity && complete && requestedStatus === "planner_failed";
+    const diagnostic = {
+      schema_version: 1,
+      status: capacity ? "capture_capacity_exceeded" : planner ? "planner_failed" : "capture_failed",
+      mode: "partition_shadow",
+      base_sha: baseSha,
+      head_sha: headSha,
+      benchmark_revision: "",
+      capture_hash: planner ? capture.capture_hash : null,
+      manifest_hash: null,
+      reason_codes: [capacity ? capture.capacity_reason : planner ? reason : "capture_result_unavailable"],
+      diagnostic: "Shadow helper unavailable; details redacted.",
+      observed_lower_bounds: capacity ? capture.observed_lower_bounds : emptyBounds,
+      counts: {},
+      sizes: { encoded_output_bytes: 0 },
+    };
+    const canonicalJson = (value) => {
+      if (value === null || typeof value === "string" || typeof value === "boolean"
+        || (typeof value === "number" && Number.isFinite(value))) return JSON.stringify(value);
+      if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+      if (Object.getPrototypeOf(value) !== Object.prototype) throw new TypeError("diagnostic must be plain JSON");
+      return `{${Object.keys(value).sort().map((key) =>
+        `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+    };
+    for (;;) {
+      const encodedBytes = Buffer.byteLength(`${canonicalJson(diagnostic)}\n`);
+      if (diagnostic.sizes.encoded_output_bytes === encodedBytes) break;
+      diagnostic.sizes.encoded_output_bytes = encodedBytes;
+    }
+    if (diagnostic.sizes.encoded_output_bytes > maxBytes) throw new Error("shadow diagnostic exceeds size limit");
+    const temporary = join(dirname(destination), `.shadow-diagnostic-${randomUUID()}.tmp`);
+    try {
+      writeFileSync(temporary, `${canonicalJson(diagnostic)}\n`, { flag: "wx", mode: 0o600 });
+      renameSync(temporary, destination);
+    } finally {
+      try { unlinkSync(temporary); } catch {}
+    }
+  ' "$SHADOW_CONFIG_FILE" "$RUN_TMP/shadow-capture.json" "$staged_local" \
+    "$requested_status" "$reason" "$BASE_SHA" "$HEAD_SHA"
+}
+
+run_partition_shadow() {
+  [ "$PARTITION_SHADOW" = 1 ] || return 0
+  local status="$SHADOW_SETUP_STATUS" capture_helper units_helper staged_local
+  local capture_stderr="$RUN_TMP/shadow-capture.stderr"
+  local units_stderr="$RUN_TMP/shadow-units.stderr"
+  staged_local="$RUN_TMP/shadow-local.staged.json"
+  capture_helper="$(support_exec scripts/review-capture.mjs || :)"
+  units_helper="$(support_exec scripts/review-units.mjs || :)"
+  if [ -z "$capture_helper" ]; then
+    stage_shadow_helper_diagnostic capture_failed capture_helper_unavailable \
+      "$capture_stderr" "$staged_local" || :
+  elif ! run_shadow_command "$capture_stderr" \
+    node "$capture_helper" capture \
+    --repo "$REVIEW_ROOT" --base "$BASE_SHA" --head "$HEAD_SHA" \
+    --limits "$SHADOW_LIMITS_FILE" \
+    --out "$RUN_TMP/shadow-capture.json"; then
+    stage_shadow_helper_diagnostic capture_failed capture_helper_failed \
+      "$capture_stderr" "$staged_local" || :
+  elif [ ! -s "$RUN_TMP/shadow-capture.json" ]; then
+    stage_shadow_helper_diagnostic capture_failed capture_output_missing \
+      "$capture_stderr" "$staged_local" || :
+  elif [ -n "$status" ]; then
+    stage_shadow_helper_diagnostic "$status" "$SHADOW_SETUP_REASON" \
+      "$units_stderr" "$staged_local" || :
+  elif [ -z "$units_helper" ]; then
+    stage_shadow_helper_diagnostic planner_failed planner_helper_unavailable \
+      "$units_stderr" "$staged_local" || :
+  elif ! run_shadow_command "$units_stderr" \
+    node "$units_helper" shadow \
+    --capture "$RUN_TMP/shadow-capture.json" \
+    --profile "$SHADOW_PROFILE_FILE" \
+    --config "$SHADOW_CONFIG_FILE" \
+    --local-out "$staged_local"; then
+    stage_shadow_helper_diagnostic planner_failed planner_helper_failed \
+      "$units_stderr" "$staged_local" || :
+  elif [ ! -s "$staged_local" ]; then
+    stage_shadow_helper_diagnostic planner_failed planner_output_missing \
+      "$units_stderr" "$staged_local" || :
+  fi
+  if [ -s "$staged_local" ] && [ -n "$units_helper" ] && [ -f "$units_helper" ]; then
+    if ! node "$SELF_ROOT/scripts/review-units.mjs" validate-output \
+      --input "$staged_local" --profile "$SHADOW_PROFILE_FILE" \
+      --config "$SHADOW_CONFIG_FILE" --max-bytes "$LOCAL_SHADOW_VALIDATION_MAX_BYTES" \
+      >>"$units_stderr" 2>&1; then
+      if ! stage_shadow_helper_diagnostic planner_failed planner_output_invalid \
+        "$units_stderr" "$staged_local"; then
+        rm -f -- "$staged_local"
+      fi
+    fi
+  fi
+  if [ -s "$staged_local" ]; then
+    status="$(node -e '
+      const fs = require("node:fs");
+      const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      if (typeof value.status !== "string" || !/^[a-z_]{1,64}$/.test(value.status)) process.exit(1);
+      process.stdout.write(value.status);
+    ' "$staged_local" 2>/dev/null || printf planner_failed)"
+    if ! node -e '
+      const fs = require("node:fs");
+      const { basename, dirname, join } = require("node:path");
+      const { randomBytes } = require("node:crypto");
+      const [source, destination] = process.argv.slice(1);
+      if (fs.existsSync(destination) && fs.lstatSync(destination).isSymbolicLink()) {
+        throw new Error("refusing to replace a symbolic-link output path");
+      }
+      let descriptor;
+      let temporary;
+      try {
+        for (let attempt = 0; attempt < 10; attempt += 1) {
+          temporary = join(dirname(destination),
+            `.${basename(destination)}.tmp-${randomBytes(8).toString("hex")}`);
+          try {
+            descriptor = fs.openSync(temporary, "wx", 0o600);
+            break;
+          } catch (error) {
+            if (error.code !== "EEXIST") throw error;
+          }
+        }
+        if (descriptor === undefined) throw new Error("could not allocate shadow staging file");
+        fs.writeFileSync(descriptor, fs.readFileSync(source));
+        fs.closeSync(descriptor);
+        descriptor = undefined;
+        fs.renameSync(temporary, destination);
+        temporary = undefined;
+      } finally {
+        if (descriptor !== undefined) fs.closeSync(descriptor);
+        if (temporary !== undefined) {
+          try { fs.unlinkSync(temporary); } catch {}
+        }
+      }
+    ' "$staged_local" "$PARTITION_SHADOW_OUT_FD_PATH" 2>/dev/null; then
+      status="planner_failed"
+    fi
+  elif [ -z "$status" ]; then
+    status="capture_failed"
+  fi
+  say "partition shadow: $status"
+}
+
 if [ ${#VALID_OUTS[@]} -eq 0 ]; then
   printf '%s\n' '{"findings":[]}' > "$TMP_OUT"
   write_publication not-run 1
   publish_findings
+  run_partition_shadow
   die "every configured pass failed"
 fi
 UNION_OUT="$RUN_TMP/union.json"
@@ -1553,6 +1928,7 @@ elif RENDERER="$(support_exec scripts/post-review.mjs)"; then
 else
   cat "$TMP_OUT"
 fi
+run_partition_shadow
 
 printf '\n' >&2
 if [ "$CLEAN" = 1 ] && [ "$ANALYSIS_STATE" = "complete" ]; then

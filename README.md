@@ -319,6 +319,33 @@ result at `/tmp/review-result.json` before artifact upload. Locally, `--out`,
 `--publication-out`, and `--diagnostics-out` write the corresponding artifacts
 directly.
 
+### Optional partition shadow diagnostics
+
+`partition_shadow` is off by default. Local `--partition-shadow` runs only
+after every review worker has stopped and the ordinary findings, publication,
+and result have completed. The hosted form is a separate best-effort
+`partition-shadow` job after the authoritative review, with its own five-minute
+timeout plus `contents: read` and `pull-requests: read` permissions. Neither
+adds a gate; capture or planner failure, timeout, and cancellation cannot
+change the review job, result, publication, outputs, comment, summary, or
+merge state.
+
+The capture limits are exactly 8,388,608 patch bytes, 8,388,608 raw-z bytes,
+16,777,216 bytes for one blob, 67,108,864 bytes cumulatively for blobs, and
+30 seconds. Atom payloads target 16,000 bytes, units target 64,000 bytes, and
+the frontier contains at most 128 units. Hosted output is the optional,
+separately retained seven-day `agentic-review-partition-shadow` artifact
+containing only the redacted/compacted `review-partition-shadow.json`, bounded
+to 4,194,304 bytes; it contains no blob or line content.
+
+This is diagnostic-only shadow planning, not convergence, durable state, delta
+reuse, or partitioned execution. Enable it from a reusable caller with
+`partition_shadow: true`, or have the installer emit that setting with
+`--partition-shadow`. Locally, `--partition-shadow` requires its companion
+`--partition-shadow-out FILE` destination. The local environment defaults are
+`AGENTIC_REVIEW_PARTITION_SHADOW=true|false` and
+`AGENTIC_REVIEW_PARTITION_SHADOW_OUT=FILE`; command-line options override them.
+
 ### Standing summaries and finding history
 
 Summary mode does not ask the model for Markdown. It deterministically renders
@@ -450,6 +477,7 @@ cell means that surface does not expose the setting.
 | Broad discovery rounds per cycle | `2` | `max_discovery_rounds` | `--max-discovery-rounds` |  |
 | One additional human-authorized discovery | none | `review_cycle_override_reason` |  |  |
 | Post a PR comment | `true` | `post_comment` | `--no-comment` |  |
+| Partition shadow diagnostics | off | `partition_shadow` | `--partition-shadow` | `--partition-shadow --partition-shadow-out FILE`; `AGENTIC_REVIEW_PARTITION_SHADOW`, `AGENTIC_REVIEW_PARTITION_SHADOW_OUT` |
 | Resolve stale threads | `true` | `resolve_stale` |  |  |
 | Suppress every PR write | `false` | `suppress_writes` |  |  |
 | Block the hosted job on a blocked gate | `false` | `fail_on_findings` | `--fail-on-findings` | `--no-fail` separately suppresses the local any-finding exit |

@@ -37,6 +37,7 @@
 #   --omp-version V          pin @oh-my-pi/pi-coding-agent
 #   --bun-version V          pin bun
 #   --extra-omp-args ARGS    display flags only: --print-thoughts, --hide-thinking, --no-title
+#   --partition-shadow    upload optional non-gating partition diagnostics
 #   --pr-agent-model SLUG    model for PR-Agent on this repo
 
 set -euo pipefail
@@ -65,8 +66,7 @@ REPO=""; OR_KEY=""; ASSUME_YES=0; WITH_PR_AGENT=""; PR_AGENT_MODEL=""
 I_MODEL=""; I_THINKING=""; I_TOOLS=""; I_MAX_TIME=""; I_PROMPT=""; I_SKILL=""
 I_MAX_FINDINGS=""; I_MAX_DISCOVERY_ROUNDS=""; I_MAX_PARALLEL=""; I_FAIL=""; I_COMMENT=""
 I_OMP_VERSION=""; I_BUN_VERSION=""; I_REVIEW_MODE=""
-I_EXTRA_ARGS=""
-
+I_EXTRA_ARGS=""; I_PARTITION_SHADOW=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)             REPO="${2:-}"; shift 2 ;;
@@ -90,6 +90,7 @@ while [ $# -gt 0 ]; do
     --omp-version)      I_OMP_VERSION="${2:-}"; shift 2 ;;
     --bun-version)      I_BUN_VERSION="${2:-}"; shift 2 ;;
     --extra-omp-args)   I_EXTRA_ARGS="${2:-}"; shift 2 ;;
+    --partition-shadow)  I_PARTITION_SHADOW="true"; shift ;;
     -y|--yes)           ASSUME_YES=1; shift ;;
     # Print the header comment, stopping at the first line that isn't one.
     # A line range would silently start leaking code every time the header grows.
@@ -281,6 +282,7 @@ YAML
   emit omp_version      "$I_OMP_VERSION"
   emit bun_version      "$I_BUN_VERSION"
   emit extra_omp_args   "$I_EXTRA_ARGS"
+  emit partition_shadow "$I_PARTITION_SHADOW"
 
   cat >> "$tmp" <<'YAML'
 
@@ -310,6 +312,7 @@ YAML
 #   bun_version:      latest        # omp needs >= 1.3.14 and is bun-only
 #   omp_version:      latest        # pin for reproducible reviews
 #   extra_omp_args:   ''            # display only: --print-thoughts, --hide-thinking, --no-title
+#   partition_shadow:    false         # optional non-gating diagnostics artifact
 YAML
 
   args=(-f "message=chore: enable agentic code review"

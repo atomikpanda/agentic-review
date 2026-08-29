@@ -1,7 +1,7 @@
-import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
+import { canonicalJson, canonicalSha256, isPlainJsonObject } from "./lib-canonical-json.mjs";
 import { isValidFinding, sameFinding } from "./lib-findings.mjs";
 
 export const REVIEW_RESULT_SCHEMA_VERSION = 1;
@@ -52,11 +52,6 @@ const COMPACT_CREDENTIAL_SUFFIXES = [
   "secretaccesskey",
 ];
 
-function isPlainObject(value) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
-  return Object.getPrototypeOf(value) === Object.prototype;
-}
-
 function isCredentialField(key) {
   const segments = key
     .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
@@ -75,40 +70,28 @@ function isCredentialField(key) {
     || COMPACT_CREDENTIAL_SUFFIXES.some((suffix) => compact.endsWith(suffix));
 }
 
-function canonicalize(value, path = "configuration") {
-  if (value === null || typeof value === "string" || typeof value === "boolean") {
-    return JSON.stringify(value);
-  }
-  if (typeof value === "number" && Number.isFinite(value)) return JSON.stringify(value);
+function assertNoCredentialFields(value, path) {
   if (Array.isArray(value)) {
-    const items = [];
     for (let index = 0; index < value.length; index += 1) {
-      if (!Object.hasOwn(value, index)) {
-        throw new TypeError(`${path} must contain only plain JSON data`);
-      }
-      items.push(canonicalize(value[index], `${path}[${index}]`));
+      assertNoCredentialFields(value[index], `${path}[${index}]`);
     }
-    return `[${items.join(",")}]`;
+    return;
   }
-  if (!isPlainObject(value)) {
-    throw new TypeError(`${path} must contain only plain JSON data`);
-  }
-
-  const entries = [];
+  if (!isPlainJsonObject(value)) return;
   for (const key of Object.keys(value).sort()) {
     if (isCredentialField(key)) {
       throw new TypeError(`credential field ${path}.${key} is not allowed in a configuration fingerprint`);
     }
-    entries.push(`${JSON.stringify(key)}:${canonicalize(value[key], `${path}.${key}`)}`);
+    assertNoCredentialFields(value[key], `${path}.${key}`);
   }
-  return `{${entries.join(",")}}`;
 }
 
 export function configurationFingerprint(config) {
-  if (!isPlainObject(config)) {
+  if (!isPlainJsonObject(config)) {
     throw new TypeError("configuration must contain only plain JSON data");
   }
-  return createHash("sha256").update(canonicalize(config)).digest("hex");
+  assertNoCredentialFields(config, "configuration");
+  return canonicalSha256(config, "configuration");
 }
 
 function inspectCanonicalScope(scope) {
@@ -121,12 +104,12 @@ function inspectCanonicalScope(scope) {
   requireFingerprint(scope.configuration_fingerprint, "scope.configuration_fingerprint");
   const diffBytes = decodeCanonicalBase64(scope.diff_base64, "scope.diff_base64");
   requireSha(scope.head_sha, "scope.head_sha");
-  const hash = createHash("sha256").update(canonicalize({
+  const hash = canonicalSha256({
     base_sha: scope.base_sha,
     configuration_fingerprint: scope.configuration_fingerprint,
     diff_base64: scope.diff_base64,
     head_sha: scope.head_sha,
-  }, "scope")).digest("hex");
+  }, "scope");
   return { diffBytes, hash };
 }
 
@@ -178,7 +161,7 @@ export function deriveTrustedScopeMetadata(trustedScope) {
 }
 
 function requirePlainObject(value, path) {
-  if (!isPlainObject(value)) throw new TypeError(`${path} must be an object`);
+  if (!isPlainJsonObject(value)) throw new TypeError(`${path} must be an object`);
 }
 
 function requireBoolean(value, path) {
@@ -834,7 +817,7 @@ export function derivePublicationFailureResult(publication, {
 }
 
 export function validateRunMetadata(value, trustedScope) {
-  canonicalize(value, "metadata");
+  canonicalJson(value, "metadata");
   requirePlainObject(value, "metadata");
   if (value.schema_version !== REVIEW_RESULT_SCHEMA_VERSION) {
     throw new TypeError(`schema_version must be ${REVIEW_RESULT_SCHEMA_VERSION}`);
@@ -932,7 +915,7 @@ export function validateRunMetadata(value, trustedScope) {
 }
 
 export function validateReviewPublication(value) {
-  canonicalize(value, "publication");
+  canonicalJson(value, "publication");
   requirePlainObject(value, "publication");
   const expectedKeys = ["findings", "metadata", "schema_version", "scope"];
   if (!arraysEqual(Object.keys(value).sort(), expectedKeys)) {

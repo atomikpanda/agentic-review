@@ -402,6 +402,13 @@ test("configuration fingerprints reject credentials and unsupported JSON values"
   assert.throws(() => configurationFingerprint(new Date()), /plain JSON/i);
 });
 
+test("generic canonical JSON and configuration credential policy remain separate", () => {
+  assert.throws(
+    () => configurationFingerprint({ model: "example", api_key: "forbidden" }),
+    /credential field configuration\.api_key/,
+  );
+});
+
 test("run metadata validation accepts an internally consistent exact result", () => {
   const metadata = {
     schema_version: REVIEW_RESULT_SCHEMA_VERSION,

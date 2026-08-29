@@ -103,6 +103,10 @@ on:
         description: Optional pull request number used by a same-repository manual dispatcher.
         type: string
         default: ''
+      partition_shadow:
+        description: Compute diagnostic-only partition manifests after review.
+        type: boolean
+        default: false
       model:
         description: Model slug, provider-prefixed (as it appears on openrouter.ai/models).
         type: string
@@ -290,6 +294,10 @@ on:
         description: Pull request number to review.
         type: string
         required: true
+      partition_shadow:
+        description: Compute diagnostic-only partition manifests after review.
+        type: boolean
+        default: false
       max_parallel:
         description: Maximum independent model passes to execute concurrently.
         type: number
@@ -375,6 +383,12 @@ jobs:
       review_next_phase: ${{ steps.continuation_poster.outputs.review_next_phase || steps.poster.outputs.review_next_phase || steps.cycle.outputs.next_phase }}
       discovery_round: ${{ steps.continuation_poster.outputs.discovery_round || steps.poster.outputs.discovery_round || steps.cycle.outputs.discovery_round }}
       max_discovery_rounds: ${{ steps.continuation_poster.outputs.max_discovery_rounds || steps.poster.outputs.max_discovery_rounds || inputs.max_discovery_rounds || 2 }}
+      shadow_repo: ${{ steps.target.outputs.repo }}
+      shadow_pr: ${{ steps.target.outputs.pr }}
+      shadow_base: ${{ steps.target.outputs.base }}
+      shadow_head: ${{ steps.target.outputs.head }}
+      shadow_eligible: ${{ steps.target.outputs.eligible }}
+      shadow_ran: ${{ steps.cycle.outputs.should_run }}
     steps:
       # ONE place that answers "what am I reviewing, and with what credential".
       # Everything downstream reads these outputs instead of
@@ -973,6 +987,7 @@ jobs:
           HEAD: ${{ steps.target.outputs.head }}
           AGENTIC_REVIEW_PHASE: ${{ steps.cycle.outputs.phase }}
           AGENTIC_REVIEW_KNOWN_FINDINGS: /tmp/review-known-findings.json
+          AGENTIC_REVIEW_PARTITION_SHADOW: ${{ inputs.partition_shadow }}
         run: &run-review-phase |
           set -euo pipefail
           actual_head="$(git rev-parse --verify 'HEAD^{commit}')"
@@ -988,6 +1003,7 @@ jobs:
           REVIEW_RUNNER_STDERR=/tmp/review-runner.err
           # A failed continuation must not let its poster consume the preceding
           # verification publication as if it came from final discovery.
+          REVIEW_PARTITION_SHADOW_PROFILE=/tmp/review-partition-shadow-profile.json
           rm -f "$REVIEW_FINDINGS_FILE" "$REVIEW_PUBLICATION_FILE" \
             "$REVIEW_DIAGNOSTICS_FILE" "$REVIEW_RUNNER_STDOUT" "$REVIEW_RUNNER_STDERR"
           RUNNER_ARGS=(
@@ -1010,6 +1026,10 @@ jobs:
           )
           if [ -n "$MAX_TIME" ]; then RUNNER_ARGS+=(--max-time "$MAX_TIME"); fi
           if [ "${CODEGRAPH:-true}" != "true" ]; then RUNNER_ARGS+=(--no-codegraph); fi
+          if [ "${AGENTIC_REVIEW_PARTITION_SHADOW:-false}" = "true" ]; then
+            rm -f "$REVIEW_PARTITION_SHADOW_PROFILE"
+            RUNNER_ARGS+=(--execution-profile-out "$REVIEW_PARTITION_SHADOW_PROFILE")
+          fi
 
           if [ -n "$EXTRA_ARGS" ]; then
             set -f
@@ -1626,6 +1646,16 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+      - name: upload partition shadow execution profile
+        if: ${{ !cancelled() && inputs.partition_shadow && steps.target.outputs.eligible == 'true' && steps.cycle.outputs.should_run == 'true' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentic-review-partition-shadow-profile
+          path: /tmp/review-partition-shadow-profile.json
+          retention-days: 1
+          if-no-files-found: ignore
+
       - name: upload optional review diagnostics
         if: ${{ !cancelled() && steps.target.outputs.eligible == 'true' }}
         uses: actions/upload-artifact@v4
@@ -1637,5 +1667,364 @@ jobs:
             /tmp/review-runner.out
             /tmp/review-runner.err
             /tmp/review-pass-diagnostics.json
+          retention-days: 7
+          if-no-files-found: ignore
+  # This diagnostic-only job deliberately has no outputs and cannot influence
+  # the authoritative review job that precedes it.
+  partition-shadow:
+    needs: review
+    if: ${{ always() && inputs.partition_shadow && needs.review.outputs.shadow_eligible == 'true' && needs.review.outputs.shadow_ran == 'true' && (needs.review.result == 'success' || needs.review.result == 'failure') }}
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: resolve partition shadow target
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          IN_REPO: ${{ needs.review.outputs.shadow_repo }}
+          IN_PR: ${{ needs.review.outputs.shadow_pr }}
+          IN_BASE: ${{ needs.review.outputs.shadow_base }}
+          IN_HEAD: ${{ needs.review.outputs.shadow_head }}
+        run: |
+          set -euo pipefail
+          if [ -z "${IN_REPO:-}" ]; then
+            {
+              echo "repo=${GITHUB_REPOSITORY}"
+              echo "pr=${{ github.event.pull_request.number }}"
+              echo "base=${{ github.event.pull_request.base.sha }}"
+              echo "head=${{ github.event.pull_request.head.sha }}"
+              echo "eligible=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          case "$IN_REPO" in
+            */*[!A-Za-z0-9._/-]*|*/*/*|/*|*/) echo "::error::target_repo is not a plain owner/name: $IN_REPO"; exit 1 ;;
+            */*) ;;
+            *) echo "::error::target_repo is not owner/name: $IN_REPO"; exit 1 ;;
+          esac
+          case "$IN_PR" in ''|*[!0-9]*) echo "::error::target_pr is not a number: $IN_PR"; exit 1 ;; esac
+          if [ -n "${IN_BASE:-}" ] && [ -n "${IN_HEAD:-}" ] && [ "$IN_REPO" = "$GITHUB_REPOSITORY" ]; then
+            {
+              echo "repo=$IN_REPO"
+              echo "pr=$IN_PR"
+              echo "base=$IN_BASE"
+              echo "head=$IN_HEAD"
+              echo "eligible=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$IN_REPO" = "$GITHUB_REPOSITORY" ]; then
+            gh_t() {
+              case "$1" in
+                .base.sha) printf '%s\n' "$IN_BASE" ;;
+                .head.sha) printf '%s\n' "$IN_HEAD" ;;
+                *) gh api "repos/${IN_REPO}/pulls/${IN_PR}" --jq "$1" ;;
+              esac
+            }
+            if [ "$(gh_t .draft)" = "true" ] \
+              || [ "$(gh_t '.head.repo.full_name == .base.repo.full_name')" != "true" ]; then
+              echo "eligible=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            {
+              echo "repo=$IN_REPO"
+              echo "pr=$IN_PR"
+              echo "base=$(gh_t .base.sha)"
+              echo "head=$(gh_t .head.sha)"
+              echo "eligible=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          [ -n "${APP_ID:-}" ] && [ -n "${APP_PRIVATE_KEY:-}" ] \
+            || { echo "::error::target_repo dispatch needs App credentials"; exit 1; }
+          cat > "${RUNNER_TEMP}/partition-shadow-app-token.mjs" <<'NODE'
+          import { createSign } from "node:crypto";
+          const [repo] = process.argv.slice(2);
+          const b64 = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+          const now = Math.floor(Date.now() / 1000);
+          const body = `${b64({ alg: "RS256", typ: "JWT" })}.${b64({ iat: now - 60, exp: now + 540, iss: process.env.APP_ID })}`;
+          const signature = createSign("RSA-SHA256").update(body).end()
+            .sign(process.env.APP_PRIVATE_KEY, "base64url");
+          const jwt = `${body}.${signature}`;
+          const api = async (url, options = {}) => {
+            const response = await fetch(url, {
+              ...options,
+              headers: { authorization: `Bearer ${jwt}`, accept: "application/vnd.github+json", ...options.headers },
+            });
+            if (!response.ok) throw new Error(`${options.method ?? "GET"} ${url} -> ${response.status}`);
+            return response.json();
+          };
+          const installation = await api(`https://api.github.com/repos/${repo}/installation`);
+          const token = await api(installation.access_tokens_url, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              repositories: [repo.split("/")[1]],
+              permissions: { contents: "read", pull_requests: "read" },
+            }),
+          });
+          process.stdout.write(token.token);
+          NODE
+          token="$(node "${RUNNER_TEMP}/partition-shadow-app-token.mjs" "$IN_REPO")"
+          echo "::add-mask::$token"
+          cleanup_token() {
+            rm -f -- "${RUNNER_TEMP}/partition-shadow-app-token.mjs"
+            unset token auth
+          }
+          trap cleanup_token EXIT
+          gh_t() {
+            case "$1" in
+              .base.sha) printf '%s\n' "$IN_BASE" ;;
+              .head.sha) printf '%s\n' "$IN_HEAD" ;;
+              *) GH_TOKEN="$token" gh api "repos/${IN_REPO}/pulls/${IN_PR}" --jq "$1" ;;
+            esac
+          }
+          [ "$(gh_t .state)" = "open" ] || { echo "::error::${IN_REPO}#${IN_PR} is not open"; exit 1; }
+          if [ "$(gh_t .draft)" = "true" ] \
+            || [ "$(gh_t '.head.repo.full_name == .base.repo.full_name')" != "true" ]; then
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base="$(gh_t .base.sha)"
+          head="$(gh_t .head.sha)"
+          auth="$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')"
+          git -C "$GITHUB_WORKSPACE" init --quiet
+          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/${IN_REPO}.git"
+          git -C "$GITHUB_WORKSPACE" \
+            -c credential.helper= \
+            -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+            fetch --no-tags --depth=1 origin "$base" "$head"
+          auth=""
+          git -C "$GITHUB_WORKSPACE" checkout --detach --force "$head"
+          cleanup_token
+          trap - EXIT
+          {
+            echo "repo=$IN_REPO"
+            echo "pr=$IN_PR"
+            echo "base=$base"
+            echo "head=$head"
+            echo "checked_out=true"
+            echo "eligible=true"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: checkout immutable partition shadow target
+        if: steps.target.outputs.eligible == 'true' && steps.target.outputs.checked_out != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.target.outputs.repo }}
+          ref: ${{ steps.target.outputs.head }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: resolve partition shadow support ref
+        id: central-ref
+        if: steps.target.outputs.eligible == 'true'
+        env:
+          IN_CENTRAL_REF: ${{ inputs.central_ref }}
+        run: |
+          set -euo pipefail
+          CENTRAL_REF="${IN_CENTRAL_REF:-main}"
+          if [ "$CENTRAL_REF" = "main" ]; then
+            RESOLVED_REF="refs/heads/main"
+          elif [[ "$CENTRAL_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            RESOLVED_REF="$CENTRAL_REF"
+          elif [[ "$CENTRAL_REF" =~ ^v(0|[1-9][0-9]*)$ ]] \
+            || [[ "$CENTRAL_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            RESOLVED_REF="refs/tags/$CENTRAL_REF"
+          else
+            echo "::error::central_ref is invalid"
+            exit 1
+          fi
+          echo "ref=$RESOLVED_REF" >> "$GITHUB_OUTPUT"
+
+      - name: prepare partition shadow support checkout
+        if: steps.target.outputs.eligible == 'true'
+        run: rm -rf -- .partition-shadow-support
+
+      - name: fetch trusted partition shadow helpers
+        if: steps.target.outputs.eligible == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: atomikpanda/agentic-review
+          ref: ${{ steps.central-ref.outputs.ref }}
+          token: ${{ github.token }}
+          persist-credentials: false
+          path: .partition-shadow-support
+          sparse-checkout: scripts
+
+      - name: strip target agent configuration
+        if: steps.target.outputs.eligible == 'true'
+        run: |
+          bash "$GITHUB_WORKSPACE/.partition-shadow-support/scripts/strip-agent-config.sh" --strip "$GITHUB_WORKSPACE"
+
+      - name: download partition shadow execution profile
+        if: steps.target.outputs.eligible == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: agentic-review-partition-shadow-profile
+          path: ${{ runner.temp }}/partition-shadow-profile
+
+      - name: capture partition shadow diagnostics
+        if: steps.target.outputs.eligible == 'true'
+        env:
+          BASE_SHA: ${{ steps.target.outputs.base }}
+          HEAD_SHA: ${{ steps.target.outputs.head }}
+          SUPPORT_ROOT: ${{ github.workspace }}/.partition-shadow-support
+          PARTITION_SHADOW_OUTPUT: /tmp/review-partition-shadow.json
+        run: |
+          set -euo pipefail
+          LIMITS_FILE="${RUNNER_TEMP}/partition-shadow-limits.json"
+          CONFIG_FILE="${RUNNER_TEMP}/partition-shadow-config.json"
+          PROFILE_FILE="${RUNNER_TEMP}/partition-shadow-profile/review-partition-shadow-profile.json"
+          CAPTURE_FILE="${RUNNER_TEMP}/partition-shadow-capture.json"
+          CAPTURE_HELPER="${SUPPORT_ROOT}/scripts/review-capture.mjs"
+          UNITS_HELPER="${SUPPORT_ROOT}/scripts/review-units.mjs"
+          rm -f -- "$CAPTURE_FILE" "$PARTITION_SHADOW_OUTPUT"
+          printf '%s\n' '{"schema_version":1,"max_patch_bytes":8388608,"max_raw_z_bytes":8388608,"max_single_blob_bytes":16777216,"max_total_blob_bytes":67108864,"max_capture_seconds":30}' > "$LIMITS_FILE"
+          printf '%s\n' '{"schema_version":1,"benchmark_revision":"","atom_target_bytes":16000,"unit_target_bytes":64000,"max_frontier_units":128,"max_shadow_artifact_bytes":4194304}' > "$CONFIG_FILE"
+          fallback() {
+            local status="$1" reason="$2"
+            if ! canonical_fallback "$status" "$reason"; then
+              emergency_fallback "$status" "$reason"
+            fi
+          }
+          canonical_fallback() {
+            local status="$1" reason="$2"
+            STATUS="$status" REASON="$reason" BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" \
+              node --input-type=module - "$CAPTURE_HELPER" "$UNITS_HELPER" "$CONFIG_FILE" "$CAPTURE_FILE" "$PARTITION_SHADOW_OUTPUT" <<'NODE'
+          import { readFileSync } from "node:fs";
+          import { pathToFileURL } from "node:url";
+          const [captureHelper, unitsHelper, configFile, captureFile, output] = process.argv.slice(2);
+          const { validateCapturedReviewInput } = await import(pathToFileURL(captureHelper).href);
+          const { buildShadowDiagnostic, writeShadowOutput } = await import(pathToFileURL(unitsHelper).href);
+          const config = JSON.parse(readFileSync(configFile, "utf8"));
+          let capture;
+          let validated;
+          try {
+            capture = JSON.parse(readFileSync(captureFile, "utf8"));
+            validated = validateCapturedReviewInput(capture);
+          } catch {}
+          const observed_lower_bounds = validated?.observed_lower_bounds
+            ?? { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 };
+          const completeCapture = validated?.status === "complete"
+            && typeof validated.capture_hash === "string"
+            && /^[0-9a-f]{64}$/.test(validated.capture_hash);
+          const fallbackStatus = completeCapture
+            ? process.env.STATUS
+            : validated?.status ?? "capture_failed";
+          const fallbackReason = completeCapture
+            ? process.env.REASON
+            : validated?.capacity_reason ?? "result_unavailable";
+          writeShadowOutput(output, buildShadowDiagnostic({
+            status: fallbackStatus,
+            base_sha: process.env.BASE_SHA,
+            head_sha: process.env.HEAD_SHA,
+            benchmark_revision: config.benchmark_revision,
+            capture_hash: completeCapture ? validated.capture_hash : null,
+            reason_codes: [fallbackReason],
+            diagnostic: "Partition shadow helper failed; details redacted.",
+            observed_lower_bounds,
+            counts: {},
+          }, config.max_shadow_artifact_bytes));
+          NODE
+          }
+          emergency_fallback() {
+            local status="$1" reason="$2"
+            STATUS="$status" REASON="$reason" BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" \
+              node --input-type=module - "$CONFIG_FILE" "$PARTITION_SHADOW_OUTPUT" <<'NODE'
+          import { randomUUID } from "node:crypto";
+          import { lstatSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+          import { dirname, join } from "node:path";
+          const [configFile, output] = process.argv.slice(2);
+          let maxBytes = 4_194_304;
+          try {
+            const configured = JSON.parse(readFileSync(configFile, "utf8")).max_shadow_artifact_bytes;
+            if (Number.isSafeInteger(configured) && configured > 0) maxBytes = configured;
+          } catch {}
+          const gitId = (value) => /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(value ?? "")
+            ? value
+            : "0".repeat(40);
+          const reason = typeof process.env.REASON === "string" && process.env.REASON.length > 0 && process.env.REASON.length <= 256
+            ? process.env.REASON
+            : "result_unavailable";
+          const canonicalJson = (value) => {
+            if (value === null || typeof value === "string" || typeof value === "boolean"
+              || (typeof value === "number" && Number.isFinite(value))) return JSON.stringify(value);
+            if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+            if (Object.getPrototypeOf(value) !== Object.prototype) throw new TypeError("diagnostic must be plain JSON");
+            return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+          };
+          const diagnostic = {
+            schema_version: 1,
+            status: ["capture_capacity_exceeded", "capture_failed"].includes(process.env.STATUS) ? process.env.STATUS : "capture_failed",
+            mode: "partition_shadow",
+            base_sha: gitId(process.env.BASE_SHA),
+            head_sha: gitId(process.env.HEAD_SHA),
+            benchmark_revision: "",
+            capture_hash: null,
+            manifest_hash: null,
+            reason_codes: [reason],
+            diagnostic: "Partition shadow diagnostic unavailable.",
+            observed_lower_bounds: { patch_bytes: 0, raw_z_bytes: 0, blob_bytes: 0, blob_count: 0, elapsed_milliseconds: 0 },
+            counts: {},
+            sizes: { encoded_output_bytes: 0 },
+          };
+          for (;;) {
+            const encodedBytes = Buffer.byteLength(`${canonicalJson(diagnostic)}\n`);
+            if (diagnostic.sizes.encoded_output_bytes === encodedBytes) break;
+            diagnostic.sizes.encoded_output_bytes = encodedBytes;
+          }
+          const content = `${canonicalJson(diagnostic)}\n`;
+          if (Buffer.byteLength(content) > maxBytes) throw new Error("emergency diagnostic exceeds configured artifact limit");
+          try {
+            if (lstatSync(output).isSymbolicLink()) throw new Error("output path must not be a symlink");
+          } catch (error) {
+            if (error?.code !== "ENOENT") throw error;
+          }
+          const temporary = join(dirname(output), `.partition-shadow-${randomUUID()}.tmp`);
+          try {
+            writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
+            renameSync(temporary, output);
+          } finally {
+            try { unlinkSync(temporary); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+          }
+          NODE
+          }
+          if ! node "$CAPTURE_HELPER" capture --repo "$GITHUB_WORKSPACE" --base "$BASE_SHA" --head "$HEAD_SHA" --limits "$LIMITS_FILE" --out "$CAPTURE_FILE"; then
+            fallback capture_failed capture_helper_failed
+          elif ! node "$UNITS_HELPER" shadow --capture "$CAPTURE_FILE" --profile "$PROFILE_FILE" --config "$CONFIG_FILE" --diagnostics-out "$PARTITION_SHADOW_OUTPUT"; then
+            fallback planner_failed planner_helper_failed
+          fi
+          test -s "$PARTITION_SHADOW_OUTPUT" || fallback capture_failed output_unavailable
+          shadow_output_status() {
+            node --input-type=module - "$PARTITION_SHADOW_OUTPUT" 2>/dev/null <<'NODE'
+          import { readFileSync } from "node:fs";
+          const value = JSON.parse(readFileSync(process.argv[2], "utf8"));
+          if (typeof value?.status !== "string" || value.status.length === 0) throw new TypeError("shadow output status is unreadable");
+          process.stdout.write(value.status);
+          NODE
+          }
+          if ! OUTPUT_STATUS="$(shadow_output_status)"; then
+            fallback planner_failed output_status_unreadable
+          elif ! node "$UNITS_HELPER" validate-output --input "$PARTITION_SHADOW_OUTPUT" --capture "$CAPTURE_FILE" --profile "$PROFILE_FILE" --config "$CONFIG_FILE" --max-bytes 4194304; then
+            fallback planner_failed output_validation_failed
+          fi
+
+      - name: upload optional partition shadow diagnostics
+        if: ${{ !cancelled() && steps.target.outputs.eligible == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentic-review-partition-shadow
+          path: /tmp/review-partition-shadow.json
           retention-days: 7
           if-no-files-found: ignore

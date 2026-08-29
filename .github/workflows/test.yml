@@ -33,4 +33,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: verify review result contracts
-        run: node --test scripts/thread-change.test.mjs scripts/review-result.test.mjs scripts/post-review.test.mjs scripts/merge-findings.test.mjs scripts/run-review.test.mjs
+        run: node --test scripts/thread-change.test.mjs scripts/lib-canonical-json.test.mjs scripts/review-result.test.mjs scripts/review-capture.test.mjs scripts/review-units.test.mjs scripts/post-review.test.mjs scripts/merge-findings.test.mjs scripts/run-review.test.mjs
+      - name: verify optional partition shadow contracts
+        run: node --test --test-name-pattern='partition shadow|optional diagnostics' scripts/run-review.test.mjs
