@@ -6818,3 +6818,61 @@ exec "\${REAL_NODE}" "$@"
     assert.equal(validatePublication(run.publicationFile).status, 0);
   }
 });
+
+test("partition shadow removes malformed staged output when both diagnostic writers fail", (t) => {
+  const fixture = createFixture(t);
+  const nodeWrapper = join(fixture.bin, "node");
+  const replacementFailure = join(fixture.directory, "shadow-replacement-failure");
+  const diagnosticWriterLog = join(fixture.directory, "shadow-diagnostic-writers.log");
+  writeFileSync(nodeWrapper, `#!/usr/bin/env bash
+if [ "\${1##*/}" = review-units.mjs ] && [ "\${2:-}" = shadow ]; then
+  "$REAL_NODE" "$@"
+  result=$?
+  [ "$result" -eq 0 ] || exit "$result"
+  for ((index = 1; index <= $#; index += 1)); do
+    if [ "\${!index}" = --local-out ]; then
+      next=$((index + 1))
+      output="\${!next}"
+      break
+    fi
+  done
+  printf '%s\\n' '{"malformed":"staged shadow output"}' > "$output"
+  exit 0
+fi
+if [ "\${1##*/}" = review-units.mjs ] && [ "\${2:-}" = validate-output ]; then
+  : > "$FAKE_SHADOW_REPLACEMENT_FAILURE"
+  exit 97
+fi
+if [ -e "$FAKE_SHADOW_REPLACEMENT_FAILURE" ] \
+  && [ "\${1:-}" = --input-type=module ] && [ "\${2:-}" = -e ]; then
+  printf '%s\\n' diagnostic-writer >> "$FAKE_SHADOW_DIAGNOSTIC_WRITER_LOG"
+  exit 98
+fi
+exec "$REAL_NODE" "$@"
+`);
+  chmodSync(nodeWrapper, 0o755);
+  const shadowFile = join(fixture.directory, "partition-shadow.json");
+  const run = runReview(t, {
+    general: [{ findings: [] }],
+    correctness: [{ findings: [] }],
+    boundaries: [{ findings: [] }],
+  }, {
+    existingFixture: fixture,
+    args: ["--partition-shadow", "--partition-shadow-out", shadowFile, "--json"],
+    env: {
+      FAKE_SHADOW_DIAGNOSTIC_WRITER_LOG: diagnosticWriterLog,
+      FAKE_SHADOW_REPLACEMENT_FAILURE: replacementFailure,
+    },
+  });
+
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.equal(run.logs.length, 3, "shadow failure must not gate the authoritative review");
+  assert.equal(existsSync(shadowFile), false, "malformed staged shadow output must not publish");
+  assert.equal(
+    readFileSync(diagnosticWriterLog, "utf8").trim().split("\n").length,
+    2,
+    "both helper-backed and inline diagnostic writers must fail",
+  );
+  assert.match(run.result.stderr, /partition shadow: capture_failed/);
+  assert.equal(validatePublication(run.publicationFile).status, 0);
+});
